@@ -1,7 +1,10 @@
 """开机自启动：HKCU Run 注册表项。"""
 import os
 import sys
-import winreg
+try:
+    import winreg
+except ImportError:
+    winreg = None
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "DeskPet"
@@ -16,6 +19,8 @@ def _command() -> str:
 
 
 def is_enabled() -> bool:
+    if winreg is None:
+        return False
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as k:
             winreg.QueryValueEx(k, VALUE_NAME)
@@ -26,6 +31,8 @@ def is_enabled() -> bool:
 
 def set_enabled(enable: bool) -> bool:
     """设置开机自启。返回操作后的状态。"""
+    if winreg is None:
+        return False
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
                             winreg.KEY_SET_VALUE) as k:

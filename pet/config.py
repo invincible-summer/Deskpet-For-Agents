@@ -2,6 +2,8 @@
 import copy
 import json
 import os
+import tempfile
+import threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
@@ -22,8 +24,12 @@ DEFAULTS = {
         "font_family": "Microsoft YaHei UI",
         "font_size": 11,
         "font_color": "#1f2430",
-        "bg": "#ffffff",
-        "border": "#3a7bd5",
+        "bg": "#fffdf8",
+        "border": "#d7dfdc",
+        "height": 132,
+        "relative_width": 1.0,
+        "relative_height": 1.0,
+        "relative_font": 1.0,
         "width": 300,            # 固定宽度（不再自适应）
         "max_lines": 2,          # 固定行数
         "autohide_sec": 8,
@@ -41,6 +47,10 @@ DEFAULTS = {
         "gone_grace_sec": 45.0,         # 进程消失宽限期：扫描抖动不立刻判定退出
         "pinned": "",                   # 手动钉住的主绑定实例 key（空=自动选择）
     },
+    "connection_mode": "hybrid",
+    "managed": {"command": "codex", "history_limit": 300, "experimental": False},
+    "animation_cache_mb": 48,
+    "config_version": 2,
     "force_state": "",           # 锁定动画：空=自动；walk/attack/die/special/sleep
     "keys": {
         "claude": {"approve": "Return", "deny": "Escape"},
@@ -50,7 +60,7 @@ DEFAULTS = {
     },
     "convert": {"height": 240, "fps": 12},
     "window_instances": {},      # 批复用：agent 实例 key -> 手动绑定的终端窗口标题
-    "auto_approve": {"enabled": False},   # 自动批复（对所有等待批复自动发送批准键）
+    "auto_approve": {"enabled": False},   # 旧版设置，仅用于迁移提示；新设置按受控会话保存
     "approve_restore_focus": True,        # 批复发送后把焦点还给原先窗口
 }
 
@@ -60,7 +70,9 @@ KEY_LABEL = {"Return": "Enter", "Escape": "Esc", "space": "空格", "y": "y", "n
 
 def _deep_merge(base: dict, override: dict) -> dict:
     out = copy.deepcopy(base)
-    for k, v in (override or {}).items():
+    if not isinstance(override, dict):
+        return out
+    for k, v in override.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = _deep_merge(out[k], v)
         else:
@@ -70,7 +82,9 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 class Config:
     def __init__(self):
+        self._lock = threading.RLock()
         self.data = copy.deepcopy(DEFAULTS)
+        self.migration_notice = False
         self.load()
 
     def load(self):
@@ -79,28 +93,53 @@ class Config:
                 self.data = _deep_merge(DEFAULTS, json.load(f))
         except (OSError, ValueError):
             self.data = copy.deepcopy(DEFAULTS)
+        legacy_auto = self.data.get("auto_approve")
+        self.migration_notice = bool(
+            isinstance(legacy_auto, dict) and legacy_auto.get("enabled")
+        )
+        self.data["auto_approve"] = {"enabled": False}
+        self.data["config_version"] = 2
+        if self.data.get("connection_mode") not in ("hybrid", "readonly"):
+            self.data["connection_mode"] = "hybrid"
         if self.data.get("skin") == "default":     # 旧版皮肤名迁移
             self.data["skin"] = "amiya"
 
     def save(self):
-        try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-        except OSError:
-            pass
+        # Same-directory atomic replacement avoids half-written settings on exit.
+        with self._lock:
+            temporary = None
+            try:
+                fd, temporary = tempfile.mkstemp(prefix=".deskpet-config-", dir=ROOT)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+                os.replace(temporary, CONFIG_PATH)
+            except OSError:
+                pass
+            finally:
+                if temporary and os.path.exists(temporary):
+                    try:
+                        os.unlink(temporary)
+                    except OSError:
+                        pass
 
     # 便捷访问
     def get(self, path, default=None):
-        node = self.data
-        for part in path.split("."):
-            if not isinstance(node, dict) or part not in node:
-                return default
-            node = node[part]
-        return node
+        with self._lock:
+            node = self.data
+            for part in path.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return copy.deepcopy(node) if isinstance(node, (dict, list)) else node
 
     def set(self, path, value):
-        node = self.data
-        parts = path.split(".")
-        for part in parts[:-1]:
-            node = node.setdefault(part, {})
-        node[parts[-1]] = value
+        with self._lock:
+            node = self.data
+            parts = path.split(".")
+            for part in parts[:-1]:
+                child = node.get(part)
+                if not isinstance(child, dict):
+                    child = {}
+                    node[part] = child
+                node = child
+            node[parts[-1]] = copy.deepcopy(value)

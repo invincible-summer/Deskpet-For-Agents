@@ -12,6 +12,8 @@ import threading
 user32 = ctypes.windll.user32
 shell32 = ctypes.windll.shell32
 kernel32 = ctypes.windll.kernel32
+kernel32.GetCurrentThreadId.restype = wt.DWORD
+user32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
 
 # 明确签名：回调里会收到 64 位 wParam/lparam，缺省转换会溢出
 user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
@@ -59,6 +61,7 @@ class TrayIcon:
         self.events: "queue.Queue" = queue.Queue()
         self.tooltip = tooltip
         self._thread: threading.Thread | None = None
+        self._thread_id = 0
         self._ready = threading.Event()
         self._hwnd = None
         self._wndproc_ref = None          # 保住回调引用防 GC
@@ -76,15 +79,26 @@ class TrayIcon:
         self._ready.wait(timeout=5)
 
     def stop(self):
+        thread_id = self._thread_id
+        if thread_id:
+            # WM_QUIT belongs to the target thread's message queue.  This is
+            # the reliable shutdown path even when the hidden window is being
+            # torn down at the same time.
+            user32.PostThreadMessageW(thread_id, 0x0012, 0, 0)
         if self._hwnd:
-            user32.PostMessageW(self._hwnd, 0x0012, 0, 0)  # WM_QUIT
+            # WM_QUIT is a thread-queue message and cannot be delivered
+            # reliably with PostMessage(hwnd, ...).  Send a private window
+            # message and let the tray thread call PostQuitMessage itself.
+            user32.PostMessageW(self._hwnd, WM_APP_QUIT, 0, 0)
         if self._thread:
             self._thread.join(timeout=3)
         self._thread = None
         self._hwnd = None
+        self._thread_id = 0
 
     # ---- worker 线程 ----
     def _run(self):
+        self._thread_id = int(kernel32.GetCurrentThreadId())
         hinst = kernel32.GetModuleHandleW(None)
         cls = "DeskPetTrayWnd"
 
@@ -97,9 +111,9 @@ class TrayIcon:
                 if ev:
                     self.events.put(ev)
                 return 0
-            if msg == 0x0012:  # WM_QUIT -> 退出消息循环前删图标
+            if msg == WM_APP_QUIT:
                 self._remove()
-                user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+                user32.PostQuitMessage(0)
                 return 0
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 

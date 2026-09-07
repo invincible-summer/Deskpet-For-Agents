@@ -39,9 +39,11 @@ def _match_kind(name: str, cmd: str) -> AgentKind | None:
     return None
 
 
-def scan_windows() -> list[AgentInstance]:
+def scan_windows(exclude_pids: set[int] | None = None) -> list[AgentInstance]:
+    """扫描 Windows 进程；可排除受控 manager 已拥有的 PID。"""
     import psutil
 
+    exclude_pids = {int(pid) for pid in (exclude_pids or set()) if pid}
     out: list[AgentInstance] = []
     try:
         procs = list(psutil.process_iter(attrs=["pid", "name", "cmdline", "create_time"]))
@@ -50,7 +52,7 @@ def scan_windows() -> list[AgentInstance]:
 
     matched: list[tuple[AgentInstance, object]] = []
     for p in procs:
-        if p.info["pid"] == _SELF_PID:
+        if p.info["pid"] == _SELF_PID or p.info["pid"] in exclude_pids:
             continue
         name = p.info.get("name") or ""
         cmd = _norm_cmdline(p)
@@ -99,6 +101,8 @@ class WslScanner:
         self._distros: list[str] = []
         self._distros_ts = 0.0
         self._lock = threading.Lock()
+        self.last_ok = True
+        self.last_error = ""
 
     def _list_running_distros(self) -> list[str]:
         if time.time() - self._distros_ts < 15:
@@ -109,8 +113,13 @@ class WslScanner:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             text = r.stdout.decode("utf-16", errors="replace")
-        except Exception:
-            text = ""
+            rc = getattr(r, "returncode", 0)
+            if rc not in (0, None):
+                raise RuntimeError(f"wsl.exe -l failed ({rc})")
+        except Exception as exc:
+            self.last_ok = False
+            self.last_error = str(exc)
+            return self._distros
         distros = []
         for line in text.splitlines():
             parts = line.split()
@@ -122,11 +131,19 @@ class WslScanner:
         with self._lock:
             self._distros = distros
             self._distros_ts = time.time()
+            self.last_ok = True
+            self.last_error = ""
         return distros
 
-    def scan(self) -> list[AgentInstance]:
+    def scan(self, exclude_pids: set[int] | None = None) -> list[AgentInstance]:
+        """扫描各发行版；命令失败时保留 last_ok=False 供 Monitor 保留旧缓存。"""
+        exclude_pids = {int(pid) for pid in (exclude_pids or set()) if pid}
         out: list[AgentInstance] = []
-        for distro in self._list_running_distros():
+        distros = self._list_running_distros()
+        if not self.last_ok:
+            return out
+        scan_ok = True
+        for distro in distros:
             try:
                 r = subprocess.run(
                     ["wsl.exe", "-d", distro, "--", "sh", "-c",
@@ -136,6 +153,10 @@ class WslScanner:
                 )
                 text = r.stdout.decode("utf-8", errors="replace")
             except Exception:
+                scan_ok = False
+                continue
+            if getattr(r, "returncode", 0) not in (0, None):
+                scan_ok = False
                 continue
             now = time.time()
             for line in text.splitlines():
@@ -163,8 +184,12 @@ class WslScanner:
                     pid = int(pid_s)
                 except ValueError:
                     continue
+                if pid in exclude_pids:
+                    continue
                 out.append(AgentInstance(
                     kind=kind, pid=pid, source=f"wsl:{distro}",
                     started_at=now - float(etimes_s),
                 ))
+        self.last_ok = scan_ok
+        self.last_error = "" if scan_ok else "WSL 进程扫描部分失败"
         return out

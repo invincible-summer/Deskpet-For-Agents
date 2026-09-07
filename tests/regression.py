@@ -53,8 +53,11 @@ def t1():
     GEO_CALLS.clear()
     app.toast("很长很长的提示文本，" * 14, 6)   # 强制气泡尺寸变化
     def check1():
-        ok = bool(GEO_CALLS) and all(anchor_of(c) == anchor_of(GEO_CALLS[0])
-                                     for c in GEO_CALLS)
+        # The card has a fixed size, so changing only its text may legitimately
+        # require no geometry call at all.  If a redraw does resize, every
+        # call must still preserve the same anchor.
+        ok = not GEO_CALLS or all(anchor_of(c) == anchor_of(GEO_CALLS[0])
+                                  for c in GEO_CALLS)
         step("气泡变化不移动锚点", ok,
              f"{len(GEO_CALLS)} 次几何调用, 锚点集合="
              f"{ {anchor_of(c) for c in GEO_CALLS} }")

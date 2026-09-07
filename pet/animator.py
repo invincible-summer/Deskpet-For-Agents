@@ -9,12 +9,21 @@ MAX_CACHED_ANIMS = 2
 class Animation:
     def __init__(self, path: str, meta: dict):
         self.path = path
-        self.n = int(meta.get("frames", 1))
-        self.base_delay = int(meta.get("delay_ms", 83))
+        try:
+            self.n = max(1, int(meta.get("frames", 1)))
+        except (TypeError, ValueError):
+            self.n = 1
+        try:
+            self.base_delay = max(1, int(meta.get("delay_ms", 83)))
+        except (TypeError, ValueError):
+            self.base_delay = 83
         self.loop = bool(meta.get("loop", True))
-        self.width = int(meta.get("width", 0))
-        self.height = int(meta.get("height", 0))
-        self._frames: dict[int, tk.PhotoImage] = {}
+        try:
+            self.width = max(0, int(meta.get("width", 0)))
+            self.height = max(0, int(meta.get("height", 0)))
+        except (TypeError, ValueError):
+            self.width = self.height = 0
+        self._frames: OrderedDict[int, tk.PhotoImage] = OrderedDict()
 
     def frame(self, i: int) -> tk.PhotoImage:
         img = self._frames.get(i)
@@ -30,6 +39,7 @@ class Animation:
                     self._frames[0] = img
                 return img
             self._frames[i] = img
+        self._frames.move_to_end(i)
         return img
 
     def free(self):
@@ -43,6 +53,8 @@ class Animator:
         self.root = root
         self.speed = 1.0
         self.static = False
+        self.paused = False
+        self.cache_bytes = 48 * 1024 * 1024
         self.current: Animation | None = None
         self._name = ""
         self._idx = 0
@@ -74,7 +86,7 @@ class Animator:
         self._name = name
         self._idx = 0
         self._on_done = on_done
-        self._repeats_left = (repeat - 1) if repeat > 0 else (0 if anim.loop else -1)
+        self._repeats_left = repeat if repeat > 0 else (0 if anim.loop else 1)
         if self._after_id:
             self.root.after_cancel(self._after_id)
             self._after_id = None
@@ -85,7 +97,18 @@ class Animator:
     def frame_image(self) -> tk.PhotoImage | None:
         if not self.current:
             return None
-        return self.current.frame(min(self._idx, self.current.n - 1))
+        image = self.current.frame(min(self._idx, self.current.n - 1))
+        # Keep the displayed frame, evict least recently used decoded pixels globally.
+        used = sum(len(a._frames) * max(1, a.width*a.height*4) for a in self._pool.values())
+        for a in list(self._pool.values()):
+            for index in list(a._frames):
+                if used <= self.cache_bytes:
+                    return image
+                if a is self.current and a._frames[index] is image:
+                    continue
+                del a._frames[index]
+                used -= max(1, a.width*a.height*4)
+        return image
 
     def frame_size(self) -> tuple[int, int]:
         if self.current:
@@ -113,9 +136,10 @@ class Animator:
         """释放不在当前皮肤路径集中的动画（换肤/换尺寸后调用）。"""
         alive = set(self._paths.values())
         for path in list(self._pool):
-            anim = self._pool.pop(path)
-            if anim is not self.current:
-                anim.free()
+            if path not in alive:
+                anim = self._pool.pop(path)
+                if anim is not self.current:
+                    anim.free()
 
     def free_all(self):
         for a in self._pool.values():
@@ -134,7 +158,7 @@ class Animator:
             self._after_id = None
 
     def _schedule(self):
-        if self.static or not self.current:
+        if self.static or self.paused or not self.current:
             return
         delay = max(20, int(self.current.base_delay / self.speed))
         self._after_id = self.root.after(delay, self._advance)
@@ -145,17 +169,13 @@ class Animator:
             return
         self._idx += 1
         if self._idx >= self.current.n:
-            if self._repeats_left > 0:
+            if self._repeats_left > 1:
                 self._repeats_left -= 1
                 self._idx = 0
             elif self._repeats_left == 0:      # 循环动画
                 self._idx = 0
             else:                               # 非循环动画播完：释放帧缓存再回调
                 self._idx = self.current.n - 1
-                finished, self.current = self.current, None
-                finished.free()
-                self._pool = OrderedDict(
-                    (k, v) for k, v in self._pool.items() if v is not finished)
                 cb, self._on_done = self._on_done, None
                 if self._tick_cb:
                     self._tick_cb()
@@ -180,5 +200,14 @@ class Animator:
             self._idx = 0
             if self._tick_cb:
                 self._tick_cb()
+        elif not self._after_id:
+            self._schedule()
+
+    def set_paused(self, paused: bool):
+        if self.paused == bool(paused):
+            return
+        self.paused = bool(paused)
+        if self.paused:
+            self.stop()
         elif not self._after_id:
             self._schedule()

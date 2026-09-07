@@ -12,3 +12,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+
+# Local UI snapshots and measurements
+.test-artifacts/

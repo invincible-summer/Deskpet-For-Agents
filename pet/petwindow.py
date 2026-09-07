@@ -14,7 +14,10 @@ class PetWindow:
         self.config = config
         self.root.title("DeskPet")
         self.root.overrideredirect(True)
-        self.root.attributes("-transparentcolor", MAGIC)
+        try:
+            self.root.attributes("-transparentcolor", MAGIC)
+        except tk.TclError:
+            pass  # 允许无 Windows 桌面的界面测试
         self._apply_topmost()
         try:
             self.root.attributes("-toolwindow", True)  # 不显示在 Alt+Tab / 任务栏
@@ -32,14 +35,14 @@ class PetWindow:
         self.canvas.bind("<Button-3>", self._on_menu)
         self.canvas.bind("<Double-Button-1>", self._on_double)
 
-    @property
-    def dragging(self) -> bool:
-        return self._drag_off is not None
-
         self.on_click_button = None   # cb(tag)  批复按钮点击
         self.on_menu = None           # cb(menu) 右键菜单构建
         self.on_interact = None       # cb()     双击互动
         self.on_moved = None          # cb(anchor_x, anchor_y) 拖动结束
+
+    @property
+    def dragging(self) -> bool:
+        return self._drag_off is not None
 
     # ---- 可见性 ----
     def hide(self):
@@ -102,6 +105,9 @@ class PetWindow:
                 self.on_moved()
 
     def _on_double(self, _ev):
+        if self.hit_button(_ev.x, _ev.y):
+            return "break"
+        self._drag_off = None
         if self.on_interact:
             self.on_interact()
 

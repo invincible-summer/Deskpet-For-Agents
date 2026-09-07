@@ -1,0 +1,1 @@
+"""DeskPet automated tests."""

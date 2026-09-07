@@ -7,15 +7,29 @@ import re
 
 _MD_NOISE = re.compile(r"^[\s>#*\-`·•]+")
 _MD_INLINE = re.compile(r"[`*_/]+")
+_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_LOG_PREFIX = re.compile(
+    r"^(?:\[[^\]]{1,32}\]\s*|(?:trace|debug|info|warn|warning|error)\s*:\s*)",
+    re.IGNORECASE,
+)
 
 
 def shorten(text: str, limit: int = 90) -> str:
-    """取首个有效行 → 去掉 markdown 噪声 → 优先在句末截断，否则硬截断。"""
+    """把文本压成一条确定长度的本地摘要。
+
+    只取首个有效行，去掉常见 Markdown/终端噪声，并优先在句末截断。
+    该函数不解析协议，也不调用模型；所有调用方都可以在 UI 边界再次使用。
+    """
     if not text:
         return ""
+    limit = max(1, int(limit))
     s = ""
     for raw_line in str(text).splitlines():
-        line = _MD_NOISE.sub("", _MD_INLINE.sub("", raw_line))
+        line = _ANSI.sub("", raw_line).strip()
+        if not line or line.startswith("```"):
+            continue
+        line = _LOG_PREFIX.sub("", line)
+        line = _MD_NOISE.sub("", _MD_INLINE.sub("", line))
         line = " ".join(line.split())
         if line:
             s = line
@@ -28,24 +42,79 @@ def shorten(text: str, limit: int = 90) -> str:
     for sep in ("。", "！", "？", ". ", "! ", "? ", "；", "; ", "，", ", "):
         i = head.rfind(sep)
         if i >= limit * 0.5:
-            return head[: i + (0 if len(sep) == 1 else 1)].rstrip(" ,;，；")
+            return head[: i + len(sep)].rstrip(" ,;，；")
     return head.rstrip() + "…"
 
 
 def fmt_command(cmd, limit: int = 70) -> str:
     """命令列表/字符串 → 单行短命令（超长时中段省略）。"""
+    limit = max(1, int(limit))
     if isinstance(cmd, (list, tuple)):
         cmd = " ".join(str(c) for c in cmd)
     s = " ".join(str(cmd).split())
     if len(s) > limit:
-        keep = max(4, limit - 2)          # 给“…”留位
+        if limit <= 3:
+            return "…"[:limit]
+        keep = limit - 1                  # 给一个“…”留位
         return s[: keep // 2] + "…" + s[-(keep - keep // 2):]
     return s
 
 
+_TOOL_RULES = (
+    ("test", ("test", "pytest", "unittest", "vitest", "jest", "check"), "测试"),
+    ("search", ("grep", "rg", "ripgrep", "search", "find", "glob", "query"), "搜索"),
+    ("read", ("read", "cat", "head", "tail", "list", "ls", "stat", "inspect"), "读取"),
+    ("write", ("write", "create", "save", "mkdir", "touch"), "写入"),
+    ("edit", ("edit", "patch", "replace", "apply_patch", "modify", "delete"), "修改"),
+    ("web", ("web", "browser", "fetch", "http", "url", "browse"), "查询"),
+    ("execute", ("bash", "shell", "command", "exec", "run", "terminal"), "执行"),
+    ("delegate", ("task", "agent", "delegate", "spawn"), "委派"),
+)
+
+
+def _tool_label(name: str, detail: str = "") -> str:
+    """返回工具调用的稳定中文类别；未知工具只显示短名称。"""
+    raw = " ".join(str(name or "").replace("_", " ").replace("-", " ").split())
+    low = raw.lower()
+    detail_low = str(detail or "").lower()
+    # 低成本识别常见命令行工具，即使事件只给了命令正文。
+    if any(word in detail_low for word in ("pytest", "npm test", "cargo test", "go test", "unittest", "vitest", "jest")):
+        return "测试"
+    for _kind, words, label in _TOOL_RULES:
+        if any(word in low for word in words):
+            return label
+    if raw:
+        return raw[:24]
+    return "处理中"
+
+
+def classify_tool(name: str, detail: str = "", limit: int = 90) -> str:
+    """工具名/参数 → 适合气泡的一行本地活动摘要。
+
+    只保留类别和有限参数，避免把完整 shell 命令或工具输入搬到界面。
+    """
+    limit = max(8, int(limit))
+    label = _tool_label(name, detail)
+    detail_s = fmt_command(detail, max(8, limit - len(label) - 2)) if detail else ""
+    if detail_s:
+        return shorten(f"{label}：{detail_s}", limit)
+    return shorten(label, limit)
+
+
+def summarize_tool(name: str, detail: str = "", limit: int = 90) -> str:
+    """兼容旧 watcher 的工具摘要命名。"""
+    return classify_tool(name, detail, limit)
+
+
+def summarize_activity(assistant_text: str = "", tool_name: str = "",
+                       tool_detail: str = "", limit: int = 120) -> str:
+    """优先返回最近的助手文本，否则返回分类后的工具摘要。"""
+    text = shorten(assistant_text, limit)
+    return text or classify_tool(tool_name, tool_detail, limit)
+
+
 def tool_line(name: str, detail: str, limit: int = 90) -> str:
-    detail = shorten(detail, max(20, limit - len(name) - 2)) if detail else ""
-    return f"{name}: {detail}" if detail else str(name)
+    return classify_tool(name, detail, limit)
 
 
 # ---- 模式名映射（本地查表） ----

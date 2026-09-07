@@ -53,6 +53,10 @@ def session_files(kind: AgentKind, roots: list[str], window_sec: float) -> list[
     """在根目录下找出活跃的会话文件，按 mtime 新→旧返回 [(mtime, path)]。"""
     import time
 
+    try:
+        window = max(0.0, float(window_sec))
+    except (TypeError, ValueError):
+        window = 180.0
     now = time.time()
     found: list[tuple[float, str]] = []
 
@@ -62,9 +66,9 @@ def session_files(kind: AgentKind, roots: list[str], window_sec: float) -> list[
             with os.scandir(root) as it:
                 for e in it:
                     try:
-                        if e.is_file() and e.name.endswith(".jsonl"):
+                        if e.is_file() and e.name.lower().endswith(".jsonl"):
                             st = e.stat()
-                            if now - st.st_mtime <= window_sec:
+                            if now - st.st_mtime <= window:
                                 found.append((st.st_mtime, e.path))
                         elif e.is_dir() and depth > 0:
                             walk_jsonl(e.path, depth - 1)

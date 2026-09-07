@@ -1,109 +1,216 @@
-"""Claude Code watcher：~/.claude/projects/**.jsonl
+"""Claude Code watcher（只读兼容模式）。
 
-事件格式（已查证 v2.1.x）：
-  type=assistant → message.content[] 里有 text / tool_use 块
-  type=user      → message.content[] 里 tool_result 块（配对 tool_use_id）
-  type=ai-title / summary / last-prompt
-  type=system, subtype=turn_duration → 回合结束
-待批复检测：磁盘上没有"pending permission"记录（已查证），
-用启发式：存在未闭合 tool_use + 文件静默 > waiting_quiet_sec → 推测等待批复。
+Claude 的权限暂停不会可靠地写入会话 JSONL。未闭合 tool_use 加静默只
+能说明会话暂时没有新记录，不能证明有一个可安全批准的请求，因此本
+watcher 不由静默生成 WAITING/ApprovalRequest。
 """
+import json
 import time
 
-from .base import BaseWatcher, FileState
-from .models import AgentKind, ApprovalRequest, Status
-from .summarize import CLAUDE_MODE, shorten, tool_line
+from .base import BaseWatcher, FileState, parse_ts
+from .models import AgentKind, Status
+from .summarize import CLAUDE_MODE, classify_tool, shorten
+
+
+def _feed_ts(obj: dict) -> float:
+    return parse_ts(obj.get("timestamp")) or time.time()
+
+
+def _text(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("value") or "")
+    if isinstance(value, list):
+        return " ".join(_text(item) for item in value)
+    return ""
+
+
+def _first_present(mapping: dict, *keys):
+    """Read protocol fields without treating valid zero values as missing."""
+    for key in keys:
+        if key in mapping and mapping[key] not in (None, ""):
+            return mapping[key]
+    return ""
 
 
 def _summarize_tool(block) -> str:
     name = block.get("name", "?")
     inp = block.get("input") or {}
     detail = ""
-    for key in ("command", "file_path", "path", "pattern", "url", "description", "prompt"):
-        if isinstance(inp, dict) and inp.get(key):
-            detail = str(inp[key])
-            break
-    return tool_line(name, detail, 90)
+    if isinstance(inp, dict):
+        for key in ("command", "file_path", "path", "pattern", "url", "description", "prompt"):
+            if inp.get(key):
+                detail = str(inp[key])
+                break
+    return classify_tool(name, detail, 120)
 
 
 class ClaudeFile(FileState):
     def __init__(self, path: str):
         super().__init__(path)
         self.title = ""
+        self.goal = ""
         self.last_text = ""
         self.last_tool = ""
         self.mode = ""
         self.open_tools: dict[str, str] = {}
         self.done_ts = 0.0
+        self.error_text = ""
+        self.error_ts = 0.0
+        self.input_pending = False
+        self.input_summary = ""
+        self.turn_active = False
+        self.last_assistant_ts = 0.0
+        self.last_tool_ts = 0.0
+        self.last_activity_kind = ""
+
+    def _touch(self, obj: dict) -> float:
+        ts = _feed_ts(obj)
+        self.last_event_ts = max(self.last_event_ts, ts)
+        sid = obj.get("session_id") or obj.get("sessionId")
+        if sid and not self.session_id:
+            self.session_id = str(sid)
+        turn = obj.get("turn_id") or obj.get("turnId")
+        if turn:
+            self.turn_id = str(turn)
+        cwd = obj.get("cwd") or obj.get("workingDirectory")
+        if cwd:
+            self.cwd = str(cwd)
+        return ts
+
+    def _set_error(self, obj: dict, ts: float):
+        message = obj.get("message") or obj.get("error") or obj.get("reason")
+        self.error_text = shorten(message or "Claude 报告错误", 160)
+        self.error_ts = ts
+        self.turn_active = False
+        self.input_pending = False
+        self.done_ts = 0.0
+        self.phase = "异常"
+
+    def _set_input(self, obj: dict):
+        value = _first_present(obj, "question", "prompt", "message")
+        self.input_pending = True
+        self.input_summary = shorten(_text(value) or "等待输入", 120)
+        self.phase = "等待输入"
 
     def feed(self, line: str):
-        import json
         try:
             obj = json.loads(line)
-        except ValueError:
+        except (TypeError, ValueError):
             return
-        self.last_event_ts = max(self.last_event_ts, _feed_ts(obj))
-        t = obj.get("type")
+        ts = self._touch(obj)
+        t = str(obj.get("type") or "")
+
         if t == "assistant":
+            self.turn_active = True
+            self.done_ts = 0.0
             msg = obj.get("message") or {}
             for block in msg.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
                 btype = block.get("type")
-                if btype == "text" and block.get("text", "").strip():
-                    self.last_text = shorten(block["text"], 160)
+                if btype == "text" and _text(block.get("text")).strip():
+                    self.last_text = shorten(_text(block.get("text")), 160)
+                    self.last_assistant_ts = ts
+                    self.last_activity_kind = "assistant"
+                    self.phase = "回答"
                 elif btype == "tool_use":
                     summary = _summarize_tool(block)
                     self.last_tool = summary
-                    self.open_tools[str(block.get("id"))] = summary
-        elif t == "user":
+                    self.last_tool_ts = ts
+                    self.last_activity_kind = "tool"
+                    self.phase = summary.split("：", 1)[0] if summary else "执行"
+                    self.open_tools[str(block.get("id") or "")] = summary
+            return
+
+        if t == "user":
+            self.input_pending = False
             msg = obj.get("message") or {}
             content = msg.get("content")
             blocks = content if isinstance(content, list) else []
             for block in blocks:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
-                    self.open_tools.pop(str(block.get("tool_use_id")), None)
-        elif t == "ai-title":
-            self.title = shorten(obj.get("aiTitle") or "", 60)
+                    self.open_tools.pop(str(block.get("tool_use_id") or ""), None)
+            # 普通 user 记录是下一回合输入，不是 permission approval。
+            if any(not (isinstance(block, dict) and block.get("type") == "tool_result")
+                   for block in blocks):
+                self.turn_active = True
+                self.done_ts = 0.0
+            return
+
+        if t == "ai-title":
+            self.title = shorten(obj.get("aiTitle") or "", 100)
+            self.goal = self.goal or self.title
         elif t == "summary":
-            self.title = self.title or shorten(obj.get("summary") or "", 60)
+            title = shorten(obj.get("summary") or "", 100)
+            self.title = self.title or title
+            self.goal = self.goal or title
         elif t == "permission-mode":
             mode = obj.get("mode") or obj.get("permissionMode") or ""
             self.mode = CLAUDE_MODE.get(str(mode), str(mode))
-        elif t == "system" and obj.get("subtype") == "turn_duration":
-            self.done_ts = time.time()
+        elif t in {"input", "input_request", "request_user_input", "user_input_required"}:
+            self._set_input(obj)
+        elif t in {"error", "fatal_error"} or (t == "system" and obj.get("subtype") == "error"):
+            self._set_error(obj, ts)
+        elif t == "system" and obj.get("subtype") in {"turn_duration", "turn_complete", "turn_finished"}:
+            # 使用记录里的时间，历史回放不能伪造“刚完成”。
+            self.done_ts = ts
+            self.turn_active = False
+            self.input_pending = False
             self.open_tools.clear()
+            self.phase = "完成"
+        elif t in {"result", "turn_complete", "turn_finished"}:
+            self.done_ts = ts
+            self.turn_active = False
+            result = obj.get("result") or obj.get("message")
+            if result:
+                self.last_text = shorten(_text(result), 160)
+                self.last_assistant_ts = ts
+                self.last_activity_kind = "assistant"
+            self.phase = "完成"
 
     def status(self, now: float, cfg: dict):
-        quiet = now - self.last_event_ts
-        waiting_quiet = cfg.get("waiting_quiet_sec", 15.0)
-        approval = None
-        if self.open_tools and quiet >= waiting_quiet:
-            approval = ApprovalRequest(
-                summary=next(iter(self.open_tools.values())), exact=False,
-            )
-            return Status.WAITING, approval
-        if self.done_ts and now - self.done_ts < 8:
+        if self.error_ts and 0 <= now - self.error_ts < 30:
+            return Status.ERROR, None
+        if self.input_pending:
+            return Status.INPUT, None
+        if self.done_ts and 0 <= now - self.done_ts < 8:
             return Status.DONE, None
-        if self.open_tools or quiet < 10:
+        # open_tools + 静默只说明没有新的磁盘记录，不能生成审批请求。
+        if self.turn_active or now - self.last_event_ts < 10:
             return Status.WORKING, None
         return Status.IDLE, None
+
+    def _summary(self) -> str:
+        if self.last_activity_kind == "assistant" and self.last_text:
+            return self.last_text
+        if self.last_activity_kind == "tool" and self.last_tool:
+            return self.last_tool
+        if self.last_assistant_ts >= self.last_tool_ts and self.last_text:
+            return self.last_text
+        return self.last_tool or self.last_text
 
     def fill_snapshot(self, snap):
         snap.mode = self.mode
         snap.title = self.title
-        if snap.status == Status.WAITING:
-            snap.exact_waiting = False
-            snap.last_line = f"（推测）等待批复：{next(iter(self.open_tools.values()), '')}"
+        snap.goal = self.goal or self.title
+        snap.cwd = self.cwd
+        snap.session_id = self.session_id or snap.session_id
+        snap.turn_id = self.turn_id
+        snap.phase = self.phase
+        if snap.status == Status.ERROR:
+            summary = self.error_text or "Claude 报告错误"
+        elif snap.status == Status.INPUT:
+            summary = self.input_summary or "等待输入"
         elif snap.status == Status.DONE:
-            snap.last_line = self.last_text or "回合完成"
-        elif snap.status == Status.WORKING:
-            snap.last_line = self.last_tool or self.last_text
+            summary = self.last_text or "回合完成"
         else:
-            snap.last_line = self.last_text
-
-
-def _feed_ts(obj) -> float:
-    from .base import parse_ts
-    return parse_ts(obj.get("timestamp"))
+            summary = self._summary() or ("处理中" if snap.status == Status.WORKING else "待命")
+        snap.summary = shorten(summary, 120)
+        snap.last_line = snap.summary
+        snap.exact_waiting = False
+        snap.can_approve = False
 
 
 class ClaudeWatcher(BaseWatcher):

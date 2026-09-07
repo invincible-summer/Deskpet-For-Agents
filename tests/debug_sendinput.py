@@ -1,35 +1,18 @@
-"""调试 SendInput：对比 UNICODE 与 VK 两种方式，检查 GUI 线程焦点。"""
-import sys, time, subprocess, ctypes
+"""调试终端窗口绑定：只检查枚举、身份校验和前台唤起，不发送输入。"""
+import sys
+import time
 sys.path.insert(0, r"D:\mycode\program\deskpet")
 from actions import winkeys
-import ctypes.wintypes as wt
 
-user32 = ctypes.windll.user32
-proc = subprocess.Popen(["notepad.exe"])
-time.sleep(3)
+windows = winkeys.terminal_candidates()
+print("候选终端:", len(windows))
+for hwnd, pid, title, cls in windows[:20]:
+    print(f"  hwnd={hwnd} pid={pid} class={cls!r} title={title!r}")
 
-target = None
-for hwnd, pid, title, cls in winkeys.enum_windows():
-    if title.strip() and ("记事本" in title or "Notepad" in title):
-        target = hwnd
-        break
-print("hwnd:", target)
-winkeys.focus_and_send(target, [])  # 仅聚焦
-time.sleep(0.5)
-
-# GUI 线程焦点检查
-class GUITHREADINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wt.DWORD), ("flags", wt.DWORD), ("hwndActive", wt.HWND),
-                ("hwndFocus", wt.HWND), ("hwndCapture", wt.HWND),
-                ("hwndMenuOwner", wt.HWND), ("hwndMoveSize", wt.HWND),
-                ("hwndCaret", wt.HWND), ("rcCaret", wt.RECT)]
-gti = GUITHREADINFO()
-gti.cbSize = ctypes.sizeof(GUITHREADINFO)
-tid = user32.GetWindowThreadProcessId(target, None)
-ok = user32.GetGUIThreadInfo(tid, ctypes.byref(gti))
-print("GetGUIThreadInfo ok:", bool(ok), "focus hwnd:", gti.hwndFocus)
-
-# 方式1：VK 'Y'
-winkeys._press_vk(0x59)
-time.sleep(0.8)
-print("VK Y 已发送（请看记事本：应出现 y）")
+if windows:
+    hwnd, pid, title, cls = windows[0]
+    print("身份:", winkeys.window_identity(hwnd))
+    print("唤起结果:", winkeys.raise_window(hwnd))
+    time.sleep(0.5)
+else:
+    print("没有可检查的终端窗口")
