@@ -1,0 +1,14 @@
+# ---- 素材版权保护：桌宠素材不入库，用户自行放置 ----
+assets/pets/*
+!assets/pets/README.md
+assets/cache/
+assets/icon.ico
+
+# ---- 本机配置（含个人路径） ----
+config.json
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
