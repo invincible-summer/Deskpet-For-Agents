@@ -1,5 +1,4 @@
-"""Pure monitoring tests: no Tk window, subprocess, or live Agent required."""
-
+"""V3 纯监听测试：无 Tk 窗口、无子进程、无真实 Agent（plan.md §56-§61）。"""
 from __future__ import annotations
 
 import json
@@ -13,10 +12,19 @@ from unittest.mock import patch
 from agents.base import parse_ts
 from agents.claude import ClaudeFile, ClaudeWatcher
 from agents.codex import CodexFile, CodexWatcher
-from agents.kimi import KimiFile
-from agents.models import AgentInstance, AgentKind, Snapshot, Status
+from agents.kimi import KimiFile, KimiWatcher
+from agents.models import (
+    AgentInstance,
+    AgentKind,
+    Confidence,
+    EvidenceSource,
+    Mode,
+    Observation,
+    Phase,
+    Snapshot,
+    Status,
+)
 from agents.monitor import Monitor
-from agents.pi import PiFile
 from agents.summarize import classify_tool, fmt_command, shorten
 from agents.tailer import FileTailer
 
@@ -28,12 +36,16 @@ class MemoryConfig:
         self.data = data or {
             "monitor": {
                 "agents": {kind.value: True for kind in AgentKind},
+                "windows_enabled": True,
                 "wsl_enabled": False,
                 "windows_scan_sec": 3600,
                 "wsl_scan_sec": 3600,
+                "file_poll_sec": 0.5,
+                "session_scan_sec": 3600,
                 "gone_grace_sec": 30,
-                "working_hold_sec": 90,
-            }
+                "activity_grace_sec": 10,
+            },
+            "privacy": {"goal_max_chars": 120, "summary_max_chars": 160},
         }
 
     def get(self, path, default=None):
@@ -99,27 +111,177 @@ class SummaryAndTailerTests(unittest.TestCase):
         self.assertEqual(parse_ts("2020-01-01T00:00:00Z"), 1577836800.0)
 
 
-class WatcherLifecycleTests(unittest.TestCase):
-    def test_codex_silence_never_creates_a_guessed_approval(self):
+# ============================================================ Codex fixtures
+
+class CodexWatcherTests(unittest.TestCase):
+    def test_goal_from_latest_user_message(self):
+        state = CodexFile("rollout-x.jsonl")
+        state.feed(json.dumps({
+            "type": "event_msg",
+            "timestamp": "2020-01-01T00:00:00Z",
+            "payload": {"type": "user_message", "message": "帮我把登录系统迁移成 JWT 并跑测试"},
+        }))
+        obs = state.observation(time.time(), {})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertEqual(obs.goal, "帮我把登录系统迁移成 JWT 并跑测试")
+        self.assertTrue(obs.turn_active)
+        # 新的 user message 更新 Goal（不是只保留第一条）
+        state.feed(json.dumps({
+            "type": "event_msg",
+            "timestamp": "2020-01-01T00:01:00Z",
+            "payload": {"type": "user_message", "message": "再补充单元测试"},
+        }))
+        self.assertEqual(state.observation(time.time(), {}).goal, "再补充单元测试")
+
+    def test_task_started_carries_collaboration_mode_kind(self):
+        state = CodexFile("rollout-x.jsonl")
+        state.feed(json.dumps({
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "t1",
+                        "collaboration_mode_kind": "plan"},
+        }))
+        obs = state.observation(time.time(), {})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertEqual(obs.mode, Mode.PLAN)
+        self.assertEqual(obs.phase, Phase.THINKING)
+        # turn_context 的 approval/sandbox 不应覆盖 Plan mode
+        state.feed(json.dumps({
+            "type": "turn_context",
+            "payload": {"cwd": "/w", "approval_policy": "on-request",
+                        "sandbox_policy": {"type": "workspace-write"}},
+        }))
+        obs = state.observation(time.time(), {})
+        self.assertEqual(obs.mode, Mode.PLAN)
+        self.assertEqual(state.policy, "按需审批·工作区写入")
+
+    def test_phase_mapping_read_code_test_exec_answer(self):
+        state = CodexFile("rollout-x.jsonl")
+        state.feed(json.dumps({"type": "event_msg", "payload": {
+            "type": "task_started", "collaboration_mode_kind": "default"}}))
+        base = time.time()
+        state.feed(json.dumps({"type": "response_item", "timestamp": base + 1, "payload": {
+            "type": "function_call", "name": "read", "arguments": '{"path": "/a.py"}'}}))
+        self.assertEqual(state.phase, Phase.READING)
+        state.feed(json.dumps({"type": "response_item", "timestamp": base + 2, "payload": {
+            "type": "function_call", "name": "apply_patch", "arguments": '{"path": "/a.py"}'}}))
+        self.assertEqual(state.phase, Phase.CODING)
+        state.feed(json.dumps({"type": "response_item", "timestamp": base + 3, "payload": {
+            "type": "function_call", "name": "shell", "arguments": '{"cmd": ["pytest", "-q"]}'}}))
+        self.assertEqual(state.phase, Phase.TESTING)
+        state.feed(json.dumps({"type": "response_item", "timestamp": base + 4, "payload": {
+            "type": "function_call", "name": "shell", "arguments": '{"cmd": ["cargo", "build"]}'}}))
+        self.assertEqual(state.phase, Phase.EXECUTING)
+        state.feed(json.dumps({"type": "event_msg", "timestamp": base + 5, "payload": {
+            "type": "agent_message", "message": "已完成迁移"}}))
+        self.assertEqual(state.phase, Phase.ANSWERING)
+        state.feed(json.dumps({"type": "event_msg", "timestamp": base + 6, "payload": {
+            "type": "task_complete", "last_agent_message": "完成", "turn_id": "t1"}}))
+        obs = state.observation(base + 6.5, {})
+        self.assertEqual(obs.status, Status.DONE)
+
+    def test_paginated_item_completed_command_execution(self):
+        state = CodexFile("rollout-x.jsonl")
+        state.feed(json.dumps({"type": "event_msg", "payload": {
+            "type": "item_completed",
+            "item": {"type": "command_execution", "command": ["pytest", "-q"],
+                     "status": "completed"}}}))
+        self.assertEqual(state.phase, Phase.TESTING)
+
+    def test_error_and_abort_lifecycle(self):
+        state = CodexFile("rollout-x.jsonl")
+        base = time.time()
+        state.feed(json.dumps({"type": "event_msg", "timestamp": base, "payload": {
+            "type": "error", "message": "boom"}}))
+        self.assertEqual(state.observation(base + 1, {}).status, Status.ERROR)
+        # 新 turn 开始立刻清除 ERROR
+        state.feed(json.dumps({"type": "event_msg", "timestamp": base + 2, "payload": {
+            "type": "task_started", "collaboration_mode_kind": "default"}}))
+        self.assertEqual(state.observation(base + 3, {}).status, Status.WORKING)
+        state.feed(json.dumps({"type": "event_msg", "timestamp": base + 4, "payload": {
+            "type": "turn_aborted", "reason": "interrupted"}}))
+        self.assertEqual(state.observation(base + 5, {}).status, Status.IDLE)
+
+    def test_silence_never_creates_a_guessed_approval(self):
         state = CodexFile("codex.jsonl")
         state.feed(json.dumps({
             "type": "event_msg",
             "timestamp": "2020-01-01T00:00:00Z",
-            "payload": {"type": "task_started", "task": "old task"},
+            "payload": {"type": "task_started", "task": "old task",
+                        "collaboration_mode_kind": "default"},
         }))
-        status, approval = state.status(time.time() + 120, {"waiting_quiet_sec": 0})
-        self.assertEqual(status, Status.WORKING)
-        self.assertIsNone(approval)
-
+        obs = state.observation(time.time() + 120, {})
+        self.assertEqual(obs.status, Status.WORKING)   # active turn 已知 → 无限保持
         state.feed(json.dumps({
             "type": "event_msg",
-            "timestamp": "2020-01-01T00:00:00Z",
+            "timestamp": "2020-01-01T00:00:05Z",
             "payload": {"type": "task_complete", "last_agent_message": "finished"},
         }))
-        status, _ = state.status(time.time(), {})
-        self.assertEqual(status, Status.IDLE)
+        self.assertEqual(state.observation(time.time(), {}).status, Status.IDLE)
 
-    def test_claude_old_completion_is_not_new_done_or_waiting(self):
+    def test_activity_only_evidence_degrades_to_unknown_not_idle(self):
+        state = CodexFile("codex.jsonl")
+        # 只有零散活动事件，从未见过 turn 生命周期
+        recent = time.time() - 5
+        state.feed(json.dumps({
+            "type": "event_msg",
+            "timestamp": recent,
+            "payload": {"type": "token_count", "info": None},
+        }))
+        obs = state.observation(time.time(), {"activity_grace_sec": 10})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertFalse(obs.turn_active)
+        self.assertEqual(obs.confidence, Confidence.MEDIUM)
+        # 过了宽限期 → 无观察（UNKNOWN），不伪造 IDLE
+        self.assertIsNone(state.observation(time.time() + 60, {}))
+
+
+# ============================================================ Claude fixtures
+
+class ClaudeWatcherTests(unittest.TestCase):
+    def test_user_prompt_becomes_goal_and_tool_result_is_not_goal(self):
+        state = ClaudeFile("claude.jsonl")
+        base = time.time()
+        state.feed(json.dumps({
+            "type": "user", "timestamp": base,
+            "message": {"content": [{"type": "text", "text": "优化 WSL Agent 监听"}]},
+        }))
+        state.feed(json.dumps({
+            "type": "user", "timestamp": base + 1,
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                     "content": "noise"}]},
+        }))
+        obs = state.observation(base + 2, {})
+        self.assertEqual(obs.goal, "优化 WSL Agent 监听")
+        self.assertNotIn("noise", obs.goal)
+
+    def test_permission_mode_normalized(self):
+        state = ClaudeFile("claude.jsonl")
+        state.feed(json.dumps({"type": "permission-mode", "mode": "plan"}))
+        self.assertEqual(state.mode, Mode.PLAN)
+        state.feed(json.dumps({"type": "permission-mode", "mode": "acceptEdits"}))
+        self.assertEqual(state.mode, Mode.ACCEPT_EDITS)
+        state.feed(json.dumps({"type": "permission-mode", "mode": "default"}))
+        self.assertEqual(state.mode, Mode.DEFAULT)
+
+    def test_tool_use_phase_and_turn_complete(self):
+        state = ClaudeFile("claude.jsonl")
+        base = time.time()
+        state.feed(json.dumps({
+            "type": "assistant", "timestamp": base,
+            "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/a.py"}},
+            ]},
+        }))
+        obs = state.observation(base + 1, {})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertEqual(obs.phase, Phase.READING)
+        state.feed(json.dumps({
+            "type": "result", "timestamp": base + 2, "result": "done",
+        }))
+        self.assertEqual(state.observation(base + 2.5, {}).status, Status.DONE)
+        self.assertEqual(state.observation(base + 20, {}).status, Status.IDLE)
+
+    def test_old_completion_is_not_new_done_or_waiting(self):
         state = ClaudeFile("claude.jsonl")
         state.feed(json.dumps({
             "type": "assistant",
@@ -133,50 +295,157 @@ class WatcherLifecycleTests(unittest.TestCase):
             "type": "system", "subtype": "turn_duration",
             "timestamp": "2020-01-01T00:00:01Z",
         }))
-        status, approval = state.status(time.time(), {"waiting_quiet_sec": 0})
-        self.assertEqual(status, Status.IDLE)
-        self.assertIsNone(approval)
+        obs = state.observation(time.time(), {})
+        self.assertEqual(obs.status, Status.IDLE)
 
-    def test_kimi_preserves_explicit_zero_request_id_and_identity(self):
+    def test_open_tool_plus_silence_never_waits(self):
+        state = ClaudeFile("claude.jsonl")
+        state.feed(json.dumps({
+            "type": "assistant", "timestamp": "2020-01-01T00:00:00Z",
+            "message": {"content": [{"type": "tool_use", "id": "t", "name": "Bash",
+                                     "input": {"command": "ls"}}]},
+        }))
+        obs = state.observation(time.time() + 999, {})
+        # turn 已知 active（assistant 活动后没有完成记录）→ 仍 WORKING，
+        # 但绝不因静默变成 WAITING
+        self.assertIn(obs.status, (Status.WORKING, Status.UNKNOWN))
+        self.assertIsNot(obs.status, Status.WAITING)
+
+
+# ============================================================ Kimi fixtures
+
+class KimiWatcherTests(unittest.TestCase):
+    def _wire(self, path: Path):
+        return str(path / "agents" / "main" / "wire.jsonl")
+
+    def test_real_cli_wire_format(self):
+        """实机验证过的真实 wire 格式：顶层点分事件 + append_loop_event 包裹。"""
+        state = KimiFile("wire.jsonl")
+        base_ms = int(time.time() * 1000) - 5000
+        state.feed(json.dumps({"type": "metadata", "protocol_version": "1.5",
+                               "created_at": base_ms}))
+        state.feed(json.dumps({"type": "prompt.accepted", "agentId": "main",
+                               "content": [{"type": "text", "text": "帮我重构 WSL 监听"}],
+                               "time": base_ms + 10}))
+        state.feed(json.dumps({"type": "plan_mode.enter", "agentId": "main",
+                               "time": base_ms + 20}))
+        state.feed(json.dumps({"type": "permission.set_mode", "mode": "manual",
+                               "time": base_ms + 30}))
+        state.feed(json.dumps({"type": "context.append_loop_event",
+                               "event": {"type": "step.begin", "turnId": "0", "step": 1},
+                               "time": base_ms + 100}))
+        state.feed(json.dumps({"type": "context.append_loop_event",
+                               "event": {"type": "tool.call", "toolCallId": "Edit_0",
+                                         "name": "Edit", "args": {"file_path": "/a.py"}},
+                               "time": base_ms + 200}))
+        obs = state.observation(time.time(), {})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertEqual(obs.mode, Mode.PLAN)          # plan_mode.enter → EXACT
+        self.assertEqual(obs.goal, "帮我重构 WSL 监听")   # prompt.accepted → Goal
+        self.assertEqual(obs.phase, Phase.CODING)
+        self.assertEqual(state.permission_mode, "manual")
+        state.feed(json.dumps({"type": "context.append_loop_event",
+                               "event": {"type": "content.part",
+                                         "part": {"type": "text", "text": "已完成重构"}},
+                               "time": base_ms + 300}))
+        self.assertEqual(state.phase, Phase.ANSWERING)
+        state.feed(json.dumps({"type": "turn.ended", "agentId": "main",
+                               "turnId": 0, "reason": "complete",
+                               "durationMs": 8000, "time": base_ms + 400}))
+        self.assertEqual(state.observation(time.time(), {}).status, Status.DONE)
+
+    def test_wire_ms_time_is_used_not_wall_clock(self):
+        state = KimiFile("wire.jsonl")
+        old_ms = 1788000000000   # 很旧的毫秒时间
+        state.feed(json.dumps({"type": "context.append_loop_event",
+                               "event": {"type": "step.end"}, "time": old_ms}))
+        # 旧事件不应制造“近期活动”（无 turn 生命周期 → None/UNKNOWN）
+        self.assertIsNone(state.observation(time.time(), {"activity_grace_sec": 10}))
+
+    def test_new_layout_state_and_wire(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session_dir = root / "sessions" / "key1" / "s1"
+            (session_dir / "agents" / "main").mkdir(parents=True)
+            (session_dir / "state.json").write_text(json.dumps({
+                "title": "重构监控", "lastPrompt": "重构 WSL 监听"}), encoding="utf-8")
+            wire = session_dir / "agents" / "main" / "wire.jsonl"
+            base = time.time()
+            _line(wire, {"type": "TurnBegin", "timestamp": base})
+            _line(wire, {"type": "StatusUpdate", "timestamp": base + 1,
+                         "payload": {"type": "StatusUpdate", "plan_mode": True}})
+            _line(wire, {"type": "ToolCall", "timestamp": base + 2,
+                         "payload": {"type": "ToolCall", "name": "edit",
+                                     "arguments": {"file_path": "/a.py"}}})
+            state = KimiFile(str(wire))
+            with wire.open(encoding="utf-8") as fh:
+                for line in fh:
+                    state.feed(line)
+            obs = state.observation(base + 3, {})
+            self.assertEqual(obs.status, Status.WORKING)
+            self.assertEqual(obs.mode, Mode.PLAN)
+            self.assertEqual(obs.phase, Phase.CODING)
+
+    def test_wire_user_prompt_updates_goal(self):
+        state = KimiFile("wire.jsonl")
+        state.feed(json.dumps({"type": "UserPrompt", "timestamp": time.time(),
+                               "payload": {"type": "UserPrompt", "prompt": "重构 WSL 监听"}}))
+        self.assertEqual(state.goal, "重构 WSL 监听")
+        state.feed(json.dumps({"type": "UserPrompt", "timestamp": time.time(),
+                               "payload": {"type": "UserPrompt", "prompt": "再跑一次测试"}}))
+        self.assertEqual(state.goal, "再跑一次测试")
+
+    def test_state_json_last_prompt_loaded_by_watcher(self):
+        with tempfile.TemporaryDirectory() as temp:
+            session_dir = Path(temp) / "s1"
+            (session_dir / "agents" / "main").mkdir(parents=True)
+            (session_dir / "state.json").write_text(json.dumps({
+                "title": "重构监控", "lastPrompt": "重构 WSL 监听"}), encoding="utf-8")
+            wire = session_dir / "agents" / "main" / "wire.jsonl"
+            wire.write_text("", encoding="utf-8")
+            watcher = KimiWatcher({})
+            inst = AgentInstance(AgentKind.KIMI, 1, "wsl:Ubuntu", cwd="/w",
+                                 home="/home/u", process_token="7")
+            from agents import paths as paths_mod
+            index_text = json.dumps({"sessionId": "s1", "sessionDir": str(session_dir),
+                                     "workDir": "/w"})
+            with patch.object(paths_mod, "read_kimi_index_tail", return_value=[
+                    {"sessionId": "s1", "sessionDir": str(session_dir), "workDir": "/w"}]):
+                candidates = watcher.extra_candidates("wsl:Ubuntu", [inst])
+            self.assertEqual(len(candidates), 1)
+            self.assertTrue(candidates[0][1].endswith("wire.jsonl"))
+
+    def test_approval_request_exact_and_response_clears(self):
         state = KimiFile("wire.jsonl")
         state.feed(json.dumps({
             "type": "ApprovalRequest",
             "timestamp": "2020-01-01T00:00:00Z",
-            "payload": {
-                "type": "ApprovalRequest", "id": 0,
-                "thread_id": "thread-1", "turn_id": "turn-1", "item_id": "item-1",
-                "command": "pytest -q",
-            },
+            "payload": {"type": "ApprovalRequest", "id": 0,
+                        "thread_id": "thread-1", "turn_id": "turn-1", "item_id": "item-1",
+                        "command": "pytest -q"},
         }))
-        status, approval = state.status(time.time(), {})
-        self.assertEqual(status, Status.WAITING)
-        self.assertIsNotNone(approval)
-        self.assertEqual(approval.request_id, 0)
-        self.assertEqual(approval.thread_id, "thread-1")
-        self.assertEqual(approval.turn_id, "turn-1")
-        self.assertEqual(approval.item_id, "item-1")
-        state.feed(json.dumps({
-            "type": "ApprovalResponse", "payload": {"type": "ApprovalResponse", "id": 1}
-        }))
-        self.assertIsNotNone(state.pending)
-        state.feed(json.dumps({
-            "type": "ApprovalResponse", "payload": {"type": "ApprovalResponse", "id": 0}
-        }))
-        self.assertIsNone(state.pending)
+        obs = state.observation(time.time(), {})
+        self.assertEqual(obs.status, Status.WAITING)
+        self.assertEqual(obs.phase, Phase.APPROVAL)
+        self.assertEqual(obs.confidence, Confidence.EXACT)
+        self.assertIn("pytest", obs.summary)
+        # 未匹配 id 的 response 不清除；匹配的清除
+        state.feed(json.dumps({"type": "ApprovalResponse", "payload": {"type": "ApprovalResponse", "id": 1}}))
+        self.assertEqual(state.observation(time.time(), {}).status, Status.WAITING)
+        state.feed(json.dumps({"type": "ApprovalResponse", "payload": {"type": "ApprovalResponse", "id": 0}}))
+        obs = state.observation(time.time(), {})
+        self.assertIsNot(obs.status, Status.WAITING)
 
-    def test_pi_reports_local_summary_and_does_not_use_cwd_as_title(self):
-        state = PiFile("pi.jsonl")
-        state.feed(json.dumps({"type": "session", "cwd": "/work/project"}))
-        state.feed(json.dumps({
-            "type": "message", "timestamp": "2020-01-01T00:00:00Z",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": "Done"}]},
-        }))
-        snap = Snapshot("k", AgentKind.PI, "windows", 1, status=Status.IDLE)
-        state.fill_snapshot(snap)
-        self.assertEqual(snap.title, "")
-        self.assertEqual(snap.cwd, "/work/project")
-        self.assertEqual(snap.summary, "Done")
+    def test_turn_end_done_then_idle(self):
+        state = KimiFile("wire.jsonl")
+        base = time.time()
+        state.feed(json.dumps({"type": "TurnBegin", "timestamp": base}))
+        state.feed(json.dumps({"type": "TurnEnd", "timestamp": base + 1}))
+        self.assertEqual(state.observation(base + 2, {}).status, Status.DONE)
+        self.assertEqual(state.observation(base + 20, {}).status, Status.IDLE)
 
+
+# ============================================================ 绑定
 
 class BindingTests(unittest.TestCase):
     def test_base_binds_by_session_identity_and_leaves_ambiguous_files_unknown(self):
@@ -188,15 +457,14 @@ class BindingTests(unittest.TestCase):
             second.write_text(json.dumps({
                 "type": "session_meta", "payload": {"session_id": "s2", "cwd": "/two"}
             }) + "\n", encoding="utf-8")
-            watcher = CodexWatcher({"active_file_window_sec": 3600, "file_scan_sec": 1})
+            watcher = CodexWatcher({"active_file_window_sec": 3600, "session_scan_sec": 1})
             one = AgentInstance(AgentKind.CODEX, 1, "windows", session_id="s1")
             two = AgentInstance(AgentKind.CODEX, 2, "windows", session_id="s2")
             active = [(first.stat().st_mtime, str(first)), (second.stat().st_mtime, str(second))]
             with patch("agents.base.paths.session_files", return_value=active):
-                snapshots = watcher.poll([one, two])
-            bound = {snap.key: snap.session_file for snap in snapshots}
-            self.assertEqual(bound[one.key], str(first))
-            self.assertEqual(bound[two.key], str(second))
+                observations = watcher.poll([one, two])
+            self.assertEqual(observations[one.key].session_file, str(first))
+            self.assertEqual(observations[two.key].session_file, str(second))
 
             ambiguous = CodexWatcher({"active_file_window_sec": 3600})
             no_id = Path(temp) / "three.jsonl"
@@ -205,91 +473,171 @@ class BindingTests(unittest.TestCase):
             a = AgentInstance(AgentKind.CODEX, 3, "windows")
             b = AgentInstance(AgentKind.CODEX, 4, "windows")
             with patch("agents.base.paths.session_files", return_value=candidates):
-                snapshots = ambiguous.poll([a, b])
-            self.assertTrue(all(s.status == Status.UNKNOWN for s in snapshots))
-            self.assertTrue(all(not s.session_file for s in snapshots))
+                observations = ambiguous.poll([a, b])
+            self.assertTrue(all(not observations[k].session_bound for k in (a.key, b.key)))
 
-    def test_manual_binding_survives_directory_scan_exclusion(self):
+    def test_instance_cwd_from_proc_wins_binding(self):
+        """V3：/proc cwd 让两个同目录外的实例按项目区分。"""
+        with tempfile.TemporaryDirectory() as temp:
+            fa = Path(temp) / "a.jsonl"
+            fb = Path(temp) / "b.jsonl"
+            fa.write_text(json.dumps({"type": "session_meta", "payload": {"cwd": "/proj/a"}}) + "\n", encoding="utf-8")
+            fb.write_text(json.dumps({"type": "session_meta", "payload": {"cwd": "/proj/b"}}) + "\n", encoding="utf-8")
+            watcher = CodexWatcher({"active_file_window_sec": 3600, "session_scan_sec": 1})
+            ia = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu", cwd="/proj/a")
+            ib = AgentInstance(AgentKind.CODEX, 2, "wsl:Ubuntu", cwd="/proj/b")
+            with patch("agents.base.paths.session_files",
+                       return_value=[(fa.stat().st_mtime, str(fa)), (fb.stat().st_mtime, str(fb))]), \
+                 patch.object(CodexWatcher, "_roots_for_source", return_value=[temp]):
+                observations = watcher.poll([ia, ib])
+            self.assertEqual(observations[ia.key].session_file, str(fa))
+            self.assertEqual(observations[ib.key].session_file, str(fb))
+
+    def test_runtime_binding_survives_directory_scan_exclusion(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "manual.jsonl"
             path.write_text('{"type":"event_msg","payload":{"type":"token_count"}}\n', encoding="utf-8")
             instance = AgentInstance(AgentKind.CODEX, 10, "windows")
-            watcher = CodexWatcher({
-                "active_file_window_sec": 1,
-                "session_bindings": {instance.key: str(path)},
-            })
+            watcher = CodexWatcher({"active_file_window_sec": 1})
+            watcher.set_runtime_binding(instance.key, str(path))
             with patch("agents.base.paths.session_files", return_value=[]):
-                snapshots = watcher.poll([instance])
-            self.assertEqual(snapshots[0].session_file, str(path))
+                observations = watcher.poll([instance])
+            self.assertEqual(observations[instance.key].session_file, str(path))
+            # 运行期 override 不写配置
+            self.assertNotIn("session_bindings", watcher.cfg)
 
 
-class MonitorManagedTests(unittest.TestCase):
-    def test_managed_snapshots_are_refreshed_without_readonly_discovery(self):
+# ============================================================ Monitor
+
+class MonitorPassiveTests(unittest.TestCase):
+    def test_monitor_fuses_session_and_terminal_observation(self):
         config = MemoryConfig()
         monitor = Monitor(config)
-        key = "managed|windows|1"
+        monitor._terminal = None   # 无 UIA 环境
+        inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w",
+                             process_token="999")
+        watcher = monitor._watchers[AgentKind.CODEX]
+        with patch.object(watcher, "poll") as wpoll, \
+             patch.object(monitor._probe, "snapshot",
+                          return_value=({"windows": [inst]}, {"windows": True, "wsl": True})):
+            def fake_poll(instances):
+                obs = Observation(
+                    source=EvidenceSource.SESSION, timestamp=time.time(),
+                    status=Status.WORKING, phase=Phase.CODING,
+                    mode=Mode.PLAN, confidence=Confidence.HIGH,
+                    turn_active=True, goal="迁移 JWT", summary="修改 codex.py",
+                    session_bound=True, session_id="s1", session_file="/x.jsonl")
+                return {i.key: obs for i in instances}
+            wpoll.side_effect = fake_poll
+            monitor._tick()
+        target = monitor.get_target(inst.key)
+        self.assertIsNotNone(target)
+        self.assertEqual(target.snapshot.status, Status.WORKING)
+        self.assertEqual(target.snapshot.phase, Phase.CODING)
+        self.assertEqual(target.snapshot.mode, Mode.PLAN)
+        self.assertEqual(monitor.primary_key, inst.key)
 
-        class FakeManager:
-            _stopped = False
-
-            def __init__(self):
-                self.status = Status.WORKING
-                self.summary = "正在连接"
-                self.instance = AgentInstance(AgentKind.CODEX, 0, "windows", key=key)
-
-            def instances(self):
-                return [self.instance]
-
-            def snapshots(self):
-                return {key: Snapshot(
-                    key, AgentKind.CODEX, "windows", 0, status=self.status,
-                    summary=self.summary, last_line=self.summary, connection="managed",
-                )}
-
-        manager = FakeManager()
-        monitor.attach_managed(manager)
-        # No Windows/WSL scan is due in this isolated test.
-        monitor._last_windows_scan = time.time()
-        monitor._tick()
-        self.assertEqual(monitor.get_state()[1][key].summary, "正在连接")
-        self.assertEqual(monitor.get_state()[1][key].connection, "managed")
-        manager.status = Status.DONE
-        manager.summary = "已完成"
-        monitor._tick()
-        self.assertEqual(monitor.get_state()[1][key].status, Status.DONE)
-        self.assertEqual(monitor.get_state()[1][key].summary, "已完成")
-
-    def test_pinned_managed_key_survives_empty_async_instance_read(self):
+    def test_terminal_waiting_preempts_session_working(self):
+        """终端可见审批（HIGH 绑定）覆盖会话 WORKING（plan §26 优先级）。"""
+        from agents.terminal_uia import PaneInfo, TerminalObserver, TerminalBackend
         config = MemoryConfig()
         monitor = Monitor(config)
-        key = "managed|windows|async"
-        config.set("monitor.pinned", key)
+        backend = TerminalBackend()
+        observer = TerminalObserver(backend, cfg={"terminal_observer": True})
+        observer._started = True
+        pane_id = (11, (1, 2))
+        observer.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
+                                           window_pid=50, title="codex")
+        observer.observations[pane_id] = Observation(
+            source=EvidenceSource.TERMINAL, timestamp=time.time(),
+            status=Status.WAITING, phase=Phase.APPROVAL,
+            confidence=Confidence.HIGH, summary="命令执行需要确认",
+            expires_at=time.time() + 1.5)
+        observer._last_discover = time.time()   # 阻止空发现清掉预置 pane
+        monitor._terminal = observer
+        inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
+        from agents.models import BindingConfidence, TerminalBinding
+        fake_binding = TerminalBinding(
+            hwnd=11, pane_id=pane_id, confidence=BindingConfidence.HIGH,
+            observable=True, last_seen=time.time())
+        watcher = monitor._watchers[AgentKind.CODEX]
+        with patch.object(watcher, "poll") as wpoll, \
+             patch.object(monitor._resolver, "resolve", return_value={inst.key: fake_binding}), \
+             patch.object(monitor._probe, "snapshot",
+                          return_value=({"windows": [inst]}, {"windows": True, "wsl": True})):
+            wpoll.return_value = {inst.key: Observation(
+                source=EvidenceSource.SESSION, timestamp=time.time(),
+                status=Status.WORKING, phase=Phase.CODING,
+                turn_active=True, confidence=Confidence.HIGH,
+                session_bound=True, summary="修改中")}
+            monitor._tick()
+        target = monitor.get_target(inst.key)
+        self.assertEqual(target.snapshot.status, Status.WAITING)
+        self.assertEqual(target.snapshot.phase, Phase.APPROVAL)
+        self.assertIn("终端", target.snapshot.summary)
 
-        class FakeManager:
-            _stopped = False
+    def test_ambiguous_binding_does_not_fuse_terminal_observation(self):
+        from agents.terminal_uia import PaneInfo, TerminalObserver, TerminalBackend
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        observer = TerminalObserver(TerminalBackend(), cfg={})
+        observer._started = True
+        pane_id = (11, (1, 2))
+        observer.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
+                                           window_pid=50, title="codex")
+        observer.observations[pane_id] = Observation(
+            source=EvidenceSource.TERMINAL, timestamp=time.time(),
+            status=Status.WAITING, phase=Phase.APPROVAL,
+            confidence=Confidence.HIGH, expires_at=time.time() + 1.5)
+        observer._last_discover = time.time()
+        monitor._terminal = observer
+        inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
+        from agents.models import BindingConfidence, TerminalBinding
+        fake_binding = TerminalBinding(
+            hwnd=11, pane_id=pane_id, confidence=BindingConfidence.AMBIGUOUS,
+            observable=True)
+        watcher = monitor._watchers[AgentKind.CODEX]
+        with patch.object(watcher, "poll") as wpoll, \
+             patch.object(monitor._resolver, "resolve", return_value={inst.key: fake_binding}), \
+             patch.object(monitor._probe, "snapshot",
+                          return_value=({"windows": [inst]}, {"windows": True, "wsl": True})):
+            wpoll.return_value = {inst.key: Observation(
+                source=EvidenceSource.SESSION, timestamp=time.time(),
+                status=Status.WORKING, turn_active=True,
+                confidence=Confidence.HIGH, session_bound=True, summary="修改中")}
+            monitor._tick()
+        target = monitor.get_target(inst.key)
+        # AMBIGUOUS → 终端审批不归属（plan §25）
+        self.assertEqual(target.snapshot.status, Status.WORKING)
 
-            def __init__(self):
-                self.present = True
-                self.instance = AgentInstance(AgentKind.CODEX, 0, "windows", key=key)
-
-            def instances(self):
-                return [self.instance] if self.present else []
-
-            def snapshots(self):
-                return {key: Snapshot(
-                    key, AgentKind.CODEX, "windows", 0, status=Status.UNKNOWN,
-                    summary="连接中", connection="managed",
-                )} if self.present else {}
-
-        manager = FakeManager()
-        monitor.attach_managed(manager)
-        monitor._last_windows_scan = time.time()
-        monitor._tick()
-        self.assertEqual(monitor.primary_key, key)
-        manager.present = False
-        monitor._tick()
-        self.assertEqual(monitor.primary_key, key)
-        self.assertIn(key, monitor.instances)
+    def test_pinned_and_auto_follow(self):
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        monitor._terminal = None
+        a = AgentInstance(AgentKind.CODEX, 1, "windows", process_token="1", started_at=100)
+        b = AgentInstance(AgentKind.CLAUDE, 2, "windows", process_token="2", started_at=200)
+        monitor.instances = {a.key: a, b.key: b}
+        monitor.snapshots = {
+            a.key: Snapshot(a.key, a.kind, a.source, a.pid, status=Status.WORKING),
+            b.key: Snapshot(b.key, b.kind, b.source, b.pid, status=Status.WAITING),
+        }
+        monitor._select_primary()
+        self.assertEqual(monitor.primary_key, b.key)   # WAITING 抢占 WORKING
+        # 双 WORKING：同优先级保持粘性，不因另一个普通 Working 切走
+        monitor.snapshots[b.key].status = Status.WORKING
+        monitor._select_primary()
+        self.assertEqual(monitor.primary_key, b.key)
+        monitor.set_primary(a.key, manual=True)
+        self.assertEqual(monitor.primary_key, a.key)
+        monitor.reset_primary()
+        monitor._select_primary()
+        first_pick = monitor.primary_key
+        monitor._select_primary()
+        self.assertEqual(monitor.primary_key, first_pick)   # 双 Working 下稳定不闪跳
+        # 出现 WAITING 仍可抢占
+        monitor.snapshots[b.key].status = Status.WAITING
+        monitor._select_primary()
+        self.assertEqual(monitor.primary_key, b.key)
 
 
 if __name__ == "__main__":

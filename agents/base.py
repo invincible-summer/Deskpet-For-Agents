@@ -1,9 +1,15 @@
 """Watcher 基类：增量读取会话文件并建立保守、可解释的实例绑定。
 
-进程发现和会话文件发现是两条不可靠的只读观察线。这里不能按 mtime
-把两条排序后硬配，否则多个 Agent 或多个来源时很容易把摘要串到另一
-个终端。绑定只使用来源、明确会话 ID、工作目录、启动时间等证据；证据
-不足时保留 UNKNOWN，交给上层选择或手动绑定。
+进程发现和会话文件发现是两条不可靠的只读观察线。绑定只使用来源、
+明确会话 ID、工作目录（V3 起来自 /proc/<pid>/cwd 的真实值）、启动时间
+等证据；证据不足时保留 UNKNOWN，不乱绑（plan.md §10/§34/§35）。
+
+V3 变化：
+  * watcher 产出 Observation（带证据/置信度/TTL），由 StateReducer 融合。
+  * 会话目录扫描：有未绑定 Agent 时 1~3s；全部绑定后 10~15s。
+  * late-start fallback：DeskPet 晚于 Agent 启动时，允许一次无时间窗的
+    最近 N 候选扫描 + cwd/session 评分，不无限递归全 HOME。
+  * 手工绑定 JSONL 已取消；高级诊断的运行期临时 override 不落盘。
 """
 import json
 import os
@@ -11,19 +17,27 @@ import time
 from datetime import datetime, timezone
 
 from . import paths
-from .models import AgentKind, Snapshot, Status
+from .models import (
+    AgentKind,
+    Confidence,
+    EvidenceSource,
+    Mode,
+    Observation,
+    Phase,
+    Status,
+)
 from .tailer import FileTailer
 
 MAX_TRACKED_FILES = 8
-DEFAULT_SCAN_SEC = 5.0
+DEFAULT_SCAN_SEC = 3.0        # 有未绑定实例时的解析周期
+BOUND_RESAN_SEC = 15.0        # 全部绑定后的目录重扫周期
+FALLBACK_RETRY_SEC = 15.0     # late-start fallback 的重试周期
+GOAL_MAX = 120
+SUMMARY_MAX = 160
 
 
 def parse_ts(value) -> float:
-    """ISO8601/epoch → epoch；缺失或非法值返回 0，不伪造当前时间。
-
-    回放历史会话时，使用当前时间作为缺失事件时间会把旧的完成事件误判
-    成刚刚完成。调用方如果需要“到达时间”，应显式使用自己的 fallback。
-    """
+    """ISO8601/epoch → epoch；缺失或非法值返回 0，不伪造当前时间。"""
     if value is None or value == "":
         return 0.0
     try:
@@ -49,6 +63,13 @@ def _as_text(value) -> str:
     return str(value).strip() if value is not None else ""
 
 
+def _number(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _path_session_id(path: str) -> str:
     """从常见会话路径取稳定 ID，避免把 wire/rollout 这类文件名当 ID。"""
     name = os.path.basename(path)
@@ -65,6 +86,8 @@ def _path_session_id(path: str) -> str:
 class FileState:
     """每个会话文件的解析状态，由具体 watcher 实现。"""
 
+    kind: AgentKind = None  # type: ignore[assignment]
+
     def __init__(self, path: str):
         self.path = path
         self.tailer = FileTailer(path)
@@ -74,10 +97,13 @@ class FileState:
         self.thread_id = ""
         self.turn_id = ""
         self.cwd = ""
+        self.title = ""
+        self.phase = Phase.NONE
+        self.mode = Mode.NONE
         self.goal = ""
-        self.phase = ""
         self.started_at = 0.0
         self.last_event_ts = 0.0
+        self.last_arrival_ts = 0.0
         self.last_poll_seen = 0.0
         self.last_mtime = 0.0
         self.last_type = ""
@@ -119,9 +145,6 @@ class FileState:
                     item.get("turn_id") or item.get("turnId"))
             if not self.cwd:
                 self.cwd = _as_text(item.get("cwd") or item.get("workingDirectory"))
-            if not self.goal:
-                self.goal = _as_text(
-                    item.get("goal") or item.get("task") or item.get("title"))
             if not self.started_at:
                 self.started_at = parse_ts(
                     item.get("started_at") or item.get("startTime") or item.get("created_at"))
@@ -130,143 +153,170 @@ class FileState:
 
     def poll_lines(self):
         arrival = time.time()
+        got = False
         for line in self.tailer.poll():
+            got = True
+            self.last_arrival_ts = arrival
             self._observe(line, arrival)
             try:
                 self.feed(line)
-            except Exception as exc:
-                # 一条坏记录不应让整个会话静默消失；保留有界诊断供日志层使用。
+            except Exception:
+                # 一条坏记录不应让整个会话静默消失；保留有界诊断。
                 self.parse_errors += 1
-                self.last_parse_error = type(exc).__name__
             event_ts = self._observed_ts or arrival
             self.last_event_ts = max(self.last_event_ts, event_ts)
+        if got:
+            self.last_arrival_ts = arrival
 
-    def status(self, now: float, cfg: dict) -> tuple[Status, object]:
+    # ------------------------------------------------------------------
+    # 子类需要的生命周期标记（由具体 watcher 维护）：
+    #   turn_active      已知 active turn（WORKING 不过期）
+    #   turn_known_over  明确见过 turn 结束（IDLE 的前提）
+    #   error_ts/input_pending/pending 等按 agent 而定
+    turn_active = False
+    turn_known_over = False
+    error_ts = 0.0
+    input_pending = False
+
+    def activity_grace(self, cfg: dict) -> float:
+        try:
+            return max(1.0, float(cfg.get("activity_grace_sec", 10.0)))
+        except (TypeError, ValueError):
+            return 10.0
+
+    def observation(self, now: float, cfg: dict) -> Observation | None:
+        """把文件状态转成证据观察；无法建立状态时返回 None。"""
         raise NotImplementedError
 
-    def fill_snapshot(self, snap: Snapshot):
-        """旧 watcher 未实现扩展字段时仍产出合理的保守快照。"""
-        snap.session_id = self.session_id or snap.session_id
-        snap.turn_id = self.turn_id or snap.turn_id
-        snap.cwd = self.cwd or snap.cwd
-        snap.goal = self.goal or snap.goal
-        snap.phase = self.phase or snap.phase
-        snap.summary = snap.last_line or snap.summary
+    def base_observation(self) -> Observation:
+        return Observation(
+            source=EvidenceSource.SESSION,
+            timestamp=self.last_event_ts or self.last_arrival_ts,
+            session_id=self.session_id,
+            session_file=self.path,
+            cwd=self.cwd,
+            title=self.title,
+        )
 
 
 class BaseWatcher:
-    kind: AgentKind = None  # type: ignore
+    kind: AgentKind = None  # type: ignore[assignment]
 
     def __init__(self, monitor_cfg: dict):
         self.cfg = monitor_cfg or {}
         self.files: dict[str, FileState] = {}
         self._file_source: dict[str, str] = {}
+        self._file_cwd_hint: dict[str, str] = {}      # path → 已知 cwd（如 Kimi 索引）
         self._source_files: dict[str, list[tuple[float, str]]] = {}
         self._source_last_scan: dict[str, float] = {}
+        self._source_last_fallback: dict[str, float] = {}
         self._source_scan_errors: dict[str, int] = {}
         self._instance_files: dict[str, str] = {}
+        self._runtime_bindings: dict[str, str] = {}   # 运行期临时 override（不落盘）
 
-    # ---- 文件发现与绑定 ----
-    def _scan_interval(self) -> float:
-        value = self.cfg.get("file_scan_sec", self.cfg.get("directory_scan_sec", DEFAULT_SCAN_SEC))
+    # ------------------------------------------------------- 子类 hook
+    def instance_hints(self, inst) -> dict[str, str]:
+        """Agent 特定的强 hint（如 Claude PID registry 的 sessionId）。"""
+        return {}
+
+    def extra_candidates(self, source: str, instances: list) -> list[tuple[float, str]]:
+        """Agent 特定的候选注入（如 Kimi session_index）。"""
+        return []
+
+    def revalidate_bindings(self, instances: list, now: float):
+        """绑定后校验 hook（Claude 用于 /clear 后切换新 transcript）。"""
+
+    # ------------------------------------------------------- 文件发现
+    def _scan_interval(self, unbound: bool) -> float:
+        if unbound:
+            value = self.cfg.get("session_scan_sec",
+                                 self.cfg.get("file_scan_sec", DEFAULT_SCAN_SEC))
+        else:
+            value = self.cfg.get("directory_rescan_sec", BOUND_RESAN_SEC)
         try:
             return max(1.0, float(value))
         except (TypeError, ValueError):
-            return DEFAULT_SCAN_SEC
+            return DEFAULT_SCAN_SEC if unbound else BOUND_RESAN_SEC
 
-    def _roots_for_source(self, source: str) -> list[str]:
+    def _roots_for_source(self, source: str, instances: list) -> list[str]:
         if source == "windows":
             return paths.windows_roots(self.kind)
         if source.startswith("wsl:"):
-            return paths.wsl_roots(self.kind, source.split(":", 1)[1])
+            roots: list[str] = []
+            seen = set()
+            for inst in instances:
+                if _as_text(getattr(inst, "source", "")) != source:
+                    continue
+                for root in paths.instance_roots(inst, self.kind):
+                    if root.lower() not in seen:
+                        seen.add(root.lower())
+                        roots.append(root)
+            if roots:
+                return roots
+            # 元数据缺失时退回默认 /home/<default-user> 布局不可靠，
+            # 保持为空——诚实呈现"未解析"胜过扫全 HOME。
+            return []
         return []
 
-    def _bindings(self) -> dict:
-        value = self.cfg.get("session_bindings", {})
-        return value if isinstance(value, dict) else {}
-
-    @staticmethod
-    def _instance_aliases(inst) -> list[str]:
-        aliases = []
-        key = _as_text(getattr(inst, "key", ""))
-        if key:
-            aliases.append(key)
-        source = _as_text(getattr(inst, "source", ""))
-        kind = getattr(getattr(inst, "kind", None), "value", getattr(inst, "kind", ""))
-        pid = getattr(inst, "pid", "")
-        if source and kind and pid not in (None, ""):
-            aliases.append(f"{source}|{kind}|{pid}")
-        sid = _as_text(getattr(inst, "session_id", ""))
-        if sid:
-            aliases.append(sid)
-        return aliases
-
-    def _binding_value(self, inst):
-        bindings = self._bindings()
-        source = _as_text(getattr(inst, "source", ""))
-        for alias in self._instance_aliases(inst):
-            value = bindings.get(alias)
-            if value is not None:
-                return value
-        # 也接受按 source 分组的配置：{source: {instance_key: binding}}。
-        grouped = bindings.get(source)
-        if isinstance(grouped, dict):
-            for alias in self._instance_aliases(inst):
-                if alias in grouped:
-                    return grouped[alias]
-        return None
-
-    @staticmethod
-    def _binding_parts(value) -> dict[str, str]:
-        if isinstance(value, str):
-            return {"path": value}
-        if not isinstance(value, dict):
-            return {}
-        out = {}
-        for dest, keys in {
-            "path": ("path", "file", "session_file"),
-            "session_id": ("session_id", "sessionId", "id", "thread_id", "threadId"),
-            "cwd": ("cwd", "workdir", "working_directory"),
-            "started_at": ("started_at", "start_time", "created_at"),
-        }.items():
-            for key in keys:
-                if value.get(key) not in (None, ""):
-                    out[dest] = _as_text(value[key])
-                    break
-        return out
+    def _session_candidates(self, source: str, instances: list,
+                            window_sec: float | None) -> list[tuple[float, str]]:
+        roots = self._roots_for_source(source, instances)
+        try:
+            found = list(paths.session_files(self.kind, roots, window_sec))
+        except Exception:
+            self._source_scan_errors[source] = self._source_scan_errors.get(source, 0) + 1
+            return []
+        extra = []
+        try:
+            extra = [c for c in self.extra_candidates(source, instances)
+                     if c[1] not in {p for _m, p in found}]
+        except Exception:
+            extra = []
+        return found + extra
 
     def refresh_files(self, sources: list[str], instances: list | None = None,
                       force: bool = False):
         """低频刷新目录候选；已绑定文件仍由 poll() 每轮增量读取。"""
         now = time.time()
         sources = sorted(set(sources))
-        interval = self._scan_interval()
+        instances = list(instances or [])
+        current_keys = {_as_text(getattr(i, "key", "")) for i in instances}
+        unbound = [k for k in current_keys if k not in self._instance_files]
+        has_unbound = bool(unbound)
+        interval = self._scan_interval(has_unbound)
+        window = self.cfg.get("active_file_window_sec", 180)
+
         for source in sources:
             due = (force or source not in self._source_files or
                    now - self._source_last_scan.get(source, 0.0) >= interval)
             if not due:
                 continue
             try:
-                active = paths.session_files(
-                    self.kind, self._roots_for_source(source),
-                    self.cfg.get("active_file_window_sec", 180))
+                active = self._session_candidates(source, instances, window)
             except Exception:
-                # 失败时保留该来源的旧候选，不能用空列表覆盖它。
                 self._source_scan_errors[source] = self._source_scan_errors.get(source, 0) + 1
                 continue
+            # late-start fallback（plan §34）：仍有未绑定实例时，周期性合并
+            # 无时间窗的最近 N 候选（DeskPet 可能晚于 Agent 启动很久）。
+            if has_unbound and now - self._source_last_fallback.get(source, 0.0) >= FALLBACK_RETRY_SEC:
+                self._source_last_fallback[source] = now
+                try:
+                    extra = self._session_candidates(source, instances, None)
+                except Exception:
+                    extra = []
+                known = {p for _m, p in active}
+                active = active + [c for c in extra if c[1] not in known]
             self._source_files[source] = list(active or [])
             self._source_last_scan[source] = now
             self._source_scan_errors.pop(source, None)
 
-        current_keys = {_as_text(getattr(i, "key", "")) for i in (instances or [])}
         bound_paths = {
-            p for key, p in self._instance_files.items() if key in current_keys and p in self.files
+            p for key, p in self._instance_files.items()
+            if key in current_keys and p in self.files
         }
-        # 手动绑定的路径即使长时间没有 mtime 变化，也必须保留。
         manual_paths = set()
-        for inst in instances or []:
-            parts = self._binding_parts(self._binding_value(inst))
-            path = parts.get("path", "")
+        for inst in instances:
+            path = self._runtime_bindings.get(_as_text(getattr(inst, "key", "")))
             if path and os.path.isfile(path):
                 manual_paths.add(path)
 
@@ -276,20 +326,14 @@ class BaseWatcher:
             for _mtime, path in candidates[:MAX_TRACKED_FILES]:
                 wanted[path] = source
         for path in bound_paths | manual_paths:
-            source = self._file_source.get(path, "")
-            if not source:
-                for inst in instances or []:
-                    if self._binding_parts(self._binding_value(inst)).get("path") == path:
-                        source = _as_text(getattr(inst, "source", ""))
-                        break
-            wanted[path] = source
+            wanted[path] = self._file_source.get(path, "")
 
-        # 仅移除不再活跃且没有任何绑定证据的文件状态。
         for path in list(self.files):
             if path not in wanted:
                 self.files[path].tailer.close()
                 self.files.pop(path, None)
                 self._file_source.pop(path, None)
+                self._file_cwd_hint.pop(path, None)
 
         for path, source in wanted.items():
             if path in self.files:
@@ -306,37 +350,35 @@ class BaseWatcher:
             self.files[path] = st
             self._file_source[path] = source
 
+    # ------------------------------------------------------- 绑定评分
     def _candidate_score(self, inst, st: FileState) -> int:
         source = _as_text(getattr(inst, "source", ""))
         if source and st.source and source != st.source:
             return -1
         score = 0
-        binding = self._binding_parts(self._binding_value(inst))
-        if binding.get("path"):
-            if os.path.normcase(os.path.normpath(binding["path"])) == os.path.normcase(os.path.normpath(st.path)):
+        runtime = self._runtime_bindings.get(_as_text(getattr(inst, "key", "")))
+        if runtime:
+            if _same_path(runtime, st.path):
                 score += 10000
-            elif binding["path"] in (st.file_id, st.session_id):
-                score += 9000
         sid = _as_text(getattr(inst, "session_id", ""))
         if sid and sid in {st.session_id, st.file_id}:
             score += 5000
-        bind_sid = binding.get("session_id", "")
-        if bind_sid and bind_sid in {st.session_id, st.file_id}:
-            score += 4000
+        hint = self.instance_hints(inst)
+        hint_sid = _as_text(hint.get("session_id"))
+        if hint_sid and hint_sid in {st.session_id, st.file_id}:
+            # PID registry 是强 hint 但非真值：要求 cwd 兼容（plan §12）。
+            inst_cwd = _norm_cwd(getattr(inst, "cwd", ""))
+            st_cwd = _norm_cwd(st.cwd or self._file_cwd_hint.get(st.path, ""))
+            if not inst_cwd or not st_cwd or inst_cwd == st_cwd:
+                score += 4000
         inst_cwd = _norm_cwd(getattr(inst, "cwd", ""))
-        st_cwd = _norm_cwd(getattr(st, "cwd", ""))
-        bind_cwd = _norm_cwd(binding.get("cwd", ""))
+        st_cwd = _norm_cwd(st.cwd or self._file_cwd_hint.get(st.path, ""))
         if inst_cwd and st_cwd and inst_cwd == st_cwd:
             score += 1000
-        if bind_cwd and st_cwd and bind_cwd == st_cwd:
-            score += 900
         inst_start = _number(getattr(inst, "started_at", 0.0))
         st_start = _number(getattr(st, "started_at", 0.0))
-        bind_start = _number(binding.get("started_at", 0.0))
         if inst_start and st_start and abs(inst_start - st_start) <= 180:
             score += 500
-        if bind_start and st_start and abs(bind_start - st_start) <= 180:
-            score += 450
         return score
 
     def _assign_files(self, instances: list):
@@ -345,7 +387,6 @@ class BaseWatcher:
         used: set[str] = set()
         mapping: dict[str, str] = {}
 
-        # 先保留旧绑定，避免每次目录刷新重新配对。
         for key, path in self._instance_files.items():
             inst = live.get(key)
             st = self.files.get(path)
@@ -355,9 +396,14 @@ class BaseWatcher:
 
         pending = [i for key, i in live.items() if key not in mapping]
         candidates = [st for st in self.files.values() if st.path not in used]
+        # 预计算 pending 实例 × 候选文件 的评分矩阵：同分竞争检测用。
+        score_matrix = {
+            (id(inst), st.path): self._candidate_score(inst, st)
+            for inst in pending for st in candidates
+        }
         for inst in pending:
-            scored = [(self._candidate_score(inst, st), st) for st in candidates
-                      if self._candidate_score(inst, st) >= 0]
+            scored = [(score_matrix[(id(inst), st.path)], st) for st in candidates
+                      if score_matrix[(id(inst), st.path)] >= 0]
             scored.sort(key=lambda pair: pair[0], reverse=True)
             if not scored:
                 continue
@@ -375,6 +421,14 @@ class BaseWatcher:
                     len(same_source_pending) == 1 and len(same_source_candidates) == 1):
                 continue
             chosen = tied[0]
+            # 另一个未绑定实例对同一文件同分 → 无法区分归属，保持未绑定
+            #（plan §10：证据不足时明确保持 unbound，不先到先得）。
+            rival = any(
+                item is not inst
+                and score_matrix.get((id(item), chosen.path), -1) >= best_score
+                for item in same_source_pending)
+            if rival:
+                continue
             key = _as_text(getattr(inst, "key", ""))
             mapping[key] = chosen.path
             used.add(chosen.path)
@@ -382,21 +436,34 @@ class BaseWatcher:
 
         self._instance_files = mapping
 
+    def set_runtime_binding(self, key: str, path: str):
+        """高级诊断的运行期临时 override（plan §39）：不写永久配置。"""
+        if path and os.path.isfile(path):
+            self._runtime_bindings[key] = path
+            self._instance_files.pop(key, None)
+        else:
+            self._runtime_bindings.pop(key, None)
+
+    def reset_scan_cache(self):
+        """清空目录扫描缓存，让下一次 poll 立即重扫（重新扫描入口）。"""
+        self._source_files.clear()
+        self._source_last_scan.clear()
+        self._source_last_fallback.clear()
+
     def make_state(self, path: str) -> FileState:
         raise NotImplementedError
 
-    def poll(self, instances: list) -> list[Snapshot]:
+    # ------------------------------------------------------- 主入口
+    def poll(self, instances: list) -> dict[str, Observation]:
+        """产出每个实例的会话观察（None 值以 status=None 的占位观察表示）。"""
         if not instances:
-            # Once discovery has confirmed that no process is alive, release
-            # the tailers and their bounded parser state.  Monitor keeps
-            # disappeared processes during its grace window, so a transient
-            # scan miss does not discard a live binding here.
             for state in self.files.values():
                 state.tailer.close()
             self.files.clear()
             self._file_source.clear()
+            self._file_cwd_hint.clear()
             self._instance_files = {}
-            return []
+            return {}
         self.refresh_files(sorted({i.source for i in instances}), instances)
         now = time.time()
         for st in self.files.values():
@@ -404,54 +471,66 @@ class BaseWatcher:
             st.last_poll_seen = now
             mtime = _file_mtime(st.path)
             if mtime:
-                # mtime is a useful freshness hint for the UI, but it is not
-                # an event timestamp.  Mixing it into last_event_ts makes a
-                # file containing a historical completion look active merely
-                # because it was copied or restored today.
+                # mtime 是 UI 的新鲜度提示，不是事件时间；不能混入
+                # last_event_ts（否则恢复的旧完成文件会被当成活跃）。
                 st.last_mtime = max(st.last_mtime, mtime)
         self._assign_files(instances)
+        try:
+            self.revalidate_bindings(instances, now)
+        except Exception:
+            pass
 
-        snaps: list[Snapshot] = []
+        out: dict[str, Observation] = {}
         for inst in sorted(instances, key=lambda item: _as_text(getattr(item, "key", ""))):
             key = _as_text(getattr(inst, "key", ""))
             path = self._instance_files.get(key, "")
             st = self.files.get(path) if path else None
-            snap = Snapshot(
-                key=key, kind=inst.kind, source=inst.source, pid=inst.pid,
-                session_file=path,
+            placeholder = Observation(
+                source=EvidenceSource.SESSION, timestamp=now,
+                status=None, session_bound=False, cwd=inst.cwd,
                 session_id=_as_text(getattr(inst, "session_id", "")),
-                cwd=_as_text(getattr(inst, "cwd", "")),
-                connection="readonly",
-                # Keep completion detection tied to the record's timestamp;
-                # Snapshot's dataclass default is wall clock time and would
-                # make every historical DONE replay look newly completed.
-                ts=0.0,
-                freshness=0.0,
             )
             if st is None:
-                snap.status = Status.UNKNOWN
-                snap.last_line = "进程存活，但未找到可唯一绑定的会话文件"
-                snap.summary = snap.last_line
+                placeholder.summary = "Session：未解析"
+                out[key] = placeholder
+                continue
+            if not st.last_event_ts and not st.last_arrival_ts:
+                placeholder.summary = "会话文件尚无完整事件"
+                out[key] = placeholder
+                continue
+            obs = st.observation(now, self.cfg)
+            if obs is None:
+                placeholder.summary = "状态暂不可读"
+                out[key] = placeholder
             else:
-                if not st.last_event_ts:
-                    # Empty files or files whose first write is still a
-                    # partial line cannot establish an Agent state.
-                    snap.status = Status.UNKNOWN
-                    snap.last_line = "会话文件尚无完整事件"
-                    snap.summary = snap.last_line
-                else:
-                    status, extra = st.status(now, self.cfg)
-                    snap.status = status
-                    st.fill_snapshot(snap)
-                    if extra is not None:
-                        snap.approval = extra
-                        snap.exact_waiting = bool(getattr(extra, "exact", False))
-                snap.freshness = st.last_event_ts or st.last_mtime
-                snap.ts = snap.freshness
-                # 只读 tail 没有可以安全写回的协议审批通道。
-                snap.can_approve = False
-            snaps.append(snap)
-        return snaps
+                obs.session_id = obs.session_id or st.session_id
+                obs.session_file = obs.session_file or st.path
+                obs.cwd = obs.cwd or st.cwd
+                obs.title = obs.title or st.title
+                obs.session_bound = True
+                out[key] = obs
+                # 回填实例 session_id，供下轮绑定评分使用。
+                if st.session_id and not getattr(inst, "session_id", ""):
+                    try:
+                        inst.session_id = st.session_id
+                    except Exception:
+                        pass
+        return out
+
+    def release(self):
+        for state in self.files.values():
+            state.tailer.close()
+        self.files.clear()
+        self._file_source.clear()
+        self._file_cwd_hint.clear()
+        self._instance_files = {}
+
+
+def _same_path(a: str, b: str) -> bool:
+    try:
+        return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+    except (TypeError, ValueError):
+        return False
 
 
 def _norm_cwd(value) -> str:
@@ -459,13 +538,6 @@ def _norm_cwd(value) -> str:
     if not text:
         return ""
     return os.path.normcase(os.path.normpath(text.rstrip("/\\")))
-
-
-def _number(value) -> float:
-    try:
-        return float(value or 0)
-    except (TypeError, ValueError):
-        return 0.0
 
 
 def _file_mtime(path: str) -> float | None:
@@ -489,3 +561,31 @@ def jdump(obj) -> str:
         return json.dumps(obj, ensure_ascii=False)
     except Exception:
         return str(obj)
+
+
+# ------------------------------------------------- 工具 → Phase 映射
+
+import re as _re
+
+_TEST_WORDS = _re.compile(r"\b(tests?|pytest|unittest|vitest|jest)\b")
+_READ_WORDS = _re.compile(r"\b(grep|rg|ripgrep|search|find|glob|query|read|reads|cat|head|tail|list|ls|stat|inspect)\b")
+_CODE_WORDS = _re.compile(r"\b(edit|edits|patch|replace|apply_?patch|modify|write|writes|create|save|delete)\b")
+_EXEC_WORDS = _re.compile(r"\b(bash|shell|command|commands|exec|execute|run|terminal|make|build|task|agent|delegate|spawn)\b")
+
+
+def classify_phase(name: str, detail: str = "") -> Phase:
+    """工具名/命令 → V3 Phase（plan.md §11；UI 再本地化）。"""
+    raw = " ".join(str(name or "").replace("_", " ").replace("-", " ").split()).lower()
+    detail_low = " ".join(str(detail or "").split()).lower()
+    joined = f"{raw} {detail_low}"
+    if _TEST_WORDS.search(joined):
+        return Phase.TESTING
+    if _READ_WORDS.search(joined):
+        return Phase.READING
+    if _CODE_WORDS.search(joined):
+        return Phase.CODING
+    if _EXEC_WORDS.search(joined):
+        return Phase.EXECUTING
+    if raw:
+        return Phase.EXECUTING
+    return Phase.NONE

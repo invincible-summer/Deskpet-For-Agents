@@ -1,23 +1,38 @@
-# DeskPet — Agent 监听桌宠
+# DeskPet V3 — 被动 Agent 观察桌宠
 
-一只常驻桌面的自定义桌宠，实时监听终端里正在运行的 AI 编码 Agent（**Claude Code / Codex / Kimi CLI / pi**，Windows 原生与 WSL 均可，可多选多监听），用头顶气泡汇报状态；受控 Codex 会话可在气泡中处理官方审批请求，并支持双击唤起 Agent 终端。
+一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
+
+V3 不创建、不托管、不控制任何 Agent：不配置 hooks、不注入进程、不发送键盘事件、不自动审批。
 
 ```
-进程发现 ──► 会话文件定位 ──► 增量 tail 解析 ──► 本地摘要 ──► 动画 + 气泡
-(Windows+WSL)  (~/.claude 等)   (只读，无 hooks)   (规则压缩)   (批复按钮)
+Process tells us WHO.          /proc + psutil（含 cwd/tty/uid/启动 token）
+Session data tells us WHAT.    各 Agent 自己落盘的 JSONL（增量只读 tail）
+Terminal UIA tells us          Windows Terminal 官方 UI Automation 接口
+  WHAT THE USER IS ASKED.      （Notification 事件 + 当前可见区域）
+StateReducer combines them.    ERROR > WAITING > INPUT > WORKING > DONE > IDLE > UNKNOWN
+DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 ```
+
+## 正常使用流程
+
+```
+打开 Windows Terminal → 进入 Windows/WSL → 自己执行 codex / claude / kimi
+        ↓ DeskPet 自动发现、自动绑定会话、自动关联终端
+桌宠动画 + 气泡（Codex · Plan · 编码中 / 目标 / 当前活动）
+```
+
+等待审批时气泡提示"请在终端处理"；双击桌宠唤起该 Agent 所在终端。
 
 ## 功能
 
-- **五状态动画**：`walk` 工作中 ｜ `attack` 下达指令/批复发出 ｜ `die` 等待批复 ｜ `special` 任务完成（×3）｜ `sleep` 无任务
-- **状态气泡**：显示 Agent 类型、当前模式（如 Codex 的审批策略/沙箱、Claude 的权限模式、Kimi 的 Plan 模式与上下文占用）、任务标题与最新活动的**本地摘要**（规则压缩截断，不调用 LLM，不搬运原始输出）
-- **一键批复**：受控 Codex 会话通过官方 app-server JSON-RPC 请求通道在气泡内 [批准]/[拒绝]；只读监听会话只提供终端唤起，不会合成或注入按键
-- **自动批复**：仅对指定的受控 Codex 会话生效，按会话开关；用户输入/MCP 表单始终需要手动回复
-- **双击桌宠**：把当前 Agent 的终端窗口强制置顶唤回
-- **多 Agent**：多实例同时监听，气泡轮播；仪表盘勾选绑定
-- **系统集成**：托盘图标（左键显隐/右键菜单）、开机自启动、暂时隐藏桌宠
-- **位置稳定**：窗口位置由"锚点"（桌宠底部中心）反推，气泡变化/换肤/缩放不漂移
-- **低内存**：常驻约 **50MB**（tkinter 原生 GIF 解码、帧缓存 LRU、素材转换在独立子进程完成）
+- **五状态动画**：`walk` 工作中 ｜ `attack` 下达指令 ｜ `die` 等待审批 ｜ `special` 任务完成（×3）｜ `sleep` 空闲
+- **语义化状态气泡**：`Agent · Mode · Phase` + Goal（≤120 字）+ 当前活动摘要（≤160 字，本地规则压缩，不调用 LLM）
+- **等待审批检测**：Kimi 来自 wire `ApprovalRequest`（精确）；Codex/Claude 来自 Windows Terminal UIA 当前可见审批 UI（高置信 + 1.5s TTL 复检）——**静默永远不被推断为等待审批**
+- **多 Agent**：自动跟随（WAITING > INPUT > ERROR > WORKING …，工作中粘性），或手动钉住直到该 Agent 退出
+- **仪表盘 V3**：`当前 ★ | Agent | 项目 | 环境/终端 | Mode | 状态 | 活动`；PID 等技术细节在"详情"高级诊断
+- **双击桌宠**：唤起当前 Agent 的终端（公共 Win32 API 置顶）
+- **系统集成**：托盘图标、开机自启、隐藏、换肤、缩放、锁定动画
+- **隐私**：`/proc/<pid>/environ` 只在 WSL 内部按 allowlist（`WT_SESSION`/`CODEX_HOME` 等 9 项）过滤后才进入 Python；终端文本只在内存、绝不落盘
 
 ## 快速开始
 
@@ -32,120 +47,101 @@ D:\miniconda3\envs\deskpet\python.exe -m pip install -r requirements.txt
 D:\miniconda3\envs\deskpet\python.exe main.py
 ```
 
-## 自定义桌宠（素材用户自备）
+旧 V2 配置自动迁移到 `config_version: 3`（删除连接方式/受控会话/按键/自动审批配置，清空旧绑定）。
 
-桌宠动画由**五个素材文件**驱动，按状态命名：
+## 三路观察（安全、无 hooks）
 
-| 文件名 | 状态 | 播放方式 |
+1. **进程探测**（`agents/discovery.py`）：psutil 扫 Windows；WSL 每发行版每周期 1×`ps` + 1×匹配 PID 批量 metadata（`/proc/<pid>/cwd`、`stat` 启动 ticks=进程 token、allowlisted environ、`getent passwd` 解析 HOME，不再枚举 `/home/*`）
+2. **会话文件 tail**（`agents/*.py`）：增量只读，容忍残行/轮转/超长行
+
+| Agent | 数据根（env 覆盖） | 结构化状态 |
 |---|---|---|
-| `walk` | Agent 工作中 | 循环 |
-| `attack` | 指令/批复发出 | 单次 |
-| `die` | 等待批复/中断 | 循环 |
-| `special` | 任务完成庆祝 | 自动 ×3 |
-| `sleep` | 无任务 | 循环 |
+| Codex | `$CODEX_HOME`（默认 `~/.codex`） | `task_started.collaboration_mode_kind` → Plan/Default（EXACT）；user_message → Goal |
+| Claude Code | `$CLAUDE_CONFIG_DIR`（默认 `~/.claude`） | `permission-mode` → 六种模式；`sessions/<pid>.json` 为强 hint（/clear 后自动切换新 transcript） |
+| Kimi | `$KIMI_CODE_HOME`（默认 `~/.kimi-code`，legacy `~/.kimi` 兜底） | `session_index.jsonl` 按 cwd 精确定位；`state.json.lastPrompt` + `prompt.accepted` → Goal；`plan_mode.enter/exit`（EXACT）；wire `ApprovalRequest`（EXACT，兜底 SDK 命名） |
+| pi | `~/.pi` | assistant/toolCall 生命周期 |
 
-**放置方式**：在 `assets/pets/<你的桌宠名>/` 下放入五个素材（`.webm` / `.mp4` / `.gif`），可选 `manifest.json`：
+3. **终端 UIA**（`agents/terminal_uia.py`）：独立 MTA 线程（comtypes `CUIAutomation8`/`IUIAutomation5`），订阅 TermControl 的 Notification（2022 起携带新增文本）+ TextChanged fallback；弱触发词命中才读 `GetVisibleRanges()` 当前可见区域；审批识别要求**标题模式 + 选项结构同时出现**；内存边界：delta≤2048 / ring≤8192 / pane≤16 / 队列≤256。
 
-```json
-{
-  "name": "我的桌宠",
-  "title": "显示名称",
-  "animations": {
-    "walk": {"loop": true}, "attack": {"loop": false}, "die": {"loop": false},
-    "special": {"loop": false, "repeat": 3}, "sleep": {"loop": true}
-  }
-}
-```
+## 终端关联的置信度（诚实原则）
 
-**自动链路**：选择皮肤后自动完成 背景抠除（纯色背景连通域抠像，不伤主体深色）→ 内容裁剪对齐 → 缩放（0.5x~2x 按需生成缓存）→ 生成带透明索引的 GIF → 热切换显示。也可通过 仪表盘 → 皮肤 → 导入 从任意文件夹导入。
+Windows Terminal 没有 `WT_SESSION → pane` 公开接口：
 
-> ⚠️ 素材版权自负：请使用你拥有权利或已获授权的素材。`.gitignore` 已排除 `assets/pets/*`（素材）、`assets/cache/`（转换缓存）、`assets/icon.ico` 与 `config.json`，均不会进入 git 仓库。
-
-## 监听原理（安全、无 hooks）
-
-不注入 Agent 进程、不使用 hooks，只用两类只读信息：
-
-1. **进程列表**：psutil 扫 Windows 进程；`wsl.exe ps` 扫 WSL 发行版内进程
-2. **会话文件 tail**：各 Agent 自己实时落盘的 JSONL（增量读、容忍残行）
-
-| Agent | 会话文件 | 状态判定 | 审批方式 |
-|---|---|---|---|
-| Claude Code | `~/.claude/projects/<路径改写>/<uuid>.jsonl` | assistant/tool_use/turn_duration；permission-mode → 模式 | 只读观察，终端内处理 |
-| Codex | `~/.codex/sessions/年/月/日/rollout-*.jsonl` | task_started / complete、CommandExecution；不会从静默猜测审批 | 只读观察；新建受控会话使用 app-server JSON-RPC |
-| Kimi CLI | `~/.kimi/sessions/<md5(cwd)>/<uuid>/wire.jsonl` | TurnBegin/End、ToolCall；StatusUpdate → Plan/上下文 | 只读观察，终端内处理 |
-| pi | `~/.pi/agent/sessions/<编码cwd>/*.jsonl` | assistant/toolCall（设计上无审批） | 只读观察 |
-
-WSL 内 Agent 的会话文件经 `\\wsl.localhost\<发行版>\home\...` 读取；批复/唤起复用其宿主 Windows Terminal 窗口。
-
-## 受控 Codex 会话与审批
-
-- 在“监听目标”页选择“兼容监听＋可控新会话”，点击“新建 Codex 会话”即可启动 DeskPet 管理的 `codex app-server` 会话。消息、阶段和有限历史在仪表盘“会话”页查看。
-- app-server 的命令、文件变更和权限请求以 JSON-RPC 原始请求 ID 建立一次性待处理记录；界面只显示带连接代数的短期 opaque token，避免旧按钮误批复后续请求。
-- 点击气泡或会话页的批准/拒绝会把类型正确的响应写回同一个 app-server 连接。自动批准只对该会话的审批请求开启，重连后自动关闭；用户输入和 MCP elicitation 始终手动。
-- 只读监听会话没有安全的通用后台审批通道，DeskPet 只负责显示状态与唤起终端，不会向其他进程注入键盘事件。
-- **彻底免审批的官方途径**（对新建会话生效，与桌宠互补）：
-  - Codex：`~/.codex/config.toml` 里 `approval_policy = "never"` + `sandbox_mode = "workspace-write"`（或 CLI `--full-auto`），参考 [Codex 配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)
-  - Claude Code：`--permission-mode acceptEdits`（自动接受编辑）或 `--dangerously-skip-permissions`（完全跳过，有风险），参考 [权限模式文档](https://code.claude.com/docs/en/permission-modes)
-  - Kimi CLI：`kimi --yolo`（自动批准全部工具调用）
-  - pi：设计上无审批弹窗
+- **Windows 原生 Agent**：PID 祖先链 → 唯一窗口 → `CONFIRMED`
+- **WSL Agent**：标题/cwd/distro 评分，唯一强候选 → `HIGH`；并列 → `AMBIGUOUS`；无 → `NONE`
+- 只有 `CONFIRMED/HIGH` 才把终端审批观察归属到该 Agent；`AMBIGUOUS` 时仪表盘显示 ⚠ 并提供"高级：关联当前 Pane"修复入口（仅运行期有效）
+- UIA 不可用时正常降级：Goal/Mode/Phase 来自会话文件，仅 Codex/Claude 的"等待审批"无法补足（仪表盘提示"终端交互状态不可读"）
 
 ## 稳定性设计
 
-- **主绑定自动选择**：发现 Agent 时自动选一个作为主绑定（等待批复 > 工作中 > 最新启动），选中后保持粘性；多个 Agent 时可 右键 → 监听目标 或 仪表盘 双击行手动钉住
-- **消失宽限期**（`monitor.gone_grace_sec`，默认 45s）：进程从扫描中短暂消失（扫描抖动/WSL 卡顿）不会立刻判定退出，状态不闪跳
-- **工作保持**（`monitor.working_hold_sec`，默认 90s）：Agent 活动后即使会话文件暂时静默（长思考/长命令），仍保持"工作中"，直到确认回合结束才转睡眠
-- **固定尺寸气泡**：固定宽×两行（`bubble.width` / `bubble.max_lines`），不随内容伸缩；显示当前任务/最新摘要，不显示 Agent 名称前缀、不轮播
-- **锁定动画**：外观设置可固定展示 walk/attack/die/special/sleep 之一（如演示/截图用）
-- **定时清理**：每 10 分钟自动清理内存日志环、转换临时目录、已删除皮肤的缓存与多余尺寸缓存
-
-## 已知限制（如实说明）
-
-- **只读 Codex rollout 文件不承载 app-server 的实时审批请求**，因此只读 watcher 不会把静默猜成 WAITING；要在气泡中安全批复，请从 DeskPet 新建受控会话
-- **Claude Code 的权限暂停没有稳定的落盘记录**，只读 watcher 不创建可操作的审批请求，长时间运行仍可能暂时显示工作中
-- Codex **桌面版（App）不写 rollout jsonl**，只能检测到进程存活（状态"未知"）
-- 只读会话的双击唤起依赖 Windows 前台切换策略；无法唯一验证宿主窗口时，仪表盘提供手动绑定。
-- 各 CLI 会话格式属内部格式，解析按 type 字段容错处理，异常行跳过
+- **线程架构**：Tk UI ｜ Monitor Core（0.5s）｜ ProcessProbe worker（3s，single-slot）｜ UIA MTA —— WSL 卡顿不卡气泡
+- **进程身份**：key 含启动 token（`wsl:Ubuntu|codex|4812|<ticks>`），PID 复用不继承旧绑定；消失宽限 15s，来源隔离缓存
+- **状态语义**：已知 active turn → 无限保持 WORKING；仅活动证据 → 10s 宽限后回 UNKNOWN（不伪造）；DONE 展示 8s；IDLE 只在明确见过 turn 结束后出现
+- **会话解析**：绑定用 source/session_id/cwd/started_at 评分，同分竞争保持未绑定；late-start 每 15s 无窗 fallback（最近 12 候选）；目录重扫有绑定时降为 15s
 
 ## 项目结构
 
 ```
 main.py                 入口（DPI 感知、单实例互斥）
-pet/                    UI：窗口/动画器/气泡/仪表盘/皮肤/托盘/自启/配置
-agents/                 监听：发现/tailer/四个 watcher/本地摘要/监控线程
-actions/                终端唤起：winkeys（Win32）+ approver
-tools/convert.py        素材→透明GIF 管线（含 CLI，子进程调用）
-assets/pets/<名字>/     素材（用户自备，不入库）
-assets/cache/<名字>@<h> 转换缓存（不入库）
-tests/                  回放/批复/托盘/回归测试
+pet/                    UI：app/dashboard/bubble/labels/petwindow/animator/skins/tray/config
+agents/
+  models.py             Status/Phase/Mode/Observation/AgentInstance/TerminalBinding/AgentTarget
+  state.py              StateReducer（状态融合与优先级）
+  discovery.py          Windows + WSL ProcessProbe（三层探测、env allowlist）
+  paths.py              数据根/wsl_unc 安全转换/Kimi 索引/Claude PID registry
+  base.py               watcher 基座（候选发现、评分绑定、late-start fallback）
+  codex.py claude.py kimi.py pi.py
+  terminal_uia.py       UIA 观察器 + 审批识别器 + TerminalResolver
+  monitor.py            ProcessProbeWorker + Monitor Core + AgentTarget API
+  tailer.py summarize.py
+actions/winkeys.py      仅终端唤起（公共 Win32；无任何键盘注入）
+tools/convert.py        素材→透明GIF 管线
+tests/                  单元/隐私/UIA/基准/实机探针/回归
 ```
 
-## 常用配置（config.json）
+## 常用配置（config.json，v3）
 
 ```jsonc
 {
-  "skin": "amiya",            // 当前皮肤（= assets/pets 下的文件夹名）
-  "scale": 1.0,               // 整体缩放
-  "speed": 1.0,               // 播放速度
-  "animated": true,           // 动态/静态
-  "tray_enabled": true,       // 托盘图标
-  "pet_pos": [x, y],          // 锚点（桌宠底部中心）
-  "connection_mode": "hybrid",    // hybrid 或 readonly
-  "managed": { "command": "codex", "history_limit": 300 },
-  "bubble": { "font_family": "...", "font_size": 11, "max_width": 280 },
   "monitor": {
     "agents": { "claude": true, "codex": true, "kimi": true, "pi": true },
-    "wsl_enabled": true,
-    "waiting_quiet_sec": 15
+    "windows_enabled": true, "wsl_enabled": true,
+    "windows_scan_sec": 3.0, "wsl_scan_sec": 3.0,
+    "file_poll_sec": 0.5, "session_scan_sec": 3.0,
+    "gone_grace_sec": 15.0, "activity_grace_sec": 10.0,
+    "terminal_observer": true, "pinned": ""
   },
-  "window_instances": {}      // 手动绑定的终端窗口身份（只读会话唤起用）
+  "privacy": {
+    "terminal_text_to_disk": false, "session_text_to_disk": false,
+    "goal_max_chars": 120, "summary_max_chars": 160
+  }
 }
 ```
 
 ## 测试
 
 ```bat
-D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\regression.py   # 位置/气泡/缩放/隐藏/托盘/自启
-D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\tray_test.py    # 托盘事件链路
-D:\miniconda3\envs\deskpet\python.exe -X utf8 -m unittest tests.test_managed  # app-server 批复链路
-D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\replay_real.py  # 真实会话数据回放
+D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（88+）
+D:\miniconda3\envs\deskpet\python.exe tests\benchmark_monitor.py                 # 合成基准（队列/缓冲上限）
+D:\miniconda3\envs\deskpet\python.exe tests\uia_probe.py                         # UIA 实机冒烟（--verbose 可见区域）
+D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\regression.py                # 位置/气泡/缩放/托盘/自启
+D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\replay_real.py               # 真实会话数据回放
+```
+
+## 已知边界（如实说明）
+
+- Codex 的审批事件明确不持久化到 rollout（官方 transient 策略），因此 Codex/Claude 的"等待审批"只能来自终端 UIA 可见区域；若审批 pane 无法唯一关联到 Agent（多 pane/后台 tab），在"不 hooks、不控制 Agent"的约束下没有第三条可靠信息源——此时显示 UNKNOWN/工作中而不是猜（plan §55 物理边界）
+- Claude Code 上游存在"活跃 session transcript 不实时写出"的回归 → 终端活动观察可补充 WORKING 证据，但不伪造具体 Phase
+- Codex 桌面版不写 rollout → 只能检测进程存活（UNKNOWN）
+- 自定义桌宠素材版权自负；`assets/pets/*`、`assets/cache/`、`config.json` 不入 git
+
+## V3 不变量（任何实现不得违反）
+
+```
+1. 不启动 Agent        7. 不把静默解释为审批     13. 不确定 Agent↔pane 时不乱绑定
+2. 不修改 Agent        8. 不扫描用户整个 HOME    14. UI 只暴露 AgentTarget
+3. 不配置 hooks        9. 不持久化终端原文       （PID/JSONL/HWND 只在高级诊断）
+4. 不使用 SendInput   10. 不持久化完整 environ
+5. 不向终端写输入      11. 终端文本只做匹配归类
+6. 不自动审批          12. （见上）
 ```

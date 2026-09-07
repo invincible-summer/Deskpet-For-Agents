@@ -1,4 +1,8 @@
-"""Terminal window activation through public Win32 APIs; never sends input."""
+"""Terminal window activation through public Win32 APIs; never sends input.
+
+V3（plan.md §43/§51）：只保留公共 Win32 的窗口唤起能力；
+SendInput / 键盘注入 / 剪贴板路径已从产品中彻底移除。
+"""
 import ctypes
 import ctypes.wintypes as wt
 import os
@@ -47,65 +51,16 @@ def _ancestor_pids(pid,depth=12):
     return pids
 
 
-def window_identity(hwnd):
-    import psutil
-    for h,pid,title,cls in enum_windows():
-        if h==hwnd:
-            try: created=psutil.Process(pid).create_time()
-            except (psutil.Error,OSError): return None
-            return dict(hwnd=h,pid=pid,created=created,title=title,window_class=cls)
-    return None
-
-
-def valid_binding(binding,wins=None):
-    if not isinstance(binding,dict): return None
-    for hwnd,pid,_,cls in (enum_windows() if wins is None else wins):
-        if hwnd==binding.get('hwnd') and pid==binding.get('pid') and cls==binding.get('window_class'):
-            import psutil
-            try:
-                if abs(psutil.Process(pid).create_time()-float(binding['created']))<.01: return hwnd
-            except (psutil.Error,OSError,ValueError,KeyError): pass
-    return None
-
-
-def terminal_candidates():
-    import psutil
-    out=[]
-    for win in enum_windows():
-        hwnd,pid,title,cls=win
-        try: name=psutil.Process(pid).name().lower()
-        except (psutil.Error,OSError): continue
-        if cls in ('ConsoleWindowClass','CASCADIA_HOSTING_WINDOW_CLASS','mintty','VirtualConsoleClass') or name in (
-            'windowsterminal.exe','openconsole.exe','conemu64.exe','conemu.exe','code.exe','wezterm-gui.exe','alacritty.exe'):
-            out.append(win)
-    return out
-
-
-def find_terminal_window(instance_key,pid,source,hints,saved_title):
-    wins=enum_windows()
-    if isinstance(saved_title,dict):
-        return valid_binding(saved_title,wins)  # stale binding must never retarget silently
-    if saved_title:
-        return None  # legacy titles require a fresh, explicit verified binding
-    if source=='windows' and pid:
-        parents=_ancestor_pids(pid)
-        matches=[h for h,p,_,_ in wins if p in parents]
-        if len(matches)==1: return matches[0]
-    return None  # title substring does not establish ownership
-
-
-def foreground_window_title():
-    if not user32: return None
-    hwnd=user32.GetForegroundWindow()
-    return next((title for h,_,title,_ in enum_windows() if h==hwnd),None)
-
-
-def foreground_identity():
-    return window_identity(user32.GetForegroundWindow()) if user32 else None
+def raise_terminal(binding) -> bool:
+    """唤起 TerminalBinding 指向的终端窗口（plan §43 的公共 API 路径）。"""
+    hwnd = int(getattr(binding, "hwnd", 0) or 0)
+    if not hwnd:
+        return False
+    return raise_window(hwnd)
 
 
 class FLASHWINFO(ctypes.Structure):
-    _fields_=[('cbSize',wt.UINT),('hwnd',wt.HWND),('dwFlags',wt.DWORD),('uCount',wt.UINT),('dwTimeout',wt.DWORD)]
+    _fields_=[('cbSize',wt.UINT),('hwnd',wt.HWND),('dwFlags',wt.DWORD),('dwCount',wt.UINT),('dwTimeout',wt.DWORD)]
 
 
 def raise_window(hwnd):

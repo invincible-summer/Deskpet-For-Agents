@@ -1,11 +1,18 @@
-"""增量 JSONL tailer：只读追加，轮询 stat，读增量，容忍最后一行残缺。"""
+"""增量 JSONL tailer：只读追加，轮询 stat，读增量，容忍最后一行残缺。
+
+V3 优化（plan.md §33）：metadata（size/mtime_ns）没有变化时直接返回，
+只在变化或每 5 秒 safety verification 时读取文件 prefix 检测替换，
+降低 \\\\wsl.localhost 上的额外 I/O。
+"""
 import os
+import time
 from collections import deque
 
 
 class FileTailer:
     MAX_CHUNK = 4 * 1024 * 1024  # 单次最多读 4MB 增量，防爆炸
     MAX_LINE = 1024 * 1024        # 单行上限；异常长行不应占满常驻内存
+    VERIFY_INTERVAL = 5.0         # prefix 替换检测的最小间隔（秒）
 
     def __init__(self, path: str):
         self.path = path
@@ -14,6 +21,8 @@ class FileTailer:
         self._identity = None       # (st_dev, st_ino)，识别原地替换/轮换
         self._prefix = b""          # detects overwrite/replace on filesystems without inode
         self._dropping = False      # 正在跳过超长行直到下一个换行
+        self._last_verify = 0.0     # 上次 prefix 校验时间
+        self._last_sig = None       # (size, mtime_ns) 快速跳过
 
     def poll(self) -> deque[str]:
         """返回新完成的行（str，UTF-8 容错）。文件截断/轮换时自动从头开始。"""
@@ -23,29 +32,40 @@ class FileTailer:
         except OSError:
             return lines
         size = st.st_size
+        sig = (size, getattr(st, "st_mtime_ns", 0))
+        now = time.monotonic()
+        need_verify = now - self._last_verify >= self.VERIFY_INTERVAL
+        if sig == self._last_sig and not need_verify and self._identity is not None:
+            return lines   # metadata 未变且近期校验过：无新数据
+        check_prefix = need_verify or sig != self._last_sig
+        self._last_sig = sig
         identity = (getattr(st, "st_dev", 0), getattr(st, "st_ino", 0))
         replaced = self._identity is not None and identity != self._identity
-        # Windows and some network filesystems report a constant/zero inode.
-        # A short stable prefix lets us distinguish an overwrite from append
-        # without retaining the file or reading the whole transcript.
-        if self._identity is not None and not replaced:
+        # plan.md §33：metadata 有变化或每 5 秒 safety verification 时才读
+        # prefix 检测替换；metadata 未变的常规 poll 直接跳过这次额外 I/O。
+        if self._identity is not None and not replaced and check_prefix:
             try:
                 with open(self.path, "rb") as prefix_file:
                     prefix = prefix_file.read(256)
                 # A short file grows into a longer prefix during normal
                 # append.  Compare only the bytes that existed on the prior
-                # poll; comparing the whole prefix would rewind and duplicate
-                # every record whenever such a file grew past its old size.
+                # verification; comparing the whole prefix would rewind and
+                # duplicate every record whenever such a file grew past its
+                # old size.
                 replaced = bool(self._prefix and
                                 prefix[:len(self._prefix)] != self._prefix)
             except OSError:
                 prefix = self._prefix
-        else:
+        elif self._identity is None:
             try:
                 with open(self.path, "rb") as prefix_file:
                     prefix = prefix_file.read(256)
             except OSError:
                 prefix = b""
+        else:
+            prefix = self._prefix
+        if check_prefix:
+            self._last_verify = now
         if replaced:
             # 文件可能被原子替换但新文件更大，不能只依赖 size < pos。
             self.pos = 0
@@ -94,3 +114,4 @@ class FileTailer:
         self._identity = None
         self._prefix = b""
         self._dropping = False
+        self._last_sig = None

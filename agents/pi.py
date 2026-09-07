@@ -1,4 +1,4 @@
-"""pi watcher：会话 JSONL 的只读状态和本地摘要。
+"""pi watcher：会话 JSONL 的只读状态和本地摘要（V3 观察模型）。
 
 pi 没有通用审批弹窗；这里保留明确的输入/错误生命周期，但不根据静默
 生成审批或把 cwd 当作任务标题。
@@ -6,9 +6,18 @@ pi 没有通用审批弹窗；这里保留明确的输入/错误生命周期，�
 import json
 import time
 
-from .base import BaseWatcher, FileState, parse_ts
-from .models import AgentKind, Status
-from .summarize import classify_tool, fmt_command, shorten
+from .base import BaseWatcher, FileState, classify_phase, parse_ts
+from .models import (
+    AgentKind,
+    Confidence,
+    Observation,
+    Phase,
+    Status,
+)
+from .summarize import fmt_command, shorten
+
+GOAL_MAX = 120
+SUMMARY_MAX = 160
 
 
 def _event_ts(obj: dict) -> float:
@@ -21,20 +30,19 @@ def _text(value) -> str:
     if isinstance(value, dict):
         return str(value.get("text") or value.get("value") or "")
     if isinstance(value, list):
-        return " ".join(_text(x) for x in value)
+        return " ".join(_text(item) for item in value)
     return ""
 
 
 class PiFile(FileState):
+    kind = AgentKind.PI
+
     def __init__(self, path: str):
         super().__init__(path)
-        self.cwd = ""
         self.goal = ""
         self.last_text = ""
         self.last_tool = ""
         self.last_cmd = ""
-        self.phase = ""
-        self.input_pending = False
         self.input_summary = ""
         self.error_text = ""
         self.error_ts = 0.0
@@ -54,23 +62,24 @@ class PiFile(FileState):
         cwd = obj.get("cwd") or obj.get("workingDirectory")
         if cwd:
             self.cwd = str(cwd)
-        goal = obj.get("goal") or obj.get("task") or obj.get("title")
+        goal = obj.get("goal") or obj.get("task")
         if goal and not self.goal:
-            self.goal = shorten(goal, 100)
+            self.goal = shorten(str(goal), GOAL_MAX)
         return ts
 
     def _set_error(self, obj: dict, ts: float):
         message = obj.get("message") or obj.get("error") or obj.get("reason")
-        self.error_text = shorten(message or "pi 报告错误", 160)
+        self.error_text = shorten(str(message or "pi 报告错误"), SUMMARY_MAX)
         self.error_ts = ts
+        self.turn_known_over = True
         self.input_pending = False
-        self.phase = "异常"
+        self.phase = Phase.NONE
 
     def _set_input(self, obj: dict):
         value = obj.get("question") or obj.get("prompt") or obj.get("message") or obj.get("text")
         self.input_pending = True
-        self.input_summary = shorten(_text(value) or "等待输入", 120)
-        self.phase = "等待输入"
+        self.input_summary = shorten(_text(value) or "等待输入", GOAL_MAX)
+        self.phase = Phase.USER_INPUT
 
     def feed(self, line: str):
         try:
@@ -86,7 +95,8 @@ class PiFile(FileState):
                 self.session_id = str(sid)
             title = obj.get("title") or obj.get("name") or obj.get("goal")
             if title:
-                self.goal = shorten(title, 100)
+                self.goal = shorten(str(title), GOAL_MAX)
+                self.title = self.goal
             return
 
         if t in {"error", "fatal_error"}:
@@ -103,7 +113,8 @@ class PiFile(FileState):
 
         msg = obj.get("message") or {}
         role = msg.get("role")
-        self.input_pending = False if role == "user" else self.input_pending
+        if role == "user":
+            self.input_pending = False
         content = msg.get("content")
         blocks = content if isinstance(content, list) else (
             [{"type": "text", "text": content}] if isinstance(content, str) else [])
@@ -114,12 +125,20 @@ class PiFile(FileState):
             if role == "assistant" and btype in {"text", "output_text"}:
                 value = _text(block.get("text") or block.get("content"))
                 if value.strip():
-                    self.last_text = shorten(value, 160)
+                    self.last_text = shorten(value, SUMMARY_MAX)
                     self.last_assistant_ts = ts
                     self.last_activity_kind = "assistant"
-                    self.phase = "回答"
+                    self.phase = Phase.ANSWERING
+                    self.turn_active = True
+                    self.turn_known_over = False
+            elif role == "user" and btype in {"text", "input_text"}:
+                value = _text(block.get("text") or block.get("content"))
+                if value.strip():
+                    self.goal = shorten(value, GOAL_MAX)
+                    self.turn_active = True
+                    self.turn_known_over = False
             elif btype in {"thinking", "ThinkingContent", "thinking_content"}:
-                self.phase = "思考"
+                self.phase = Phase.THINKING
             elif btype in {"toolCall", "tool_call"}:
                 name = block.get("name") or "?"
                 args = block.get("arguments")
@@ -128,28 +147,20 @@ class PiFile(FileState):
                     detail = str(args.get("command") or args.get("path") or args.get("file_path") or "")
                 elif isinstance(args, str):
                     detail = args
-                self.last_cmd = fmt_command(f"{name}: {detail}" if detail else name, 100)
-                self.last_tool = classify_tool(name, detail, 120)
+                self.last_cmd = fmt_command(f"{name}: {detail}" if detail else str(name), 100)
+                self.last_tool = shorten(f"{name}: {detail}" if detail else str(name), SUMMARY_MAX)
                 self.last_tool_ts = ts
                 self.last_activity_kind = "tool"
-                self.phase = self.last_tool.split("：", 1)[0] if self.last_tool else "执行"
+                phase = classify_phase(str(name), detail)
+                self.phase = phase if phase is not Phase.NONE else Phase.EXECUTING
             elif btype in {"toolResult", "tool_result"}:
                 value = _text(block.get("content") or block.get("text") or block.get("output"))
                 if value.strip():
-                    self.last_text = shorten(value, 160)
+                    self.last_text = shorten(value, SUMMARY_MAX)
                     self.last_assistant_ts = ts
                     self.last_activity_kind = "assistant"
 
-    def status(self, now: float, cfg: dict):
-        if self.error_ts and 0 <= now - self.error_ts < 30:
-            return Status.ERROR, None
-        if self.input_pending:
-            return Status.INPUT, None
-        if now - self.last_event_ts < 10:
-            return Status.WORKING, None
-        return Status.IDLE, None
-
-    def _summary(self) -> str:
+    def _summary_text(self) -> str:
         if self.last_activity_kind == "assistant" and self.last_text:
             return self.last_text
         if self.last_activity_kind == "tool" and self.last_tool:
@@ -158,23 +169,44 @@ class PiFile(FileState):
             return self.last_text
         return self.last_tool or self.last_text
 
-    def fill_snapshot(self, snap):
-        snap.title = ""
-        snap.goal = self.goal
-        snap.cwd = self.cwd
-        snap.session_id = self.session_id or snap.session_id
-        snap.turn_id = self.turn_id
-        snap.phase = self.phase
-        if snap.status == Status.ERROR:
-            summary = self.error_text or "pi 报告错误"
-        elif snap.status == Status.INPUT:
-            summary = self.input_summary or "等待输入"
-        else:
-            summary = self._summary() or ("处理中" if snap.status == Status.WORKING else "待命")
-        snap.summary = shorten(summary, 120)
-        snap.last_line = snap.summary
-        snap.exact_waiting = False
-        snap.can_approve = False
+    def observation(self, now: float, cfg: dict) -> Observation | None:
+        obs = self.base_observation()
+        obs.goal = self.goal
+
+        if self.error_ts and 0 <= now - self.error_ts < 30:
+            obs.status = Status.ERROR
+            obs.confidence = Confidence.HIGH
+            obs.summary = shorten(self.error_text or "pi 报告错误", SUMMARY_MAX)
+            return obs
+        if self.input_pending:
+            obs.status = Status.INPUT
+            obs.phase = Phase.USER_INPUT
+            obs.confidence = Confidence.EXACT
+            obs.summary = shorten(self.input_summary or "等待输入", SUMMARY_MAX)
+            return obs
+        if self.turn_active:
+            obs.status = Status.WORKING
+            obs.phase = self.phase
+            obs.turn_active = True
+            obs.confidence = Confidence.HIGH
+            obs.summary = shorten(self._summary_text() or "处理中", SUMMARY_MAX)
+            return obs
+        if self.turn_known_over:
+            obs.status = Status.IDLE
+            obs.confidence = Confidence.HIGH
+            obs.summary = shorten(self._summary_text() or "待命", SUMMARY_MAX)
+            return obs
+        grace = self.activity_grace(cfg)
+        anchor = max(self.last_event_ts, self.last_arrival_ts)
+        if anchor and now - anchor < grace:
+            obs.status = Status.WORKING
+            obs.phase = self.phase
+            obs.turn_active = False
+            obs.expires_at = anchor + grace
+            obs.confidence = Confidence.MEDIUM
+            obs.summary = shorten(self._summary_text() or "处理中", SUMMARY_MAX)
+            return obs
+        return None
 
 
 class PiWatcher(BaseWatcher):

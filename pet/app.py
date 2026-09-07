@@ -1,24 +1,26 @@
-"""PetApp：状态机聚合 + 气泡调度 + 右键菜单 + 批复动作 + 托盘/隐藏/自启。
+"""PetApp：V3 被动观察状态机 + 气泡调度 + 右键菜单 + 托盘/隐藏/自启。
 
-位置模型：只记“锚点”（桌宠底部中心的屏幕坐标），窗口尺寸/位置全部由锚点
-反推；拖动时更新锚点。气泡高度变化、换肤、缩放都不会让桌宠漂移。
+V3（plan.md §37/§41/§42）：
+  * 无受控会话、无审批按钮、无连接模式。
+  * 气泡格式：`Codex · Plan · 编码中` + Goal + 当前活动；
+    Waiting 时提示"请在终端处理"。
+  * 双击桌宠 = 打开当前 Agent 所在终端（公共 Win32 唤起）。
 """
 import os
 import queue
+import random
 import time
 import tkinter as tk
 
-from actions import approver
-from agents.models import Status
-from agents.managed import ManagedManager
+from actions import winkeys
+from agents.models import BindingConfidence, Mode, Phase, Status
 from agents.summarize import shorten
-from agents.monitor import Monitor
 
 from . import autostart, skins
 from .animator import Animator
 from .bubble import BubbleModel, BubbleRenderer
-
 from .dashboard import Dashboard
+from .labels import PHASE_LABELS, STATUS_LABELS, mode_text, phase_text, status_text
 from .petwindow import MAGIC, PetWindow
 
 
@@ -42,13 +44,11 @@ class PetApp:
         self.animator = Animator(self.root)
         self.bubble = BubbleRenderer(self.win.canvas, config)
         self.win.bind_hit(self.bubble.hit_button)
-        self.managed = ManagedManager(config)
+        from agents.monitor import Monitor
         self.monitor = Monitor(config)
-        self.monitor.managed = self.managed
         self.animator.cache_bytes = int(config.get("animation_cache_mb", 48)) * 1024 * 1024
         self._pet_item = None
         self._pet_image = None
-        self._waiting_ref = None
         self._display_key = None
         self._skin_after = None
         self._poll_build_after = None
@@ -56,16 +56,14 @@ class PetApp:
         self._ui_after = None
         self._janitor_after = None
         self.dashboard: Dashboard | None = None
-        self.tray: TrayIcon | None = None
+        self.tray = None
         self._active_menu = None
 
         self.state = "sleep"
-        self._waiting_key: str | None = None
         self._toast: tuple[str, float] | None = None
         self._special_until = 0.0
         self._done_seen: dict[str, float] = {}
         self._closing = False
-        self._auto_apr_seen: dict[str, float] = {}   # 自动批复冷却
 
         # 锚点 = 桌宠底部中心（屏幕坐标）
         pos = self.config.get("pet_pos")
@@ -86,7 +84,7 @@ class PetApp:
 
         self._apply_skin()
         if getattr(config, "migration_notice", False):
-            self.toast("旧自动按键审批已停用，请在会话页设置协议审批", 8)
+            self.toast("DeskPet V3 已切换为自动被动监听，不再创建或控制 Agent", 8)
         if bool(self.config.get("tray_enabled", True)):
             self.start_tray()
 
@@ -218,9 +216,9 @@ class PetApp:
 
     def _bubble_model(self) -> BubbleModel:
         m = BubbleModel()
-        self._waiting_ref = None
-        snap = self.monitor.primary_snapshot()
-        self._display_key = snap.key if snap else None
+        target = self.monitor.primary_target()
+        snap = target.snapshot if target else None
+        self._display_key = target.key if target else None
         if not bool(self.config.get("bubble.enabled", True)):
             return m
         if self._toast and time.time() < self._toast[1]:
@@ -229,39 +227,55 @@ class PetApp:
         self._toast = None
         if snap is None:
             return m
-        labels = {"idle":"待命", "working":"处理中", "waiting":"等待审批",
-                  "input":"等待你的回复", "done":"已完成", "error":"需要留意", "unknown":"状态暂不可读"}
-        phases = {"plan":"计划中", "planning":"计划中", "thinking":"思考中", "reading":"阅读中",
-                  "coding":"编码中", "executing":"执行中", "testing":"测试中",
-                  # 受控会话可能直接转发本地化阶段名；统一映射后避免
-                  # 气泡退回笼统的“处理中”。
-                  "计划":"计划中", "计划中":"计划中", "思考":"思考中", "思考中":"思考中",
-                  "读取":"阅读中", "阅读":"阅读中", "阅读中":"阅读中",
-                  "编码":"编码中", "编码中":"编码中", "执行":"执行中", "执行中":"执行中",
-                  "测试":"测试中", "测试中":"测试中", "回答":"回答中", "回答中":"回答中",
-                  "修改":"编码中", "写入":"编码中"}
-        phase = getattr(snap.phase, "value", snap.phase)
-        label = phases.get(phase, labels.get(snap.status.value, "处理中")) if snap.status == Status.WORKING else labels.get(snap.status.value, "处理中")
         m.visible = True
-        m.status = f"{snap.kind.label} · {label}"
-        m.text = shorten(snap.summary or snap.last_line or "等待新的任务", 160)
-        m.footer = ("目标 · " + shorten(snap.goal, 60)) if snap.goal else ("查看会话" if snap.connection == "managed" else "打开终端 · 只读监听")
+
+        # 标题行：`Codex · Plan · 编码中`（plan §41）
+        head = snap.kind.label
+        mode = mode_text(snap)
+        phase = phase_text(snap)
+        if snap.status == Status.WORKING:
+            label = " · ".join(x for x in (head, mode, phase or "处理中") if x)
+        else:
+            label = " · ".join(x for x in (head, status_text(snap)) if x)
+        m.status = label
+
+        if snap.status == Status.WAITING:
+            m.text = snap.waiting_detail or snap.summary or "等待审批"
+            m.footer = "请在终端处理"
+            m.accent = "#a06b38"
+            return m
+        if snap.status == Status.INPUT:
+            m.text = snap.waiting_detail or snap.summary or "等待你的回复"
+            m.footer = "请在终端回复"
+            m.accent = "#a06b38"
+            return m
+
+        m.text = shorten(snap.summary or "等待新的任务", 160)
+        if snap.goal:
+            m.footer = "目标 · " + shorten(snap.goal, 60)
+        else:
+            m.footer = self._source_footer(target)
         if snap.status == Status.DONE:
             m.accent = "#487f73"
-        elif snap.status.value in ("waiting", "input", "error"):
-            m.accent = "#a06b38"
-        ap = snap.approval
-        if snap.connection == "managed" and ap and ap.exact and ap.state in ("pending", "submitting"):
-            m.text = shorten(ap.summary, 160)
-            m.submitting = ap.state == "submitting"
-            if snap.can_approve:
-                m.approve_label = "正在提交" if m.submitting else "批准本次"
-                m.deny_label = "拒绝"
-                m.request_id = ap.request_id
-                self._waiting_ref = (snap.key, ap.request_id)
-            else:
-                m.footer = "打开会话回复"
+        elif snap.status == Status.ERROR:
+            m.accent = "#a06060"
         return m
+
+    def _source_footer(self, target) -> str:
+        """气泡 footer：环境而不是 pid（plan §42）。"""
+        inst = target.instance
+        if inst.distro:
+            text = f"DeskPet · WSL {inst.distro}"
+        else:
+            binding = target.terminal
+            title = (binding.title if binding and binding.title else "").strip()
+            if title:
+                text = shorten(title, 40)
+            else:
+                text = "Windows"
+        if target.snapshot.stale:
+            text += " · 状态可能延迟"
+        return text
 
     def toast(self, text: str, sec: float = 3.0):
         self._toast = (text, time.time() + sec)
@@ -282,22 +296,14 @@ class PetApp:
         except Exception:
             pass
         try:
-            self._auto_approve_pass()
-        except Exception:
-            pass
-        try:
             self._poll_tray_events()
         except Exception:
             pass
         self._poll_monitor_after = self.root.after(400, self._poll_monitor)
 
-    def _auto_approve_pass(self):
-        # Protocol manager owns request identity, deduplication and per-session policy.
-        pass
-
     def _aggregate(self):
         now = time.time()
-        _insts, snaps = self.monitor.get_state()
+        _targets = self.monitor.get_targets()
 
         # 锁定动画：固定展示五状态之一（仪表盘/菜单可设）
         locked = str(self.config.get("force_state") or "")
@@ -308,19 +314,20 @@ class PetApp:
                                    force=True)
             return
 
-        bound = [s for s in snaps.values() if self.monitor.is_bound(s.key)]
+        bound = [t for t in _targets.values() if self.monitor.is_bound(t.key)]
 
         if now < self._special_until:
             return
 
-        waiting = [s for s in bound if s.status == Status.WAITING]
-        done_now = [s for s in bound if s.status == Status.DONE]
-        working = [s for s in bound if s.status == Status.WORKING]
+        waiting = [t for t in bound if t.snapshot.status == Status.WAITING]
+        done_now = [t for t in bound if t.snapshot.status == Status.DONE]
+        working = [t for t in bound if t.snapshot.status == Status.WORKING]
 
         new_target = None
-        for s in done_now:
-            if now - self._done_seen.get(s.key, 0) > 12 and now - s.ts < 10:
-                self._done_seen[s.key] = now
+        for t in done_now:
+            snap = t.snapshot
+            if now - self._done_seen.get(t.key, 0) > 12 and now - snap.ts < 10:
+                self._done_seen[t.key] = now
                 new_target = "special"
                 break
         if new_target is None:
@@ -344,57 +351,32 @@ class PetApp:
 
     # ================= 交互 =================
     def interact(self):
-        import random
         self.toast(random.choice(INTERACT_LINES), 4)
 
     def _on_double_click(self):
-        if self.monitor.primary_snapshot() is None:
+        """双击桌宠 = 打开当前 Agent 所在终端（plan §37）。"""
+        if not self._raise_current_terminal():
             self.interact()
-        else:
-            self._raise_current_terminal()
-
-    def _pick_focus_snapshot(self):
-        return self.monitor.primary_snapshot()
 
     def _raise_current_terminal(self) -> bool:
-        snap = self._pick_focus_snapshot()
-        if snap is None:
+        target = self.monitor.primary_target()
+        if target is None:
             return False
-        if snap.connection == "managed":
-            self.open_dashboard()
-            self.dashboard.open_session(snap.key)
-            return True
-        saved = self.config.get("window_instances", {}).get(snap.key)
-        ok, msg = approver.raise_terminal(self.config, snap, saved)
-        self.toast(msg, 4)
-        if not ok and not approver.winkeys.find_terminal_window(snap.key, snap.pid, snap.source, [], saved):
-            self.bind_missing_window(snap.key)
+        binding = target.terminal
+        if binding is None or not getattr(binding, "hwnd", 0):
+            self.toast("未能定位该 Agent 的终端窗口", 4)
+            return False
+        ok = winkeys.raise_terminal(binding)
+        if ok:
+            self.toast("已唤起终端", 2)
+        else:
+            self.toast("Windows 未允许切换焦点，已提醒任务栏", 4)
         return ok
 
     def _on_bubble_button(self, tag: str):
         if tag == "details":
             self._raise_current_terminal()
             return
-        if tag not in ("approve", "deny") or not self._waiting_ref:
-            return
-        key, request_id = self._waiting_ref
-        ok, msg = self.managed.approve(key, request_id, "accept" if tag == "approve" else "decline")
-        if not ok:
-            self.toast(msg, 5)
-        elif tag == "approve":
-            self._set_state("attack", repeat=1)
-        self._redraw()
-
-    def bind_missing_window(self, key: str):
-        self.open_dashboard()
-        self.dashboard.pick_terminal(key)
-
-    def set_connection_mode(self, mode):
-        if mode not in ("hybrid", "readonly"):
-            return
-        self.config.set("connection_mode", mode)
-        self.config.save()
-        self.managed.set_mode(mode)
 
     # ================= 显示/隐藏/托盘/自启 =================
     def hide_pet(self):
@@ -478,28 +460,25 @@ class PetApp:
 
     # ================= 右键菜单 =================
     def _build_menu(self, menu: tk.Menu):
-        menu.add_command(label="⬆ 唤起 Agent 终端（置顶）", command=self._on_double_click)
+        menu.add_command(label="⬆ 打开 Agent 终端（置顶）", command=self._on_double_click)
         menu.add_command(label="🤚 摸摸头（互动）", command=self.interact)
         menu.add_command(label="📊 打开仪表盘", command=self.open_dashboard)
         menu.add_command(
             label="🙈 暂时隐藏桌宠（托盘可恢复）", command=self.hide_pet)
         menu.add_separator()
 
-        _insts, snaps = self.monitor.get_state()
+        targets = self.monitor.get_targets()
         m_targets = tk.Menu(menu, tearoff=0)
         m_targets.add_radiobutton(
-            label="自动选择主绑定", value="",
+            label="自动跟随（按状态优先级）", value="",
             command=lambda: self.monitor.set_primary("", manual=False))
-        for key, s in sorted(snaps.items()):
-            label = f"{s.kind.label} · {s.source} · pid{s.pid} · {s.status.value}"
+        for key, t in sorted(targets.items()):
+            s = t.snapshot
+            label = f"{s.kind.label} · {t.instance.project or t.instance.source} · {status_text(s)}"
             m_targets.add_radiobutton(
                 label=("★ " if self.monitor.is_bound(key) else "") + label,
                 value=key,
                 command=lambda k=key: self.monitor.set_primary(k, manual=True))
-        for key, s in sorted(snaps.items()):
-            m_targets.add_command(
-                label=f"🎯 绑定窗口… {s.kind.label} pid{s.pid}",
-                command=lambda k=key: self.bind_missing_window(k))
         menu.add_cascade(label="🎧 监听目标", menu=m_targets)
 
         m_look = tk.Menu(menu, tearoff=0)
@@ -540,18 +519,15 @@ class PetApp:
         menu.add_cascade(label="🎨 外观", menu=m_look)
 
         m_sys = tk.Menu(menu, tearoff=0)
-        m_sys.add_command(label="当前会话审批设置…", command=self.open_dashboard)
-        mode_menu = tk.Menu(m_sys, tearoff=0)
-        for mode, label in (("hybrid", "兼容监听＋可控新会话"), ("readonly", "仅监听现有终端")):
-            mode_menu.add_radiobutton(label=label, value=mode,
-                                      command=lambda v=mode: self.set_connection_mode(v))
-        m_sys.add_cascade(label="接入方式", menu=mode_menu)
         autostart_on = tk.BooleanVar(value=autostart.is_enabled())
         m_sys.add_checkbutton(label="开机自启动", variable=autostart_on,
                               command=lambda: self._toggle_autostart())
         tray_on = tk.BooleanVar(value=bool(self.config.get("tray_enabled", True)))
         m_sys.add_checkbutton(label="托盘图标", variable=tray_on,
                               command=lambda: self._toggle_tray(tray_on.get()))
+        terminal_on = tk.BooleanVar(value=bool(self.config.get("monitor.terminal_observer", True)))
+        m_sys.add_checkbutton(label="终端交互观察（UIA）", variable=terminal_on,
+                              command=lambda: self._toggle_terminal_observer(terminal_on.get()))
         menu.add_cascade(label="⚙ 设置", menu=m_sys)
 
         menu.add_separator()
@@ -578,10 +554,13 @@ class PetApp:
         self.config.save()
         self.toast("锁定动画：" + (v if v else "自动"), 3)
 
-    def _toggle_auto_approve(self, flag: bool):
-        snap = self.monitor.primary_snapshot()
-        if snap and snap.connection == "managed":
-            self.managed.set_auto(snap.key, bool(flag))
+    def _toggle_terminal_observer(self, flag: bool):
+        self.config.set("monitor.terminal_observer", bool(flag))
+        self.config.save()
+        if flag:
+            self.toast("终端观察将在重启 DeskPet 后启用", 5)
+        else:
+            self.toast("终端观察将在重启 DeskPet 后停用", 5)
 
     def _toggle_autostart(self):
         on = self.toggle_autostart()
@@ -594,7 +573,6 @@ class PetApp:
             self.stop_tray()
 
     def _rebuild_skin(self):
-        import os
         from .config import CACHE_DIR
         d = skins.cache_dir(self.config.get("skin", "amiya"), self._gif_height())
         if os.path.isdir(d):
@@ -620,7 +598,7 @@ class PetApp:
         self.root.mainloop()
 
     def _janitor(self):
-        """定时清理：日志/事件队列、转换临时目录、不再存在的皮肤缓存、过多的高度缓存。"""
+        """定时清理：日志/事件队列、转换临时目录、皮肤缓存。"""
         if self._closing:
             return
         try:
@@ -654,7 +632,6 @@ class PetApp:
                 items.sort(reverse=True)
                 for _mt, path in items[2:]:
                     shutil.rmtree(path, ignore_errors=True)
-            self._log("清理完成") if hasattr(self, "_log") else None
         except Exception:
             pass
         self._janitor_after = self.root.after(600_000, self._janitor)
@@ -674,7 +651,6 @@ class PetApp:
     def quit(self):
         self._closing = True
         try:
-            self.managed.stop()
             self.monitor.stop()
             self.animator.stop()
             if self.tray:

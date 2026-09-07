@@ -1,4 +1,8 @@
-"""Fixed, scalable status card. Layout and canvas items change only when needed."""
+"""Fixed, scalable status card. Layout and canvas items change only when needed.
+
+V3：气泡不再有 [批准]/[拒绝] 按钮（plan §41），底行是 footer
+（Goal / 环境提示），点击气泡 = 打开终端。
+"""
 import math
 from dataclasses import dataclass
 import tkinter as tk
@@ -19,13 +23,9 @@ def round_rect_points(x0, y0, x1, y1, r=10):
 class BubbleModel:
     text: str = ""
     status: str = ""
-    footer: str = "查看详情"
+    footer: str = "打开终端"
     accent: str = "#487f73"
-    approve_label: str = ""
-    deny_label: str = ""
     visible: bool = False
-    request_id: str = ""
-    submitting: bool = False
 
 
 def metrics(config, dpi=1.0):
@@ -143,20 +143,9 @@ class BubbleRenderer:
             add(c.create_text(ox+pad,ty,text=line,anchor='nw',font=font,fill=font_color))
             ty+=font.metrics('linespace')
         by=y1-pad-m['button']
-        if self.model.approve_label:
-            bw=(self.w-2*pad-m['gap'])//2
-            for i,(label,tag,color) in enumerate(((self.model.approve_label,'approve','#487f73'),
-                                                 (self.model.deny_label,'deny','#a06060'))):
-                bx=ox+pad+i*(bw+m['gap']); bb=(bx,by,bx+bw,by+m['button'])
-                if not self.model.submitting: self.btn_boxes[tag]=bb
-                add(c.create_polygon(round_rect_points(*bb,max(3,m['radius']//2)),smooth=True,
-                                     fill='#a3ada9' if self.model.submitting else color,outline=''))
-                add(c.create_text(bx+bw/2,by+m['button']/2,text=fit_text(label,bw-4,font.measure),
-                                  font=font,fill='#ffffff'))
-        else:
-            self.btn_boxes['details']=(ox+pad,by,x1-pad,y1-pad)
-            add(c.create_text(ox+pad,by+m['button']/2,anchor='w',font=font,
-                              text=fit_text(self.model.footer,self.w-2*pad,font.measure),fill='#6a7c75'))
+        self.btn_boxes['details']=(ox+pad,by,x1-pad,y1-pad)
+        add(c.create_text(ox+pad,by+m['button']/2,anchor='w',font=font,
+                          text=fit_text(self.model.footer,self.w-2*pad,font.measure),fill='#6a7c75'))
 
     def hit_button(self,x,y):
         return next((tag for tag,(x0,y0,x1,y1) in self.btn_boxes.items() if x0<=x<=x1 and y0<=y<=y1),None)
