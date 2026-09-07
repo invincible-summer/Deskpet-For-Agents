@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Byte-compile
+        run: python -m compileall agents pet actions tools
+      - name: Unit tests
+        run: python -m unittest discover tests -p "test_*.py"
+      - name: Monitor benchmark
+        run: python tests/benchmark_monitor.py --ticks 5000
+      # 真实 UIA / Windows Terminal 验收（tests/uia_probe.py）属于
+      # 本机 manual acceptance，不在 CI 中操作真实终端。

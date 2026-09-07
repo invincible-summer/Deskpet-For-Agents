@@ -51,11 +51,35 @@ def _ancestor_pids(pid,depth=12):
     return pids
 
 
+def validate_terminal_window(binding) -> bool:
+    """唤起前的 HWND 复用验证：IsWindow + 属主 PID + 窗口类三者一致。
+
+    Windows 会复用 HWND；终端已关闭而 resolver 尚未更新时，旧 HWND
+    可能指向别的窗口——不符合即拒绝唤起（绝不 SendInput/PostMessage）。
+    """
+    hwnd = int(getattr(binding, "hwnd", 0) or 0)
+    if not hwnd or not user32 or not user32.IsWindow(hwnd):
+        return False
+    wpid = int(getattr(binding, "window_pid", 0) or 0)
+    if wpid:
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value and pid.value != wpid:
+            return False
+    cls = str(getattr(binding, "window_class", "") or "")
+    if cls:
+        buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, buf, 64)
+        if buf.value and buf.value != cls:
+            return False
+    return True
+
+
 def raise_terminal(binding) -> bool:
     """唤起 TerminalBinding 指向的终端窗口（plan §43 的公共 API 路径）。"""
-    hwnd = int(getattr(binding, "hwnd", 0) or 0)
-    if not hwnd:
+    if not validate_terminal_window(binding):
         return False
+    hwnd = int(getattr(binding, "hwnd", 0) or 0)
     return raise_window(hwnd)
 
 

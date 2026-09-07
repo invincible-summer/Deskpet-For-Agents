@@ -1,14 +1,23 @@
-"""ProcessProbe 测试：解析、PID reuse、env 隐私、多 distro、UNC 安全（plan §57/§58）。"""
+"""ProcessProbe 测试：解析、PID reuse、env 隐私、多 distro、UNC 安全（plan §57/§58）。
+
+V3.1：进程树 canonicalization、fallback 代次 token、root metadata 默认关、
+按真实 source 的健康隔离、--running --quiet 解析、输出解码。
+"""
 from __future__ import annotations
 import unittest
 import unittest.mock
 
 from agents import paths
 from agents.discovery import (
+    ProcessCandidate,
     WslProcessProbe,
     build_metadata_script,
+    canonicalize_agent_processes,
+    parse_list_verbose,
     parse_metadata,
+    parse_running_quiet,
     filter_env_line,
+    _decode_wsl_output,
 )
 from agents.models import AgentKind, AgentInstance
 
@@ -186,6 +195,243 @@ class InstanceRootsTests(unittest.TestCase):
         inst = AgentInstance(kind=AgentKind.KIMI, pid=1, source="wsl:Ubuntu",
                              process_token="1", home="/home/u")
         self.assertTrue(paths.instance_roots(inst)[0].endswith("\\.kimi-code"))
+
+
+class CanonicalizationTests(unittest.TestCase):
+    """wrapper → runtime 只保留最深后代；不跨 kind、不按 kind 全局去重。"""
+
+    def _cand(self, kind, pid, ppid):
+        return ProcessCandidate(kind=kind, pid=pid, ppid=ppid)
+
+    def test_wrapper_child_keeps_child(self):
+        cands = [self._cand(AgentKind.CLAUDE, 100, 1),    # npm shim
+                 self._cand(AgentKind.CLAUDE, 101, 100)]  # node runtime
+        canonical, launchers = canonicalize_agent_processes(
+            cands, {100: 1, 101: 100})
+        self.assertEqual(canonical, {101})
+        self.assertEqual(launchers[101], (100,))
+
+    def test_wrapper_chain_keeps_deepest(self):
+        cands = [self._cand(AgentKind.KIMI, 10, 1),
+                 self._cand(AgentKind.KIMI, 11, 10),
+                 self._cand(AgentKind.KIMI, 12, 11)]
+        canonical, _ = canonicalize_agent_processes(
+            cands, {10: 1, 11: 10, 12: 11})
+        self.assertEqual(canonical, {12})
+
+    def test_two_independent_same_kind_kept(self):
+        cands = [self._cand(AgentKind.CLAUDE, 101, 1),
+                 self._cand(AgentKind.CLAUDE, 201, 1)]
+        canonical, launchers = canonicalize_agent_processes(cands, {})
+        self.assertEqual(canonical, {101, 201})
+        self.assertEqual(launchers, {})
+
+    def test_no_cross_kind_folding(self):
+        # Claude wrapper + Codex child：互为祖先但 kind 不同 → 都保留
+        cands = [self._cand(AgentKind.CLAUDE, 100, 1),
+                 self._cand(AgentKind.CODEX, 101, 100)]
+        canonical, launchers = canonicalize_agent_processes(
+            cands, {100: 1, 101: 100})
+        self.assertEqual(canonical, {100, 101})
+        self.assertEqual(launchers, {})
+
+    def test_siblings_not_merged(self):
+        cands = [self._cand(AgentKind.CODEX, 200, 100),
+                 self._cand(AgentKind.CODEX, 201, 100)]
+        canonical, _ = canonicalize_agent_processes(
+            cands, {200: 100, 201: 100, 100: 1})
+        self.assertEqual(canonical, {200, 201})
+
+    def test_ancestor_via_intermediate_non_match(self):
+        # npm → sh(未匹配) → node：跨过中间进程仍识别 wrapper
+        cands = [self._cand(AgentKind.CLAUDE, 100, 1),
+                 self._cand(AgentKind.CLAUDE, 300, 200)]
+        canonical, launchers = canonicalize_agent_processes(
+            cands, {100: 1, 200: 100, 300: 200})
+        self.assertEqual(canonical, {300})
+        self.assertEqual(launchers[300], (100,))
+
+
+class DistroListParsingTests(unittest.TestCase):
+    def test_running_quiet_parsing(self):
+        text = "Ubuntu\r\nDebian\r\n"
+        self.assertEqual(parse_running_quiet(text), ["Ubuntu", "Debian"])
+
+    def test_running_quiet_skips_header(self):
+        text = "\ufeffNAME\nUbuntu\n"
+        self.assertEqual(parse_running_quiet(text), ["Ubuntu"])
+
+    def test_list_verbose_parsing(self):
+        text = ("  NAME            STATE           VERSION\n"
+                "* Ubuntu          Running         2\n"
+                "  Debian          Stopped         2\n")
+        self.assertEqual(parse_list_verbose(text), ["Ubuntu"])
+
+    def test_decode_utf16_and_utf8(self):
+        utf16 = "Ubuntu\nDebian\n".encode("utf-16-le") + b"\x00"
+        self.assertIn("Ubuntu", _decode_wsl_output(utf16))
+        bom = "Ubuntu\n".encode("utf-16")
+        self.assertIn("Ubuntu", _decode_wsl_output(bom))
+        utf8 = "Ubuntu\n".encode("utf-8")
+        self.assertIn("Ubuntu", _decode_wsl_output(utf8))
+        self.assertEqual(_decode_wsl_output(b""), "")
+
+
+_PS_HEADER = ("  PID  PPID  SID  PGID TPGID TT  UID ETIMES COMMAND\n")
+
+
+def _ps_line(pid, ppid, comm, args, uid=1000, etimes=60):
+    return f" {pid} {ppid} 10 10 10 pts/0 {uid} {etimes} {comm} {args}\n"
+
+
+def _make_ps_output(rows):
+    return _PS_HEADER + "".join(
+        _ps_line(*r) for r in rows)
+
+
+class FallbackTokenTests(unittest.TestCase):
+    def test_ticks_present_uses_proc(self):
+        probe = WslProcessProbe()
+        token, source = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX,
+                                             "36791842", 60)
+        self.assertEqual(token, "36791842")
+        self.assertEqual(source, "proc")
+
+    def test_fallback_token_stable_across_scans(self):
+        probe = WslProcessProbe()
+        t1, s1 = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX, "", 60)
+        t2, s2 = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX, "", 63)
+        self.assertEqual(t1, t2)
+        self.assertEqual(s1, "fallback")
+        self.assertEqual(s2, "fallback")
+        self.assertTrue(t1.startswith("fb"))
+
+    def test_pid_reuse_rotates_generation(self):
+        probe = WslProcessProbe()
+        t1, _ = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX, "", 300)
+        # etimes 明显回退 → 同 PID 已被复用
+        t2, _ = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX, "", 5)
+        self.assertNotEqual(t1, t2)
+
+    def test_kind_change_rotates_generation(self):
+        probe = WslProcessProbe()
+        t1, _ = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX, "", 60)
+        t2, _ = probe._resolve_token("Ubuntu", 5, AgentKind.CLAUDE, "", 62)
+        self.assertNotEqual(t1, t2)
+
+    def test_fallback_token_never_empty(self):
+        probe = WslProcessProbe()
+        token, _ = probe._resolve_token("Ubuntu", 9, AgentKind.KIMI, "", 1)
+        self.assertTrue(token)
+
+
+class RootFallbackTests(unittest.TestCase):
+    """root metadata 重试默认关闭；显式开启才允许一次 -u root 调用。"""
+
+    def _probe_with_calls(self, allow_root, missing_meta=True):
+        probe = WslProcessProbe(allow_root_metadata=allow_root)
+        calls = []
+
+        def fake_run(distro, script, timeout=8.0, user=None):
+            calls.append((distro, user))
+            if missing_meta:
+                return "P\t42\nC\t\nT\t\n"   # 进程存在但读不到 metadata
+            return "P\t42\nC\t/w\nT\t123\n"
+
+        return probe, calls, fake_run
+
+    def test_default_never_escalates_to_root(self):
+        probe, calls, fake = self._probe_with_calls(allow_root=False)
+        with unittest.mock.patch("agents.discovery._run_wsl", side_effect=fake):
+            meta = probe._metadata("Ubuntu", [42])
+        self.assertEqual(meta[42]["cwd"], "")
+        self.assertEqual(calls, [("Ubuntu", None)])
+        for _distro, user in calls:
+            self.assertNotEqual(user, "root")
+
+    def test_explicit_opt_in_allows_single_root_retry(self):
+        probe, calls, fake = self._probe_with_calls(allow_root=True)
+        with unittest.mock.patch("agents.discovery._run_wsl", side_effect=fake):
+            meta = probe._metadata("Ubuntu", [42])
+        self.assertEqual(calls[0], ("Ubuntu", None))
+        self.assertEqual(calls[1], ("Ubuntu", "root"))
+        self.assertEqual(len(calls), 2)
+
+
+class MultiDistroScanTests(unittest.TestCase):
+    """scan() 返回按真实 source 分组的结果与健康位（隔离失败）。"""
+
+    def test_scan_groups_by_source_and_isolates_failure(self):
+        probe = WslProcessProbe()
+
+        def fake_ps(distro, exclude_pids):
+            if distro == "Debian":
+                raise RuntimeError("wsl.exe failed (1)")
+            rows = [
+                # wrapper（祖先：命令行自身也匹配 codex）
+                (4243, 1, 10, 10, 10, "pts/0", 1000, 60, "npm",
+                 "node /usr/lib/codex/codex.js run"),
+                # 真正的 runtime
+                (4242, 4243, 10, 10, 10, "pts/0", 1000, 60, "codex",
+                 "/home/u/.codex/bin/codex"),
+            ]
+            return rows
+
+        def fake_meta(distro, pids):
+            if distro != "Ubuntu":
+                return {}
+            return {4242: {"cwd": "/home/u/proj", "ticks": "36791842",
+                           "uid": "1000", "home": "/home/u",
+                           "env": {"WT_SESSION": "g1"}}}
+
+        with unittest.mock.patch.object(WslProcessProbe, "_list_running_distros",
+                                        return_value=["Ubuntu", "Debian"]), \
+             unittest.mock.patch.object(WslProcessProbe, "_ps_scan",
+                                        side_effect=fake_ps), \
+             unittest.mock.patch.object(WslProcessProbe, "_metadata",
+                                        side_effect=fake_meta):
+            instances, healthy = probe.scan()
+
+        self.assertIn("wsl:Ubuntu", instances)
+        self.assertIn("wsl:Debian", instances)   # Debian 无缓存 → 空
+        self.assertEqual(instances["wsl:Debian"], [])
+        self.assertTrue(healthy["wsl:Ubuntu"])
+        self.assertFalse(healthy["wsl:Debian"])
+        # wrapper 折叠后只剩 runtime 进程
+        ubantu = instances["wsl:Ubuntu"]
+        self.assertEqual(len(ubantu), 1)
+        inst = ubantu[0]
+        self.assertEqual(inst.pid, 4242)
+        self.assertEqual(inst.process_token, "36791842")
+        self.assertEqual(inst.process_token_source, "proc")
+        self.assertEqual(inst.cwd, "/home/u/proj")
+        self.assertEqual(inst.wt_session, "g1")
+        self.assertEqual(inst.launcher_pids, (4243,))
+
+    def test_scan_fallback_token_when_ticks_missing(self):
+        probe = WslProcessProbe()
+
+        def fake_ps(distro, exclude_pids):
+            return [(50, 1, 10, 10, 10, "pts/0", 1000, 120, "codex",
+                     "/usr/bin/codex")]
+
+        def fake_meta(distro, pids):
+            return {50: {"cwd": "/w", "ticks": "", "uid": "", "home": "",
+                         "env": {}}}
+
+        with unittest.mock.patch.object(WslProcessProbe, "_list_running_distros",
+                                        return_value=["Ubuntu"]), \
+             unittest.mock.patch.object(WslProcessProbe, "_ps_scan",
+                                        side_effect=fake_ps), \
+             unittest.mock.patch.object(WslProcessProbe, "_metadata",
+                                        side_effect=fake_meta):
+            instances, healthy = probe.scan()
+        inst = instances["wsl:Ubuntu"][0]
+        self.assertTrue(inst.process_token)          # 绝不退化成空
+        self.assertEqual(inst.process_token_source, "fallback")
+        # key 含 fallback token，而不是裸 PID identity
+        self.assertEqual(inst.key,
+                         f"wsl:Ubuntu|codex|50|{inst.process_token}")
 
 
 class KimiIndexTests(unittest.TestCase):

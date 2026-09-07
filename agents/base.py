@@ -14,9 +14,11 @@ V3 变化：
 import json
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from . import paths
+from .matching import mutual_unique_matches
 from .models import (
     AgentKind,
     Confidence,
@@ -88,6 +90,10 @@ class FileState:
 
     kind: AgentKind = None  # type: ignore[assignment]
 
+    # 解析器兼容性诊断：子类可声明 RECORD_TYPES（已知记录类型集合），
+    # 未声明的 watcher 一律视为全部可识别（health=OK）。
+    RECORD_TYPES: frozenset | None = None
+
     def __init__(self, path: str):
         self.path = path
         self.tailer = FileTailer(path)
@@ -100,6 +106,7 @@ class FileState:
         self.title = ""
         self.phase = Phase.NONE
         self.mode = Mode.NONE
+        self.mode_raw = ""
         self.goal = ""
         self.started_at = 0.0
         self.last_event_ts = 0.0
@@ -109,18 +116,35 @@ class FileState:
         self.last_type = ""
         self.parse_errors = 0
         self.last_parse_error = ""
+        # 兼容性健康计数（只记类型名与计数，绝不保存事件内容）
+        self.records_seen = 0
+        self.recognized_records = 0
+        self.unknown_types: dict[str, int] = {}
         self._observed_ts = 0.0
 
     def feed(self, line: str):
         raise NotImplementedError
 
-    def _observe(self, line: str, arrival_ts: float):
+    # ---- 解析器兼容性 ----
+    def _record_type(self, obj: dict) -> str:
+        """记录的规范类型名（子类可覆盖以展开 payload/event 内层类型）。"""
+        return str(obj.get("type") or "?")
+
+    def _count_record(self, obj: dict):
+        self.records_seen += 1
+        known = self.RECORD_TYPES
+        if known is None:
+            self.recognized_records += 1
+            return
+        rtype = self._record_type(obj)
+        if rtype in known:
+            self.recognized_records += 1
+        elif len(self.unknown_types) < 8:
+            self.unknown_types[rtype] = self.unknown_types.get(rtype, 0) + 1
+
+    def _observe(self, obj, arrival_ts: float):
         """读取通用元数据；具体 watcher 仍负责解释自己的事件。"""
         self._observed_ts = arrival_ts
-        try:
-            obj = json.loads(line)
-        except (TypeError, ValueError):
-            return
         if not isinstance(obj, dict):
             return
         containers = [obj]
@@ -157,7 +181,13 @@ class FileState:
         for line in self.tailer.poll():
             got = True
             self.last_arrival_ts = arrival
-            self._observe(line, arrival)
+            try:
+                obj = json.loads(line)
+            except (TypeError, ValueError):
+                obj = None
+            if isinstance(obj, dict):
+                self._count_record(obj)
+            self._observe(obj, arrival)
             try:
                 self.feed(line)
             except Exception:
@@ -197,6 +227,17 @@ class FileState:
             cwd=self.cwd,
             title=self.title,
         )
+
+
+@dataclass
+class ParserDiagnostics:
+    """会话解析器的兼容性健康（只含类型名与计数，无事件内容）。"""
+    bound: bool
+    parse_errors: int
+    records_seen: int
+    recognized_records: int
+    unknown_types: tuple[str, ...]
+    health: str   # OK / PARTIAL / UNKNOWN
 
 
 class BaseWatcher:
@@ -382,7 +423,12 @@ class BaseWatcher:
         return score
 
     def _assign_files(self, instances: list):
-        """在同一来源内建立稳定一对一绑定，证据不足时明确保持未绑定。"""
+        """在同一来源内建立稳定一对一绑定，证据不足时明确保持未绑定。
+
+        V3.1：用互相唯一匹配（matching.mutual_unique_matches）替代逐实例
+        greedy——绑定结果不依赖实例遍历顺序；0 分退化（同 source 恰好
+        1 实例 + 1 候选）仍单独处理。
+        """
         live = {_as_text(getattr(i, "key", "")): i for i in instances}
         used: set[str] = set()
         mapping: dict[str, str] = {}
@@ -396,43 +442,36 @@ class BaseWatcher:
 
         pending = [i for key, i in live.items() if key not in mapping]
         candidates = [st for st in self.files.values() if st.path not in used]
-        # 预计算 pending 实例 × 候选文件 的评分矩阵：同分竞争检测用。
-        score_matrix = {
+        matrix = {
             (id(inst), st.path): self._candidate_score(inst, st)
             for inst in pending for st in candidates
         }
-        for inst in pending:
-            scored = [(score_matrix[(id(inst), st.path)], st) for st in candidates
-                      if score_matrix[(id(inst), st.path)] >= 0]
-            scored.sort(key=lambda pair: pair[0], reverse=True)
-            if not scored:
-                continue
-            best_score = scored[0][0]
-            tied = [st for score, st in scored if score == best_score]
-            # 明确证据必须唯一；无证据时只允许唯一实例/唯一候选的安全退化。
-            if len(tied) != 1:
-                continue
-            source = _as_text(getattr(inst, "source", ""))
-            same_source_pending = [item for item in pending
-                                   if _as_text(getattr(item, "source", "")) == source]
-            same_source_candidates = [item for item in candidates
-                                      if not item.source or item.source == source]
-            if best_score <= 0 and not (
-                    len(same_source_pending) == 1 and len(same_source_candidates) == 1):
-                continue
-            chosen = tied[0]
-            # 另一个未绑定实例对同一文件同分 → 无法区分归属，保持未绑定
-            #（plan §10：证据不足时明确保持 unbound，不先到先得）。
-            rival = any(
-                item is not inst
-                and score_matrix.get((id(item), chosen.path), -1) >= best_score
-                for item in same_source_pending)
-            if rival:
-                continue
+        decisions = mutual_unique_matches(
+            [id(i) for i in pending], [st.path for st in candidates],
+            lambda iid, path: matrix.get((iid, path), -1),
+            min_score=1, min_margin=1)
+        inst_by_id = {id(i): i for i in pending}
+        for iid, dec in decisions.items():
+            inst = inst_by_id[iid]
             key = _as_text(getattr(inst, "key", ""))
-            mapping[key] = chosen.path
-            used.add(chosen.path)
-            candidates = [st for st in candidates if st.path != chosen.path]
+            mapping[key] = dec.right
+            used.add(dec.right)
+
+        # 0 分 fallback：同 source 恰好剩余 1 个未绑定实例 + 1 个未用候选
+        # 才允许无证据绑定（plan §10 的安全退化）。
+        remaining_pending = [i for i in pending
+                             if _as_text(getattr(i, "key", "")) not in mapping]
+        remaining_candidates = [st for st in candidates if st.path not in used]
+        grouped: dict[str, list] = {}
+        for inst in remaining_pending:
+            grouped.setdefault(_as_text(getattr(inst, "source", "")), []).append(inst)
+        for source, items in grouped.items():
+            compat = [st for st in remaining_candidates
+                      if not st.source or st.source == source]
+            if len(items) == 1 and len(compat) == 1:
+                key = _as_text(getattr(items[0], "key", ""))
+                mapping[key] = compat[0].path
+                used.add(compat[0].path)
 
         self._instance_files = mapping
 
@@ -443,6 +482,24 @@ class BaseWatcher:
             self._instance_files.pop(key, None)
         else:
             self._runtime_bindings.pop(key, None)
+
+    def diagnostics_for(self, key: str) -> ParserDiagnostics:
+        """该实例的会话解析器健康（UI 只看 Snapshot 上的投影，不碰 watcher）。"""
+        path = self._instance_files.get(key, "")
+        st = self.files.get(path) if path else None
+        if st is None:
+            return ParserDiagnostics(bound=False, parse_errors=0,
+                                     records_seen=0, recognized_records=0,
+                                     unknown_types=(), health="UNKNOWN")
+        unknown = tuple(sorted(st.unknown_types))
+        if st.unknown_types or st.parse_errors > 3:
+            health = "PARTIAL"
+        else:
+            health = "OK"
+        return ParserDiagnostics(bound=True, parse_errors=st.parse_errors,
+                                 records_seen=st.records_seen,
+                                 recognized_records=st.recognized_records,
+                                 unknown_types=unknown, health=health)
 
     def reset_scan_cache(self):
         """清空目录扫描缓存，让下一次 poll 立即重扫（重新扫描入口）。"""
@@ -463,7 +520,13 @@ class BaseWatcher:
             self._file_source.clear()
             self._file_cwd_hint.clear()
             self._instance_files = {}
+            self._runtime_bindings.clear()
             return {}
+        # 运行期手动绑定也要有生命周期：实例退出/文件消失后清理
+        live_keys = {_as_text(getattr(i, "key", "")) for i in instances}
+        for key in list(self._runtime_bindings):
+            if key not in live_keys:
+                self._runtime_bindings.pop(key, None)
         self.refresh_files(sorted({i.source for i in instances}), instances)
         now = time.time()
         for st in self.files.values():

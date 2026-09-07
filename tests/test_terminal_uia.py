@@ -1,4 +1,8 @@
-"""UIA 观察器单元测试：FakeBackend，不需要真实 Terminal（plan.md §62）。"""
+"""UIA 观察器单元测试：FakeBackend，不需要真实 Terminal（plan.md §62）。
+
+V3.1：TextChanged debounce 审批 fallback、可见读取限流、
+StructureChanged 重发现、订阅生命周期、互相唯一 pane 绑定。
+"""
 from __future__ import annotations
 import time
 import unittest
@@ -8,18 +12,22 @@ from agents.terminal_uia import (
     APPROVAL_TTL,
     DELTA_MAX,
     EVENT_QUEUE_MAX,
+    GLOBAL_VISIBLE_READ_LIMIT,
     RING_MAX,
+    UIA_CALL_QUEUE_MAX,
     CodexTerminalRecognizer,
     ClaudeTerminalRecognizer,
     KimiTerminalRecognizer,
     PaneInfo,
+    SubscriptionTracker,
     TerminalBackend,
     TerminalEvent,
     TerminalObserver,
     TerminalResolver,
+    UiaBackend,
     WEAK_TRIGGER_RE,
 )
-from agents.models import AgentInstance, AgentKind, BindingConfidence
+from agents.models import AgentInstance, AgentKind, AgentKind as _AK, BindingConfidence
 
 NOW = 1_000_000.0
 
@@ -61,13 +69,25 @@ class FakeBackend(TerminalBackend):
         self.panes: dict[tuple, PaneInfo] = {}
         self.visible: dict[tuple, str] = {}
         self.reads: list[tuple] = []
+        self.discover_count = 0
+        self.sync_history: list[set] = []
+        self.unsubscribed: list[tuple] = []
 
     def discover_panes(self) -> list[PaneInfo]:
+        self.discover_count += 1
         return list(self.panes.values())
 
     def read_visible(self, pane_id: tuple) -> str:
         self.reads.append(pane_id)
         return self.visible.get(pane_id, "")
+
+    def sync_pane_subscriptions(self, panes):
+        wanted = {p.pane_id for p in panes}
+        prev = self.sync_history[-1] if self.sync_history else set()
+        self.sync_history.append(wanted)
+        for pane_id in prev:
+            if pane_id not in wanted:
+                self.unsubscribed.append(pane_id)
 
     def emit(self, pane_id: tuple, kind: str, text: str = "", ts: float | None = None):
         self.event_sink(TerminalEvent(pane_id=pane_id, kind=kind, text=text,
@@ -319,6 +339,236 @@ class ResolverTests(unittest.TestCase):
         resolver.set_manual_binding(inst.key, pane_id)
         bindings = resolver.resolve([inst], panes, NOW)
         self.assertEqual(bindings[inst.key].confidence, BindingConfidence.CONFIRMED)
+
+
+class TextChangedFallbackTests(unittest.TestCase):
+    """TextChanged → debounce → 有界可见读取（Notification 失效时的兜底）。"""
+
+    def _observer_with_pane(self, pane_id=(11, (1,)), visible="plain output"):
+        observer, backend = make_observer()
+        backend.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
+                                          window_pid=5, title="x")
+        observer.refresh_panes(force=True)
+        backend.visible[pane_id] = visible
+        return observer, backend
+
+    def test_text_changed_schedules_bounded_visible_read(self):
+        observer, backend = self._observer_with_pane()
+        backend.emit((11, (1,)), "activity", "", ts=NOW)
+        observer.poll(NOW)
+        # debounce 未到：不读取
+        self.assertEqual(backend.reads, [])
+        observer.poll(NOW + 0.2)
+        self.assertEqual(backend.reads, [(11, (1,))])
+        # 读取后没有审批 UI → 不产生 WAITING，但活动已记录
+        self.assertEqual(observer.observations, {})
+        self.assertIn((11, (1,)), observer.activity)
+
+    def test_debounce_merges_burst_into_single_read(self):
+        observer, backend = self._observer_with_pane()
+        for i in range(100):
+            backend.emit((11, (1,)), "activity", "", ts=NOW)
+        observer.poll(NOW)
+        observer.poll(NOW + 0.2)
+        # 100 个 TextChanged 合并为 1 次可见读取
+        self.assertEqual(len(backend.reads), 1)
+        observer.poll(NOW + 0.4)
+        observer.poll(NOW + 0.6)
+        # 单 pane 限流（≥0.5s 间隔）后也只再有界增长
+        self.assertLessEqual(len(backend.reads), 2)
+
+    def test_text_changed_fallback_detects_approval(self):
+        observer, backend = self._observer_with_pane(
+            visible=CODEX_APPROVAL_VISIBLE)
+        backend.emit((11, (1,)), "activity", "", ts=NOW)
+        observer.poll(NOW + 0.2)
+        self.assertIn((11, (1,)), observer.observations)
+        self.assertEqual(observer.observations[(11, (1,))].status,
+                         Status.WAITING)
+
+    def test_global_visible_read_budget(self):
+        observer, backend = make_observer()
+        for i in range(8):
+            pane_id = (11, (i,))
+            backend.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
+                                              window_pid=5, title=f"p{i}")
+        observer.refresh_panes(force=True)
+        for i in range(8):
+            backend.emit((11, (i,)), "activity", "", ts=NOW)
+        observer.poll(NOW)
+        observer.poll(NOW + 0.2)
+        # 8 个 dirty pane，全局预算 6/s：最多读 6 次
+        self.assertLessEqual(len(backend.reads), GLOBAL_VISIBLE_READ_LIMIT)
+        # 预算耗尽的 pane 被推迟，下一轮（1s 窗口滑过后）再读
+        self.assertTrue(observer._dirty_panes or len(backend.reads) == 8)
+
+    def test_waiting_recheck_not_debounced(self):
+        observer, backend = self._observer_with_pane(
+            visible=CODEX_APPROVAL_VISIBLE)
+        backend.emit((11, (1,)), "notification",
+                     "Would you like to run the following command?", ts=NOW)
+        observer.poll(NOW)
+        # 审批等待期间走 0.75s 复检通道，不进 debounce 队列
+        self.assertIn((11, (1,)), observer._waiting_recheck)
+        self.assertNotIn((11, (1,)), observer._dirty_panes)
+
+
+class StructureChangedTests(unittest.TestCase):
+    def test_structure_event_triggers_immediate_rediscovery(self):
+        observer, backend = make_observer()
+        base = backend.discover_count
+        backend.emit((), "structure", "", ts=NOW)
+        observer.poll(NOW)
+        self.assertGreater(backend.discover_count, base)
+
+    def test_new_pane_discovered_without_waiting(self):
+        observer, backend = make_observer()
+        backend.emit((), "structure", "", ts=NOW)
+        observer.poll(NOW)      # 重发现：pane 集合尚空
+        pane_id = (11, (9,))
+        backend.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
+                                          window_pid=5, title="new")
+        observer._last_discover = time.time()   # 阻止周期性重发现
+        backend.emit((), "structure", "", ts=NOW + 1)
+        observer.poll(NOW + 1)
+        self.assertIn(pane_id, observer.panes)
+
+    def test_removed_pane_unsubscribed(self):
+        observer, backend = make_observer()
+        p1 = (11, (1,))
+        backend.panes[p1] = PaneInfo(pane_id=p1, hwnd=11, window_pid=5, title="x")
+        observer.refresh_panes(force=True)
+        self.assertEqual(len(backend.sync_history), 1)
+        del backend.panes[p1]
+        observer.refresh_panes(force=True)
+        self.assertEqual(backend.unsubscribed, [p1])
+
+
+class SubscriptionLifecycleTests(unittest.TestCase):
+    def test_tracker_churn_does_not_accumulate(self):
+        tracker = SubscriptionTracker()
+        added = removed = 0
+        final = {("win", (i,)) for i in range(3)}
+        for cycle in range(1000):
+            wanted = {("win", ((cycle + i) % 5,)) for i in range(3)}
+            to_add, to_remove = tracker.sync(wanted)
+            added += len(to_add)
+            removed += len(to_remove)
+            self.assertLessEqual(len(tracker.active), 5)
+        tracker.sync(final)
+        self.assertEqual(tracker.active, final)
+        self.assertEqual(added - removed, len(final))
+        self.assertEqual(added, removed + 3)
+
+    def test_uia_call_queue_bounded(self):
+        backend = UiaBackend()
+        q = backend._queue
+        for i in range(UIA_CALL_QUEUE_MAX):
+            q.put_nowait(object())
+        with self.assertRaises(Exception):
+            q.put_nowait(object())
+        self.assertEqual(q.maxsize, UIA_CALL_QUEUE_MAX)
+
+    def test_backend_stats_counts(self):
+        backend = UiaBackend()
+        stats = backend.stats()
+        self.assertIn("uia_calls", stats)
+        self.assertIn("uia_timeouts", stats)
+        self.assertIn("uia_queue_dropped", stats)
+
+
+class RecognizerKindTests(unittest.TestCase):
+    def test_recognizer_observations_carry_agent_kind(self):
+        for rec, visible in (
+                (CodexTerminalRecognizer(), CODEX_APPROVAL_VISIBLE),
+                (ClaudeTerminalRecognizer(), CLAUDE_PERMISSION_VISIBLE),
+                (KimiTerminalRecognizer(), "Approve this command?\n yes / no (esc)")):
+            obs = rec.inspect(visible, "", NOW)
+            self.assertEqual(len(obs), 1)
+            self.assertEqual(obs[0].agent_kind, rec.KIND)
+
+    def test_pane_activity_observation_has_no_kind(self):
+        observer, backend = make_observer()
+        pane_id = (11, (1,))
+        backend.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
+                                          window_pid=5, title="x")
+        observer.refresh_panes(force=True)
+        backend.emit(pane_id, "activity", "", ts=NOW)
+        observer.poll(NOW)
+        obs = observer.pane_activity_observation(pane_id, NOW + 1, 10.0)
+        self.assertIsNone(obs.agent_kind)
+
+
+class MutualBindingTests(unittest.TestCase):
+    def test_weak_single_pane_not_high(self):
+        """唯一 pane + 1 分弱提示（只命中 user@）→ 绝不能 HIGH。"""
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        inst = AgentInstance(kind=AgentKind.CODEX, pid=1, source="wsl:Ubuntu",
+                             process_token="9", cwd="/x/y", user="u")
+        panes = {(11, (1,)): PaneInfo(pane_id=(11, (1,)), hwnd=11,
+                                      window_pid=5, title="u@box")}
+        bindings = resolver.resolve([inst], panes, NOW)
+        b = bindings[inst.key]
+        self.assertEqual(b.confidence, BindingConfidence.AMBIGUOUS)
+        self.assertEqual(b.score, 1)
+
+    def test_two_agents_two_panes_mutual_unique(self):
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        codex = AgentInstance(kind=AgentKind.CODEX, pid=1, source="wsl:Ubuntu",
+                              process_token="9", cwd="/w/alpha", user="u1")
+        claude = AgentInstance(kind=AgentKind.CLAUDE, pid=2, source="wsl:Ubuntu",
+                               process_token="10", cwd="/w/beta", user="u2")
+        panes = {
+            (11, (1,)): PaneInfo(pane_id=(11, (1,)), hwnd=11, window_pid=5,
+                                 title="codex u1@box:~/alpha"),
+            (11, (2,)): PaneInfo(pane_id=(11, (2,)), hwnd=11, window_pid=5,
+                                 title="claude u2@box:~/beta"),
+        }
+        b1 = resolver.resolve([codex, claude], panes, NOW)
+        b2 = resolver.resolve([claude, codex], panes, NOW)   # 顺序无关
+        self.assertEqual(b1[codex.key].confidence, BindingConfidence.HIGH)
+        self.assertEqual(b1[claude.key].confidence, BindingConfidence.HIGH)
+        self.assertEqual(b1[codex.key].pane_id, (11, (1,)))
+        self.assertEqual(b1[claude.key].pane_id, (11, (2,)))
+        self.assertEqual(
+            {k: v.pane_id for k, v in b1.items()},
+            {k: v.pane_id for k, v in b2.items()})
+
+    def test_close_competition_not_high(self):
+        """同分差仅 1（<margin=2 的保守设定）时用户可手动修复。"""
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        a = AgentInstance(kind=AgentKind.CODEX, pid=1, source="wsl:Ubuntu",
+                          process_token="9", cwd="/w/alpha", user="u")
+        b = AgentInstance(kind=AgentKind.CODEX, pid=2, source="wsl:Ubuntu",
+                          process_token="10", cwd="/w/beta", user="u")
+        # 两个 pane 都含 "codex"（+3）与 "u@"（+1），各自 cwd 差异化（+2）
+        panes = {
+            (11, (1,)): PaneInfo(pane_id=(11, (1,)), hwnd=11, window_pid=5,
+                                 title="codex alpha u@box"),
+            (11, (2,)): PaneInfo(pane_id=(11, (2,)), hwnd=11, window_pid=5,
+                                 title="codex beta u@box"),
+        }
+        bindings = resolver.resolve([a, b], panes, NOW)
+        # A: X=6, Y=4；B: X=4, Y=6 → 双向唯一，margin=2 → 都 HIGH
+        self.assertEqual(bindings[a.key].confidence, BindingConfidence.HIGH)
+        self.assertEqual(bindings[b.key].confidence, BindingConfidence.HIGH)
+
+    def test_manual_binding_pruned_when_agent_or_pane_gone(self):
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        inst = AgentInstance(kind=AgentKind.CODEX, pid=1, source="wsl:Ubuntu",
+                             process_token="9")
+        pane_id = (33, (7,))
+        panes = {pane_id: PaneInfo(pane_id=pane_id, hwnd=33, window_pid=9, title="x")}
+        resolver.set_manual_binding(inst.key, pane_id)
+        bindings = resolver.resolve([inst], panes, NOW)
+        self.assertEqual(bindings[inst.key].confidence, BindingConfidence.CONFIRMED)
+        # pane 消失 → manual 清理
+        resolver.resolve([inst], {}, NOW)
+        self.assertEqual(resolver._manual, {})
+        # Agent 退出 → manual 清理
+        resolver.set_manual_binding(inst.key, pane_id)
+        resolver.resolve([], panes, NOW)
+        self.assertEqual(resolver._manual, {})
 
 
 if __name__ == "__main__":

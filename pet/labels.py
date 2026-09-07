@@ -16,6 +16,7 @@ MODE_LABELS = {
     Mode.NONE: "", Mode.DEFAULT: "Default", Mode.PLAN: "Plan",
     Mode.ACCEPT_EDITS: "Accept Edits", Mode.AUTO: "Auto",
     Mode.DONT_ASK: "Don't Ask", Mode.BYPASS: "Bypass",
+    Mode.UNKNOWN: "Unknown",
 }
 
 

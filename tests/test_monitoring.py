@@ -610,6 +610,91 @@ class MonitorPassiveTests(unittest.TestCase):
         # AMBIGUOUS → 终端审批不归属（plan §25）
         self.assertEqual(target.snapshot.status, Status.WORKING)
 
+    def test_terminal_waiting_kind_mismatch_not_attributed(self):
+        """Codex 绑定的 pane 上命中 Claude 审批文案 → 不能归属给 Codex。"""
+        from agents.terminal_uia import PaneInfo, TerminalObserver, TerminalBackend
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        observer = TerminalObserver(TerminalBackend(), cfg={})
+        observer._started = True
+        pane_id = (11, (1, 2))
+        observer.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
+                                           window_pid=50, title="claude")
+        observer._last_discover = time.time()
+        observer.observations[pane_id] = Observation(
+            source=EvidenceSource.TERMINAL, timestamp=time.time(),
+            status=Status.WAITING, phase=Phase.APPROVAL,
+            agent_kind=AgentKind.CLAUDE,
+            confidence=Confidence.HIGH, summary="Bash 命令需要确认",
+            expires_at=time.time() + 1.5)
+        monitor._terminal = observer
+        inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
+        from agents.models import BindingConfidence, TerminalBinding
+        fake_binding = TerminalBinding(
+            hwnd=11, pane_id=pane_id, confidence=BindingConfidence.HIGH,
+            observable=True, last_seen=time.time())
+        watcher = monitor._watchers[AgentKind.CODEX]
+        with patch.object(watcher, "poll") as wpoll, \
+             patch.object(monitor._resolver, "resolve", return_value={inst.key: fake_binding}), \
+             patch.object(monitor._probe, "snapshot",
+                          return_value=({"wsl:Ubuntu": [inst]}, {"wsl:Ubuntu": True})):
+            wpoll.return_value = {inst.key: Observation(
+                source=EvidenceSource.SESSION, timestamp=time.time(),
+                status=Status.WORKING, turn_active=True,
+                confidence=Confidence.HIGH, session_bound=True, summary="修改中")}
+            monitor._tick()
+        target = monitor.get_target(inst.key)
+        self.assertEqual(target.snapshot.status, Status.WORKING)   # 不串 WAITING
+
+    def test_session_done_survives_terminal_activity(self):
+        """任务完成后终端 prompt 绘制（泛化活动）不得吞掉 DONE 动画。"""
+        from agents.terminal_uia import PaneInfo, TerminalObserver, TerminalBackend
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        observer = TerminalObserver(TerminalBackend(), cfg={})
+        observer._started = True
+        pane_id = (11, (1, 2))
+        observer.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
+                                           window_pid=50, title="codex")
+        observer._last_discover = time.time()
+        observer.activity[pane_id] = time.time()   # 泛化终端活动（无 agent_kind）
+        monitor._terminal = observer
+        inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
+        from agents.models import BindingConfidence, TerminalBinding
+        fake_binding = TerminalBinding(
+            hwnd=11, pane_id=pane_id, confidence=BindingConfidence.HIGH,
+            observable=True, last_seen=time.time())
+        watcher = monitor._watchers[AgentKind.CODEX]
+        with patch.object(watcher, "poll") as wpoll, \
+             patch.object(monitor._resolver, "resolve", return_value={inst.key: fake_binding}), \
+             patch.object(monitor._probe, "snapshot",
+                          return_value=({"wsl:Ubuntu": [inst]}, {"wsl:Ubuntu": True})):
+            wpoll.return_value = {inst.key: Observation(
+                source=EvidenceSource.SESSION, timestamp=time.time(),
+                status=Status.DONE, confidence=Confidence.EXACT,
+                session_bound=True, summary="完成")}
+            monitor._tick()
+        target = monitor.get_target(inst.key)
+        self.assertEqual(target.snapshot.status, Status.DONE)
+
+    def test_source_health_isolation_for_stale_flag(self):
+        """Ubuntu 扫描失败只影响 Ubuntu 实例的 stale 标记。"""
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        monitor._terminal = None
+        ubuntu = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
+                               process_token="1")
+        win = AgentInstance(AgentKind.CODEX, 2, "windows", process_token="2")
+        watcher = monitor._watchers[AgentKind.CODEX]
+        with patch.object(watcher, "poll") as wpoll, \
+             patch.object(monitor._probe, "snapshot",
+                          return_value=({"windows": [win], "wsl:Ubuntu": [ubuntu]},
+                                        {"windows": True, "wsl:Ubuntu": False})):
+            wpoll.return_value = {}
+            monitor._tick()
+        self.assertTrue(monitor.get_target(ubuntu.key).snapshot.stale)
+        self.assertFalse(monitor.get_target(win.key).snapshot.stale)
+
     def test_pinned_and_auto_follow(self):
         config = MemoryConfig()
         monitor = Monitor(config)

@@ -25,7 +25,7 @@ from .models import (
     Observation,
     Phase,
     Status,
-    normalize_mode,
+    parse_mode,
 )
 from .summarize import fmt_command, shorten
 
@@ -34,6 +34,14 @@ SUMMARY_MAX = 160
 # PID registry 指向旧 JSONL 后，同 cwd 新 JSONL 需要连续 N 个扫描周期
 # 确认增长才自动切换（plan §12）。
 _STALE_CONFIRM_CYCLES = 2
+
+# conversation JSONL 顶层记录类型（2026-09 查证）
+_RECORD_TYPES = frozenset({
+    "user", "assistant", "system", "result", "ai-title", "summary",
+    "permission-mode", "permissionMode", "permission_mode",
+    "input", "input_request", "request_user_input", "user_input_required",
+    "error", "fatal_error", "turn_complete", "turn_finished", "?",
+})
 
 
 def _feed_ts(obj: dict) -> float:
@@ -72,6 +80,7 @@ def _summarize_tool(block) -> tuple[str, str]:
 
 class ClaudeFile(FileState):
     kind = AgentKind.CLAUDE
+    RECORD_TYPES = _RECORD_TYPES
 
     def __init__(self, path: str):
         super().__init__(path)
@@ -184,7 +193,7 @@ class ClaudeFile(FileState):
             self.title = self.title or title
         elif t in {"permission-mode", "permissionMode", "permission_mode"}:
             mode = obj.get("mode") or obj.get("permissionMode") or obj.get("permission_mode")
-            self.mode = normalize_mode(mode)
+            self.mode, self.mode_raw = parse_mode(mode)
         elif t in {"input", "input_request", "request_user_input", "user_input_required"}:
             self._set_input(obj)
         elif t in {"error", "fatal_error"} or (t == "system" and obj.get("subtype") == "error"):
@@ -226,6 +235,7 @@ class ClaudeFile(FileState):
     def observation(self, now: float, cfg: dict) -> Observation | None:
         obs = self.base_observation()
         obs.mode = self.mode
+        obs.mode_raw = self.mode_raw
         obs.goal = self.goal or self.title
 
         if self.error_ts and 0 <= now - self.error_ts < 30:

@@ -51,8 +51,13 @@ class Phase(str, Enum):
 
 
 class Mode(str, Enum):
-    """归一化的 Agent 模式（Plan/Default 等是模式，不是状态）。"""
+    """归一化的 Agent 模式（Plan/Default 等是模式，不是状态）。
+
+    UNKNOWN：出现了非空但无法归一的原始值（如上游新增 "delegate"）。
+    未知值不能静默吞掉——保留原始字符串供诊断展示。
+    """
     NONE = ""
+    UNKNOWN = "unknown"
     DEFAULT = "default"
     PLAN = "plan"
     ACCEPT_EDITS = "acceptEdits"
@@ -64,6 +69,7 @@ class Mode(str, Enum):
     def label(self) -> str:
         return {
             "": "",
+            "unknown": "Unknown",
             "default": "Default",
             "plan": "Plan",
             "acceptEdits": "Accept Edits",
@@ -73,27 +79,39 @@ class Mode(str, Enum):
         }[self.value]
 
 
+_MODE_ALIASES = {
+    "": Mode.NONE,
+    "default": Mode.DEFAULT,
+    "code": Mode.DEFAULT,
+    "execute": Mode.DEFAULT,
+    "pair_programming": Mode.DEFAULT,
+    "custom": Mode.DEFAULT,
+    "plan": Mode.PLAN,
+    "planning": Mode.PLAN,
+    "acceptedits": Mode.ACCEPT_EDITS,
+    "accept_edits": Mode.ACCEPT_EDITS,
+    "auto": Mode.AUTO,
+    "dontask": Mode.DONT_ASK,
+    "dont_ask": Mode.DONT_ASK,
+    "bypasspermissions": Mode.BYPASS,
+    "bypass_permissions": Mode.BYPASS,
+    "yolo": Mode.BYPASS,
+}
+
+
+def parse_mode(value) -> tuple[Mode, str]:
+    """原始值 → (归一 Mode, 原始字符串)。未知非空值 → (UNKNOWN, 原始值)。"""
+    raw = str(value or "").strip()
+    mode = _MODE_ALIASES.get(raw.lower(), None)
+    if mode is not None:
+        return mode, raw
+    if not raw:
+        return Mode.NONE, ""
+    return Mode.UNKNOWN, raw
+
+
 def normalize_mode(value) -> Mode:
-    text = str(value or "").strip().lower()
-    mapping = {
-        "": Mode.NONE,
-        "default": Mode.DEFAULT,
-        "code": Mode.DEFAULT,
-        "execute": Mode.DEFAULT,
-        "pair_programming": Mode.DEFAULT,
-        "custom": Mode.DEFAULT,
-        "plan": Mode.PLAN,
-        "planning": Mode.PLAN,
-        "acceptedits": Mode.ACCEPT_EDITS,
-        "accept_edits": Mode.ACCEPT_EDITS,
-        "auto": Mode.AUTO,
-        "dontask": Mode.DONT_ASK,
-        "dont_ask": Mode.DONT_ASK,
-        "bypasspermissions": Mode.BYPASS,
-        "bypass_permissions": Mode.BYPASS,
-        "yolo": Mode.BYPASS,
-    }
-    return mapping.get(text, Mode.NONE if not text else Mode.NONE)
+    return parse_mode(value)[0]
 
 
 class EvidenceSource(str, Enum):
@@ -132,6 +150,13 @@ class Observation:
     turn_active: bool = False
     session_bound: bool = True   # 该观察是否来自已绑定的会话文件
 
+    # 终端审批识别器命中的 Agent 种类（错误归属防护：绑定为 Codex 的
+    # pane 上命中 Claude 审批文案时不能归属给 Codex）。
+    # 泛化的终端活动观察（pane 有文本变化）必须保持 None。
+    agent_kind: AgentKind | None = None
+    # Mode 为 UNKNOWN 时保留的原始值（仅诊断展示，不进普通气泡）
+    mode_raw: str = ""
+
     # 会话侧身份信息（由 watcher 填写；终端观察不需要）
     session_file: str = ""
     session_id: str = ""
@@ -159,6 +184,11 @@ class AgentInstance:
     started_at: float = 0.0
     key: str = field(default="")
     cwd: str = ""
+    # process_token 的来源：proc（/proc starttime ticks）/ create_time
+    # （Windows psutil）/ fallback（metadata 失败时的稳定代次 token）
+    process_token_source: str = ""
+    # 匹配到的 launcher/祖先进程（npm shim 等），仅运行期诊断
+    launcher_pids: tuple[int, ...] = ()
 
     ppid: int = 0
     uid: int | None = None
@@ -257,6 +287,12 @@ class TerminalBinding:
     confidence: BindingConfidence = BindingConfidence.NONE
     observable: bool = False     # 该 pane 的可见文本是否可经 UIA 读取
     last_seen: float = 0.0
+    # 绑定依据诊断（dashboard 高级诊断展示；score=最佳评分，runner_up=次佳）
+    score: int = 0
+    runner_up_score: int = 0
+    agent_margin: int = 0       # 该 Agent 的 top1-top2 分差
+    pane_margin: int = 0        # 该 pane 的 top1-top2 分差
+    reason: str = ""            # 如 "kind+cwd+distro"
 
     def raise_target(self) -> int:
         return self.hwnd
@@ -286,7 +322,12 @@ class Snapshot:
     confidence: Confidence = Confidence.UNKNOWN
     # 展示用的审批策略字符串（如"按需审批 · 工作区写入"），不是 Mode
     policy: str = ""
-    # WSL/终端扫描退化时提示"状态可能延迟"
+    # Mode 为 UNKNOWN 时的原始值（仅详情页诊断展示）
+    mode_raw: str = ""
+    # 会话解析器兼容性健康（OK / PARTIAL / UNKNOWN）与非敏感说明
+    parser_health: str = ""
+    parser_detail: str = ""
+    # WSL/终端扫描退化时提示"状态可能延迟"（按实例真实 source 判定）
     stale: bool = False
 
     def bubble_text(self) -> str:

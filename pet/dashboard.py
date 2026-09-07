@@ -91,6 +91,10 @@ class Dashboard(tk.Toplevel):
         if binding is None or not getattr(binding, 'hwnd', 0):
             self.app.toast('未能定位该 Agent 的终端窗口', 4)
             return
+        if not winkeys.validate_terminal_window(binding):
+            self.app.monitor.rediscover_terminal()
+            self.app.toast('终端窗口已变化，正在重新识别', 4)
+            return
         if not winkeys.raise_terminal(binding):
             self.app.toast('Windows 未允许切换焦点，已提醒任务栏', 4)
 
@@ -124,9 +128,12 @@ class Dashboard(tk.Toplevel):
         inst, snap = target.instance, target.snapshot
         binding = target.terminal
         lines = []
+        mode_label = mode_text(snap)
+        if mode_label == 'Unknown' and snap.mode_raw:
+            mode_label += f'（原始值：{snap.mode_raw}）'
         lines.append(f"{snap.kind.label} · {status_text(snap)}"
                      + (f" · {phase_text(snap)}" if phase_text(snap) else '')
-                     + (f" · Mode: {mode_text(snap)}" if mode_text(snap) else ''))
+                     + (f" · Mode: {mode_label}" if mode_label else ''))
         if snap.policy:
             lines.append(f"审批策略：{snap.policy}")
         if snap.goal:
@@ -138,19 +145,42 @@ class Dashboard(tk.Toplevel):
         lines.append('')
         lines.append(f"项目目录：{inst.cwd or '?'}")
         lines.append(f"环境：{inst.environment_label}")
+        parser_map = {'OK': '正常', 'PARTIAL': '部分识别', 'UNKNOWN': '未解析'}
+        if snap.parser_health:
+            line = f"Session parser：{parser_map.get(snap.parser_health, snap.parser_health)}"
+            if snap.parser_detail:
+                line += f"（{snap.parser_detail}）"
+            lines.append(line)
         if binding is not None and binding.title:
             conf = {'confirmed': '已确认', 'high': '高置信', 'ambiguous': '无法唯一确定', 'none': '未绑定'}.get(
                 binding.confidence.value if hasattr(binding.confidence, 'value') else str(binding.confidence), '?')
             lines.append(f"终端：{binding.title}（{conf}）")
+            if binding.reason:
+                detail = f"依据：{binding.reason}"
+                if binding.score:
+                    detail += f" · score {binding.score}"
+                    if binding.runner_up_score:
+                        detail += f" / 次佳 {binding.runner_up_score}"
+                lines.append(detail)
             if binding.confidence == BindingConfidence.AMBIGUOUS:
                 lines.append('⚠ 无法唯一确定终端 Pane：终端审批观察不会归属到该 Agent')
         if not self.app.monitor.terminal_available():
-            lines.append('终端交互状态不可读（UIA 不可用）')
+            err = self.app.monitor.terminal_startup_error()
+            lines.append('终端交互状态不可读（UIA 不可用）'
+                         + (f'：{err[:80]}' if err else ''))
         if snap.stale:
-            lines.append('状态可能延迟（进程扫描部分失败）')
+            lines.append('状态可能延迟（该来源进程扫描失败）')
         lines.append('')
         lines.append('—— 高级诊断 ——')
-        lines.append(f"PID {inst.pid} · token {inst.process_token or '?'} · started {int(inst.started_at)}")
+        token_src = {'proc': '/proc', 'create_time': 'create_time',
+                     'fallback': 'fallback'}.get(inst.process_token_source, '')
+        token_line = f"PID {inst.pid} · token {inst.process_token or '?'}"
+        if token_src:
+            token_line += f"（{token_src}）"
+        token_line += f" · started {int(inst.started_at)}"
+        lines.append(token_line)
+        if inst.launcher_pids:
+            lines.append(f"launcher pids：{', '.join(str(p) for p in inst.launcher_pids)}")
         if inst.tty:
             lines.append(f"TTY {inst.tty} · SID {inst.sid} · PGID {inst.pgid}")
         if inst.uid is not None:
@@ -238,6 +268,15 @@ class Dashboard(tk.Toplevel):
         ttk.Checkbutton(row, text='托盘图标', variable=tray,
                         command=lambda: self.app.start_tray() if tray.get() else self.app.stop_tray()).pack(side='left', padx=12)
         ttk.Button(row, text='隐藏桌宠', command=self.app.hide_pet).pack(side='left')
+        row = ttk.Frame(outer)
+        row.pack(fill='x', padx=18, pady=8)
+        root_meta = tk.BooleanVar(value=bool(cfg.get('privacy.wsl_root_metadata_fallback', False)))
+        ttk.Checkbutton(row, text='允许使用 WSL root 补充 Agent 进程元数据（重启生效）',
+                        variable=root_meta,
+                        command=lambda: self._save('privacy.wsl_root_metadata_fallback',
+                                                   root_meta.get())).pack(side='left')
+        ttk.Label(outer, text='仅读取 cwd、进程启动 token、uid/HOME 和 allowlist 环境变量；默认关闭，关闭时元数据不可读的 Agent 仍会被发现（会话可能显示未解析）。',
+                  foreground='#687970').pack(anchor='w', padx=18, pady=(0, 8))
         ttk.Label(outer, text='DeskPet V3 只被动监听：不启动 Agent、不配置 hooks、不发送键盘、不自动审批。',
                   foreground='#687970').pack(anchor='w', padx=18, pady=8)
 
@@ -412,8 +451,12 @@ class Dashboard(tk.Toplevel):
         stats = monitor.stats()
         perf = (f"targets={stats.get('targets', 0)}"
                 f" · wsl调用={stats.get('wsl_spawn_count', 0)}"
+                f" · wsl扫描={stats.get('wsl_scan_count', 0)}"
+                f"（{stats.get('wsl_scan_ms', 0)}ms"
+                f"/win {stats.get('windows_scan_ms', 0)}ms）"
                 f" · uia事件={stats.get('events', 0)}"
-                f" · 可见读取={stats.get('visible_reads', 0)}")
+                f" · 可见读取={stats.get('visible_reads', 0)}"
+                f" · uia队列丢弃={stats.get('uia_queue_dropped', 0)}")
         if self.perf_var.get() != perf:
             self.perf_var.set(perf)
         logs = '\n'.join(monitor.recent_logs())

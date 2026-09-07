@@ -23,12 +23,35 @@ from .models import (
     Observation,
     Phase,
     Status,
-    normalize_mode,
+    parse_mode,
 )
 from .summarize import CODEX_MODE, CODEX_SANDBOX, fmt_command, shorten
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
+
+# rollout 顶层记录类型（2026-09 查证）
+_TOP_RECORD_TYPES = frozenset({
+    "session_meta", "turn_context", "event_msg", "response_item",
+    "compacted", "token_usage_record", "error", "fatal_error",
+    "input", "request_user_input", "?",
+})
+# event_msg / response_item 的 payload.type
+_EVENT_TYPES = frozenset({
+    "error", "turn_error", "task_error", "fatal_error", "stream_error",
+    "input", "input_required", "request_user_input", "user_input_required",
+    "task_started", "turn_started", "task_complete", "turn_complete",
+    "turn_finished", "turn_aborted", "task_aborted", "turn_cancelled",
+    "task_cancelled", "user_message", "agent_message", "agent_reasoning",
+    "agent_reasoning_raw_content", "mcp_tool_call_end", "web_search_end",
+    "item_completed", "input_received", "user_input", "token_count",
+})
+# response_item 的 payload.type
+_ITEM_TYPES = frozenset({
+    "message", "function_call", "tool_call", "local_shell_call",
+    "custom_tool_call", "input", "request_user_input", "error",
+    "reasoning",
+})
 
 
 def _event_ts(obj, payload=None) -> float:
@@ -50,6 +73,17 @@ def _text_content(value) -> str:
 
 class CodexFile(FileState):
     kind = AgentKind.CODEX
+    RECORD_TYPES = _TOP_RECORD_TYPES | {f"event_msg:{t}" for t in _EVENT_TYPES} \
+        | {f"response_item:{t}" for t in _ITEM_TYPES}
+
+    def _record_type(self, obj: dict) -> str:
+        t = str(obj.get("type") or "?")
+        if t in ("event_msg", "response_item"):
+            payload = obj.get("payload")
+            inner = str(payload.get("type") or "") if isinstance(payload, dict) else ""
+            if inner:
+                t = f"{t}:{inner}"
+        return t
 
     def __init__(self, path: str):
         super().__init__(path)
@@ -164,7 +198,7 @@ class CodexFile(FileState):
             self.turn_id = str(payload.get("turn_id") or payload.get("turnId") or self.turn_id)
             collab = payload.get("collaboration_mode") or payload.get("collaborationMode")
             if collab:
-                self.mode = normalize_mode(collab)
+                self.mode, self.mode_raw = parse_mode(collab)
             self.cwd = str(payload.get("cwd") or self.cwd)
             return
 
@@ -200,10 +234,11 @@ class CodexFile(FileState):
             self.error_ts = 0.0
             self.task_started_ts = ts
             self.turn_id = str(payload.get("turn_id") or payload.get("turnId") or self.turn_id)
-            mode = normalize_mode(payload.get("collaboration_mode_kind")
-                                  or payload.get("collaborationModeKind"))
+            mode, mode_raw = parse_mode(payload.get("collaboration_mode_kind")
+                                        or payload.get("collaborationModeKind"))
             if mode is not Mode.NONE:
                 self.mode = mode
+                self.mode_raw = mode_raw
             self.phase = Phase.THINKING
         elif ptype in {"task_complete", "turn_complete", "turn_finished"}:
             self.task_active = False
@@ -335,6 +370,7 @@ class CodexFile(FileState):
     def observation(self, now: float, cfg: dict) -> Observation | None:
         obs = self.base_observation()
         obs.mode = self.mode
+        obs.mode_raw = self.mode_raw
         obs.goal = self.goal or self.title
 
         if self.error_ts and 0 <= now - self.error_ts < 30:

@@ -52,6 +52,9 @@ DEFAULTS = {
     "privacy": {
         "terminal_text_to_disk": False,
         "session_text_to_disk": False,
+        # 默认绝不使用 WSL root 读取进程 metadata；仅在用户显式开启后
+        # 允许一次 root retry（只读 cwd/启动 token/uid/HOME/allowlist env）
+        "wsl_root_metadata_fallback": False,
         "goal_max_chars": 120,
         "summary_max_chars": 160,
     },

@@ -1,7 +1,16 @@
 """V3 StateReducer：会话观察 + 终端观察 → 最终 Snapshot（plan.md §26-§28）。
 
-优先级严格为：
+语义级证据的优先级严格为：
     ERROR > WAITING > INPUT > WORKING > DONE > IDLE > UNKNOWN
+
+但必须区分两类终端证据的强弱（V3.1）：
+  * semantic terminal evidence：审批识别器命中（WAITING，带 agent_kind），
+    与 Session 同权参与上述优先级；
+  * generic activity evidence：pane 最近有文本变化（WORKING/MEDIUM，
+    agent_kind=None）。它只说明"这个 pane 在动"——可能是 final answer
+    绘制、shell prompt 回来、用户自己敲命令——绝不能推翻结构化的
+    turn completion。因此 Session 存在有效状态时 generic activity 只作
+    融合来源标记，Session 无有效状态时才作为 WORKING fallback。
 
 关键不变量：
   * 静默永远不能推断 WAITING（WAITING 只能来自 wire ApprovalRequest
@@ -49,6 +58,13 @@ def _live(observation: Observation | None, now: float) -> Observation | None:
     return observation
 
 
+def _is_generic_activity(obs: Observation) -> bool:
+    """泛化终端活动：pane 有文本变化，但没有任何审批语义。"""
+    return (obs.source == EvidenceSource.TERMINAL
+            and obs.status == Status.WORKING
+            and obs.agent_kind is None)
+
+
 def _pick(session: Observation | None, terminal: Observation | None,
           now: float) -> Observation | None:
     """选出来源观察：状态优先级 → 置信度 → 会话（结构化）优先。"""
@@ -89,8 +105,19 @@ def reduce_state(instance: AgentInstance,
             snap.summary = session.summary
         if session.title:
             snap.title = session.title
+        if session.mode_raw:
+            snap.mode_raw = session.mode_raw
 
-    winner = _pick(session, terminal, now)
+    session_live = _live(session, now)
+    terminal_live = _live(terminal, now)
+
+    # 证据强弱：generic terminal activity 不能覆盖结构化 Session 状态
+    #（DONE/IDLE/ERROR/INPUT/WORKING 都算结构化状态）。
+    if (terminal_live is not None and _is_generic_activity(terminal_live)
+            and session_live is not None):
+        winner = session_live
+    else:
+        winner = _pick(session_live, terminal_live, now)
 
     if winner is None:
         # 没有任何存活证据：进程存活但状态未知（绝不伪装 IDLE）。
@@ -129,11 +156,12 @@ def reduce_state(instance: AgentInstance,
         snap.phase = Phase.USER_INPUT
         snap.waiting_detail = snap.summary or "等待输入"
 
-    # 终端活动 + 会话证据并存 → 融合来源
-    if (terminal is not None and session is not None
-            and terminal.source == EvidenceSource.TERMINAL
-            and terminal.live(now) and terminal.status == Status.WORKING
-            and winner is session):
+    # 终端活动 + 会话证据并存 → 融合来源（仅限会话 WORKING；
+    # DONE/IDLE 的展示不因终端还在滚动而被改写）
+    if (terminal_live is not None and session_live is not None
+            and _is_generic_activity(terminal_live)
+            and winner is session_live
+            and session_live.status == Status.WORKING):
         snap.evidence = EvidenceSource.FUSED
 
     if snap.status == Status.WORKING and not snap.summary:

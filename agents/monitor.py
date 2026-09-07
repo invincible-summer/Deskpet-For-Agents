@@ -71,7 +71,11 @@ def _kind(value):
 
 
 class ProcessProbeWorker:
-    """独立探测线程：结果写入 single-slot 最新快照（plan §32/§48）。"""
+    """独立探测线程：结果写入 single-slot 最新快照（plan §32/§48）。
+
+    快照按真实 source 键控（windows / wsl:Ubuntu / wsl:Debian…），
+    健康位同样按 source 隔离：一个 distro 失败不污染其他来源。
+    """
 
     def __init__(self, config):
         self.config = config
@@ -80,9 +84,12 @@ class ProcessProbeWorker:
         self._lock = threading.Lock()
         self._snapshot: dict[str, list[AgentInstance]] = {}
         self._ok: dict[str, bool] = {}
-        self._wsl = WslProcessProbe()
+        self._wsl = WslProcessProbe(
+            allow_root_metadata=bool(config.get(
+                "privacy.wsl_root_metadata_fallback", False)))
         self._last_windows = 0.0
         self._last_wsl = 0.0
+        self.windows_scan_ms = 0.0
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -116,34 +123,43 @@ class ProcessProbeWorker:
     def _tick(self):
         cfg_m = self.config.get("monitor") or {}
         now = time.time()
-        changed = False
         if now - self._last_windows >= _num(cfg_m.get("windows_scan_sec", 3.0), 3.0):
             self._last_windows = now
+            t0 = time.perf_counter()
             try:
                 found = scan_windows()
                 with self._lock:
                     self._snapshot["windows"] = found
                     self._ok["windows"] = True
-                changed = True
             except Exception:
                 with self._lock:
                     self._ok["windows"] = False
-        if bool(cfg_m.get("wsl_enabled", True)) and now - self._last_wsl >= _num(
+            self.windows_scan_ms = time.perf_counter() - t0
+        wsl_enabled = bool(cfg_m.get("wsl_enabled", True))
+        if wsl_enabled and now - self._last_wsl >= _num(
                 cfg_m.get("wsl_scan_sec", 3.0), 3.0):
             self._last_wsl = now
             try:
-                found = self._wsl.scan()
+                by_source, healthy = self._wsl.scan()
                 with self._lock:
-                    self._snapshot["wsl"] = found
-                    self._ok["wsl"] = bool(self._wsl.last_ok)
-                changed = True
+                    # 清掉已消失的 wsl source 键
+                    for key in list(self._snapshot):
+                        if key.startswith("wsl:") and key not in by_source:
+                            self._snapshot.pop(key, None)
+                            self._ok.pop(key, None)
+                    self._snapshot.update(by_source)
+                    self._ok.update(healthy)
             except Exception:
                 with self._lock:
-                    self._ok["wsl"] = False
-        elif not bool(cfg_m.get("wsl_enabled", True)):
+                    for key in list(self._ok):
+                        if key.startswith("wsl:"):
+                            self._ok[key] = False
+        elif not wsl_enabled:
             with self._lock:
-                self._snapshot.pop("wsl", None)
-                self._ok["wsl"] = True
+                for key in list(self._snapshot):
+                    if key.startswith("wsl:"):
+                        self._snapshot.pop(key, None)
+                        self._ok.pop(key, None)
 
 
 class Monitor:
@@ -293,13 +309,36 @@ class Monitor:
     def terminal_available(self) -> bool:
         return bool(self._terminal is not None and not self._terminal_failed)
 
+    def terminal_startup_error(self) -> str:
+        """UIA 启动失败的非敏感原因（诊断展示用）。"""
+        if self._terminal is None:
+            return ""
+        backend = getattr(self._terminal.backend, "startup_error", "")
+        return str(backend or "")
+
+    def rediscover_terminal(self):
+        """HWND 失效等场景下的终端重发现（只刷新运行期 pane 缓存）。"""
+        if self._terminal is not None:
+            try:
+                self._terminal.refresh_panes(force=True)
+            except Exception:
+                pass
+
     def stats(self) -> dict:
+        wsl = self._probe._wsl
         out = {
             "targets": len(self.instances),
-            "wsl_spawn_count": getattr(self._probe._wsl, "spawn_count", 0),
+            "wsl_spawn_count": getattr(wsl, "spawn_count", 0),
+            "wsl_scan_count": getattr(wsl, "scan_count", 0),
+            "wsl_scan_ms": round(getattr(wsl, "scan_ms", 0.0), 1),
+            "windows_scan_ms": round(self._probe.windows_scan_ms, 1),
+            "metadata_pid_count": getattr(wsl, "metadata_pid_count", 0),
         }
         if self._terminal is not None:
             out.update(self._terminal.stats)
+            backend = getattr(self._terminal.backend, "stats", None)
+            if callable(backend):
+                out.update(backend())
         return out
 
     def recent_logs(self) -> list[str]:
@@ -345,21 +384,25 @@ class Monitor:
         return out
 
     def _merge_instances(self, now: float):
-        """读 latest probe 快照并合并；失败来源保留缓存（plan §54）。"""
+        """读 latest probe 快照并合并；失败来源按真实 source 保留缓存（plan §54）。
+
+        authoritative 按 inst.source 判定：Ubuntu 扫描失败不会阻止
+        Windows / Debian 实例的正常退出清理。
+        """
         snap, ok = self._probe.snapshot()
         cfg_m = self.config.get("monitor") or {}
         enabled = self._enabled_kinds(cfg_m)
         grace = _num(cfg_m.get("gone_grace_sec", 15.0), 15.0)
         found: dict[str, AgentInstance] = {}
         authoritative: set[str] = set()
-        for source_key, instances in snap.items():
-            if source_key == "windows" and not bool(cfg_m.get("windows_enabled", True)):
+        for source, instances in snap.items():
+            if source == "windows" and not bool(cfg_m.get("windows_enabled", True)):
                 continue
             for inst in instances:
                 if inst.kind in enabled:
                     found[inst.key] = inst
-            if ok.get(source_key):
-                authoritative.add(source_key)
+            if ok.get(source):
+                authoritative.add(source)
         with self.lock:
             old = dict(self.instances)
             merged = dict(found)
@@ -367,9 +410,8 @@ class Monitor:
                 if key in found:
                     self._gone_since.pop(key, None)
                     continue
-                source = inst.source
-                source_key = "wsl" if source.startswith("wsl:") else "windows"
-                if source_key not in authoritative:
+                if inst.source not in authoritative:
+                    # 该来源本轮不 authoritative（扫描失败）：保留缓存实例
                     merged[key] = inst
                     continue
                 since = self._gone_since.setdefault(key, now)
@@ -389,8 +431,7 @@ class Monitor:
         cfg_m = dict(self.config.get("monitor") or {})
         now = time.time()
         self._merge_instances(now)
-        _snap, ok = self._probe.snapshot()
-        stale = not all(ok.get(k, True) for k in ("windows", "wsl"))
+        _snap, probe_ok = self._probe.snapshot()
 
         with self.lock:
             instances = dict(self.instances)
@@ -433,12 +474,13 @@ class Monitor:
         new_snaps: dict[str, Snapshot] = {}
         for key, inst in instances.items():
             session = session_obs.get(key)
-            terminal = self._terminal_observation(key, now, grace)
+            terminal = self._terminal_observation(inst, now, grace)
             prev = self.snapshots.get(key)
             snap = reduce_state(inst, session, terminal, prev, now)
-            snap.stale = stale
+            snap.stale = not probe_ok.get(inst.source, True)
             new_snaps[key] = snap
             self._fill_policy(snap, key)
+            self._fill_parser_health(snap, key)
 
         with self.lock:
             prev_snaps = self.snapshots
@@ -455,11 +497,11 @@ class Monitor:
                 self._log(f"{snap.kind.label} [{snap.status.value}]{extra}")
         self._trim_logs(now)
 
-    def _terminal_observation(self, key: str, now: float,
+    def _terminal_observation(self, inst: AgentInstance, now: float,
                               grace: float) -> Observation | None:
         if self._terminal is None:
             return None
-        binding = self.bindings.get(key)
+        binding = self.bindings.get(inst.key)
         if binding is None or binding.pane_id is None:
             return None
         if binding.confidence not in (BindingConfidence.CONFIRMED,
@@ -467,9 +509,32 @@ class Monitor:
             return None   # 绑定不唯一时绝不归属终端审批（plan §25）
         waiting = self._terminal.waiting_observation(binding.pane_id)
         if waiting is not None and waiting.live(now):
-            return waiting
+            # 审批文案的识别器种类必须与绑定的 AgentKind 一致：
+            # Codex pane 上命中 Claude 审批 → 不能归属给 Codex。
+            if waiting.agent_kind is None or waiting.agent_kind == inst.kind:
+                return waiting
+        # 泛化终端活动（agent_kind=None）只是 fallback 证据，
+        # 能否覆盖会话状态由 StateReducer 的证据强弱规则决定。
         return self._terminal.pane_activity_observation(
             binding.pane_id, now, grace)
+
+    def _fill_parser_health(self, snap: Snapshot, key: str):
+        """把 watcher 的解析器兼容性诊断写入快照（不含任何事件内容）。"""
+        watcher = self._watchers.get(snap.kind)
+        if watcher is None:
+            return
+        try:
+            diag = watcher.diagnostics_for(key)
+        except Exception:
+            return
+        snap.parser_health = diag.health
+        if diag.health == "PARTIAL":
+            parts = []
+            if diag.unknown_types:
+                parts.append("未知记录：" + ", ".join(diag.unknown_types))
+            if diag.parse_errors:
+                parts.append(f"解析错误 {diag.parse_errors} 条")
+            snap.parser_detail = "；".join(parts)
 
     def _fill_policy(self, snap: Snapshot, key: str):
         watcher = self._watchers.get(snap.kind)

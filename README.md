@@ -49,6 +49,8 @@ D:\miniconda3\envs\deskpet\python.exe main.py
 
 旧 V2 配置自动迁移到 `config_version: 3`（删除连接方式/受控会话/按键/自动审批配置，清空旧绑定）。
 
+依赖已拆分：`requirements-core.txt`（psutil/Pillow/comtypes，常驻监控路径）与 `requirements-convert.txt`（imageio-ffmpeg/numpy/scipy，仅皮肤转换期使用，转换在独立子进程完成）；完整安装仍是 `pip install -r requirements.txt`。
+
 ## 三路观察（安全、无 hooks）
 
 1. **进程探测**（`agents/discovery.py`）：psutil 扫 Windows；WSL 每发行版每周期 1×`ps` + 1×匹配 PID 批量 metadata（`/proc/<pid>/cwd`、`stat` 启动 ticks=进程 token、allowlisted environ、`getent passwd` 解析 HOME，不再枚举 `/home/*`）
@@ -61,23 +63,25 @@ D:\miniconda3\envs\deskpet\python.exe main.py
 | Kimi | `$KIMI_CODE_HOME`（默认 `~/.kimi-code`，legacy `~/.kimi` 兜底） | `session_index.jsonl` 按 cwd 精确定位；`state.json.lastPrompt` + `prompt.accepted` → Goal；`plan_mode.enter/exit`（EXACT）；wire `ApprovalRequest`（EXACT，兜底 SDK 命名） |
 | pi | `~/.pi` | assistant/toolCall 生命周期 |
 
-3. **终端 UIA**（`agents/terminal_uia.py`）：独立 MTA 线程（comtypes `CUIAutomation8`/`IUIAutomation5`），订阅 TermControl 的 Notification（2022 起携带新增文本）+ TextChanged fallback；弱触发词命中才读 `GetVisibleRanges()` 当前可见区域；审批识别要求**标题模式 + 选项结构同时出现**；内存边界：delta≤2048 / ring≤8192 / pane≤16 / 队列≤256。
+3. **终端 UIA**（`agents/terminal_uia.py`）：独立 MTA 线程（comtypes `CUIAutomation8`/`IUIAutomation5`），订阅 TermControl 的 Notification（2022 起携带新增文本）+ TextChanged（0.15s debounce 的有界审批 fallback）+ 窗口级 StructureChanged（pane 开合立即重发现，20s 周期仅为兜底）；弱触发词命中才读 `GetVisibleRanges()` 当前可见区域；审批识别要求**标题模式 + 选项结构同时出现**且识别器种类与绑定 Agent 一致；内存边界：delta≤2048 / ring≤8192 / pane≤16 / 事件队列≤256 / UIA 命令队列≤32 / 可见读取全局≤6/s（单 pane≥0.5s 间隔）。
 
 ## 终端关联的置信度（诚实原则）
 
 Windows Terminal 没有 `WT_SESSION → pane` 公开接口：
 
 - **Windows 原生 Agent**：PID 祖先链 → 唯一窗口 → `CONFIRMED`
-- **WSL Agent**：标题/cwd/distro 评分，唯一强候选 → `HIGH`；并列 → `AMBIGUOUS`；无 → `NONE`
-- 只有 `CONFIRMED/HIGH` 才把终端审批观察归属到该 Agent；`AMBIGUOUS` 时仪表盘显示 ⚠ 并提供"高级：关联当前 Pane"修复入口（仅运行期有效）
+- **WSL Agent**：标题/cwd/distro 评分（kind+3 / cwd+2 / user@+1 / distro+1），**互相唯一匹配**（Agent 对 pane、pane 对 Agent 双向唯一 top-1 且分差足够）→ `HIGH`；"只有一个 pane + 弱提示"不再自动 HIGH；否则 `AMBIGUOUS` / `NONE`
+- 只有 `CONFIRMED/HIGH` 才把终端审批观察归属到该 Agent；`AMBIGUOUS` 时仪表盘显示 ⚠ 并提供"高级：关联当前 Pane"修复入口（仅运行期有效）；详情页展示绑定依据与 `score / 次佳` 分数
 - UIA 不可用时正常降级：Goal/Mode/Phase 来自会话文件，仅 Codex/Claude 的"等待审批"无法补足（仪表盘提示"终端交互状态不可读"）
 
 ## 稳定性设计
 
 - **线程架构**：Tk UI ｜ Monitor Core（0.5s）｜ ProcessProbe worker（3s，single-slot）｜ UIA MTA —— WSL 卡顿不卡气泡
-- **进程身份**：key 含启动 token（`wsl:Ubuntu|codex|4812|<ticks>`），PID 复用不继承旧绑定；消失宽限 15s，来源隔离缓存
-- **状态语义**：已知 active turn → 无限保持 WORKING；仅活动证据 → 10s 宽限后回 UNKNOWN（不伪造）；DONE 展示 8s；IDLE 只在明确见过 turn 结束后出现
-- **会话解析**：绑定用 source/session_id/cwd/started_at 评分，同分竞争保持未绑定；late-start 每 15s 无窗 fallback（最近 12 候选）；目录重扫有绑定时降为 15s
+- **进程身份**：key 含启动 token（`wsl:Ubuntu|codex|4812|<ticks>`），PID 复用不继承旧绑定；wrapper/runtime 折叠（npm shim → node 只保留最深 runtime，不跨 kind 折叠）；`/proc` ticks 缺失时用稳定 fallback 代次 token，绝不退化成裸 PID；消失宽限 15s
+- **来源隔离**：探测健康按真实 source（`windows` / `wsl:Ubuntu` / `wsl:Debian`…）判定，一个 distro 扫描失败不污染其他来源的实例与"状态可能延迟"标记
+- **状态语义**：已知 active turn → 无限保持 WORKING；仅活动证据 → 10s 宽限后回 UNKNOWN（不伪造）；DONE 展示 8s；IDLE 只在明确见过 turn 结束后出现；**泛化终端活动（pane 有文本变化）永远不能推翻结构化 Session 的 DONE/IDLE/ERROR/INPUT**
+- **会话解析**：绑定用互相唯一匹配（source/session_id/cwd/started_at 评分，结果与实例遍历顺序无关），同分竞争保持未绑定；late-start 每 15s 无窗 fallback（最近 12 候选）；目录重扫有绑定时降为 15s
+- **兼容性诊断**：会话解析器按已知记录类型集合判定 `OK / PARTIAL / UNKNOWN`，上游格式变化会在仪表盘显示"未知记录"而不是静默失败；Mode 出现未知原始值时显示 `Unknown（原始值：…）`
 
 ## 项目结构
 
@@ -86,17 +90,19 @@ main.py                 入口（DPI 感知、单实例互斥）
 pet/                    UI：app/dashboard/bubble/labels/petwindow/animator/skins/tray/config
 agents/
   models.py             Status/Phase/Mode/Observation/AgentInstance/TerminalBinding/AgentTarget
-  state.py              StateReducer（状态融合与优先级）
-  discovery.py          Windows + WSL ProcessProbe（三层探测、env allowlist）
+  state.py              StateReducer（状态融合；语义证据 > 泛化终端活动）
+  matching.py           互相唯一匹配（session/pane 绑定共用，顺序无关）
+  discovery.py          Windows + WSL ProcessProbe（三层探测、canonicalization、env allowlist）
   paths.py              数据根/wsl_unc 安全转换/Kimi 索引/Claude PID registry
-  base.py               watcher 基座（候选发现、评分绑定、late-start fallback）
+  base.py               watcher 基座（互相唯一绑定、late-start fallback、parser 诊断）
   codex.py claude.py kimi.py pi.py
-  terminal_uia.py       UIA 观察器 + 审批识别器 + TerminalResolver
+  terminal_uia.py       UIA 观察器 + 审批识别器 + TerminalResolver（订阅生命周期有界）
   monitor.py            ProcessProbeWorker + Monitor Core + AgentTarget API
   tailer.py summarize.py
-actions/winkeys.py      仅终端唤起（公共 Win32；无任何键盘注入）
+actions/winkeys.py      仅终端唤起（公共 Win32 + HWND PID/class 复用验证；无任何键盘注入）
 tools/convert.py        素材→透明GIF 管线
-tests/                  单元/隐私/UIA/基准/实机探针/回归
+tests/                  单元/隐私/UIA/匹配/基准/实机探针/回归
+.github/workflows/      CI（windows-latest：compileall + unittest + benchmark）
 ```
 
 ## 常用配置（config.json，v3）
@@ -113,20 +119,25 @@ tests/                  单元/隐私/UIA/基准/实机探针/回归
   },
   "privacy": {
     "terminal_text_to_disk": false, "session_text_to_disk": false,
+    "wsl_root_metadata_fallback": false,
     "goal_max_chars": 120, "summary_max_chars": 160
   }
 }
 ```
 
+`privacy.wsl_root_metadata_fallback` 默认关闭：默认绝不使用 WSL root 读取进程 metadata（Agent 仍会被发现，会话可能显示未解析）；仅在仪表盘显式开启后允许一次 root 补读（只读 cwd/启动 token/uid/HOME/allowlist env）。
+
 ## 测试
 
 ```bat
-D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（88+）
-D:\miniconda3\envs\deskpet\python.exe tests\benchmark_monitor.py                 # 合成基准（队列/缓冲上限）
-D:\miniconda3\envs\deskpet\python.exe tests\uia_probe.py                         # UIA 实机冒烟（--verbose 可见区域）
+D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（140+）
+D:\miniconda3\envs\deskpet\python.exe tests\benchmark_monitor.py --ticks 5000    # 合成基准（队列/预算/churn 上限）
+D:\miniconda3\envs\deskpet\python.exe tests\uia_probe.py                         # UIA 实机冒烟（--verbose-text 才打印原文）
 D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\regression.py                # 位置/气泡/缩放/托盘/自启
 D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\replay_real.py               # 真实会话数据回放
 ```
+
+CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试 + benchmark 5000 ticks；真实 UIA 验收属于本机 manual acceptance。
 
 ## 已知边界（如实说明）
 

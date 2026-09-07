@@ -26,12 +26,28 @@ from .models import (
     Observation,
     Phase,
     Status,
-    normalize_mode,
+    parse_mode,
 )
 from .summarize import fmt_command, shorten
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
+
+# 真实 wire 顶层事件 + legacy SDK 命名（2026-09 实机验证）
+_TOP_TYPES = frozenset({
+    "metadata", "runtime.set_binding", "profile.bind", "prompt.accepted",
+    "plan_mode.enter", "plan_mode.exit", "plan_mode.cancel",
+    "permission.set_mode", "turn.begin", "turn.started", "turn.ended",
+    "turn.cancel", "error", "fatal", "approval.request", "approval.response",
+    "approval.resolved", "ApprovalRequest", "ApprovalResponse",
+    "ApprovalRequestResolved", "context.append_loop_event",
+    "TurnBegin", "TurnEnd", "ToolCall", "ToolCallRequest", "UserPrompt",
+    "UserMessage", "PromptSubmitted", "Notification", "StatusUpdate", "?",
+})
+_LOOP_EVENT_TYPES = frozenset({
+    "step.begin", "step.end", "tool.call", "tool.result", "content.part",
+    "error", "fatal",
+})
 
 
 def _event_ts(obj: dict, payload: dict) -> float:
@@ -80,6 +96,16 @@ def approval_summary(p: dict) -> str:
 
 class KimiFile(FileState):
     kind = AgentKind.KIMI
+    RECORD_TYPES = _TOP_TYPES | {f"ctx:{t}" for t in _LOOP_EVENT_TYPES}
+
+    def _record_type(self, obj: dict) -> str:
+        t = str(obj.get("type") or "?")
+        if t == "context.append_loop_event":
+            event = obj.get("event")
+            inner = str(event.get("type") or "") if isinstance(event, dict) else ""
+            if inner:
+                t = f"ctx:{inner}"
+        return t
 
     def __init__(self, path: str):
         super().__init__(path)
@@ -178,9 +204,9 @@ class KimiFile(FileState):
                 self.done_ts = 0.0
                 self.phase = Phase.THINKING
         elif t == "plan_mode.enter":
-            self.mode = normalize_mode("plan")
+            self.mode, self.mode_raw = parse_mode("plan")
         elif t in ("plan_mode.exit", "plan_mode.cancel"):
-            self.mode = normalize_mode("default")
+            self.mode, self.mode_raw = parse_mode("default")
         elif t == "permission.set_mode":
             # manual/auto 等审批策略；只影响展示，不是 Mode 本身
             mode = str(obj.get("mode") or "")
@@ -315,7 +341,8 @@ class KimiFile(FileState):
                 self.phase = Phase.ANSWERING
         elif pt == "StatusUpdate":
             if "plan_mode" in payload:
-                self.mode = normalize_mode("plan" if payload.get("plan_mode") else "default")
+                self.mode, self.mode_raw = parse_mode(
+                    "plan" if payload.get("plan_mode") else "default")
         elif pt in ("UserPrompt", "UserMessage", "PromptSubmitted"):
             text = payload.get("prompt") or payload.get("message") or payload.get("text")
             if text:
@@ -349,6 +376,7 @@ class KimiFile(FileState):
     def observation(self, now: float, cfg: dict) -> Observation | None:
         obs = self.base_observation()
         obs.mode = self.mode
+        obs.mode_raw = self.mode_raw
         obs.goal = self.goal
 
         if self.error_ts and 0 <= now - self.error_ts < 30:

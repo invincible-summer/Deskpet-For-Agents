@@ -61,12 +61,51 @@ class PriorityTests(unittest.TestCase):
         self.assertEqual(snap.status, Status.INPUT)
         self.assertEqual(snap.phase, Phase.USER_INPUT)
 
-    def test_working_beats_done(self):
+    def test_done_survives_generic_terminal_activity(self):
+        """泛化终端活动不能推翻结构化 DONE（V3.1 证据强弱规则）。"""
         inst = make_instance()
         snap = reduce_state(inst, session_obs(Status.DONE),
                             terminal_obs(Status.WORKING, phase=Phase.NONE,
                                          expires_at=1008.0), None, 1000.0)
+        self.assertEqual(snap.status, Status.DONE)
+
+    def test_idle_survives_generic_terminal_activity(self):
+        inst = make_instance()
+        snap = reduce_state(inst, session_obs(Status.IDLE, turn_active=False),
+                            terminal_obs(Status.WORKING, phase=Phase.NONE,
+                                         expires_at=1008.0), None, 1000.0)
+        self.assertEqual(snap.status, Status.IDLE)
+
+    def test_error_and_input_survive_generic_terminal_activity(self):
+        inst = make_instance()
+        activity = terminal_obs(Status.WORKING, phase=Phase.NONE,
+                                expires_at=1008.0)
+        snap = reduce_state(inst, session_obs(Status.ERROR), activity,
+                            None, 1000.0)
+        self.assertEqual(snap.status, Status.ERROR)
+        snap = reduce_state(inst, session_obs(Status.INPUT), activity,
+                            None, 1000.0)
+        self.assertEqual(snap.status, Status.INPUT)
+
+    def test_no_session_status_activity_fallback_working(self):
+        """会话无有效状态（占位观察）+ 终端活动 → WORKING/MEDIUM fallback。"""
+        inst = make_instance()
+        placeholder = Observation(source=EvidenceSource.SESSION, timestamp=1000.0,
+                                   status=None, session_bound=False)
+        snap = reduce_state(inst, placeholder,
+                            terminal_obs(Status.WORKING, phase=Phase.NONE,
+                                         confidence=Confidence.MEDIUM,
+                                         expires_at=1008.0), None, 1000.0)
         self.assertEqual(snap.status, Status.WORKING)
+        self.assertEqual(snap.confidence, Confidence.MEDIUM)
+        self.assertEqual(snap.evidence, EvidenceSource.TERMINAL)
+
+    def test_terminal_waiting_still_beats_session_done(self):
+        """审批是语义级终端证据：仍然高于 DONE/IDLE（plan §26）。"""
+        inst = make_instance()
+        snap = reduce_state(inst, session_obs(Status.DONE),
+                            terminal_obs(Status.WAITING), None, 1000.0)
+        self.assertEqual(snap.status, Status.WAITING)
 
     def test_idle_when_session_known_over(self):
         inst = make_instance()

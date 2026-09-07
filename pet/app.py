@@ -13,7 +13,7 @@ import time
 import tkinter as tk
 
 from actions import winkeys
-from agents.models import BindingConfidence, Mode, Phase, Status
+from agents.models import BindingConfidence, Phase, Status
 from agents.summarize import shorten
 
 from . import autostart, skins
@@ -365,6 +365,11 @@ class PetApp:
         binding = target.terminal
         if binding is None or not getattr(binding, "hwnd", 0):
             self.toast("未能定位该 Agent 的终端窗口", 4)
+            return False
+        if not winkeys.validate_terminal_window(binding):
+            # HWND 已失效/被复用：触发一次终端重发现，不盲目唤起
+            self.monitor.rediscover_terminal()
+            self.toast("终端窗口已变化，正在重新识别", 4)
             return False
         ok = winkeys.raise_terminal(binding)
         if ok:
