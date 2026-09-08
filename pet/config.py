@@ -173,6 +173,20 @@ def normalize(data: dict) -> dict:
         else:
             monitor["agents"] = {k: bool(agents.get(k, True))
                                  for k in _KIND_KEYS}
+        # 节奏类配置的代码级 clamp（v4.1.1 §11）：配置文件手改异常值
+        # 也不能制造高频 loop / 高频扫描。
+        monitor["windows_scan_sec"] = _clamp(
+            monitor.get("windows_scan_sec", 3.0), 1.0, 60.0)
+        monitor["wsl_scan_sec"] = _clamp(
+            monitor.get("wsl_scan_sec", 3.0), 1.0, 120.0)
+        monitor["file_poll_sec"] = _clamp(
+            monitor.get("file_poll_sec", 0.5), 0.2, 5.0)
+        monitor["session_scan_sec"] = _clamp(
+            monitor.get("session_scan_sec", 3.0), 1.0, 60.0)
+        monitor["activity_grace_sec"] = _clamp(
+            monitor.get("activity_grace_sec", 10.0), 1.0, 60.0)
+        monitor["active_file_window_sec"] = _clamp(
+            monitor.get("active_file_window_sec", 180), 30, 3600)
     concurrent = ((data.get("presentation") or {}).get("concurrent"))
     if isinstance(concurrent, dict):
         if concurrent.get("mode") not in _MODES:

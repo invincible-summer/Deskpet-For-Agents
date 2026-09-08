@@ -570,32 +570,39 @@ class MonitorPassiveTests(unittest.TestCase):
         self.assertEqual(target.snapshot.mode, Mode.PLAN)
 
     def test_terminal_waiting_preempts_session_working(self):
-        """终端可见审批（HIGH 绑定）覆盖会话 WORKING（plan §26 优先级）。"""
-        from agents.terminal_uia import PaneInfo, TerminalObserver, TerminalBackend
+        """终端可见审批（HIGH observation binding）覆盖会话 WORKING（plan §26）。"""
+        from agents.terminal_uia import (ObservedTerminalControl,
+                                         TerminalObserver, TerminalBackend)
+        from agents.models import (
+            ObservationBindingConfidence, TerminalObservationBinding,
+            TerminalWindowBinding, WindowBindingConfidence, WindowIdentity,
+        )
         config = MemoryConfig()
         monitor = Monitor(config)
-        backend = TerminalBackend()
-        observer = TerminalObserver(backend, cfg={"terminal_observer": True})
+        observer = TerminalObserver(TerminalBackend(), cfg={})
         observer._started = True
-        pane_id = (11, (1, 2))
-        observer.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
-                                           window_pid=50, title="codex")
-        observer.observations[pane_id] = Observation(
+        control_id = (11, (1, 2))
+        observer.controls[control_id] = ObservedTerminalControl(
+            control_id=control_id, hwnd=11, window_pid=50, title="codex")
+        observer.observations[control_id] = Observation(
             source=EvidenceSource.TERMINAL, timestamp=time.time(),
             status=Status.WAITING, phase=Phase.APPROVAL,
             confidence=Confidence.HIGH, summary="命令执行需要确认",
             expires_at=time.time() + 1.5)
-        observer._last_discover = time.time()   # 阻止空发现清掉预置 pane
+        observer._last_discover = time.time()   # 阻止空发现清掉预置 control
         monitor._terminal_service = WindowsTerminalService(observer)
         inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
-        from agents.models import BindingConfidence, TerminalBinding
-        fake_binding = TerminalBinding(
-            hwnd=11, pane_id=pane_id, confidence=BindingConfidence.HIGH,
-            observable=True, last_seen=time.time())
+        fake_window = {inst.key: TerminalWindowBinding(
+            window=WindowIdentity(hwnd=11, pid=50, process_created=1.0,
+                                  window_class="CASCADIA_HOSTING_WINDOW_CLASS"),
+            confidence=WindowBindingConfidence.HIGH, last_seen=time.time())}
+        fake_obs = {inst.key: TerminalObservationBinding(
+            agent_key=inst.key, control_id=control_id,
+            confidence=ObservationBindingConfidence.HIGH, reason="test")}
         watcher = monitor._watchers[AgentKind.CODEX]
         with patch.object(watcher, "poll") as wpoll, \
              patch.object(monitor._terminal_service, "resolve",
-                          return_value={inst.key: fake_binding}), \
+                          return_value=(fake_window, fake_obs)), \
              patch.object(monitor._probe, "snapshot",
                           return_value=probe({"windows": (True, [inst])})):
             wpoll.return_value = {inst.key: Observation(
@@ -610,29 +617,31 @@ class MonitorPassiveTests(unittest.TestCase):
         self.assertIn("终端", target.snapshot.summary)
 
     def test_ambiguous_binding_does_not_fuse_terminal_observation(self):
-        from agents.terminal_uia import PaneInfo, TerminalObserver, TerminalBackend
+        from agents.terminal_uia import (ObservedTerminalControl,
+                                         TerminalObserver, TerminalBackend)
+        from agents.models import TerminalWindowBinding, WindowBindingConfidence
         config = MemoryConfig()
         monitor = Monitor(config)
         observer = TerminalObserver(TerminalBackend(), cfg={})
         observer._started = True
-        pane_id = (11, (1, 2))
-        observer.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
-                                           window_pid=50, title="codex")
-        observer.observations[pane_id] = Observation(
+        control_id = (11, (1, 2))
+        observer.controls[control_id] = ObservedTerminalControl(
+            control_id=control_id, hwnd=11, window_pid=50, title="codex")
+        observer.observations[control_id] = Observation(
             source=EvidenceSource.TERMINAL, timestamp=time.time(),
             status=Status.WAITING, phase=Phase.APPROVAL,
             confidence=Confidence.HIGH, expires_at=time.time() + 1.5)
         observer._last_discover = time.time()
         monitor._terminal_service = WindowsTerminalService(observer)
         inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
-        from agents.models import BindingConfidence, TerminalBinding
-        fake_binding = TerminalBinding(
-            hwnd=11, pane_id=pane_id, confidence=BindingConfidence.AMBIGUOUS,
-            observable=True)
+        # AMBIGUOUS：window=None，且没有 observation binding
+        fake_window = {inst.key: TerminalWindowBinding(
+            confidence=WindowBindingConfidence.AMBIGUOUS,
+            last_seen=time.time(), reason="multiple terminal windows")}
         watcher = monitor._watchers[AgentKind.CODEX]
         with patch.object(watcher, "poll") as wpoll, \
              patch.object(monitor._terminal_service, "resolve",
-                          return_value={inst.key: fake_binding}), \
+                          return_value=(fake_window, {})), \
              patch.object(monitor._probe, "snapshot",
                           return_value=probe({"windows": (True, [inst])})):
             wpoll.return_value = {inst.key: Observation(
@@ -641,21 +650,26 @@ class MonitorPassiveTests(unittest.TestCase):
                 confidence=Confidence.HIGH, session_bound=True, summary="修改中")}
             monitor._tick()
         target = monitor.get_target(inst.key)
-        # AMBIGUOUS → 终端审批不归属（plan §25）
+        # 无安全归属 → 终端审批不归属（plan §25）
         self.assertEqual(target.snapshot.status, Status.WORKING)
 
     def test_terminal_waiting_kind_mismatch_not_attributed(self):
-        """Codex 绑定的 pane 上命中 Claude 审批文案 → 不能归属给 Codex。"""
-        from agents.terminal_uia import PaneInfo, TerminalObserver, TerminalBackend
+        """Codex 的 observation control 上命中 Claude 审批文案 → 不能归属给 Codex。"""
+        from agents.terminal_uia import (ObservedTerminalControl,
+                                         TerminalObserver, TerminalBackend)
+        from agents.models import (
+            ObservationBindingConfidence, TerminalObservationBinding,
+            TerminalWindowBinding, WindowBindingConfidence, WindowIdentity,
+        )
         config = MemoryConfig()
         monitor = Monitor(config)
         observer = TerminalObserver(TerminalBackend(), cfg={})
         observer._started = True
-        pane_id = (11, (1, 2))
-        observer.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
-                                           window_pid=50, title="claude")
+        control_id = (11, (1, 2))
+        observer.controls[control_id] = ObservedTerminalControl(
+            control_id=control_id, hwnd=11, window_pid=50, title="claude")
         observer._last_discover = time.time()
-        observer.observations[pane_id] = Observation(
+        observer.observations[control_id] = Observation(
             source=EvidenceSource.TERMINAL, timestamp=time.time(),
             status=Status.WAITING, phase=Phase.APPROVAL,
             agent_kind=AgentKind.CLAUDE,
@@ -663,14 +677,17 @@ class MonitorPassiveTests(unittest.TestCase):
             expires_at=time.time() + 1.5)
         monitor._terminal_service = WindowsTerminalService(observer)
         inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
-        from agents.models import BindingConfidence, TerminalBinding
-        fake_binding = TerminalBinding(
-            hwnd=11, pane_id=pane_id, confidence=BindingConfidence.HIGH,
-            observable=True, last_seen=time.time())
+        fake_window = {inst.key: TerminalWindowBinding(
+            window=WindowIdentity(hwnd=11, pid=50, process_created=1.0,
+                                  window_class="CASCADIA_HOSTING_WINDOW_CLASS"),
+            confidence=WindowBindingConfidence.HIGH, last_seen=time.time())}
+        fake_obs = {inst.key: TerminalObservationBinding(
+            agent_key=inst.key, control_id=control_id,
+            confidence=ObservationBindingConfidence.HIGH, reason="test")}
         watcher = monitor._watchers[AgentKind.CODEX]
         with patch.object(watcher, "poll") as wpoll, \
              patch.object(monitor._terminal_service, "resolve",
-                          return_value={inst.key: fake_binding}), \
+                          return_value=(fake_window, fake_obs)), \
              patch.object(monitor._probe, "snapshot",
                           return_value=probe({"wsl:Ubuntu": (True, [inst])})):
             wpoll.return_value = {inst.key: Observation(
@@ -683,26 +700,34 @@ class MonitorPassiveTests(unittest.TestCase):
 
     def test_session_done_survives_terminal_activity(self):
         """任务完成后终端 prompt 绘制（泛化活动）不得吞掉 DONE 动画。"""
-        from agents.terminal_uia import PaneInfo, TerminalObserver, TerminalBackend
+        from agents.terminal_uia import (ObservedTerminalControl,
+                                         TerminalObserver, TerminalBackend)
+        from agents.models import (
+            ObservationBindingConfidence, TerminalObservationBinding,
+            TerminalWindowBinding, WindowBindingConfidence, WindowIdentity,
+        )
         config = MemoryConfig()
         monitor = Monitor(config)
         observer = TerminalObserver(TerminalBackend(), cfg={})
         observer._started = True
-        pane_id = (11, (1, 2))
-        observer.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
-                                           window_pid=50, title="codex")
+        control_id = (11, (1, 2))
+        observer.controls[control_id] = ObservedTerminalControl(
+            control_id=control_id, hwnd=11, window_pid=50, title="codex")
         observer._last_discover = time.time()
-        observer.activity[pane_id] = time.time()   # 泛化终端活动（无 agent_kind）
+        observer.activity[control_id] = time.time()   # 泛化终端活动（无 agent_kind）
         monitor._terminal_service = WindowsTerminalService(observer)
         inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
-        from agents.models import BindingConfidence, TerminalBinding
-        fake_binding = TerminalBinding(
-            hwnd=11, pane_id=pane_id, confidence=BindingConfidence.HIGH,
-            observable=True, last_seen=time.time())
+        fake_window = {inst.key: TerminalWindowBinding(
+            window=WindowIdentity(hwnd=11, pid=50, process_created=1.0,
+                                  window_class="CASCADIA_HOSTING_WINDOW_CLASS"),
+            confidence=WindowBindingConfidence.HIGH, last_seen=time.time())}
+        fake_obs = {inst.key: TerminalObservationBinding(
+            agent_key=inst.key, control_id=control_id,
+            confidence=ObservationBindingConfidence.HIGH, reason="test")}
         watcher = monitor._watchers[AgentKind.CODEX]
         with patch.object(watcher, "poll") as wpoll, \
              patch.object(monitor._terminal_service, "resolve",
-                          return_value={inst.key: fake_binding}), \
+                          return_value=(fake_window, fake_obs)), \
              patch.object(monitor._probe, "snapshot",
                           return_value=probe({"wsl:Ubuntu": (True, [inst])})):
             wpoll.return_value = {inst.key: Observation(
@@ -841,14 +866,15 @@ class MonitorPassiveTests(unittest.TestCase):
 
     def test_terminal_activity_after_exit_does_not_revive_agent(self):
         """Agent 退出后 terminal shell 继续输出：不得复活 AgentTarget。"""
-        from agents.terminal_uia import PaneInfo, TerminalObserver, TerminalBackend
+        from agents.terminal_uia import (ObservedTerminalControl,
+                                         TerminalObserver, TerminalBackend)
         config = MemoryConfig()
         monitor = Monitor(config)
         observer = TerminalObserver(TerminalBackend(), cfg={})
         observer._started = True
-        pane_id = (11, (1,))
-        observer.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
-                                           window_pid=50, title="shell")
+        control_id = (11, (1,))
+        observer.controls[control_id] = ObservedTerminalControl(
+            control_id=control_id, hwnd=11, window_pid=50, title="shell")
         observer._last_discover = time.time()
         monitor._terminal_service = WindowsTerminalService(observer)
         gone = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu",
@@ -864,7 +890,7 @@ class MonitorPassiveTests(unittest.TestCase):
             # gone 实例 authoritative absence → commit exit
             self.assertNotIn(gone.key, monitor.instances)
         # terminal shell 继续产生活动事件
-        observer._on_event(TerminalEvent(pane_id=pane_id, kind="activity",
+        observer._on_event(TerminalEvent(control_id=control_id, kind="activity",
                                          ts=time.time()))
         observer.poll(time.time())
         self.assertNotIn(gone.key, monitor.instances)
@@ -885,6 +911,107 @@ class MonitorPassiveTests(unittest.TestCase):
             monitor._tick()
         self.assertEqual(calls, [[]])   # kind 为 0 也必须 poll([])
         self.assertNotIn(inst.key, monitor.instances)
+
+
+class SourceToggleTests(unittest.TestCase):
+    """v4.1.1 §10.1：windows_enabled=False 真正停止扫描。"""
+
+    def _worker(self, windows_enabled=True):
+        cfg = MemoryConfig()
+        cfg.set("monitor.windows_enabled", windows_enabled)
+        from agents.monitor import ProcessProbeWorker
+        return ProcessProbeWorker(cfg)
+
+    def test_windows_disabled_never_scans(self):
+        worker = self._worker(windows_enabled=False)
+        with patch("agents.monitor.scan_windows") as scan:
+            scan.return_value = []
+            for _ in range(5):
+                worker._tick()
+        self.assertEqual(scan.call_count, 0)
+        snap = worker.snapshot()
+        self.assertNotIn("windows", snap)
+        self.assertEqual(worker.windows_scan_ms, 0.0)
+
+    def test_windows_disable_clears_snapshot_and_cache(self):
+        worker = self._worker(windows_enabled=True)
+        inst = AgentInstance(AgentKind.CODEX, 5, "windows", process_token="5")
+        with patch("agents.monitor.scan_windows", return_value=[inst]):
+            worker._tick()
+        self.assertIn("windows", worker.snapshot())
+        self.assertEqual(worker._windows_cache, (inst,))
+        # 运行中 True → False：source snapshot 与缓存清掉
+        worker.config.set("monitor.windows_enabled", False)
+        worker._tick()
+        self.assertNotIn("windows", worker.snapshot())
+        self.assertEqual(worker._windows_cache, ())
+        self.assertEqual(worker.windows_probe_error, "")
+
+    def test_windows_reenable_scans_immediately(self):
+        worker = self._worker(windows_enabled=False)
+        worker._tick()
+        worker.config.set("monitor.windows_enabled", True)
+        with patch("agents.monitor.scan_windows", return_value=[]) as scan:
+            worker._tick()
+        self.assertEqual(scan.call_count, 1)   # 下一 probe 周期立即恢复
+
+
+class MonitorTickOrderTests(unittest.TestCase):
+    """v4.1.1 §10.3：exit 事件后同 tick 不再处理 stale instance。"""
+
+    def test_exit_event_same_tick_skips_stale_instance(self):
+        from agents.process_watch import ProcessExitEvent
+        from agents.models import ObservationBindingConfidence, \
+            TerminalObservationBinding
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        monitor._terminal_service = WindowsTerminalService(None)
+        gone = AgentInstance(AgentKind.CODEX, 7, "windows",
+                             process_token="tok")
+        monitor.instances = {gone.key: gone}
+        monitor._exit_watcher = _FakeExitWatcher([
+            ProcessExitEvent(key=gone.key, pid=7, process_token="tok",
+                             timestamp=time.time())])
+        resolved_keys = []
+        resolve_calls = []
+
+        def fake_resolve(instances, now):
+            resolve_calls.append([i.key for i in instances])
+            obs = {i.key: TerminalObservationBinding(
+                agent_key=i.key, control_id=(11, (1,)),
+                confidence=ObservationBindingConfidence.HIGH)
+                for i in instances}
+            return ({}, obs)
+
+        with patch.object(monitor._probe, "snapshot",
+                          return_value=probe({"windows": (True, [])})), \
+             patch.object(monitor._terminal_service, "resolve",
+                          side_effect=fake_resolve), \
+             patch.object(monitor._watchers[AgentKind.CODEX], "poll",
+                          return_value={}):
+            monitor._tick()
+        # exit 事件 drain 之后重新 snapshot：resolve 不再见到已退出 key
+        resolved_keys = [k for call in resolve_calls for k in call]
+        self.assertNotIn(gone.key, resolved_keys)
+        self.assertNotIn(gone.key, monitor.instances)
+        self.assertNotIn(gone.key, monitor.window_bindings)
+        self.assertNotIn(gone.key, monitor.terminal_observation_bindings)
+
+
+class DynamicPollTests(unittest.TestCase):
+    """v4.1.1 §11：file_poll_sec 运行中修改下一轮即生效（clamp 保护）。"""
+
+    def test_poll_sec_reads_config_each_time_and_clamps(self):
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        monitor._terminal_service = WindowsTerminalService(None)
+        self.assertAlmostEqual(monitor._poll_sec(), 0.5)
+        config.set("monitor.file_poll_sec", 1.5)
+        self.assertAlmostEqual(monitor._poll_sec(), 1.5)
+        config.set("monitor.file_poll_sec", 0.01)   # 异常高频值 → clamp
+        self.assertAlmostEqual(monitor._poll_sec(), 0.2)
+        config.set("monitor.file_poll_sec", 999)    # 异常低频值 → clamp
+        self.assertAlmostEqual(monitor._poll_sec(), 5.0)
 
 if __name__ == "__main__":
     unittest.main()

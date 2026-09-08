@@ -1,17 +1,20 @@
-"""V4.1 Dashboard：左侧导航 + 六页（v4plan §13）。
+"""V4.1.2 Dashboard：左侧导航 + 六页（v4plan §13，v4.1.1 收敛）。
 
   概览 / Agents / 桌宠与外观 / 监听与隐私 / 诊断 / 设置
 
   * ttk.Notebook 旧结构已删除；
   * 状态同时有文字/icon，不只靠颜色；
-  * 技术 ID（PID/RuntimeId/HWND）只在高级诊断折叠区；
-  * "打开终端"永远用 exact agent_key → Monitor.activate_target；
-  * 激活/修复入口不直接 import winkeys。
+  * 技术 ID（PID/HWND）只在高级诊断折叠区；不展示 UIA RuntimeId；
+  * "打开终端"永远用 exact agent_key → Monitor.activate_target，
+    只恢复并前置该 Agent 所在的 Windows Terminal 顶层窗口；
+  * 激活入口不直接 import winkeys；
+  * 布局自适应窗口大小：文本 wraplength 跟随实际宽度、页面纵向
+    铺满、滚动条只在内容超出时出现（非阻塞轻量刷新）。
 """
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from agents.models import ActivationCode, BindingConfidence, Status
+from agents.models import ActivationCode, Status, WindowBindingConfidence
 
 from . import autostart, skins
 from .labels import mode_text, phase_text, status_text
@@ -25,6 +28,7 @@ from .widgets import (
     ScrollableFrame,
     SegmentedControl,
     StatusChip,
+    bind_wraplength,
 )
 
 NAV_WIDTH = 184
@@ -36,11 +40,14 @@ PAGE_MONITOR = "监听与隐私"
 PAGE_DIAG = "诊断"
 PAGE_SETTINGS = "设置"
 
+APP_VERSION = "DeskPet V4.1.2"
+
 _BINDING_LABELS = {
-    BindingConfidence.CONFIRMED: "已确认",
-    BindingConfidence.HIGH: "高置信",
-    BindingConfidence.AMBIGUOUS: "无法唯一确定",
-    BindingConfidence.NONE: "未绑定",
+    WindowBindingConfidence.CONFIRMED: "已确认",
+    WindowBindingConfidence.HIGH: "高置信",
+    WindowBindingConfidence.FALLBACK: "唯一窗口兜底",
+    WindowBindingConfidence.AMBIGUOUS: "无法唯一确定",
+    WindowBindingConfidence.NONE: "未绑定",
 }
 
 
@@ -54,8 +61,8 @@ class Dashboard(tk.Toplevel):
         self.app = app
         super().__init__(app.root)
         self.title("DeskPet · 仪表盘")
-        self.geometry("1120x760")
-        self.minsize(880, 620)
+        self.geometry("1000x680")
+        self.minsize(820, 560)
         self.configure(bg=LIGHT.page)
         self.protocol("WM_DELETE_WINDOW", self.withdraw)
         self.selected_key = ""
@@ -66,7 +73,7 @@ class Dashboard(tk.Toplevel):
         nav = tk.Frame(self, bg=LIGHT.page, width=NAV_WIDTH)
         nav.pack(side="left", fill="y")
         nav.pack_propagate(False)
-        header = tk.Label(nav, text="DeskPet V4.1", bg=LIGHT.page,
+        header = tk.Label(nav, text=APP_VERSION, bg=LIGHT.page,
                           fg=LIGHT.text, font=pick_font(self, 12, True),
                           anchor="w", padx=16)
         header.pack(fill="x", pady=(18, 10))
@@ -99,7 +106,8 @@ class Dashboard(tk.Toplevel):
         self._page = page
         for name, frame in self._pages.items():
             if name == page:
-                frame.pack(fill="x", padx=24, pady=16)
+                # fill both + expand：页面随窗口缩放（诊断日志纵向铺满）
+                frame.pack(fill="both", expand=True, padx=24, pady=16)
             else:
                 frame.pack_forget()
         for name, btn in self._nav_buttons.items():
@@ -115,7 +123,7 @@ class Dashboard(tk.Toplevel):
         page = self._new_page(PAGE_OVERVIEW)
         header = tk.Frame(page, bg=LIGHT.page)
         header.pack(fill="x")
-        tk.Label(header, text="DeskPet V4.1", bg=LIGHT.page, fg=LIGHT.text,
+        tk.Label(header, text=APP_VERSION, bg=LIGHT.page, fg=LIGHT.text,
                  font=pick_font(self, 14, True)).pack(side="left")
         self.ov_summary = tk.Label(header, text="", bg=LIGHT.page,
                                    fg=LIGHT.text_secondary,
@@ -135,8 +143,9 @@ class Dashboard(tk.Toplevel):
                  anchor="w").pack(side="left", pady=(16, 4))
         HelpDot(page, "当前被动发现的全部 Agent（Monitor 层），每张卡："
                       "名称与项目目录、状态徽标、当前活动摘要；\"打开终端\""
-                      "按 exact agent_key 精确唤起该 Agent 的 Windows "
-                      "Terminal Tab/Pane（位置不唯一时会提示先在仪表盘修复）。",
+                      "按 exact agent_key 恢复并前置该 Agent 所在的 "
+                      "Windows Terminal 窗口（不切换标签页、不发送键盘"
+                      "输入）。",
                 bg=LIGHT.page).pack(side="left", pady=(16, 4))
         self.ov_cards = tk.Frame(page, bg=LIGHT.page)
         self.ov_cards.pack(fill="x")
@@ -148,7 +157,8 @@ class Dashboard(tk.Toplevel):
         working = sum(1 for t in targets.values()
                       if t.snapshot.status == Status.WORKING)
         ambiguous = sum(1 for t in targets.values()
-                        if t.terminal and _binding_conf_value(t.terminal)
+                        if t.terminal_window
+                        and _binding_conf_value(t.terminal_window)
                         == "ambiguous")
         uia = "UIA ✓" if self.app.monitor.terminal_available() else "UIA ✗"
         self.ov_summary.configure(
@@ -185,20 +195,23 @@ class Dashboard(tk.Toplevel):
                        color=STATUS_COLOR.get(status_value,
                                               LIGHT.unknown)).pack(
                 side="right")
-            tk.Label(card.body, text=detail, bg=LIGHT.surface,
-                     fg=LIGHT.text, font=pick_font(self, 10),
-                     anchor="w", justify="left", wraplength=560).pack(
-                fill="x", pady=(2, 0))
+            detail_label = tk.Label(card.body, text=detail, bg=LIGHT.surface,
+                                    fg=LIGHT.text, font=pick_font(self, 10),
+                                    anchor="w", justify="left",
+                                    wraplength=560)
+            detail_label.pack(fill="x", pady=(2, 0))
+            bind_wraplength(detail_label)   # 自适应卡片实际宽度
             foot = tk.Frame(card.body, bg=LIGHT.surface)
             foot.pack(fill="x", pady=(4, 0))
-            tk.Label(foot, text=env, bg=LIGHT.surface,
-                     fg=LIGHT.text_secondary,
-                     font=pick_font(self, 9)).pack(side="left")
-            ttk.Button(foot, text="打开终端",
-                       command=lambda k=key: self._open_terminal(k)).pack(
-                side="right")
+            env_label = tk.Label(foot, text=env, bg=LIGHT.surface,
+                                 fg=LIGHT.text_secondary,
+                                 font=pick_font(self, 9))
+            env_label.pack(side="left")
             ttk.Button(foot, text="详情",
                        command=lambda k=key: self._goto_agent(k)).pack(
+                side="right")
+            ttk.Button(foot, text="打开终端",
+                       command=lambda k=key: self._open_terminal(k)).pack(
                 side="right", padx=6)
 
     # ================================================== Agents master-detail
@@ -215,52 +228,37 @@ class Dashboard(tk.Toplevel):
 
         right = Card(body, padding=16)
         right.pack(side="left", fill="both", expand=True)
+        # 操作行先 pack 且拆两行（窄窗口下按钮也绝不被挤出视口），
+        # 详情占剩余空间
+        bar = tk.Frame(right.body, bg=LIGHT.surface)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(bar, text="打开终端",
+                   command=lambda: self._open_terminal(
+                       self.selected_key)).pack(side="left")
+        HelpDot(bar, "打开该 Agent 所在的 Windows Terminal 窗口。DeskPet "
+                     "不切换标签页、不发送键盘输入。若 Windows 阻止后台"
+                     "程序抢前台，会闪烁任务栏提醒。").pack(
+            side="left", padx=(6, 0))
+        ttk.Button(bar, text="重新扫描",
+                   command=self.app.monitor.rescan).pack(side="left",
+                                                          padx=10)
+        bar2 = tk.Frame(right.body, bg=LIGHT.surface)
+        bar2.pack(fill="x", pady=(0, 8))
+        self.include_btn = ttk.Button(
+            bar2, text="加入并发", command=self._include_selected)
+        self.include_btn.pack(side="left")
+        self.exclude_btn = ttk.Button(
+            bar2, text="移出并发", command=self._exclude_selected)
+        self.exclude_btn.pack(side="left", padx=6)
+        HelpDot(bar2, "运行期控制该 Agent 是否参与并发展示（不写配置、不"
+                      "影响监听）：移出后它的桌宠/卡片消失，Monitor 仍继续"
+                      "观察；重新加入即恢复。").pack(side="left", padx=(6, 0))
         self.ag_detail = tk.Label(right.body, text="在左侧选择一个 Agent",
                                   bg=LIGHT.surface, fg=LIGHT.text,
                                   font=pick_font(self, 11),
                                   anchor="nw", justify="left", wraplength=480)
         self.ag_detail.pack(fill="both", expand=True)
-
-        bar = tk.Frame(right.body, bg=LIGHT.surface)
-        bar.pack(fill="x", pady=(8, 0))
-        self.repair_button = ttk.Button(
-            bar, text="关联当前 Terminal 位置",
-            command=self._repair_location)
-        self.repair_button.pack(side="left")
-        HelpDot(bar, "终端位置无法自动唯一确定时的修复：先在 Windows Terminal "
-                     "切到该 Agent 所在的 Tab/Pane（键盘焦点留在该终端），"
-                     "再点本按钮。会把当前焦点的 窗口+Tab+Pane 记为该 Agent "
-                     "的位置（CONFIRMED，仅本次运行期有效；Agent 退出或窗口"
-                     "变化自动失效）。").pack(side="left", padx=(6, 0))
-        ttk.Button(bar, text="重新扫描",
-                   command=self.app.monitor.rescan).pack(side="left",
-                                                          padx=8)
-        HelpDot(bar, "清空进程/会话/终端拓扑的运行期缓存并立即重扫（不动 "
-                     "Agent 数据目录，也不改任何 Agent 配置）。").pack(
-            side="left")
-        ttk.Button(bar, text="打开终端",
-                   command=lambda: self._open_terminal(
-                       self.selected_key)).pack(side="left")
-        HelpDot(bar, "按 exact agent_key 唤起该 Agent 的终端：校验窗口身份 → "
-                     "选中 exact Tab → 定位 Pane → 恢复并前置窗口。失败时"
-                     "fail-closed 并提示原因，绝不猜测。").pack(
-            side="left", padx=(6, 0))
-        self.include_btn = ttk.Button(
-            bar, text="加入并发", command=self._include_selected)
-        self.include_btn.pack(side="left", padx=8)
-        self.exclude_btn = ttk.Button(
-            bar, text="移出并发", command=self._exclude_selected)
-        self.exclude_btn.pack(side="left")
-        HelpDot(bar, "运行期控制该 Agent 是否参与并发展示（不写配置、不影响"
-                     "监听）：移出后它的桌宠/卡片消失，Monitor 仍继续观察；"
-                     "重新加入即恢复。").pack(side="left", padx=(6, 0))
-        tk.Label(right.body,
-                 text="无法自动唯一确定终端位置时的修复：先在 Windows Terminal 切到该 "
-                      "Agent 所在的 Tab/Pane，再点\"关联当前 Terminal 位置\"（本次运行期"
-                      "有效，Agent 退出或窗口变化自动失效）。",
-                 bg=LIGHT.surface, fg=LIGHT.text_secondary,
-                 font=pick_font(self, 9), wraplength=480,
-                 justify="left").pack(fill="x", pady=(8, 0))
+        bind_wraplength(self.ag_detail)   # 详情文本自适应右侧卡实际宽度
         self._detail_sig = None
 
     def _goto_agent(self, key: str):
@@ -271,10 +269,12 @@ class Dashboard(tk.Toplevel):
         entries = []
         for key, t in sorted(targets.items()):
             snap = t.snapshot
-            entries.append((key,
-                            f"{snap.kind.label} · "
-                            f"{t.instance.project or t.instance.source}",
-                            status_text(snap), snap.status.value))
+            title = f"{snap.kind.label} · " \
+                    f"{t.instance.project or t.instance.source}"
+            if len(title) > 26:
+                title = title[:25] + "…"   # 列表项截断；详情见右侧
+            entries.append((key, title, status_text(snap),
+                            snap.status.value))
         sig = tuple(entries)
         if sig != self._ag_list_sig:
             self._ag_list_sig = sig
@@ -303,13 +303,6 @@ class Dashboard(tk.Toplevel):
             if content != self._detail_sig:
                 self._detail_sig = content
                 self.ag_detail.configure(text=content)
-            binding = target.terminal
-            # 只要还不是 CONFIRMED/HIGH 就允许手动关联修复（§5.10 的
-            # fail-closed 逃生口），包括完全没有任何绑定证据的情况
-            show_repair = (binding is None or binding.confidence not in (
-                BindingConfidence.CONFIRMED, BindingConfidence.HIGH))
-            self.repair_button.configure(
-                state="normal" if show_repair else "disabled")
         else:
             self.ag_detail.configure(text="在左侧选择一个 Agent")
             self._detail_sig = None
@@ -334,7 +327,7 @@ class Dashboard(tk.Toplevel):
 
     def _detail_text(self, target) -> str:
         inst, snap = target.instance, target.snapshot
-        binding = target.terminal
+        binding = target.terminal_window
         lines = []
         mode_label = mode_text(snap)
         if mode_label == "Unknown" and snap.mode_raw:
@@ -365,25 +358,28 @@ class Dashboard(tk.Toplevel):
                                        _binding_conf_value(binding))
             lines.append("")
             lines.append("Terminal")
-            lines.append(f"Window　{conf}" + (
-                f" · {binding.title[:30]}" if binding.title else ""))
-            lines.append(f"Tab　　 {'已学习' if binding.tab_id else '未学习'}")
-            lines.append(f"Pane　　{'已定位' if binding.pane_id else '未定位'}")
+            lines.append(f"Window　{conf}"
+                         + (f" · {binding.title[:30]}" if binding.title else ""))
+            if binding.confidence is WindowBindingConfidence.FALLBACK:
+                lines.append("· 唯一窗口兜底：可打开窗口，但终端审批观察"
+                             "不会归属到该 Agent")
             if binding.reason:
                 detail = f"依据：{binding.reason}"
                 if binding.score:
                     detail += f" · score {binding.score}"
                 lines.append(detail)
-            if binding.confidence == BindingConfidence.AMBIGUOUS:
-                lines.append("⚠ 无法唯一确定终端位置：终端审批观察不会归属到该 Agent")
+            if binding.confidence is WindowBindingConfidence.AMBIGUOUS:
+                lines.append("⚠ 无法唯一确定终端窗口：终端审批观察不会"
+                             "归属到该 Agent")
         if not self.app.monitor.terminal_available():
             err = self.app.monitor.terminal_startup_error()
-            lines.append("终端交互状态不可读（UIA 不可用）"
-                         + (f"：{err[:80]}" if err else ""))
+            lines.append("终端观察不可用（UIA）"
+                         + (f"：{err[:80]}" if err else "")
+                         + "；会话监听不受影响")
         if snap.stale:
             lines.append("状态可能延迟（该来源进程扫描失败）")
 
-        # ---- 高级诊断（技术 ID 只在这里展示）
+        # ---- 高级诊断（技术 ID 只在这里展示；不含 UIA RuntimeId）
         lines.append("")
         lines.append("—— 高级诊断（技术 ID）——")
         token_src = {"proc": "/proc", "create_time": "create_time",
@@ -409,47 +405,28 @@ class Dashboard(tk.Toplevel):
         if snap.session_file:
             bound = "已绑定" if snap.session_bound else "未解析"
             lines.append(f"会话文件（{bound}）：{snap.session_file}")
-        if binding is not None:
-            if binding.hwnd:
-                lines.append(f"HWND {binding.hwnd} · window_pid "
-                             f"{binding.window_pid} · created "
-                             f"{binding.window_created:.0f}")
-            if binding.tab_id:
-                lines.append(f"Tab RuntimeId {tuple(binding.tab_id)}")
-            if binding.pane_id:
-                lines.append(f"Pane RuntimeId {tuple(binding.pane_id)}")
+        if binding is not None and binding.window is not None:
+            lines.append(f"HWND {binding.window.hwnd} · window_pid "
+                         f"{binding.window.pid} · created "
+                         f"{binding.window.process_created:.0f} · class "
+                         f"{binding.window.window_class}")
         return "\n".join(lines)
 
-    def _repair_location(self):
-        if not self.selected_key:
-            return
-        location = self.app.monitor.bind_focused_location(self.selected_key)
-        if location is not None:
-            self.app.toast("已确认该 Agent 的终端位置（本次运行期有效）", 4)
-            self._refresh_agents(self.app.monitor.get_targets())
-        else:
-            messagebox.showinfo(
-                "未关联",
-                "没有找到当前焦点的 Windows Terminal 位置。\n"
-                "请先在 Windows Terminal 中切到目标 Tab/Pane 再试。",
-                parent=self)
-
     def _open_terminal(self, key: str):
-        """exact key 激活（v4plan §5.9）：UI 不直接碰 winkeys。"""
+        """exact key 激活（v4.1.1 §6.3）：UI 不直接碰 winkeys。"""
         if not key:
             return
         result = self.app.monitor.activate_target(key)
         if result.code == ActivationCode.OK:
             return
         if result.code == ActivationCode.FOREGROUND_DENIED:
-            self.app.toast("终端已选中，Windows 未允许抢前台（已闪烁提醒）", 4)
+            self.app.toast("Windows 未允许将终端置于前台，已闪烁任务栏提醒", 4)
         elif result.code == ActivationCode.AGENT_GONE:
             self.app.toast("该 Agent 已退出", 4)
-        elif result.code == ActivationCode.AMBIGUOUS:
-            self.app.toast("终端位置不唯一：可用\"关联当前 Terminal 位置\"修复", 5)
-        else:
-            self.app.toast("未能定位该 Agent 的终端（"
-                           + result.code.value + "）", 4)
+        elif result.code == ActivationCode.NO_BINDING:
+            self.app.toast("无法唯一确定该 Agent 所在的终端窗口", 4)
+        elif result.code == ActivationCode.STALE_WINDOW:
+            self.app.toast("原终端窗口已失效，重新识别后仍无法安全打开", 4)
 
     # ================================================== 桌宠与外观
     def _build_look(self):
@@ -583,7 +560,7 @@ class Dashboard(tk.Toplevel):
         except Exception:
             families = []
         ttk.Combobox(row2, textvariable=self.font_var, values=families,
-                     width=26).pack(side="left", padx=8)
+                     width=22).pack(side="left", padx=8)
         self.size_var = tk.IntVar(value=int(cfg.get("bubble.font_size", 11)))
         ttk.Spinbox(row2, from_=8, to=24, textvariable=self.size_var,
                     width=5).pack(side="left", padx=4)
@@ -598,16 +575,20 @@ class Dashboard(tk.Toplevel):
                         variable=self.anim_var).pack(side="left")
         HelpDot(row2, "关闭=静态模式（每段动画停在第一帧，更省电）。").pack(
             side="left")
+        # 第二行：动画锁定 + 应用（窄窗口下按钮不被挤出）
+        row3 = tk.Frame(look_card.body, bg=LIGHT.surface)
+        row3.pack(fill="x", pady=6)
         self.lock_var = tk.StringVar(value=cfg.get("force_state") or "auto")
-        ttk.Label(row2, text="动画").pack(side="left", padx=(12, 2))
-        ttk.Combobox(row2, textvariable=self.lock_var,
+        tk.Label(row3, text="动画", bg=LIGHT.surface).pack(side="left",
+                                                           padx=(0, 2))
+        ttk.Combobox(row3, textvariable=self.lock_var,
                      values=["auto", "walk", "attack", "die", "special",
                              "sleep"], state="readonly", width=9).pack(
             side="left")
-        HelpDot(row2, "锁定某段动画用于观察：auto=按监听状态自动（工作中="
+        HelpDot(row3, "锁定某段动画用于观察：auto=按监听状态自动（工作中="
                       "walk、等待批复=die、完成=special、空闲=sleep）。"
                       "锁定只影响显示。").pack(side="left", padx=(6, 0))
-        ttk.Button(row2, text="应用外观",
+        ttk.Button(row3, text="应用外观",
                    command=self._apply_look).pack(side="right")
 
         # 皮肤
@@ -942,7 +923,7 @@ class Dashboard(tk.Toplevel):
                                   anchor="nw", justify="left")
         self.diag_perf.pack(fill="x", pady=(6, 0))
         logs = Card(page)
-        logs.pack(fill="x", pady=8)
+        logs.pack(fill="both", expand=True, pady=8)   # 纵向铺满剩余高度
         bar = tk.Frame(logs.body, bg=LIGHT.surface)
         bar.pack(fill="x")
         tk.Label(bar, text="日志（不含终端原文）", bg=LIGHT.surface,
@@ -977,6 +958,12 @@ class Dashboard(tk.Toplevel):
         stats = dict(monitor.stats())
         stats.update(self.app.pet_manager.stats())
         targets = monitor.get_targets()
+
+        def _count(value: str) -> int:
+            return sum(1 for t in targets.values()
+                       if t.terminal_window
+                       and _binding_conf_value(t.terminal_window) == value)
+
         windows_err = getattr(monitor._probe, "windows_probe_error", "")
         lines = ["Process", f"  Windows        "
                  f"{'OK' if not windows_err else 'FAIL'}"]
@@ -995,12 +982,10 @@ class Dashboard(tk.Toplevel):
         lines.append("Terminal")
         lines.append(f"  UIA            "
                      f"{'OK' if monitor.terminal_available() else '不可用'}")
-        lines.append(f"  Bindings       confirmed "
-                     f"{sum(1 for t in targets.values() if t.terminal and _binding_conf_value(t.terminal) == 'confirmed')}"
-                     f" / high "
-                     f"{sum(1 for t in targets.values() if t.terminal and _binding_conf_value(t.terminal) == 'high')}"
-                     f" / ambiguous "
-                     f"{sum(1 for t in targets.values() if t.terminal and _binding_conf_value(t.terminal) == 'ambiguous')}")
+        lines.append(f"  Bindings       confirmed {_count('confirmed')}"
+                     f" / high {_count('high')}"
+                     f" / fallback {_count('fallback')}"
+                     f" / ambiguous {_count('ambiguous')}")
         text = "\n".join(lines)
         if text != self._health_signature:
             self._health_signature = text
@@ -1013,7 +998,6 @@ class Dashboard(tk.Toplevel):
                 f"/win {stats.get('windows_scan_ms', 0)}ms）"
                 f" · metadata={stats.get('metadata_pid_count', 0)}"
                 f" · uia事件={stats.get('events', 0)}"
-                f" · tab事件={stats.get('tab_events', 0)}"
                 f" · 可见读取={stats.get('visible_reads', 0)}"
                 f" · uia队列丢弃={stats.get('uia_queue_dropped', 0)}\n"
                 f"pet_views={stats.get('pet_views', 0)}"
@@ -1057,6 +1041,7 @@ class Dashboard(tk.Toplevel):
                                          font=pick_font(self, 9),
                                          wraplength=480, justify="left")
         self.autostart_detail.pack(anchor="w")
+        bind_wraplength(self.autostart_detail)
         arow = tk.Frame(auto.body, bg=LIGHT.surface)
         arow.pack(fill="x", pady=(6, 0))
         self.autostart_btn = ttk.Button(arow, text="开启",
@@ -1086,10 +1071,8 @@ class Dashboard(tk.Toplevel):
         tray = tk.BooleanVar(value=bool(
             self.app.config.get("tray_enabled", True)))
         ttk.Checkbutton(wrow, text="托盘图标", variable=tray,
-                        command=lambda: (self.app.start_tray()
-                                         if tray.get()
-                                         else self.app.stop_tray())).pack(
-            side="left", padx=10)
+                        command=lambda: self.app.set_tray_enabled(
+                            tray.get())).pack(side="left", padx=10)
         HelpDot(wrow, "系统托盘图标：左键显示/隐藏桌宠，右键完整菜单。"
                       "隐藏桌宠后托盘是唯一恢复入口，建议保持开启。").pack(
             side="left")

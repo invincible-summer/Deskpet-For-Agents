@@ -72,17 +72,19 @@ class GeometryTests(unittest.TestCase):
         self.assertTrue(callable(winkeys.try_set_foreground))
 
     def test_ambiguous_windows_do_not_bind_via_ancestors(self):
-        """两个同 PID 窗口时祖先链不能唯一定位（由 TerminalResolver 处理 AMBIGUOUS）。"""
-        from agents.terminal_uia import TerminalResolver, PaneInfo
-        from agents.models import AgentInstance, AgentKind, BindingConfidence
-        resolver = TerminalResolver(
+        """两个同 PID 窗口时祖先链不能唯一定位（window=None，不猜）。"""
+        from agents.terminal_resolver import TerminalWindowResolver
+        from agents.models import AgentInstance, AgentKind, WindowBindingConfidence
+        resolver = TerminalWindowResolver(
             enum_windows=lambda: [(1, 10, 'Codex', 'CASCADIA_HOSTING_WINDOW_CLASS'),
                                   (2, 10, 'Codex', 'CASCADIA_HOSTING_WINDOW_CLASS')],
             ancestor_pids=lambda pid: {10},
         )
         inst = AgentInstance(AgentKind.CODEX, 99, 'windows', process_token='9')
         bindings = resolver.resolve([inst], {}, 1000.0)
-        self.assertEqual(bindings[inst.key].confidence, BindingConfidence.AMBIGUOUS)
+        self.assertEqual(bindings[inst.key].confidence,
+                         WindowBindingConfidence.AMBIGUOUS)
+        self.assertIsNone(bindings[inst.key].window)
 
     def test_activation_failure_does_not_retry_or_inject(self):
         """foreground 被拒：restore→activate→flash 一次，绝不注入。"""

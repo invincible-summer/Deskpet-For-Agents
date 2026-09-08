@@ -192,7 +192,7 @@ class AttentionTests(unittest.TestCase):
         # B 变 WAITING：attention=B，但 focused 仍是 A（不偷偷改）
         t[b.key] = type("T", (), {"key": b.key, "instance": b,
                                   "snapshot": snap(b, Status.WAITING),
-                                  "terminal": None})()
+                                  "terminal_window": None})()
         state = pc.reconcile(t, NOW)
         self.assertEqual(state.attention_key, b.key)
         self.assertEqual(state.focused_key, a.key)
@@ -255,6 +255,8 @@ class FleetTests(unittest.TestCase):
         a = inst(AgentKind.CODEX, 1, cwd="/w/proj")
         state = pc.reconcile(targets((a, snap(a))), NOW)
         self.assertEqual(state.slot_keys, {"pet-1": a.key})
+        # v4.1.1 §12.1：selector 唯一认领必须标记 auto，不得显示成手动绑定
+        self.assertTrue(pc.is_auto_bound("pet-1"))
 
     def test_selector_ambiguous_auto_bind_deterministic(self):
         """selector 模糊时由自动分配兜底：确定性（注意力→started_at→key）。

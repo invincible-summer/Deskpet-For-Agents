@@ -263,7 +263,11 @@ class PresentationController:
         return slot_id in self._slot_auto
 
     def _reclaim_slots(self, targets: dict[str, AgentTarget]) -> None:
-        """重启后语义 selector 认领：0→vacant；1→自动绑；>1→不猜（§8.4）。"""
+        """重启后语义 selector 认领：0→vacant；1→自动绑；>1→不猜（§8.4）。
+
+        唯一命中属于自动认领，必须标记 _slot_auto——否则 UI 会把
+        自动 reclaim 误显示成"手动绑定"（v4.1.1 §12.1）。
+        """
         for slot_id in self.slot_ids():
             if slot_id in self._slot_bindings:
                 continue
@@ -275,6 +279,7 @@ class PresentationController:
             candidates = [t for t in candidates if t.key not in taken]
             if len(candidates) == 1:
                 self._slot_bindings[slot_id] = candidates[0].key
+                self._slot_auto.add(slot_id)
                 self._slot_vacant_reason.pop(slot_id, None)
             elif len(candidates) > 1:
                 self._slot_vacant_reason[slot_id] = "ambiguous-selector"

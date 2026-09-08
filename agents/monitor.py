@@ -36,9 +36,9 @@ from .models import (
     AgentInstance,
     AgentKind,
     AgentTarget,
-    BindingConfidence,
     EvidenceSource,
     Observation,
+    ObservationBindingConfidence,
     Phase,
     Snapshot,
     SourceProbeSnapshot,
@@ -111,6 +111,12 @@ class ProcessProbeWorker:
     def stop(self):
         self._stop.set()
 
+    def join(self, timeout: float = 2.0):
+        """有界回收探测线程（plan §18）；绝不 join 调用线程自己。"""
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+
     def snapshot(self) -> dict[str, SourceProbeSnapshot]:
         with self._lock:
             return dict(self._snapshot)
@@ -132,33 +138,45 @@ class ProcessProbeWorker:
     def _tick(self):
         cfg_m = self.config.get("monitor") or {}
         now = time.time()
-        if now - self._last_windows >= _num(cfg_m.get("windows_scan_sec", 3.0), 3.0):
-            self._last_windows = now
-            t0 = time.perf_counter()
-            self._gen += 1
-            try:
-                found = scan_windows()
-                self._windows_cache = tuple(found)
-                snap = SourceProbeSnapshot(
-                    source="windows", generation=self._gen, observed_at=now,
-                    authoritative=True, instances=self._windows_cache)
-                self.windows_probe_error = ""
-            except ProbeUnavailable as exc:
-                # 全局枚举失败：authoritative=False，保留旧实例（v4plan §4.1）
-                snap = SourceProbeSnapshot(
-                    source="windows", generation=self._gen, observed_at=now,
-                    authoritative=False, instances=self._windows_cache,
-                    error=str(exc))
-                self.windows_probe_error = str(exc)
-            except Exception as exc:   # 防御：未知异常同样不得冒充空结果
-                snap = SourceProbeSnapshot(
-                    source="windows", generation=self._gen, observed_at=now,
-                    authoritative=False, instances=self._windows_cache,
-                    error=repr(exc))
-                self.windows_probe_error = repr(exc)
+        windows_enabled = bool(cfg_m.get("windows_enabled", True))
+        if windows_enabled:
+            if now - self._last_windows >= _num(
+                    cfg_m.get("windows_scan_sec", 3.0), 3.0):
+                self._last_windows = now
+                t0 = time.perf_counter()
+                self._gen += 1
+                try:
+                    found = scan_windows()
+                    self._windows_cache = tuple(found)
+                    snap = SourceProbeSnapshot(
+                        source="windows", generation=self._gen, observed_at=now,
+                        authoritative=True, instances=self._windows_cache)
+                    self.windows_probe_error = ""
+                except ProbeUnavailable as exc:
+                    # 全局枚举失败：authoritative=False，保留旧实例（v4plan §4.1）
+                    snap = SourceProbeSnapshot(
+                        source="windows", generation=self._gen, observed_at=now,
+                        authoritative=False, instances=self._windows_cache,
+                        error=str(exc))
+                    self.windows_probe_error = str(exc)
+                except Exception as exc:   # 防御：未知异常同样不得冒充空结果
+                    snap = SourceProbeSnapshot(
+                        source="windows", generation=self._gen, observed_at=now,
+                        authoritative=False, instances=self._windows_cache,
+                        error=repr(exc))
+                    self.windows_probe_error = repr(exc)
+                with self._lock:
+                    self._snapshot["windows"] = snap
+                self.windows_scan_ms = time.perf_counter() - t0
+        else:
+            # 用户关闭 Windows source：真正停止扫描（plan §10.1）——
+            # 清 source snapshot 与缓存；_last_windows 不再推进，
+            # 重新开启时因间隔已过而立即恢复扫描，无需重启。
             with self._lock:
-                self._snapshot["windows"] = snap
-            self.windows_scan_ms = time.perf_counter() - t0
+                self._snapshot.pop("windows", None)
+            self._windows_cache = ()
+            self.windows_scan_ms = 0.0
+            self.windows_probe_error = ""
         wsl_enabled = bool(cfg_m.get("wsl_enabled", True))
         if wsl_enabled and now - self._last_wsl >= _num(
                 cfg_m.get("wsl_scan_sec", 3.0), 3.0):
@@ -192,7 +210,10 @@ class Monitor:
         self.lock = threading.Lock()
         self.instances: dict[str, AgentInstance] = {}
         self.snapshots: dict[str, Snapshot] = {}
-        self.bindings: dict[str, object] = {}
+        # 双绑定表（v4.1.1 §9.3）：window-only（能否唤起窗口）与
+        # observation-only（能否安全归属终端证据）彻底分离。
+        self.window_bindings: dict[str, object] = {}
+        self.terminal_observation_bindings: dict[str, object] = {}
         self.log_q: queue.Queue = queue.Queue(maxsize=200)
         self._log_ring: list[str] = []
         self._probe = ProcessProbeWorker(config)
@@ -214,6 +235,7 @@ class Monitor:
             observer, cfg=monitor_cfg)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._terminal_boot: threading.Thread | None = None
         self._exit_watcher = None
         try:
             from .process_watch import WindowsExitWatcher
@@ -230,11 +252,13 @@ class Monitor:
             return
         self._stop.clear()
         self._probe.start()
-        # UIA 后端初始化（comtypes/typelib/pane 发现）可能耗时数秒，
+        # UIA 后端初始化（comtypes/typelib/control 发现）可能耗时数秒，
         # 绝不能阻塞 UI 线程：放独立引导线程异步启动（plan §15/§32）。
         if self._terminal_service.observer is not None:
-            threading.Thread(target=self._start_terminal, name="deskpet-uia-boot",
-                             daemon=True).start()
+            self._terminal_boot = threading.Thread(
+                target=self._start_terminal, name="deskpet-uia-boot",
+                daemon=True)
+            self._terminal_boot.start()
         if self._exit_watcher is not None:
             try:
                 self._exit_watcher.start()
@@ -253,6 +277,7 @@ class Monitor:
             pass
 
     def stop(self):
+        """有界停机（plan §18）：所有 join 都有超时，且绝不 join 自己。"""
         self._stop.set()
         self._probe.stop()
         if self._exit_watcher is not None:
@@ -260,10 +285,20 @@ class Monitor:
                 self._exit_watcher.stop()
             except Exception:
                 pass
+        # 先置终态（service/backend 拒绝晚到的 start），再等 boot 线程
         try:
             self._terminal_service.stop()
         except Exception:
             pass
+        boot = self._terminal_boot
+        if boot is not None and boot is not threading.current_thread():
+            # typelib 首次生成可能数秒：有界等待，不让 Tk 线程无限挂起
+            boot.join(timeout=6.0)
+            self._terminal_boot = None
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=3.0)
+        self._probe.join(timeout=2.0)
         for watcher in self._watchers.values():
             try:
                 watcher.release()
@@ -280,7 +315,7 @@ class Monitor:
                     continue
                 out[key] = AgentTarget(
                     key=key, instance=inst, snapshot=snap,
-                    terminal=self.bindings.get(key))
+                    terminal_window=self.window_bindings.get(key))
             return out
 
     def get_target(self, key: str) -> AgentTarget | None:
@@ -302,33 +337,23 @@ class Monitor:
             except Exception:
                 pass
         try:
-            self._terminal_service.refresh_topology()
+            self._terminal_service.refresh_observed_controls(force=True)
         except Exception:
             pass
         self._log("已请求重新扫描（清 Process/Session/Terminal 运行期缓存）")
 
-    def bind_focused_location(self, key: str):
-        """高级修复：把当前焦点的 (Window, Tab, Pane) 关联到该 Agent。
-
-        一次 MTA transaction 捕获完整位置；结果 CONFIRMED + MANUAL，
-        只在本应用运行期有效（v4plan §5.10）。返回 TerminalLocation。
-        """
-        location = self._terminal_service.bind_focused_location(key)
-        if location is not None:
-            self._log(f"终端位置手动关联 → {key}")
-        return location
-
     def activate_target(self, key: str) -> ActivationResult:
-        """UI 激活 Terminal 的唯一入口（v4plan §5.9）。
+        """UI 激活 Terminal 窗口的唯一入口（v4.1.1 §9.2）。
 
         UI 只携带 exact agent_key；服务内部重新核验 Agent live、
-        binding、Window/Tab/Pane identity，fail-closed。
+        window binding、WindowIdentity，fail-closed。不依赖 UIA。
         """
-        target = self.get_target(key)
-        if target is None:
+        if not key:
+            return ActivationResult(ActivationCode.NO_BINDING)
+        if not self.is_live_key(key):
             return ActivationResult(ActivationCode.AGENT_GONE)
         return self._terminal_service.activate(
-            target, is_agent_live=self.is_live_key)
+            key, is_agent_live=self.is_live_key)
 
     def terminal_available(self) -> bool:
         # 不再使用 _terminal_failed 锁存：UIA 首次初始化（typelib 生成）
@@ -341,9 +366,9 @@ class Monitor:
         return self._terminal_service.startup_error()
 
     def rediscover_terminal(self):
-        """HWND 失效等场景下的终端重发现（只刷新运行期拓扑缓存）。"""
+        """HWND 失效等场景下的终端重发现（只刷新运行期观察拓扑缓存）。"""
         try:
-            self._terminal_service.refresh_topology()
+            self._terminal_service.refresh_observed_controls(force=True)
         except Exception:
             pass
 
@@ -384,8 +409,20 @@ class Monitor:
             pass
 
     # ------------------------------------------------------------ 主循环
+    def _poll_sec(self) -> float:
+        """每轮动态读取并 clamp file_poll_sec（plan §11）。
+
+        配置文件手改异常值也不能制造高频 loop；运行中修改下一轮即生效，
+        不需要重启。
+        """
+        try:
+            value = float((self.config.get("monitor") or {}).get(
+                "file_poll_sec", 0.5))
+        except (TypeError, ValueError):
+            value = 0.5
+        return max(0.2, min(5.0, value))
+
     def _loop(self):
-        poll_sec = _num(self.config.get("monitor.file_poll_sec", 0.5), 0.5)
         while not self._stop.is_set():
             t0 = time.time()
             try:
@@ -393,7 +430,7 @@ class Monitor:
             except Exception as exc:
                 self._log(f"监控异常: {exc!r}")
             elapsed = time.time() - t0
-            self._stop.wait(max(0.15, poll_sec - elapsed))
+            self._stop.wait(max(0.15, self._poll_sec() - elapsed))
 
     def _enabled_kinds(self, cfg_m: dict) -> set:
         out = set()
@@ -461,8 +498,9 @@ class Monitor:
         """
         inst = self.instances.pop(key, None)
         self.snapshots.pop(key, None)
-        self.bindings.pop(key, None)
-        # manual/observed terminal runtime binding 级联失效
+        self.window_bindings.pop(key, None)
+        self.terminal_observation_bindings.pop(key, None)
+        # 运行期 terminal runtime binding 级联失效（不再有 manual path）
         self._terminal_service.drop_instance(key)
         for watcher in self._watchers.values():
             try:
@@ -501,15 +539,20 @@ class Monitor:
         self._merge_instances(now)
         probe_snap = self._probe.snapshot()
 
-        with self.lock:
-            instances = dict(self.instances)
-
-        # WindowsExitWatcher 注册 + 事件驱动退出（census 兜底）
+        # WindowsExitWatcher 注册 + 事件驱动退出（census 兜底）。
+        # 顺序契约（plan §10.3）：merge → snapshot → register → drain
+        # → 重新 snapshot——保证 _commit_exit 后同一 tick 不再为已退出
+        # Agent 重建 snapshot/binding/observation。
         if self._exit_watcher is not None:
-            for inst in instances.values():
+            with self.lock:
+                insts = dict(self.instances)
+            for inst in insts.values():
                 if inst.source == "windows":
                     self._exit_watcher.register(inst)
             self._drain_exit_events(now)
+
+        with self.lock:
+            instances = dict(self.instances)
 
         # 1) 会话观察：每个 watcher 每轮都 poll（即使该 kind 当前为 0），
         #    让 BaseWatcher 的全清理语义真正发生（v4plan §4.6）。
@@ -536,10 +579,12 @@ class Monitor:
             self._instance_sig = sig
             self._last_resolve = now
             try:
-                self.bindings = self._terminal_service.resolve(
-                    list(instances.values()), now)
+                self.window_bindings, self.terminal_observation_bindings = \
+                    self._terminal_service.resolve(
+                        list(instances.values()), now)
             except Exception:
-                self.bindings = {}
+                self.window_bindings = {}
+                self.terminal_observation_bindings = {}
 
         # 4) 状态融合
         grace = _num(cfg_m.get("activity_grace_sec", 10.0), 10.0)
@@ -571,22 +616,30 @@ class Monitor:
 
     def _terminal_observation(self, inst: AgentInstance, now: float,
                               grace: float) -> Observation | None:
-        binding = self.bindings.get(inst.key)
-        if binding is None or binding.pane_id is None:
+        """observation binding 驱动的终端证据归属（v4.1.1 §7.4）。
+
+        只有 CONFIRMED/HIGH 的 observation binding 才允许把 WAITING/
+        activity 证据归给该 Agent；FALLBACK 窗口兜底、AMBIGUOUS 一律
+        没有 binding → 没有终端证据（宁可没有，也不错归）。
+        """
+        obs_binding = self.terminal_observation_bindings.get(inst.key)
+        if obs_binding is None:
             return None
-        if binding.confidence not in (BindingConfidence.CONFIRMED,
-                                      BindingConfidence.HIGH):
-            return None   # 绑定不唯一时绝不归属终端审批（plan §25）
-        waiting = self._terminal_service.waiting_observation(binding)
+        if obs_binding.confidence not in (
+                ObservationBindingConfidence.CONFIRMED,
+                ObservationBindingConfidence.HIGH):
+            return None
+        waiting = self._terminal_service.waiting_observation(
+            obs_binding.control_id)
         if waiting is not None and waiting.live(now):
             # 审批文案的识别器种类必须与绑定的 AgentKind 一致：
-            # Codex pane 上命中 Claude 审批 → 不能归属给 Codex。
+            # Codex control 上命中 Claude 审批 → 不能归属给 Codex。
             if waiting.agent_kind is None or waiting.agent_kind == inst.kind:
                 return waiting
         # 泛化终端活动（agent_kind=None）只是 fallback 证据，
         # 能否覆盖会话状态由 StateReducer 的证据强弱规则决定。
         return self._terminal_service.activity_observation(
-            binding, now, grace)
+            obs_binding.control_id, now, grace)
 
     def _fill_parser_health(self, snap: Snapshot, key: str):
         """把 watcher 的解析器兼容性诊断写入快照（不含任何事件内容）。"""

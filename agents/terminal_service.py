@@ -1,22 +1,22 @@
-"""WindowsTerminalService：观察、解析、激活的统一 facade（v4plan §5.8）。
+"""WindowsTerminalService：观察 + 双解析 + window-only 激活的 facade
+（v4.1.1 plan §14）。
 
-内部组合 UiaBackend / TerminalObserver / TerminalResolver /
-TerminalActivator，外部（Monitor）不再分别管理两套终端生命周期。
+内部组合 UiaBackend / TerminalObserver / TerminalWindowResolver /
+TerminalObservationResolver。Monitor 只面对本模块，不再分别管理终端
+生命周期，也不接触 UIA backend 的任何 control 级方法。
 
-exact activation 事务（v4plan §5.9，顺序固定、fail-closed）：
+window-only 激活事务（plan §6.3，顺序固定、fail-closed、不依赖 UIA）：
   1. 再确认 exact agent_key 仍 live；否则 AGENT_GONE
-  2. binding 必须存在；否则 NO_BINDING
-  3. CONFIRMED/HIGH 才允许 exact activate；否则 AMBIGUOUS
-  4. 校验 WindowIdentity（IsWindow + PID + create_time + class）
-  5. 失效时只允许一次 topology refresh/re-resolve；仍失败 STALE_WINDOW
-  6. 在 exact HWND 下枚举 TabItem，用 tab_id 定位（绝不 title/index 猜）
-  7. SelectionItemPattern.Select()
-  8. 验证目标 Tab selected
-  9. 重新发现该 Tab 的 TermControl(s)
- 10. pane revalidation：stored pane 存在→exact；缺失且唯一→sole-pane
-     safe rebind；缺失且多个→STALE_PANE（不猜）
- 11. restore + SetForegroundWindow；foreground 成功才 pane SetFocus()
- 12. OS 拒绝 foreground → FlashWindowEx + FOREGROUND_DENIED（不绕过）
+  2. TerminalWindowBinding 存在且有 window；否则 NO_BINDING
+  3. 校验 WindowIdentity（IsWindow + PID + create_time + class）
+  4. 失效时只允许一次 topology refresh + re-resolve；仍失败 STALE_WINDOW
+  5. restore_window（最小化时恢复）
+  6. try_set_foreground；OS 拒绝 → FlashWindowEx + FOREGROUND_DENIED
+     （不绕过系统 foreground policy，绝不输入注入）
+
+绝不做：UIA Tab 切换、键盘/快捷键模拟、剪贴板注入——Windows
+Terminal 没有稳定的公开"按 WT_SESSION 激活既有标签页"接口
+（microsoft/terminal#19783，closed/not_planned）。
 """
 from __future__ import annotations
 
@@ -27,142 +27,39 @@ from actions import winkeys
 from .models import (
     ActivationCode,
     ActivationResult,
-    AgentTarget,
-    BindingConfidence,
-    TerminalBinding,
-    TerminalLocation,
+    TerminalWindowBinding,
 )
-from .terminal_uia import TerminalObserver, TerminalResolver
-
-
-class TerminalActivator:
-    """exact Window → Tab → Pane 激活事务（每次调用完整走一遍校验）。"""
-
-    def __init__(self, service: "WindowsTerminalService"):
-        self._service = service
-
-    def activate(self, target: AgentTarget,
-                 is_agent_live: Callable[[str], bool]) -> ActivationResult:
-        # 1. Agent 生命周期复核（get_target 之后仍可能退出）
-        if not is_agent_live(target.key):
-            return ActivationResult(ActivationCode.AGENT_GONE)
-        observer = self._service.observer
-        backend = self._service.backend
-        if observer is None or backend is None or not backend.available:
-            return ActivationResult(ActivationCode.UIA_UNAVAILABLE,
-                                    detail="uia backend unavailable")
-
-        # 2/3. 绑定与置信度门槛
-        binding = self._service.current_binding(target.key)
-        if binding is None or not binding.hwnd:
-            return ActivationResult(ActivationCode.NO_BINDING)
-        if binding.confidence not in (BindingConfidence.CONFIRMED,
-                                      BindingConfidence.HIGH):
-            return ActivationResult(ActivationCode.AMBIGUOUS,
-                                    detail=f"binding={binding.confidence.value}")
-
-        result = self._activate_with_binding(target, binding, refresh=False)
-        if result.code == ActivationCode.OK:
-            return result
-        if result.code in (ActivationCode.STALE_WINDOW, ActivationCode.STALE_TAB):
-            # 5. 任一身份失效只允许一次 refresh/re-resolve
-            refreshed = self._service.refresh_topology()
-            if refreshed:
-                if not is_agent_live(target.key):
-                    return ActivationResult(ActivationCode.AGENT_GONE)
-                binding2 = self._service.current_binding(target.key)
-                if binding2 is None or not binding2.hwnd:
-                    return ActivationResult(ActivationCode.NO_BINDING,
-                                            repaired=True)
-                if binding2.confidence not in (BindingConfidence.CONFIRMED,
-                                               BindingConfidence.HIGH):
-                    return ActivationResult(ActivationCode.AMBIGUOUS,
-                                            repaired=True,
-                                            detail=f"binding={binding2.confidence.value}")
-                retry = self._activate_with_binding(target, binding2,
-                                                    refresh=True)
-                return ActivationResult(retry.code, repaired=True,
-                                        detail=retry.detail)
-        return result
-
-    def _activate_with_binding(self, target: AgentTarget,
-                               binding: TerminalBinding,
-                               refresh: bool) -> ActivationResult:
-        backend = self._service.backend
-        # 4. WindowIdentity 校验（HWND/PID 复用防御）
-        identity = binding.window_identity()
-        if not winkeys.validate_window(identity):
-            return ActivationResult(ActivationCode.STALE_WINDOW)
-        hwnd = binding.hwnd
-
-        # 6. exact Tab 定位（无 tab_id 时只做 Window+sole-pane 检查）
-        tab_id = binding.tab_id
-        if tab_id:
-            layout = self._service.layout()
-            tab = layout.tabs.get(tab_id) if layout is not None else None
-            if tab is None or tab.hwnd != hwnd:
-                return ActivationResult(ActivationCode.STALE_TAB)
-            # 7. SelectionItemPattern.Select()（官方语义：清除其他选择）
-            if not backend.select_tab(tab_id):
-                return ActivationResult(ActivationCode.UIA_UNAVAILABLE,
-                                        detail="select failed")
-            # 8. 验证目标 Tab 已 selected
-            selected = backend.selected_tab(hwnd)
-            if selected is None or selected.tab_id != tab_id:
-                return ActivationResult(ActivationCode.STALE_TAB,
-                                        detail="tab not selected after select")
-
-        # 9. 重新发现该 Tab 当前的 TermControl(s)（Select 后才 attach）
-        layout = self._service.refresh_panes_now()
-        panes = [p for p in (layout.panes.values() if layout else [])
-                 if p.hwnd == hwnd and (not tab_id or p.tab_id == tab_id)]
-        if not panes:
-            return ActivationResult(ActivationCode.STALE_PANE,
-                                    detail="no live term controls")
-
-        # 10. pane revalidation
-        pane = None
-        if binding.pane_id is not None:
-            pane = next((p for p in panes if p.pane_id == binding.pane_id),
-                        None)
-        if pane is None:
-            if len(panes) == 1:
-                # sole-pane safe rebind（v4plan §5.6）：唯一 pane 才允许
-                pane = panes[0]
-                self._service.note_pane_rebind(target.key, pane)
-            else:
-                return ActivationResult(
-                    ActivationCode.STALE_PANE,
-                    detail=f"{len(panes)} live panes, stored pane gone")
-
-        # 11. restore + foreground（OS policy 决定成败，不绕过）
-        winkeys.restore_window(hwnd)
-        if not winkeys.try_set_foreground(hwnd):
-            # 12. Tab 已选对，但前台被拒：Flash 提醒
-            winkeys.flash_window(hwnd)
-            return ActivationResult(ActivationCode.FOREGROUND_DENIED)
-        # foreground 成功后 pane SetFocus
-        backend.focus_pane(pane.pane_id)
-        return ActivationResult(ActivationCode.OK)
+from .terminal_resolver import (
+    TerminalObservationResolver,
+    TerminalWindowResolver,
+)
+from .terminal_uia import TerminalObserver
 
 
 class WindowsTerminalService:
     """持有同一个 UIA backend 的观察/解析/激活 facade。"""
 
     def __init__(self, observer: TerminalObserver | None,
-                 resolver: TerminalResolver | None = None,
+                 window_resolver: TerminalWindowResolver | None = None,
+                 observation_resolver: TerminalObservationResolver | None = None,
                  cfg: dict | None = None):
         self.observer = observer
-        self.resolver = resolver or TerminalResolver()
+        self.window_resolver = window_resolver or TerminalWindowResolver()
+        self.observation_resolver = (
+            observation_resolver or TerminalObservationResolver())
         self.cfg = dict(cfg or {})
-        self.activator = TerminalActivator(self)
         self.failed = observer is None
+        self._stopped = False   # stop 终态：异步 boot 晚到的 start 拒绝
         # 绑定结果缓存（Monitor 线程写入，activate 时读取）
-        self._bindings: dict[str, TerminalBinding] = {}
-        self._last_refresh = 0.0
+        self._window_bindings: dict[str, TerminalWindowBinding] = {}
+        self._observation_bindings: dict = {}
+        # 最近一次 resolve 的实例集合（activate 内 re-resolve 用）
+        self._last_instances: list = []
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> bool:
+        if self._stopped:
+            return False
         if self.observer is None:
             self.failed = True
             return False
@@ -174,6 +71,7 @@ class WindowsTerminalService:
         return ok
 
     def stop(self):
+        self._stopped = True
         if self.observer is not None:
             try:
                 self.observer.stop()
@@ -202,97 +100,126 @@ class WindowsTerminalService:
             except Exception:
                 pass
 
-    def panes(self) -> dict:
-        return self.observer.panes if self.observer is not None else {}
+    def observed_controls(self) -> dict:
+        return self.observer.controls if self.observer is not None else {}
 
     def layout(self):
         return self.observer.layout if self.observer is not None else None
 
-    def resolve(self, instances: list, now: float) -> dict[str, TerminalBinding]:
-        try:
-            bindings = self.resolver.resolve(
-                list(instances), self.panes(), now, layout=self.layout())
-        except Exception:
-            bindings = {}
-        self._bindings = bindings
-        return bindings
-
-    def current_binding(self, key: str) -> TerminalBinding | None:
-        return self._bindings.get(key)
-
-    def note_pane_rebind(self, key: str, pane) -> None:
-        """sole-pane safe rebind 后更新运行期绑定（不落盘）。"""
-        binding = self._bindings.get(key)
-        if binding is not None:
-            binding.pane_id = pane.pane_id
-            binding.tab_id = pane.tab_id or binding.tab_id
-            binding.validated_at = time.time()
-        # manual location 同步 pane（tab/window 不变，只有 pane 换代）
-        manual = self.resolver.manual_location(key)
-        if manual is not None and pane.pane_id != manual.pane_id:
-            from dataclasses import replace
-            self.resolver.set_manual_location(key, replace(
-                manual, pane_id=pane.pane_id))
-
-    def refresh_topology(self) -> bool:
-        """一次强制 topology 重发现 + 手工绑定重验证。"""
+    def refresh_observed_controls(self, force: bool = False) -> bool:
+        """一次观察拓扑重发现（HWND 失效/手工 rescan 场景）。"""
         if self.observer is None:
             return False
         try:
-            self.observer.refresh_panes(force=True)
+            self.observer.refresh_controls(force=force)
             return True
         except Exception:
             return False
 
-    def refresh_panes_now(self):
-        if self.observer is None:
-            return None
+    # ------------------------------------------------------------ 解析
+    def resolve(self, instances: list, now: float) -> tuple:
+        """双表解析：window binding + observation binding。
+
+        返回 (window_bindings, observation_bindings)；失败返回空表
+        （fail-closed，不抛出——Monitor 主循环不能被 UIA/Win32 异常打断）。
+        """
+        controls = self.observed_controls()
         try:
-            self.observer.refresh_panes(force=True)
+            window_bindings = self.window_resolver.resolve(
+                list(instances), controls, now, layout=self.layout())
         except Exception:
-            pass
-        return self.observer.layout
+            window_bindings = {}
+        try:
+            observation_bindings = self.observation_resolver.resolve(
+                list(instances), controls, window_bindings, now,
+                layout=self.layout())
+        except Exception:
+            observation_bindings = {}
+        self._last_instances = list(instances)
+        self._window_bindings = window_bindings
+        self._observation_bindings = observation_bindings
+        return window_bindings, observation_bindings
+
+    def current_window_binding(
+            self, agent_key: str) -> TerminalWindowBinding | None:
+        return self._window_bindings.get(agent_key)
+
+    def observation_binding(self, agent_key: str):
+        return self._observation_bindings.get(agent_key)
 
     # ------------------------------------------------------------ 观察 API
-    def waiting_observation(self, binding: TerminalBinding):
-        if self.observer is None or binding.pane_id is None:
+    def waiting_observation(self, control_id: tuple):
+        if self.observer is None:
             return None
-        return self.observer.waiting_observation(binding.pane_id)
+        return self.observer.waiting_observation(control_id)
 
-    def activity_observation(self, binding: TerminalBinding, now: float,
+    def activity_observation(self, control_id: tuple, now: float,
                              grace: float):
-        if self.observer is None or binding.pane_id is None:
+        if self.observer is None:
             return None
-        return self.observer.pane_activity_observation(
-            binding.pane_id, now, grace)
+        return self.observer.control_activity_observation(
+            control_id, now, grace)
 
     # ------------------------------------------------------------ 用户显式 action
-    def activate(self, target: AgentTarget,
+    def activate(self, agent_key: str, *,
                  is_agent_live: Callable[[str], bool]) -> ActivationResult:
-        return self.activator.activate(target, is_agent_live)
+        """window-only 激活事务（plan §6.3；refresh 最多一次）。"""
+        if not is_agent_live(agent_key):
+            return ActivationResult(ActivationCode.AGENT_GONE)
 
-    def bind_focused_location(self, agent_key: str) -> TerminalLocation | None:
-        """一次捕获当前焦点的 (Window, Tab, Pane) 并记为 MANUAL CONFIRMED。
+        binding = self._window_bindings.get(agent_key)
+        if binding is None or binding.window is None:
+            return ActivationResult(
+                ActivationCode.NO_BINDING,
+                detail=binding.reason if binding is not None else "")
 
-        只在本应用运行期有效；Agent exit / Window identity 变化立即使其
-        失效（resolver._prune_manual）。失败返回 None（fail-closed）。
-        """
-        backend = self.backend
-        if backend is None:
-            return None
+        if not winkeys.validate_window(binding.window):
+            # 4. 只允许一次 refresh + re-resolve
+            self.refresh_observed_controls(force=True)
+            self._resolve_once()
+            if not is_agent_live(agent_key):
+                return ActivationResult(ActivationCode.AGENT_GONE)
+            binding = self._window_bindings.get(agent_key)
+            if binding is None or binding.window is None:
+                return ActivationResult(
+                    ActivationCode.NO_BINDING, repaired=True,
+                    detail=binding.reason if binding is not None else "")
+            if not winkeys.validate_window(binding.window):
+                return ActivationResult(ActivationCode.STALE_WINDOW,
+                                        repaired=True)
+            # 5/6. refresh 后成功唤起：携带 repaired（v4.1.1 §19.2-C）
+            hwnd = binding.hwnd
+            winkeys.restore_window(hwnd)
+            if winkeys.try_set_foreground(hwnd):
+                return ActivationResult(ActivationCode.OK, repaired=True)
+            winkeys.flash_window(hwnd)
+            return ActivationResult(ActivationCode.FOREGROUND_DENIED)
+
+        # 5/6. restore + foreground（OS policy 决定成败，不绕过）
+        hwnd = binding.hwnd
+        winkeys.restore_window(hwnd)
+        if winkeys.try_set_foreground(hwnd):
+            return ActivationResult(ActivationCode.OK)
+        winkeys.flash_window(hwnd)
+        return ActivationResult(ActivationCode.FOREGROUND_DENIED)
+
+    def _resolve_once(self):
+        instances = list(self._last_instances)
+        if not instances:
+            return
         try:
-            location = backend.focused_location()
+            self.resolve(
+                [inst for inst in instances],
+                time.time())
         except Exception:
-            return None
-        if location is None or location.window.hwnd == 0:
-            return None
-        self.resolver.set_manual_location(agent_key, location)
-        return location
+            pass
 
     def drop_instance(self, agent_key: str) -> None:
-        """Agent 退出级联：清 manual binding 与缓存绑定。"""
-        self.resolver.set_manual_location(agent_key, None)
-        self._bindings.pop(agent_key, None)
+        """Agent 退出级联：清运行期缓存绑定（不再有 manual path）。"""
+        self._window_bindings.pop(agent_key, None)
+        self._observation_bindings.pop(agent_key, None)
+        self._last_instances = [inst for inst in self._last_instances
+                                if getattr(inst, "key", "") != agent_key]
 
     # ------------------------------------------------------------ 诊断
     def stats(self) -> dict:

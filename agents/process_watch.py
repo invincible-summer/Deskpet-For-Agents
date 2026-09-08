@@ -174,14 +174,16 @@ class WindowsExitWatcher:
             handles = [self._control] + [h for (_k, (h, _p, _t)) in items]
             count = len(handles)
             if count <= 1:
-                # 只有 control：等 control（注册/停止会唤醒）
+                # 只有 control：INFINITE 阻塞等待（v4.1.1 §10.2）。
+                # register/unregister/stop 都会 SetEvent(control) 安全唤醒，
+                # 不存在固定 200ms 周期唤醒——空闲时 CPU 为零。
                 arr = (wt.HANDLE * 1)(self._control)
-                kernel32.WaitForMultipleObjects(1, arr, False, 200)
+                kernel32.WaitForMultipleObjects(1, arr, False, INFINITE)
                 continue
             arr = (wt.HANDLE * count)(*handles)
             index = kernel32.WaitForMultipleObjects(count, arr, False, INFINITE)
             if index == WAIT_FAILED:
-                time.sleep(0.2)   # 等待失败：短暂退避后重建 wait set
+                time.sleep(0.2)   # 等待失败（罕见错误路径）：短暂退避后重建
                 continue
             i = index - WAIT_OBJECT_0
             if i == 0:

@@ -281,13 +281,6 @@ class SourceProbeSnapshot:
     error: str = ""
 
 
-class BindingConfidence(str, Enum):
-    CONFIRMED = "confirmed"
-    HIGH = "high"
-    AMBIGUOUS = "ambiguous"
-    NONE = "none"
-
-
 @dataclass(frozen=True)
 class WindowIdentity:
     """Windows Terminal 顶层窗口的完整 incarnation 身份（v4plan §3.3）。
@@ -301,76 +294,74 @@ class WindowIdentity:
     window_class: str
 
 
-@dataclass(frozen=True)
-class TabInfo:
-    """一个 Windows Terminal TabItem 的运行期身份。
+class WindowBindingConfidence(str, Enum):
+    """窗口解析的可靠程度（v4.1.1 §4.2）。
 
-    tab_id 只在本 desktop/UI 生命周期内有效，绝不写配置。
-    index_hint 只是展示提示：用户拖动 Tab 后 index 会变，不能当 identity。
+    与 observation attribution 的置信度彻底分离：
+      * CONFIRMED —— Windows native PID 祖先链唯一定位；
+      * HIGH —— WSL/标题/cwd/distro 证据互相唯一，先定位 control
+        再映射到其所属 window；
+      * FALLBACK —— 桌面只有一个 WT 顶层窗口：允许唤起窗口，
+        但不赋予 terminal evidence attribution；
+      * AMBIGUOUS —— 多候选窗口，无法安全唯一定位（window=None）；
+      * NONE —— 没有任何可用窗口。
     """
-    tab_id: tuple               # (hwnd, tuple(runtime_id))
-    hwnd: int
-    window_pid: int
-    title: str
-    index_hint: int
-    selected: bool
-    last_seen: float
-
-
-@dataclass(frozen=True)
-class TerminalLocation:
-    """一次手工/观察捕获的精确 Terminal 位置（Window → Tab → Pane）。"""
-    window: WindowIdentity
-    tab_id: tuple | None
-    pane_id: tuple | None
-
-
-class BindingOrigin(str, Enum):
-    AUTO = "auto"
-    OBSERVED = "observed"
-    MANUAL = "manual"
+    CONFIRMED = "confirmed"
+    HIGH = "high"
+    FALLBACK = "fallback"
+    AMBIGUOUS = "ambiguous"
+    NONE = "none"
 
 
 @dataclass
-class TerminalBinding:
-    """Agent ↔ 终端 Window/Tab/Pane 的关联（v4plan §3.3 扩展）。
+class TerminalWindowBinding:
+    """Agent ↔ Windows Terminal 顶层窗口的关联（window-only，v4.1.1 §4.2）。
 
-    WT_SESSION 没有官方 tab 查询接口，confidence 是必须的：
-    只有 CONFIRMED/HIGH 的绑定才允许 exact activation 与终端审批归属。
-    tab_id/pane_id 是 runtime-only UIA RuntimeId，绝不持久化。
+    只回答"这个 Agent 大概在哪个 WT 顶层窗口"；不含 Tab/Pane，
+    不参与 terminal text attribution（那是 TerminalObservationBinding
+    的职责）。运行期身份，绝不持久化。
     """
     provider: str = "windows-terminal"
-    hwnd: int = 0
-    window_pid: int = 0
-    window_created: float = 0.0
-    window_class: str = ""
 
+    window: WindowIdentity | None = None
     title: str = ""
 
-    # runtime-only：仅本次 desktop/UI 生命周期有效
-    tab_id: tuple | None = None
-    tab_index_hint: int = -1
-    pane_id: tuple | None = None
-
-    origin: BindingOrigin = BindingOrigin.AUTO
-    confidence: BindingConfidence = BindingConfidence.NONE
-    observable: bool = False     # 该 pane 的可见文本是否可经 UIA 读取
+    confidence: WindowBindingConfidence = WindowBindingConfidence.NONE
 
     last_seen: float = 0.0
     validated_at: float = 0.0
 
-    # 绑定依据诊断（dashboard 高级诊断展示；score=最佳评分，runner_up=次佳）
+    # 安全诊断（dashboard 高级诊断展示；禁止放 terminal text）
+    reason: str = ""
     score: int = 0
     runner_up_score: int = 0
-    agent_margin: int = 0       # 该 Agent 的 top1-top2 分差
-    pane_margin: int = 0        # 该 pane 的 top1-top2 分差
-    reason: str = ""            # 如 "kind+cwd+distro"
 
-    def window_identity(self) -> WindowIdentity:
-        return WindowIdentity(
-            hwnd=self.hwnd, pid=self.window_pid,
-            process_created=self.window_created,
-            window_class=self.window_class)
+    @property
+    def hwnd(self) -> int:
+        return self.window.hwnd if self.window else 0
+
+
+class ObservationBindingConfidence(str, Enum):
+    """观察归属结果的允许置信度（v4.1.1 §4.4）。
+
+    只有 CONFIRMED/HIGH 两个等级：AMBIGUOUS/NONE 不产生
+    Agent-specific terminal evidence，根本不生成 binding。
+    """
+    CONFIRMED = "confirmed"
+    HIGH = "high"
+
+
+@dataclass(frozen=True)
+class TerminalObservationBinding:
+    """Agent ↔ 被观察 TermControl 的一次运行期归属（observation-only）。
+
+    control_id 是 UIA observer 内部的短生命周期句柄，仅内存、不持久化、
+    不参与 window activation、不在 Dashboard 普通诊断展示。
+    """
+    agent_key: str
+    control_id: tuple
+    confidence: ObservationBindingConfidence
+    reason: str = ""
 
 
 @dataclass
@@ -419,25 +410,28 @@ class Snapshot:
 
 @dataclass
 class AgentTarget:
-    """UI 唯一操作对象（plan.md §29）：实例 + 快照 + 终端绑定。"""
+    """UI 唯一操作对象（plan.md §29）：实例 + 快照 + 终端窗口绑定。
+
+    terminal_window 只承载 window 级诊断（能否唤起该 Agent 所在的
+    Windows Terminal 顶层窗口）；terminal text attribution 由
+    Monitor 内部的 observation binding 表负责，不进 UI 模型。
+    """
     key: str
     instance: AgentInstance
     snapshot: Snapshot
-    terminal: TerminalBinding | None = None
+    terminal_window: TerminalWindowBinding | None = None
 
 
 class ActivationCode(str, Enum):
-    """exact activation 的结果码（v4plan §3.4）。fail-closed，不猜。"""
+    """终端窗口激活的结果码（v4.1.1 §6.2）。fail-closed，不猜。
+
+    window-level activation 不依赖 UIA，因此没有 UIA_UNAVAILABLE；
+    也不再区分 Tab/Pane 失效（产品不承诺切换到具体 Tab/Pane）。
+    """
     OK = "ok"
     AGENT_GONE = "agent_gone"       # Agent 进程已退出（exact key 不再 live）
-    NO_BINDING = "no_binding"       # 没有任何 Terminal 绑定
-    AMBIGUOUS = "ambiguous"         # 绑定证据不足，禁止 exact activate
-
+    NO_BINDING = "no_binding"       # 没有可安全唤起的终端窗口绑定
     STALE_WINDOW = "stale_window"   # WindowIdentity 校验失败（HWND/PID 复用等）
-    STALE_TAB = "stale_tab"         # tab runtime id 已消失且无法重解析
-    STALE_PANE = "stale_pane"       # pane 失效且多 pane 无法唯一定位
-
-    UIA_UNAVAILABLE = "uia_unavailable"   # UIA 后端不可用/Tab 无 Select pattern
     FOREGROUND_DENIED = "foreground_denied"  # OS 拒绝抢前台（已 Flash 提醒）
 
 

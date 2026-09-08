@@ -30,7 +30,11 @@ jobs:
         with:
           name: monitor-benchmark
           path: benchmark-report.json
-      # 真实 UIA / Windows Terminal 验收（tests/uia_probe.py）属于
-      # 本机 manual acceptance，不在 CI 中操作真实终端。
+      # 单测已覆盖：terminal window activation 逻辑、并发激活矩阵、
+      # source-disabled 停扫、config 运行时 clamp。
+      # 真实 Windows Terminal foreground policy / UIA 事件接受度属于
+      # 本机 manual acceptance（tools/terminal_window_probe.py 与
+      # tools/terminal_observer_probe.py）；CI 只验证纯逻辑、Win32
+      # 调用契约 mock、资源边界和 UI dataflow，不操作真实终端。
       # benchmark 保持 blocking（无 continue-on-error）：失败时靠上传的
       # benchmark-report.json 定位具体不变量。

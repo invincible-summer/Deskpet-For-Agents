@@ -1,12 +1,14 @@
-# DeskPet V4.1 — 被动 Agent 观察桌宠（exact 终端定位 + 并发呈现）
+# DeskPet V4.1.2 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
 
 一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
 
 DeskPet 不创建、不托管、不控制任何 Agent：不配置 hooks、不注入进程、不发送键盘事件、不自动审批。
 
-V4.1 新增四项能力：
+**终端唤起语义（V4.1.2 收敛）**：DeskPet 通过公共 Win32 API 恢复并尝试前置 Agent 所在的 Windows Terminal 顶层窗口，**不切换既有标签页**。Terminal UIA 只用于被动状态观察，不用于用户显式导航——Windows Terminal 目前没有稳定的公开"按 `WT_SESSION` 激活既有标签页"接口（[microsoft/terminal#19783](https://github.com/microsoft/terminal/issues/19783)，closed/not_planned），UIA Tab 选择是 fragile workaround，不再作为产品承诺。
 
-1. **exact 终端定位**：点击某 Agent 时精确恢复到它所在的 Windows Terminal 窗口 → Tab → Pane（不再只前置窗口）；位置不唯一时明确提示修复入口，绝不猜。
+V4.1 的能力概览：
+
+1. **终端窗口唤起**：点击某 Agent 时恢复并前置它所在的 Windows Terminal 顶层窗口；窗口归属用 `WindowIdentity`（HWND+PID+进程创建时间+窗口类）安全校验，stale 即 fail-closed；OS 拒绝抢前台时闪烁任务栏提醒，绝不绕过系统策略（无键盘注入、无剪贴板注入）。
 2. **并发呈现（手动开启）**：仪表盘"桌宠与外观"页可开启；支持"单宠聚合"（一只桌宠显示当前最需要注意的 Agent，气泡与单个监听完全一致）与"多宠分离"（每个 Agent 一只桌宠，**自动绑定**现有 Agent，没有绑定的槽位不显示桌宠——不是"设了 3 就唤起 3 只"）。
 3. **可靠设置持久化 + 自启修复**：设置写入失败会明确提示；开机自启能识别"注册路径已失效"并一键修复。
 4. **精确退出生命周期**：Agent CLI 进程退出即从列表消失（terminal/shell 还开着也不会"复活"）；Windows 上事件驱动、零轮询。
@@ -24,20 +26,20 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 
 ```
 打开 Windows Terminal → 进入 Windows/WSL → 自己执行 codex / claude / kimi
-        ↓ DeskPet 自动发现、自动绑定会话、自动关联终端
+        ↓ DeskPet 自动发现、自动绑定会话、自动关联终端窗口
 桌宠动画 + 气泡（Codex · Plan · 编码中 / 目标 / 当前活动）
 ```
 
-等待审批时气泡提示"请在终端处理"；双击桌宠精确回到该 Agent 所在的 Tab/Pane（聚合模式下点击具体 Agent 卡片激活，桌宠身体只用于互动）。
+等待审批时气泡提示"请在终端处理"；双击桌宠（或点击气泡底行/仪表盘卡片/托盘菜单项）唤起该 Agent 所在的 Windows Terminal 窗口（聚合模式下桌宠身体只用于互动，点击气泡底行激活）。
 
 ## 功能
 
 - **五状态动画**：`walk` 工作中 ｜ `attack` 下达指令 ｜ `die` 等待审批 ｜ `special` 任务完成（×3）｜ `sleep` 空闲
 - **语义化状态气泡**：`Agent · Mode · Phase` + Goal（≤120 字）+ 当前活动摘要（≤160 字，本地规则压缩，不调用 LLM）
 - **等待审批检测**：Kimi 来自 wire `ApprovalRequest`（精确）；Codex/Claude 来自 Windows Terminal UIA 当前可见审批 UI（高置信 + 1.5s TTL 复检）——**静默永远不被推断为等待审批**
-- **多 Agent**：自动跟随（WAITING > INPUT > ERROR > WORKING …，工作中粘性），或手动钉住直到该 Agent 退出
-- **仪表盘 V3**：`当前 ★ | Agent | 项目 | 环境/终端 | Mode | 状态 | 活动`；PID 等技术细节在"详情"高级诊断
-- **双击桌宠**：唤起当前 Agent 的终端（公共 Win32 API 置顶）
+- **多 Agent**：自动跟随（WAITING > INPUT > ERROR > WORKING …，工作中粘性），或并发模式（单宠聚合/多宠分离）
+- **仪表盘 V4.1.2**：左侧导航六页（概览/Agents/桌宠与外观/监听与隐私/诊断/设置），自适应窗口大小；PID 等技术细节在"详情"高级诊断
+- **双击桌宠/气泡底行/卡片按钮**：唤起该 Agent 所在的 Windows Terminal 窗口（公共 Win32 API 恢复并前置；foreground 被拒时闪烁任务栏）
 - **系统集成**：托盘图标、开机自启、隐藏、换肤、缩放、锁定动画
 - **隐私**：`/proc/<pid>/environ` 只在 WSL 内部按 allowlist（`WT_SESSION`/`CODEX_HOME` 等 9 项）过滤后才进入 Python；终端文本只在内存、绝不落盘
 
@@ -70,16 +72,19 @@ D:\miniconda3\envs\deskpet\python.exe main.py
 | Kimi | `$KIMI_CODE_HOME`（默认 `~/.kimi-code`，legacy `~/.kimi` 兜底） | `session_index.jsonl` 按 cwd 精确定位；`state.json.lastPrompt` + `prompt.accepted` → Goal；`plan_mode.enter/exit`（EXACT）；wire `ApprovalRequest`（EXACT，兜底 SDK 命名） |
 | pi | `~/.pi` | assistant/toolCall 生命周期 |
 
-3. **终端 UIA**（`agents/terminal_uia.py`）：独立 MTA 线程（comtypes `CUIAutomation8`/`IUIAutomation5`），订阅 TermControl 的 Notification（2022 起携带新增文本）+ TextChanged（0.15s debounce 的有界审批 fallback）+ 窗口级 StructureChanged（pane 开合立即重发现，20s 周期仅为兜底）；弱触发词命中才读 `GetVisibleRanges()` 当前可见区域；审批识别要求**标题模式 + 选项结构同时出现**且识别器种类与绑定 Agent 一致；内存边界：delta≤2048 / ring≤8192 / pane≤16 / 事件队列≤256 / UIA 命令队列≤32 / 可见读取全局≤6/s（单 pane≥0.5s 间隔）。
+3. **终端 UIA**（`agents/terminal_uia.py`，观察专用）：独立 MTA 线程（comtypes `CUIAutomation8`/`IUIAutomation5`），订阅 TermControl 的 Notification（2022 起携带新增文本）+ TextChanged（0.15s debounce 的有界审批 fallback）+ 窗口级 StructureChanged（control 开合立即重发现，20s 周期仅为兜底）；弱触发词命中才读 `GetVisibleRanges()` 当前可见区域；审批识别要求**标题模式 + 选项结构同时出现**且识别器种类与绑定 Agent 一致；内存边界：delta≤2048 / ring≤8192 / control≤16 / 事件队列≤256 / UIA 命令队列≤32 / 可见读取全局≤6/s（单 control≥0.5s 间隔）。
 
-## 终端关联的置信度（诚实原则）
+## 终端窗口关联的置信度（诚实原则）
 
-Windows Terminal 没有 `WT_SESSION → pane` 公开接口：
+Windows Terminal 没有 `WT_SESSION → tab/pane` 公开接口，DeskPet 只做 window 级关联（两条独立链）：
 
-- **Windows 原生 Agent**：PID 祖先链 → 唯一窗口 → `CONFIRMED`
-- **WSL Agent**：标题/cwd/distro 评分（kind+3 / cwd+2 / user@+1 / distro+1），**互相唯一匹配**（Agent 对 pane、pane 对 Agent 双向唯一 top-1 且分差足够）→ `HIGH`；"只有一个 pane + 弱提示"不再自动 HIGH；否则 `AMBIGUOUS` / `NONE`
-- 只有 `CONFIRMED/HIGH` 才把终端审批观察归属到该 Agent；`AMBIGUOUS` 时仪表盘显示 ⚠ 并提供"高级：关联当前 Pane"修复入口（仅运行期有效）；详情页展示绑定依据与 `score / 次佳` 分数
-- UIA 不可用时正常降级：Goal/Mode/Phase 来自会话文件，仅 Codex/Claude 的"等待审批"无法补足（仪表盘提示"终端交互状态不可读"）
+- **窗口唤起链**（用户点击"打开终端"）：
+  - **Windows 原生 Agent**：PID 祖先链 → 唯一 WT 窗口 → `CONFIRMED`
+  - **WSL Agent**：标题/cwd/distro 评分（kind+3 / cwd+2 / user@+1 / distro+1），**互相唯一匹配** → `HIGH`（TermControl 标题与 WT 顶层窗口标题双证据，后者仅在窗口内唯一 control 时采用）
+  - `FALLBACK`：桌面只有一个 WT 窗口——可以唤起窗口，但**不**把终端审批观察归属给该 Agent
+  - `AMBIGUOUS`：多个候选窗口且无可靠证据 → 拒绝唤起（fail-closed，不猜）
+- **观察归属链**（WAITING/activity 证据归给谁）：只有 `CONFIRMED`（祖先唯一窗口 + 窗口内唯一被观察 control）或 `HIGH`（标题证据互相唯一）才归属；其余宁可没有终端证据也不错归。观察用 UIA RuntimeId 是运行期内部句柄，不持久化、不参与激活、不在普通诊断展示。
+- UIA 不可用时正常降级：Goal/Mode/Phase 来自会话文件，"打开终端"不受影响（窗口激活不依赖 UIA），仅 Codex/Claude 的"等待审批"无法补足
 
 ## 稳定性设计
 
@@ -101,23 +106,29 @@ Windows Terminal 没有 `WT_SESSION → pane` 公开接口：
 main.py                 入口（DPI 感知、单实例互斥）
 pet/                    UI：app/dashboard/bubble/labels/petwindow/animator/skins/tray/config
 agents/
-  models.py             Status/Phase/Mode/Observation/AgentInstance/TerminalBinding/AgentTarget
+  models.py             Status/Phase/Mode/Observation/AgentInstance/TerminalWindowBinding/
+                        TerminalObservationBinding/AgentTarget/ActivationCode
   state.py              StateReducer（状态融合；语义证据 > 泛化终端活动）
-  matching.py           互相唯一匹配（session/pane 绑定共用，顺序无关）
+  matching.py           互相唯一匹配（session/control 绑定共用，顺序无关）
   discovery.py          Windows + WSL ProcessProbe（三层探测、canonicalization、env allowlist）
   paths.py              数据根/wsl_unc 安全转换/Kimi 索引/Claude PID registry
   base.py               watcher 基座（互相唯一绑定、late-start fallback、parser 诊断）
   codex.py claude.py kimi.py pi.py
-  terminal_uia.py       UIA 观察器 + 审批识别器 + TerminalResolver（订阅生命周期有界）
+  terminal_uia.py       UIA 观察器 + 审批识别器（observation-only；订阅生命周期有界）
+  terminal_resolver.py  TerminalWindowResolver + TerminalObservationResolver（双链分离）
+  terminal_service.py   观察/解析/window-only 激活统一 facade
   monitor.py            ProcessProbeWorker + Monitor Core + AgentTarget API
   tailer.py summarize.py
-actions/winkeys.py      仅终端唤起（公共 Win32 + HWND 属主 PID/窗口类一致性验证，fail-closed：任何一步无法证明身份即拒绝并触发重识别；无任何键盘注入）
-tools/convert.py        素材→透明GIF 管线
-tests/                  单元/隐私/UIA/匹配/基准/实机探针/回归
-.github/workflows/      CI（windows-latest：compileall + unittest + benchmark）
+actions/winkeys.py      仅窗口唤起（公共 Win32 + WindowIdentity 属主 PID/创建时间/窗口类
+                        一致性验证，fail-closed；无任何键盘注入）
+tools/convert.py                    素材→透明GIF 管线
+tools/terminal_window_probe.py      WT 窗口 list/validate/activate 实机 probe
+tools/terminal_observer_probe.py    UIA 观察（observation-only）实机 probe
+tests/                              单元/隐私/UIA/匹配/基准/实机回归
+.github/workflows/                  CI（windows-latest：compileall + unittest + benchmark）
 ```
 
-## 常用配置（config.json，v3）
+## 常用配置（config.json）
 
 ```jsonc
 {
@@ -126,8 +137,7 @@ tests/                  单元/隐私/UIA/匹配/基准/实机探针/回归
     "windows_enabled": true, "wsl_enabled": true,
     "windows_scan_sec": 3.0, "wsl_scan_sec": 3.0,
     "file_poll_sec": 0.5, "session_scan_sec": 3.0,
-    "gone_grace_sec": 15.0, "activity_grace_sec": 10.0,
-    "terminal_observer": true, "pinned": ""
+    "activity_grace_sec": 10.0, "terminal_observer": true
   },
   "privacy": {
     "terminal_text_to_disk": false, "session_text_to_disk": false,
@@ -137,23 +147,26 @@ tests/                  单元/隐私/UIA/匹配/基准/实机探针/回归
 }
 ```
 
+节奏类配置有代码级 clamp（加载与每轮读取时生效，改坏配置文件也不会制造高频 loop）：`windows_scan_sec` 1–60、`wsl_scan_sec` 1–120、`file_poll_sec` 0.2–5（运行中修改下一轮即生效）、`session_scan_sec` 1–60、`activity_grace_sec` 1–60、`active_file_window_sec` 30–3600。运行期 identity（PID/HWND/RuntimeId/WT_SESSION/exact key）绝不持久化。
+
 `privacy.wsl_root_metadata_fallback` 默认关闭：默认绝不使用 WSL root 读取进程 metadata（Agent 仍会被发现，会话可能显示未解析）；仅在仪表盘显式开启后允许一次 root 补读（只读 cwd/启动 token/uid/HOME/allowlist env）。
 
 ## 测试
 
 ```bat
-D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（175+）
+D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（290+）
 D:\miniconda3\envs\deskpet\python.exe tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json    # 合成基准（队列/预算/churn 上限）
-D:\miniconda3\envs\deskpet\python.exe tests\uia_probe.py                         # UIA 实机冒烟（--verbose-text 才打印原文）
+D:\miniconda3\envs\deskpet\python.exe tools\terminal_window_probe.py --list      # WT 窗口实机 probe（list/validate/activate）
+D:\miniconda3\envs\deskpet\python.exe tools\terminal_observer_probe.py           # UIA 观察实机 probe（默认不打印终端原文）
 D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\regression.py                # 位置/气泡/缩放/托盘/自启
 D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\replay_real.py               # 真实会话数据回放
 ```
 
-CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试 + benchmark 5000 ticks（`PYTHONUTF8=1`，benchmark 报告以 artifact 上传）；真实 UIA 验收属于本机 manual acceptance。**Release acceptance requires GitHub Actions green**：workflow conclusion=success 是发布验收的必要条件，CI 红期间不标记版本完成。
+CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试（含 window 激活逻辑、并发激活矩阵、source 停扫、config 运行时测试）+ benchmark 5000 ticks（`PYTHONUTF8=1`，benchmark 报告以 artifact 上传）。真实 Windows Terminal foreground policy / UIA 事件接受度属于本机 manual acceptance：CI 只验证纯逻辑、Win32 调用契约 mock、资源边界和 UI dataflow。**Release acceptance requires GitHub Actions green**：workflow conclusion=success 是发布验收的必要条件，CI 红期间不标记版本完成。
 
 ## 已知边界（如实说明）
 
-- Codex 的审批事件明确不持久化到 rollout（官方 transient 策略），因此 Codex/Claude 的"等待审批"只能来自终端 UIA 可见区域；若审批 pane 无法唯一关联到 Agent（多 pane/后台 tab），在"不 hooks、不控制 Agent"的约束下没有第三条可靠信息源——此时显示 UNKNOWN/工作中而不是猜（plan §55 物理边界）
+- Codex 的审批事件明确不持久化到 rollout（官方 transient 策略），因此 Codex/Claude 的"等待审批"只能来自终端 UIA 可见区域；若审批 control 无法唯一关联到 Agent（多 control/后台 tab），在"不 hooks、不控制 Agent"的约束下没有第三条可靠信息源——此时显示 UNKNOWN/工作中而不是猜（plan §55 物理边界）
 - Claude Code 上游存在"活跃 session transcript 不实时写出"的回归 → 终端活动观察可补充 WORKING 证据，但不伪造具体 Phase
 - Codex 桌面版不写 rollout → 只能检测进程存活（UNKNOWN）
 - 自定义桌宠素材版权自负；`assets/pets/*`、`assets/cache/`、`config.json` 不入 git
@@ -161,7 +174,7 @@ CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 com
 ## V3 不变量（任何实现不得违反）
 
 ```
-1. 不启动 Agent        7. 不把静默解释为审批     13. 不确定 Agent↔pane 时不乱绑定
+1. 不启动 Agent        7. 不把静默解释为审批     13. 不确定 Agent↔control 时不乱绑定
 2. 不修改 Agent        8. 不扫描用户整个 HOME    14. UI 只暴露 AgentTarget
 3. 不配置 hooks        9. 不持久化终端原文       （PID/JSONL/HWND 只在高级诊断）
 4. 不使用 SendInput   10. 不持久化完整 environ

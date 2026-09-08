@@ -241,7 +241,11 @@ class Expander(tk.Frame):
 
 
 class ScrollableFrame(tk.Frame):
-    """纵向滚动容器（Canvas + 滚动条 + 鼠标滚轮）。"""
+    """纵向滚动容器（Canvas + 滚动条 + 鼠标滚轮）——按需显示滚动条。
+
+    内容不超出可视区时滚动条自动隐藏（滑块不会"超出有内容的部分"）；
+    只有内容确实更高时才显示，并随窗口/内容尺寸变化即时切换。
+    """
 
     def __init__(self, master):
         super().__init__(master, bg=LIGHT.page)
@@ -251,23 +255,63 @@ class ScrollableFrame(tk.Frame):
         self.inner = tk.Frame(self._canvas, bg=LIGHT.page)
         self._window = self._canvas.create_window(
             (0, 0), window=self.inner, anchor="nw")
-        self._canvas.configure(yscrollcommand=self._bar.set)
+        self._canvas.configure(yscrollcommand=self._yview_changed)
         self._canvas.pack(side="left", fill="both", expand=True)
-        self._bar.pack(side="right", fill="y")
-        self.inner.bind(
-            "<Configure>",
-            lambda e: self._canvas.configure(
-                scrollregion=self._canvas.bbox("all")))
-        self._canvas.bind(
-            "<Configure>",
-            lambda e: self._canvas.itemconfigure(
-                self._window, width=e.width))
+        # 滚动条初始不 pack：_sync_bar 按内容高度决定显隐
+        self._bar_visible = False
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
         self._canvas.bind_all("<MouseWheel>", self._on_wheel)
+
+    def _on_inner_configure(self, _event):
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        self._sync_bar()
+
+    def _on_canvas_configure(self, event):
+        self._canvas.itemconfigure(self._window, width=event.width)
+        self._sync_bar()
+
+    def _sync_bar(self):
+        """内容高于可视区才显示滚动条；否则隐藏（不占宽度）。"""
+        try:
+            region = self._canvas.bbox("all")
+            canvas_h = int(self._canvas.winfo_height())
+        except tk.TclError:
+            return
+        content_h = region[3] - region[1] if region else 0
+        needed = content_h > canvas_h + 4 and canvas_h > 1
+        if needed and not self._bar_visible:
+            self._bar.pack(side="right", fill="y")
+            self._bar_visible = True
+        elif not needed and self._bar_visible:
+            self._bar.pack_forget()
+            self._bar_visible = False
+
+    def _yview_changed(self, first, last):
+        self._bar.set(first, last)
+        # 滚动到边界之外没有任何意义；内容不足一页时同步一次条状态
+        self._sync_bar()
 
     def _on_wheel(self, event):
         if not self.winfo_ismapped():
             return
+        if not self._bar_visible:
+            return   # 内容未超出：滚轮不消费、不滚动
         try:
             self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         except tk.TclError:
             pass
+
+
+def bind_wraplength(widget, min_width: int = 160, pad: int = 8):
+    """让带 wraplength 的 label 自适应实际宽度（窗口缩放不裁字/不撑爆）。
+
+    绑定 <Configure>：wraplength 跟随 widget 当前宽度减 pad，不低于
+    min_width。轻量无阻塞——只有尺寸变化时 Tk 才派发一次事件。
+    """
+    def _on_configure(event):
+        try:
+            widget.configure(wraplength=max(min_width, event.width - pad))
+        except tk.TclError:
+            pass
+    widget.bind("<Configure>", _on_configure)

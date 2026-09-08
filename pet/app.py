@@ -73,9 +73,9 @@ class PetApp:
         self._closing = False
 
         if getattr(config, "migration_notice", False):
-            self.toast("DeskPet V4.1：被动监听 · exact 终端定位 · 并发需手动开启", 8)
+            self.toast("DeskPet V4.1.2：被动监听 · 终端窗口唤起 · 并发需手动开启", 8)
         if bool(self.config.get("tray_enabled", True)):
-            self.start_tray()
+            self._start_tray_runtime()
 
     # ================= 交互入口 =================
     def interact(self):
@@ -85,27 +85,32 @@ class PetApp:
         self.interact()
 
     def activate_agent(self, key: str):
-        """唯一激活入口：UI 只携带 exact agent_key（v4plan §5.9）。"""
+        """唯一激活入口：UI 只携带 exact agent_key（v4.1.1 §6.3）。
+
+        只恢复并前置该 Agent 所在的 Windows Terminal 顶层窗口；
+        DeskPet 不切换 Terminal 标签页、不发送键盘输入。
+        """
         result = self.monitor.activate_target(key)
         if result.code == ActivationCode.OK:
-            self.toast("已定位到该 Agent 的终端" +
-                       ("（已自动重新识别）" if result.repaired else ""), 2)
+            self.toast("已打开该 Agent 所在的终端窗口"
+                       + ("（已自动重新识别）" if result.repaired else ""), 2)
         elif result.code == ActivationCode.FOREGROUND_DENIED:
-            self.toast("终端已选中，Windows 未允许抢前台（已闪烁任务栏提醒）", 4)
+            self.toast("Windows 未允许将终端置于前台，已闪烁任务栏提醒", 4)
         elif result.code == ActivationCode.AGENT_GONE:
             self.toast("该 Agent 已退出", 4)
         elif result.code == ActivationCode.NO_BINDING:
-            self.toast("未能定位该 Agent 的终端窗口", 4)
-        elif result.code == ActivationCode.AMBIGUOUS:
-            self.toast('终端位置不唯一：请在仪表盘"关联当前 Terminal 位置"', 5)
-        elif result.code in (ActivationCode.STALE_WINDOW,
-                             ActivationCode.STALE_TAB,
-                             ActivationCode.STALE_PANE):
-            self.toast(f"终端位置已变化（{result.code.value}），重新识别失败", 4)
+            self.toast("无法唯一确定该 Agent 所在的终端窗口", 4)
+        elif result.code == ActivationCode.STALE_WINDOW:
+            self.toast("原终端窗口已失效，重新识别后仍无法安全打开", 4)
         else:
-            self.toast("终端交互（UIA）不可用", 4)
+            self.toast("无法打开该 Agent 的终端窗口", 4)
 
     def _focus_and_activate(self, key: str):
+        """Dashboard"查看并设为当前"类操作：设焦点 + 激活（§8.5）。
+
+        Fleet pet body/bubble、Tray Agent、Dashboard"打开终端"只走
+        activate_agent(key)，不偷偷改变 presentation 的 focused 状态。
+        """
         self.presentation.set_focus(key)
         self.activate_agent(key)
 
@@ -300,7 +305,7 @@ class PetApp:
     # ================= 显示/隐藏/托盘/自启 =================
     def hide_pet(self):
         self.pet_manager.hide_all()
-        self.start_tray()   # 隐藏后必须留托盘入口恢复
+        self._start_tray_runtime()   # 隐藏后必须留托盘入口恢复（不写配置）
         self.toast("桌宠已隐藏，点击托盘图标恢复", 4)
         self._apply_toasts()
 
@@ -317,7 +322,8 @@ class PetApp:
         else:
             self.show_pet()
 
-    def start_tray(self):
+    def _start_tray_runtime(self):
+        """启动/显示托盘图标（纯运行期，不写配置——v4.1.1 §17）。"""
         if os.name != "nt":
             return
         from .tray import TrayIcon
@@ -326,15 +332,19 @@ class PetApp:
             self.tray.start()
         else:
             self.tray.show_icon()
-        self.config.set("tray_enabled", True)
-        self.config.save()
 
-    def stop_tray(self):
+    def _stop_tray_runtime(self):
         if self.tray:
             self.tray.stop()
             self.tray = None
-        self.config.set("tray_enabled", False)
-        self.config.save()
+
+    def set_tray_enabled(self, enabled: bool):
+        """用户显式切换托盘：运行期启停 + 一次性持久化（§17）。"""
+        if enabled:
+            self._start_tray_runtime()
+        else:
+            self._stop_tray_runtime()
+        self.config.set_and_commit("tray_enabled", enabled)
 
     def toggle_autostart(self) -> bool:
         result = autostart.toggle()
@@ -379,7 +389,11 @@ class PetApp:
             self._active_menu = None
 
     def _agents_submenu(self, menu):
-        """Agents 子菜单：每项捕获 exact key（v4plan §14）。"""
+        """Agents 子菜单：每项捕获 exact key（§8.4/§8.5）。
+
+        托盘 Agent 项只激活对应 Terminal 窗口，不改 presentation 的
+        focused 状态。
+        """
         targets = self.monitor.get_targets()
         m = tk.Menu(menu, tearoff=0)
         if not targets:
@@ -390,7 +404,7 @@ class PetApp:
                 label=f"{s.kind.label} · "
                       f"{t.instance.project or t.instance.source} · "
                       f"{status_text(s)}",
-                command=lambda k=key: self._focus_and_activate(k))
+                command=lambda k=key: self.activate_agent(k))
         menu.add_cascade(label="Agents", menu=m)
 
     # ================= 右键菜单（每只桌宠） =================
@@ -518,10 +532,7 @@ class PetApp:
         self.toast("开机自启动已" + ("开启" if on else "关闭"), 3)
 
     def _toggle_tray(self, flag: bool):
-        if flag:
-            self.start_tray()
-        else:
-            self.stop_tray()
+        self.set_tray_enabled(flag)
 
     # ================= 仪表盘 =================
     def open_dashboard(self):

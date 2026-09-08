@@ -1,39 +1,61 @@
-# DeskPet V4.1 — SourceLink / Evidence Map
+# DeskPet V4.1.2 — SourceLink / Evidence Map
 
-> 审计日期：2026-09-08  
-> DeskPet 审计基线：`invincible-summer/DeskPet@af8236d15dc3bfecaa89464e1b77d7f84c2b09be`
+> 审计日期：2026-09-08（V4.1）；V4.1.2 window-only 收敛更新：2026-09-09  
+> DeskPet 审计基线：`invincible-summer/DeskPet@af8236d15dc3bfecaa89464e1b77d7f84c2b09be`  
 >
-> 本文件是 V4.1 第 1–4 点的证据链与接口依据。链接分为：
+> 本文件是证据链与接口依据。链接分为：
 >
 > - **实现合同**：Microsoft/Linux 官方 API 文档，可作为代码语义依据；
 > - **上游当前行为**：Windows Terminal 当前源码，说明现行实现，但必须 feature-detect，不能把内部源码细节当永久公开 ABI；
 > - **能力缺口证据**：Windows Terminal 官方仓库 issue，证明截至当前公开接口仍缺某项能力；issue 本身不是 API 合同；
-> - **DeskPet 内部审计证据**：固定到本次审计 commit，便于之后核对 V3→V4.1 修改。
+> - **DeskPet 内部审计证据**：固定到本次审计 commit，便于之后核对 V3→V4.1→V4.1.2 修改。
+
+## 0. V4.1.2 Core Convergence（window-only）决策依据
+
+**exact Window → Tab → Pane 激活设计（V4.1）已 abandoned**，不再作为当前实现要求：
+
+- microsoft/terminal#19783（closed / not_planned，2026-01-25）明确：
+  外部进程目前没有稳定的按 `WT_SESSION` 激活既有 Terminal Tab 的接口；
+  UIA TabItem + SelectionItemPattern 是 fragile workaround，title matching
+  易碎。DeskPet 因此不再把 exact existing Tab activation 当作产品合同。
+- V4.1.2 语义："打开终端" = 恢复并前置该 Agent 所在的 Windows Terminal
+  顶层窗口（公共 Win32 API + `WindowIdentity` 安全校验）；UIA 只用于
+  被动观察（WAITING/activity），不用于用户显式导航。
+- 数据合同拆分：`TerminalWindowBinding`（window-only，能否唤起窗口）
+  与 `TerminalObservationBinding`（observation-only，能否安全归属终端
+  证据）彻底分离；FALLBACK 窗口兜底允许唤起但不赋予 evidence
+  attribution；观察用 UIA RuntimeId 是运行期内部句柄，不持久化、
+  不参与激活。
 
 ## 1. DeskPet 实现基线
 
-### 1.0 V4.1 当前实现（2026-09-08 完成，工作树）
+### 1.0 V4.1.2 当前实现（2026-09-09 完成，工作树）
 
-V4.1 新增/重构（`v4plan.md` 的实施产物；上游依据见后续章节）：
+V4.1.2 收敛产物（`plan.md` v4.1.1 的实施；上游依据见后续章节）：
 
-- `agents/process_watch.py`：WindowsExitWatcher（一个阻塞等待线程 +
-  OpenProcess(SYNCHRONIZE) + WaitForMultipleObjects，§11 证据）；
-- `agents/terminal_service.py`：WindowsTerminalService 统一 facade +
-  TerminalActivator exact 激活事务（§8/§9/§10 证据）；
-- `agents/models.py`：SourceProbeSnapshot 三态 / WindowIdentity /
-  TabInfo / TerminalLocation / BindingOrigin / ActivationCode /
-  ActivationResult；
-- `agents/monitor.py`：`_commit_exit()` 级联回收；primary/pinned/
-  gone_grace 全部移除（V4.1 审计确认 grep 为零）；
-- `pet/presentation.py`：PresentationController（focused/attention 分离）；
-- `pet/petview.py`：PetView/PetViewManager（N Toplevel 一 interpreter）；
-- `pet/animator.py`：SharedAnimationCache/AnimationCursor/
-  AnimationScheduler（进程级一份预算）；
-- `pet/config.py`：config_version=4 + ConfigSaveResult + backup；
-- `pet/autostart.py`：AutostartStatus 三态 + repair（§14 证据）；
-- `pet/theme.py` + `pet/widgets.py` + `pet/dashboard.py`：左侧导航
-  六页仪表盘（§15 信息架构依据）；
-- `tools/terminal_layout_probe.py`：topology 实机 probe。
+- `agents/models.py`：`WindowBindingConfidence`（CONFIRMED/HIGH/
+  FALLBACK/AMBIGUOUS/NONE）/ `TerminalWindowBinding` /
+  `ObservationBindingConfidence` / `TerminalObservationBinding` /
+  `ObservedTerminalControl` 数据合同；`ActivationCode` 收敛为 5 值
+  （删除 STALE_TAB/STALE_PANE/UIA_UNAVAILABLE/AMBIGUOUS）；
+  `AgentTarget.terminal_window`；
+- `agents/terminal_uia.py`：观察层删除全部 Tab topology
+  （TabItem 枚举、SelectionItem 选择、tab-selected 事件、pane 焦点），
+  `PaneInfo` → `ObservedTerminalControl`；保留 MTA COM 架构、
+  Notification/TextChanged/StructureChanged 事件驱动、有界读取；
+- `agents/terminal_resolver.py`：`TerminalWindowResolver`（§5 语义）+
+  `TerminalObservationResolver`（§7.4 语义）双链分离；
+- `agents/terminal_service.py`：window-only 激活事务（refresh 最多一次、
+  不依赖 UIA、fail-closed）；
+- `agents/monitor.py`：双绑定表、exit tick 顺序契约、
+  windows_enabled 真停扫、动态 file_poll clamp、有界 join；
+- `agents/process_watch.py`：空闲 INFINITE 阻塞等待（§10.2）；
+- `pet/config.py`：monitor 节奏配置 6 项代码级 clamp（§11）；
+- `pet/app.py` + `pet/dashboard.py`：删除"关联当前 Terminal 位置"手工
+  绑定链；激活 toast 按 window 级结果码；托盘启动不写盘（§17）；
+  仪表盘自适应窗口大小；
+- `tools/terminal_window_probe.py` + `tools/terminal_observer_probe.py`：
+  实机 probe 拆分（window 级 / observation-only）。
 
 ### 1.1 V3 历史审计基线（superseded，保留作证据）
 
@@ -401,7 +423,10 @@ Tab RuntimeId / Pane RuntimeId
     当作永久 UUID
 ```
 
-## 8. UIA Tab selection
+## 8. UIA Tab selection —— V4.1 exact 方案依据（**abandoned**）
+
+> V4.1.2 起 DeskPet 不再使用 UIA Tab 选择做用户显式导航；以下证据
+> 保留说明 V4.1 为什么曾经可行、以及为什么放弃（fragile workaround）。
 
 ### 8.1 SelectionItemPattern.Select
 
@@ -413,28 +438,14 @@ https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiauto
 
 > Clears any selected items and then selects the current element.
 
-V4.1 用法：
+V4.1 曾用 exact TabItem RuntimeId → Select()；V4.1.2 已移除该路径
+（见 §0）：不使用 Ctrl+Tab / Ctrl+数字 / SendInput / keybd_event。
 
-```text
-exact TabItem RuntimeId
-    ↓
-SelectionItemPattern.Select()
-```
-
-不使用：
-
-```text
-Ctrl+Tab
-Ctrl+1
-SendInput
-keybd_event
-```
-
-### 8.2 SelectionItemPattern interface
+### 8.2 SelectionItemPattern interface（V4.1 历史依据，已 abandoned）
 
 https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nn-uiautomationclient-iuiautomationselectionitempattern
 
-确认可读取：
+确认可读取（V4.1 曾用于 selected 验证）：
 
 ```text
 CurrentIsSelected
@@ -442,29 +453,16 @@ CurrentSelectionContainer
 Select()
 ```
 
-### 8.3 Selection event ID
-
-Microsoft Learn：
+### 8.3 Selection event ID（V4.1 历史依据，已 abandoned）
 
 https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-event-ids
 
 `UIA_SelectionItem_ElementSelectedEventId = 20012`。
 
-V4.1 用法：
+V4.1 曾用它学习 tab topology；V4.1.2 观察层只关心 TermControl 的
+Notification/TextChanged 与窗口 StructureChanged。
 
-```text
-用户自然切 Tab
-    ↓
-selection event
-    ↓
-topology dirty
-    ↓
-bounded current-tab refresh
-```
-
-而不是 200ms 枚举所有 Tab。
-
-## 9. UIA Pane focus
+## 9. UIA Pane focus —— V4.1 exact 方案依据（**abandoned**）
 
 Microsoft Learn：
 
@@ -474,19 +472,9 @@ https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiauto
 
 > Sets keyboard focus to this UI Automation element.
 
-V4.1 使用顺序：
-
-```text
-Select exact Tab
-        ↓
-restore / foreground exact HWND
-        ↓
-确认 foreground 成功
-        ↓
-SetFocus(exact pane)
-```
-
-不把 `SetFocus` 当绕过 Windows foreground policy 的手段。
+V4.1 曾在 foreground 成功后对 exact pane SetFocus；V4.1.2 已移除
+（window-only 激活不涉及 pane 焦点控制），也从不把 SetFocus 当绕过
+Windows foreground policy 的手段。
 
 ## 10. Windows foreground policy
 
@@ -740,22 +728,19 @@ https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdpifor
 
 | 设计判断 | 证据强度 | 依据 | 实现后果 |
 |---|---|---|---|
-| UIA 必须一个独立 MTA | 官方 API 指南 | UIA threading | 继续 V3 单 UiaBackend |
-| Tab 可用 SelectionItem.Select | 官方 API | SelectionItemPattern | 不发送键盘 |
-| RuntimeId 不能持久化 | 官方 API | GetRuntimeId | Tab/Pane runtime-only |
-| Pane 可用 UIA SetFocus | 官方 API | SetFocus | foreground成功后 exact pane focus |
+| UIA 必须一个独立 MTA | 官方 API 指南 | UIA threading | 继续单 UiaBackend（观察专用） |
+| WT_SESSION→Tab query 缺失 | 官方仓库 issue | #19783/#19818/#18692 | window-only 激活 + 观察 attribution 门槛 |
+| UIA Tab 选择是 fragile workaround | 官方仓库 issue | #19783 | V4.1.2 删除 Tab 激活链（abandoned） |
 | OS 可能拒绝抢前台 | 官方 API | SetForegroundWindow | Flash + typed failure |
-| Windows process可阻塞等待退出 | 官方 API | process signaled + WaitForMultipleObjects | 一线程 exit watcher |
-| Run key command有260字符限制 | 官方 API | Run/RunOnce | autostart预校验 |
-| `focus-tab` 只有 index | 官方 WT docs | command-line args | index只能 hint |
-| WT_SESSION→Tab query缺失 | 官方仓库 issue | #19783/#19818/#18692 | UIA topology + ambiguous |
-| Bring Window不等于正确Tab | 官方仓库 issue | #18429 | Window→Tab两层不可省 |
-| selected Tab content attach XAML root | WT当前源码 | TabManagement.cpp | 不扰动 background tabs |
-| V3 UIA 已有有界 observer | DeskPet固定commit | terminal_uia.py | 扩展而不重写 |
-| V3 primary在 Monitor | DeskPet固定commit | monitor.py | presentation拆层 |
-| V3 config save可静默失败 | DeskPet固定commit | config.py | commit result/backup |
-| V3 Animator cache是per-instance | DeskPet固定commit | animator.py | Fleet共享cache |
-| config/skins/cache已gitignore | DeskPet固定commit | .gitignore | 暂不迁LocalAppData |
+| Windows process 可阻塞等待退出 | 官方 API | process signaled + WaitForMultipleObjects | 一线程 exit watcher（空闲 INFINITE） |
+| Run key command 有 260 字符限制 | 官方 API | Run/RunOnce | autostart 预校验 |
+| RuntimeId 不能持久化 | 官方 API | GetRuntimeId | control id 运行期专用、不进诊断 |
+| selected Tab content attach XAML root | WT 当前源码 | TabManagement.cpp | 只观察当前可观察 control |
+| V3 UIA 已有有界 observer | DeskPet 固定 commit | terminal_uia.py | 扩展而不重写 |
+| V3 primary 在 Monitor | DeskPet 固定 commit | monitor.py | presentation 拆层 |
+| V3 config save 可静默失败 | DeskPet 固定 commit | config.py | commit result/backup |
+| V3 Animator cache 是 per-instance | DeskPet 固定 commit | animator.py | Fleet 共享 cache |
+| config/skins/cache 已 gitignore | DeskPet 固定 commit | .gitignore | 暂不迁 LocalAppData |
 
 ## 18. 需要实机验证、不能伪装成已知事实的点
 
@@ -840,13 +825,14 @@ OCR/screenshot terminal
 
 ## 20. 文档更新规则
 
-完成 V4.1 后：
+完成 V4.1.2 后：
 
-- `v4plan.md` 是 V4.1 的实施合同；
-- `SourceLink.md` 用本文件替换/更新，保留每项依据的“权威等级”；
+- `plan.md`（v4.1.1 Core Convergence）是本轮的唯一实施验收依据；
+  `v4plan.md` 的 exact Tab/Pane 方案标记为 abandoned（文件已移除）；
+- `SourceLink.md` 用本文件替换/更新，保留每项依据的"权威等级"；
 - `README.md` 只写用户可见行为，不把内部 RuntimeId/PID 当产品概念；
 - 如果未来 Windows Terminal 发布正式 session/tab query API：
   1. 先在 SourceLink 记录正式 API；
   2. 新增 backend；
-  3. 保留 UIA fallback；
-  4. 不改变 `TerminalService.activate(target)` 上层接口。
+  3. 保留 window-only fallback；
+  4. 不改变 `TerminalService.activate(agent_key)` 上层接口。

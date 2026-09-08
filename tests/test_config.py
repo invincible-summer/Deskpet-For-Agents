@@ -121,6 +121,26 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(len(slot_ids), len(set(slot_ids)))
         self.assertIn("a", slot_ids)
 
+    def test_monitor_interval_clamps(self):
+        """v4.1.1 §11：配置手改异常值不能制造高频 loop/扫描。"""
+        data = normalize({
+            "monitor": {"file_poll_sec": -1, "windows_scan_sec": 0,
+                        "wsl_scan_sec": 999, "session_scan_sec": 0.1,
+                        "activity_grace_sec": 0, "active_file_window_sec": 1},
+        })
+        m = data["monitor"]
+        self.assertEqual(m["file_poll_sec"], 0.2)
+        self.assertEqual(m["windows_scan_sec"], 1.0)
+        self.assertEqual(m["wsl_scan_sec"], 120)
+        self.assertEqual(m["session_scan_sec"], 1.0)
+        self.assertEqual(m["activity_grace_sec"], 1.0)
+        self.assertEqual(m["active_file_window_sec"], 30)
+        # 高于下限的合法值保持不变
+        data2 = normalize({"monitor": {"file_poll_sec": 1.5,
+                                       "windows_scan_sec": 10.0}})
+        self.assertEqual(data2["monitor"]["file_poll_sec"], 1.5)
+        self.assertEqual(data2["monitor"]["windows_scan_sec"], 10.0)
+
     def test_runtime_identity_never_loaded(self):
         # 生产管线：load → migrate（drop）→ normalize（clamp）
         data, _ = cfgmod.migrate({

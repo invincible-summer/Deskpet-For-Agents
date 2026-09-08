@@ -5,7 +5,7 @@
   restore_window / try_set_foreground / flash_window
 
 Tab/Pane 的 UIA 逻辑不放在这里（属于 agents/terminal_service）。
-SendInput / 键盘注入 / 剪贴板路径不在产品中（V3 起移除，V4.1 不回退）。
+键盘注入 / 剪贴板路径不在产品中（V3 起移除，V4.1 不回退）。
 
 Win32 契约（Microsoft Learn）：
   * GetWindowThreadProcessId 失败/无效 HWND 返回 0，输出变量保持不变

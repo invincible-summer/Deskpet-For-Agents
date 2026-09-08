@@ -272,3 +272,122 @@ class HelpDotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UiContractTests(unittest.TestCase):
+    """v4.1.1 §24：普通界面不再存在 exact Tab/Pane 产品语义字符串。
+
+    * 禁止出现：手工绑定入口文案、STALE_TAB/STALE_PANE、精确 Tab/Pane；
+    * Help 文案必须出现：打开 Windows Terminal 窗口 / 不切换标签页 /
+      不发送键盘输入；
+    * Fleet slot 绑定 UI（Presentation 绑定）保留。
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _source(self, *parts):
+        with open(os.path.join(self.ROOT, *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def test_no_manual_terminal_binding_strings_in_ui(self):
+        for parts in (("pet", "dashboard.py"), ("pet", "app.py"),
+                      ("pet", "petview.py"), ("pet", "bubble.py")):
+            src = self._source(*parts)
+            for banned in ("关联当前 Terminal 位置", "STALE_TAB",
+                           "STALE_PANE", "精确 Tab", "精确 Pane",
+                           "Tab RuntimeId", "Pane RuntimeId"):
+                self.assertNotIn(banned, src,
+                                 f"{parts} 不应包含 {banned!r}")
+
+    def test_open_terminal_help_contains_window_semantics(self):
+        src = self._source("pet", "dashboard.py")
+        for required in ("Windows Terminal 窗口", "不切换标签页",
+                         "不发送键盘输入"):
+            self.assertIn(required, src,
+                          f"帮助文案缺少 {required!r}")
+
+    def test_tray_startup_does_not_rewrite_config(self):
+        """v4.1.1 §17：启动托盘是纯运行期动作，不写 config。
+
+        只有用户显式切换（set_tray_enabled）才持久化 tray_enabled。
+        """
+        src = self._source("pet", "app.py")
+        self.assertIn("def _start_tray_runtime", src)
+        self.assertIn("def set_tray_enabled", src)
+
+        def method_body(name):
+            return src.split(f"def {name}")[1].split("\n\n    def ")[0]
+
+        # _start_tray_runtime 不做任何持久化
+        body = method_body("_start_tray_runtime")
+        self.assertNotIn("set_and_commit", body)
+        self.assertNotIn("config.save", body)
+        # 持久化只发生在 set_tray_enabled
+        set_body = method_body("set_tray_enabled")
+        self.assertIn("set_and_commit", set_body)
+
+    def test_fleet_slot_binding_ui_preserved(self):
+        """Fleet slot assignment 是 Presentation 绑定，应保留（§12.2）。"""
+        src = self._source("pet", "dashboard.py")
+        for required in ("更换 Agent", "解除绑定"):
+            self.assertIn(required, src)
+
+
+class ScrollableFrameAdaptiveTests(unittest.TestCase):
+    """v4.1.2 仪表盘自适应：滚动条只在内容超出时出现（按内容显隐）。"""
+
+    def setUp(self):
+        try:
+            import tkinter as tk
+        except Exception:
+            raise unittest.SkipTest("no display")
+        self.tk = tk
+        self.root = tk.Tk()
+        self.root.geometry("400x300+40+40")
+        self.root.deiconify()
+        self.root.update()
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def test_scrollbar_hidden_when_content_fits(self):
+        tk = self.tk
+        from pet.widgets import ScrollableFrame
+        frame = ScrollableFrame(self.root)
+        frame.pack(fill="both", expand=True)
+        tk.Label(frame.inner, text="short").pack()
+        self.root.update_idletasks()
+        self.root.update()
+        # 内容不超过可视高度：滚动条隐藏（滑块不超出内容）
+        self.assertFalse(frame._bar_visible)
+        # 内容超出：滚动条出现
+        for i in range(40):
+            tk.Label(frame.inner, text=f"line {i}").pack()
+        self.root.update_idletasks()
+        self.root.update()
+        self.assertTrue(frame._bar_visible)
+        self.assertTrue(frame.winfo_ismapped())
+
+    def test_wraplength_binding_adapts_to_width(self):
+        """容器变窄 → wraplength 跟随；不低于最小可读宽度。"""
+        tk = self.tk
+        from pet.widgets import bind_wraplength
+        holder = tk.Frame(self.root, width=240, height=30)
+        holder.pack_propagate(False)
+        label = tk.Label(holder, text="x" * 400, wraplength=480)
+        bind_wraplength(label)   # 布局前绑定：首帧即自适应
+        label.pack(fill="both", expand=True)
+        holder.pack()
+        self.root.update()
+        self.assertLessEqual(int(label.cget("wraplength")), 240)
+        # 容器变宽 → wraplength 跟随放宽
+        holder.configure(width=360)
+        self.root.update()
+        self.assertGreater(int(label.cget("wraplength")), 240)
+        # 容器极窄 → 不低于最小可读宽度
+        holder.configure(width=60)
+        self.root.update()
+        self.assertGreaterEqual(int(label.cget("wraplength")), 160)
