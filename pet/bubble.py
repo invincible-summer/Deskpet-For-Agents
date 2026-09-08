@@ -1,10 +1,17 @@
 """Fixed, scalable status card. Layout and canvas items change only when needed.
 
-V3：气泡不再有 [批准]/[拒绝] 按钮（plan §41），底行是 footer
-（Goal / 环境提示），点击气泡 = 打开终端。
+V4.1.1（用户反馈）：并发（aggregate/fleet）的气泡与单个监听完全一致——
+单卡 SingleAgentBubbleRenderer；删除 "N Agents" 多卡片栈（会造成文本框
+重叠，且信息与单卡重复）。
+
+  * BubbleRendererBase 共享 DPI metrics / 文本适配 / 圆角 / 字体缓存 /
+    hit testing；
+  * SingleAgentBubbleRenderer —— 所有模式共用的单目标卡片；
+  * HitTarget 强类型取代 tag 字符串隐式关联。
 """
 import math
 from dataclasses import dataclass
+from typing import Literal
 import tkinter as tk
 import tkinter.font as tkfont
 
@@ -26,6 +33,14 @@ class BubbleModel:
     footer: str = "打开终端"
     accent: str = "#487f73"
     visible: bool = False
+    agent_key: str = ""   # 携带 exact key：点击底行 = 激活该 Agent
+
+
+@dataclass(frozen=True)
+class HitTarget:
+    """气泡命中结果（v4plan §7.2）：彻底移除 tag=="details" 隐式关联。"""
+    action: Literal["activate_agent", "open_dashboard", "none"]
+    agent_key: str = ""
 
 
 def metrics(config, dpi=1.0):
@@ -73,82 +88,117 @@ def wrap_text(text, width, measure, count=2):
     return (lines+['']*count)[:count]
 
 
-class BubbleRenderer:
-    def __init__(self,canvas:tk.Canvas,config):
-        self.canvas,self.config=canvas,config
-        self.model=BubbleModel()
-        self.btn_boxes={}
-        self._items=[]
-        self._font=None
-        self._font_key=None
-        self._layout_key=None
-        self._draw_key=None
-        self.w=self.h=0
-        self.disp_lines=[]
+class BubbleRendererBase:
+    """共享：DPI metrics、字体缓存、圆角、命中测试。"""
+
+    def __init__(self, canvas: tk.Canvas, config):
+        self.canvas = canvas
+        self.config = config
+        self._font = None
+        self._font_key = None
+        self.w = self.h = 0
+        self._hit_boxes: list[tuple[tuple, HitTarget]] = []
 
     def _metrics(self):
-        try: dpi=float(self.canvas.winfo_fpixels('1i'))/96
-        except (AttributeError,tk.TclError): dpi=1.
-        return metrics(self.config,dpi)
+        try: dpi = float(self.canvas.winfo_fpixels('1i')) / 96
+        except (AttributeError, tk.TclError): dpi = 1.
+        return metrics(self.config, dpi)
 
     def font(self):
-        m=self._metrics()
-        key=(self.config.get('bubble.font_family') or 'Microsoft YaHei UI',m['font'])
-        if key!=self._font_key:
-            self._font=tkfont.Font(root=self.canvas,family=key[0],size=-key[1])
-            self._font_key=key
+        m = self._metrics()
+        key = (self.config.get('bubble.font_family') or 'Microsoft YaHei UI', m['font'])
+        if key != self._font_key:
+            self._font = tkfont.Font(root=self.canvas, family=key[0], size=-key[1])
+            self._font_key = key
         return self._font
 
-    def invalidate(self):
-        self._font_key=self._layout_key=self._draw_key=None
-
     def fixed_size(self):
-        m=self._metrics()
-        return m['w'],m['h']
+        m = self._metrics()
+        return m['w'], m['h']
+
+    def hit(self, x: int, y: int) -> HitTarget:
+        for (x0, y0, x1, y1), target in self._hit_boxes:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return target
+        return HitTarget(action="none")
+
+    def invalidate(self):
+        self._font_key = None
+        self._draw_key = None
+
+
+class SingleAgentBubbleRenderer(BubbleRendererBase):
+    """单目标卡片（V3 视觉兼容）。"""
+
+    def __init__(self, canvas, config):
+        super().__init__(canvas, config)
+        self.model = BubbleModel()
+        self.btn_boxes = {}
+        self._items = []
+        self._layout_key = None
+        self._draw_key = None
+        self.disp_lines = []
 
     def layout(self):
-        m=self._metrics(); self.w,self.h=m['w'],m['h']
-        font=self.font()
-        key=(self.model.text,self._font_key,tuple(m.items()))
-        if key!=self._layout_key:
-            available=self.h-2*m['pad']-m['button']-font.metrics('linespace')-2*m['gap']
-            count=max(1, min(2, available // max(1, font.metrics('linespace'))))
-            self.disp_lines=wrap_text(self.model.text,self.w-2*m['pad'],font.measure,count)
-            self._layout_key=key
-        return self.w,self.h
+        m = self._metrics(); self.w, self.h = m['w'], m['h']
+        font = self.font()
+        key = (self.model.text, self._font_key, tuple(m.items()))
+        if key != self._layout_key:
+            available = self.h - 2*m['pad'] - m['button'] - font.metrics('linespace') - 2*m['gap']
+            count = max(1, min(2, available // max(1, font.metrics('linespace'))))
+            self.disp_lines = wrap_text(self.model.text, self.w-2*m['pad'], font.measure, count)
+            self._layout_key = key
+        return self.w, self.h
 
-    def draw(self,ox,oy,pet_cx,pet_top):
-        cfg=self.config.get('bubble') or {}; m=self._metrics()
+    def draw(self, ox, oy, pet_cx, pet_top):
+        cfg = self.config.get('bubble') or {}; m = self._metrics()
         bg = cfg.get('bg', '#fffdf8'); border = cfg.get('border', '#d7dfdc')
         font_color = cfg.get('font_color', '#1f2430')
-        key=(ox,oy,pet_cx,pet_top,repr(self.model),self._layout_key,
-             bg,border,font_color)
-        if key==self._draw_key: return
-        self._draw_key=key
-        c=self.canvas
+        key = (ox, oy, pet_cx, pet_top, repr(self.model), self._layout_key,
+               bg, border, font_color)
+        if key == self._draw_key: return
+        self._draw_key = key
+        c = self.canvas
         for item in self._items: c.delete(item)
-        self._items=[]; self.btn_boxes.clear()
+        self._items = []; self.btn_boxes.clear(); self._hit_boxes = []
         if not self.model.visible: return
-        font=self.font(); pad=m['pad']; x1=ox+self.w; y1=oy+self.h
+        font = self.font(); pad = m['pad']; x1 = ox+self.w; y1 = oy+self.h
         def add(item): self._items.append(item)
-        tail=min(m['radius'],self.w//8)
-        add(c.create_polygon(pet_cx-tail,y1-1,pet_cx,pet_top,pet_cx+tail,y1-1,
-                             fill=bg,outline=border))
-        add(c.create_polygon(round_rect_points(ox,oy,x1,y1,m['radius']),smooth=True,
-                             fill=bg,outline=border,width=1))
-        title=fit_text(self.model.status or 'DeskPet',self.w-2*pad,font.measure)
-        add(c.create_text(ox+pad,oy+pad,text=title,anchor='nw',font=font,fill=self.model.accent))
-        ty=oy+pad+font.metrics('linespace')+m['gap']
+        tail = min(m['radius'], self.w//8)
+        add(c.create_polygon(pet_cx-tail, y1-1, pet_cx, pet_top, pet_cx+tail, y1-1,
+                             fill=bg, outline=border))
+        add(c.create_polygon(round_rect_points(ox, oy, x1, y1, m['radius']), smooth=True,
+                             fill=bg, outline=border, width=1))
+        title = fit_text(self.model.status or 'DeskPet', self.w-2*pad, font.measure)
+        add(c.create_text(ox+pad, oy+pad, text=title, anchor='nw', font=font, fill=self.model.accent))
+        ty = oy+pad+font.metrics('linespace')+m['gap']
         for line in self.disp_lines:
-            add(c.create_text(ox+pad,ty,text=line,anchor='nw',font=font,fill=font_color))
-            ty+=font.metrics('linespace')
-        by=y1-pad-m['button']
-        self.btn_boxes['details']=(ox+pad,by,x1-pad,y1-pad)
-        add(c.create_text(ox+pad,by+m['button']/2,anchor='w',font=font,
-                          text=fit_text(self.model.footer,self.w-2*pad,font.measure),fill='#6a7c75'))
+            add(c.create_text(ox+pad, ty, text=line, anchor='nw', font=font, fill=font_color))
+            ty += font.metrics('linespace')
+        by = y1-pad-m['button']
+        # 底行整体是激活区：携带 exact key（由 model.agent_key 提供）
+        key_for_hit = getattr(self.model, 'agent_key', '')
+        if key_for_hit:
+            self.btn_boxes['activate'] = (ox+pad, by, x1-pad, y1-pad)
+            self._hit_boxes.append((
+                (ox+pad, by, x1-pad, y1-pad),
+                HitTarget(action="activate_agent", agent_key=key_for_hit)))
+        add(c.create_text(ox+pad, by+m['button']/2, anchor='w', font=font,
+                          text=fit_text(self.model.footer, self.w-2*pad, font.measure), fill='#6a7c75'))
 
-    def hit_button(self,x,y):
-        return next((tag for tag,(x0,y0,x1,y1) in self.btn_boxes.items() if x0<=x<=x1 and y0<=y<=y1),None)
+    def hit_button(self, x, y):
+        """（兼容 PetWindow.bind_hit 的字符串接口）返回 tag 或 agent_key。"""
+        target = self.hit(x, y)
+        if target.action == 'activate_agent':
+            return ('activate', target.agent_key)
+        return None
 
     def clear_items(self):
-        self._items=[]; self.btn_boxes.clear(); self._draw_key=None
+        self._items = []
+        self.btn_boxes.clear()
+        self._hit_boxes = []
+        self._draw_key = None
+
+
+# V3 兼容别名（Phase G 前逐步迁移调用方）
+BubbleRenderer = SingleAgentBubbleRenderer

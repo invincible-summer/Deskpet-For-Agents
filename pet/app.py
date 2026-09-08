@@ -1,31 +1,33 @@
-"""PetApp：V3 被动观察状态机 + 气泡调度 + 右键菜单 + 托盘/隐藏/自启。
+"""PetApp：V4.1 应用控制器 + 气泡调度 + 右键菜单 + 托盘/隐藏/自启。
 
-V3（plan.md §37/§41/§42）：
-  * 无受控会话、无审批按钮、无连接模式。
-  * 气泡格式：`Codex · Plan · 编码中` + Goal + 当前活动；
-    Waiting 时提示"请在终端处理"。
-  * 双击桌宠 = 打开当前 Agent 所在终端（公共 Win32 唤起）。
+V4.1（v4plan §15）：root 是隐藏的 controller Tk root，不是宠物。
+宠物 = PetViewManager 管理的 N 个 Toplevel PetView（Fleet）或 1 个
+（single/aggregate）。所有 Pet 共享：
+  * 一份 SharedAnimationCache（进程级 48 MB 预算）
+  * 一个 AnimationScheduler（一个 root.after）
+  * 一个 SkinBuildManager（同 skin+height+fps 只 build 一次）
+  * 一个 Monitor / TerminalService / PresentationController
+
+UI 激活 Terminal 只允许 Monitor.activate_target(exact agent_key)。
+Aggregate 模式下桌宠 body 单击/双击只做互动，绝不激活 Terminal。
 """
+import glob
 import os
 import queue
 import random
+import shutil
+import tempfile
 import time
 import tkinter as tk
 
-from actions import winkeys
-from agents.models import BindingConfidence, Phase, Status
-from agents.summarize import shorten
+from agents.models import ActivationCode, Status
 
 from . import autostart, skins
-from .animator import Animator
-from .bubble import BubbleModel, BubbleRenderer
 from .dashboard import Dashboard
-from .labels import PHASE_LABELS, STATUS_LABELS, mode_text, phase_text, status_text
-from .petwindow import MAGIC, PetWindow
+from .labels import status_text
+from .petview import PetView, PetViewManager
+from .presentation import PresentationController, PresentationMode, PresentationState
 
-
-MARGIN = 8
-GAP = 4        # 气泡与宠物间距（尾巴）
 INTERACT_LINES = [
     "摸摸头～今天也要加油哦",
     "收到！马上冲！",
@@ -39,254 +41,127 @@ class PetApp:
     def __init__(self, config):
         self.config = config
         self.root = tk.Tk()
-        self.root.configure(bg=MAGIC)
-        self.win = PetWindow(self.root, config)
-        self.animator = Animator(self.root)
-        self.bubble = BubbleRenderer(self.win.canvas, config)
-        self.win.bind_hit(self.bubble.hit_button)
+        self.root.withdraw()   # controller root：不是宠物窗口（v4plan §8.1）
+        self.root.configure(bg="#101011")
+
         from agents.monitor import Monitor
         self.monitor = Monitor(config)
-        self.animator.cache_bytes = int(config.get("animation_cache_mb", 48)) * 1024 * 1024
-        self._pet_item = None
-        self._pet_image = None
-        self._display_key = None
-        self._skin_after = None
-        self._poll_build_after = None
+        self.presentation = PresentationController(config)
+        self.pet_manager = PetViewManager(self.root, config,
+                                          self.presentation)
+        self.pet_manager.set_hooks(
+            on_activate=self.activate_agent,
+            on_menu=self._build_menu,
+            on_interact=self._on_interact,
+            on_moved=self._on_pet_moved,
+            on_double_vacant=self._on_vacant_double_click,
+        )
+        # 隐式 pet-1 立即创建（single/aggregate 模式也用它）
+        self.pet_manager.ensure_view("pet-1")
+
         self._poll_monitor_after = None
+        self._poll_build_after = None
         self._ui_after = None
         self._janitor_after = None
+        self._skin_after = None
         self.dashboard: Dashboard | None = None
         self.tray = None
         self._active_menu = None
+        self._presentation_state: PresentationState | None = None
 
-        self.state = "sleep"
         self._toast: tuple[str, float] | None = None
-        self._special_until = 0.0
-        self._done_seen: dict[str, float] = {}
         self._closing = False
 
-        # 锚点 = 桌宠底部中心（屏幕坐标）
-        pos = self.config.get("pet_pos")
-        self.anchor: tuple[int, int] | None = tuple(pos) if pos and len(pos) == 2 else None
-        self._win_size: tuple[int, int] | None = None
-        self._build_q: "queue.Queue" | None = None
-        self._build_target = None
-
-        self.animator.bind_tick(self._redraw)
-        self.win.on_menu = self._build_menu
-        self.win.on_click_button = self._on_bubble_button
-        self.win.on_interact = self._on_double_click
-        self.win.on_moved = self._on_moved
-
-        if self.anchor is None:
-            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-            self.anchor = (sw - 300, sh - 240)
-
-        self._apply_skin()
         if getattr(config, "migration_notice", False):
-            self.toast("DeskPet V3 已切换为自动被动监听，不再创建或控制 Agent", 8)
+            self.toast("DeskPet V4.1：被动监听 · exact 终端定位 · 并发需手动开启", 8)
         if bool(self.config.get("tray_enabled", True)):
             self.start_tray()
 
-    # ================= 皮肤 =================
-    def _gif_height(self) -> int:
-        scale = float(self.config.get("scale", 1.0))
-        dpi = self.root.winfo_fpixels("1i") / 96
-        return max(96, min(960, int(round(240 * scale * dpi))))
+    # ================= 交互入口 =================
+    def interact(self):
+        self.toast(random.choice(INTERACT_LINES), 4)
 
-    def _apply_skin(self):
-        """加载皮肤；目标尺寸缓存缺失时先用现成尺寸顶上，同时后台重建。"""
-        skin = self.config.get("skin", "amiya")
-        height = self._gif_height()
-        fps = int(self.config.get("convert.fps", 12))
-        paths = skins.built_gifs(skin, height)
-        if paths:
-            self._skin_ready(paths)
-            return
-        # 就近显示，避免桌宠“消失”
-        alt = skins.built_gifs_any(skin)
-        if alt:
-            self._skin_ready(alt)
-            self.toast(f"正在生成 {height}px 尺寸（旧尺寸暂时顶替）…", 60)
+    def _on_interact(self):
+        self.interact()
+
+    def activate_agent(self, key: str):
+        """唯一激活入口：UI 只携带 exact agent_key（v4plan §5.9）。"""
+        result = self.monitor.activate_target(key)
+        if result.code == ActivationCode.OK:
+            self.toast("已定位到该 Agent 的终端" +
+                       ("（已自动重新识别）" if result.repaired else ""), 2)
+        elif result.code == ActivationCode.FOREGROUND_DENIED:
+            self.toast("终端已选中，Windows 未允许抢前台（已闪烁任务栏提醒）", 4)
+        elif result.code == ActivationCode.AGENT_GONE:
+            self.toast("该 Agent 已退出", 4)
+        elif result.code == ActivationCode.NO_BINDING:
+            self.toast("未能定位该 Agent 的终端窗口", 4)
+        elif result.code == ActivationCode.AMBIGUOUS:
+            self.toast('终端位置不唯一：请在仪表盘"关联当前 Terminal 位置"', 5)
+        elif result.code in (ActivationCode.STALE_WINDOW,
+                             ActivationCode.STALE_TAB,
+                             ActivationCode.STALE_PANE):
+            self.toast(f"终端位置已变化（{result.code.value}），重新识别失败", 4)
         else:
-            self.toast(f"正在构建皮肤 {skin}（首次需数十秒）…", 60)
-        if self._build_q is not None:
-            return  # one converter at a time; stale completion starts latest requested size
-        self._build_target = (skin, height)
-        self._build_q = skins.start_build(skin, height, fps, log=None)
+            self.toast("终端交互（UIA）不可用", 4)
 
-    def _poll_build(self):
-        self._poll_build_after = None
-        if self._closing:
+    def _focus_and_activate(self, key: str):
+        self.presentation.set_focus(key)
+        self.activate_agent(key)
+
+    def _on_vacant_double_click(self, view: PetView):
+        """空 slot 双击 → Agent picker（fleet 绑定入口，v4plan §8.2）。"""
+        self._open_agent_picker(view.view_id)
+
+    def _open_agent_picker(self, slot_id: str):
+        targets = self.monitor.get_targets()
+        if not targets:
+            self.toast("当前没有发现任何 Agent", 4)
             return
-        if self._build_q is not None:
-            try:
-                kind, payload = self._build_q.get_nowait()
-            except queue.Empty:
-                pass
+        picker = tk.Toplevel(self.root)
+        picker.title("选择要绑定的 Agent")
+        picker.geometry("420x300")
+        tk.Label(picker, text=f"绑定到 {slot_id}（只影响本次运行期）",
+                 font=("Microsoft YaHei UI", 10)).pack(anchor="w", padx=12,
+                                                       pady=(10, 4))
+        listbox = tk.Listbox(picker, font=("Microsoft YaHei UI", 10))
+        listbox.pack(fill="both", expand=True, padx=12, pady=6)
+        items = []
+        for key, t in sorted(targets.items()):
+            s = t.snapshot
+            items.append((key, f"{s.kind.label} · "
+                          f"{t.instance.project or t.instance.source} · "
+                          f"{status_text(s)}"))
+            listbox.insert("end", items[-1][1])
+        taken = {v.agent_key for v in self.pet_manager.views.values()}
+
+        def _bind(_evt=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            key = items[sel[0]][0]
+            if key in taken:
+                self.toast("该 Agent 已由其他桌宠展示", 4)
+                return
+            if self.presentation.bind_slot(slot_id, key):
+                self.toast("已绑定（本次运行期有效）", 3)
+                picker.destroy()
             else:
-                self._build_q = None
-                if self._build_target != (self.config.get("skin", "amiya"), self._gif_height()):
-                    self._apply_skin()
-                elif kind == "ok":
-                    self._skin_ready(payload)
-                    self.toast("皮肤就绪！", 2)
-                else:
-                    self.toast(f"皮肤构建失败：{payload}", 10)
-        self._poll_build_after = self.root.after(300, self._poll_build)
+                self.toast("绑定失败：该 Agent 已被占用", 4)
 
-    def _skin_ready(self, paths: dict[str, str]):
-        """热替换皮肤：先切换到新动画，再清理旧缓存（桌宠不消失）。"""
-        self.animator.load_pool(paths)
-        self.animator.set_speed(float(self.config.get("speed", 1.0)))
-        state = self.state if self.state in paths else "sleep"
-        self.state = state
-        # force：即使同名也要切到新尺寸的动画对象
-        self.animator.play(state, force=True)
-        self.animator.set_static(not bool(self.config.get("animated", True)))
-        self.animator.prune()
-
-    def set_scale(self, scale: float):
-        self.config.set("scale", round(max(.5, min(2., scale)), 2))
-        self.config.save()
-        self.apply_bubble_settings()
-        if self._skin_after:
-            self.root.after_cancel(self._skin_after)
-        self._skin_after = self.root.after(300, self._commit_scale)
-
-    def _commit_scale(self):
-        self._skin_after = None
-        self._apply_skin()
-
-    def _switch_skin(self, name: str):
-        self.config.set("skin", name)
-        self.config.save()
-        self._apply_skin()
-
-    # ================= 几何/绘制 =================
-    def _ensure_window(self, w: int, h: int):
-        if self._win_size == (w, h):
-            return
-        self._win_size = (w, h)
-        self.win.apply_geometry(w, h, self.anchor[0] - w // 2, self.anchor[1] - h)
-
-    def _on_moved(self):
-        """拖动结束：由当前窗口位置更新锚点并持久化。"""
-        w, h = self._win_size or (self.win.canvas.winfo_width(),
-                                  self.win.canvas.winfo_height())
-        self.anchor = self.win.anchor_from_window(w, h)
-        self.config.set("pet_pos", [self.anchor[0], self.anchor[1]])
-        self.config.save()
-
-    def _redraw(self):
-        if not self.win.visible or self.win.dragging:
-            return  # 拖动中冻结重绘：避免气泡高度变化把窗口从鼠标下拽走
-        c = self.win.canvas
-
-        pw, ph = self.animator.frame_size()
-
-        # 1) 布局气泡（先算，再改窗口，再绘制）；宠物没就绪时也显示气泡提示
-        model = self._bubble_model()
-        self.bubble.model = model
-        bw, bh = self.bubble.layout()
-        if pw <= 0:                       # 皮肤未就绪：仅显示气泡
-            win_w = bw + MARGIN * 2
-            win_h = bh + MARGIN * 2
-            self._ensure_window(win_w, win_h)
-            self.bubble.draw((win_w - bw) // 2, MARGIN, win_w // 2, win_h - 2)
-            return
-
-        win_w = max(pw, bw if model.visible else 0) + MARGIN * 2
-        gap = max(2, round(GAP * float(self.config.get("scale", 1)) * self.root.winfo_fpixels("1i") / 96))
-        win_h = (bh + gap if model.visible else 0) + ph + MARGIN
-        self._ensure_window(win_w, win_h)
-
-        cw = win_w
-        # 2) 宠物（底部居中）与气泡（顶部居中）
-        img = self.animator.frame_image()
-        if img is not None:
-            if self._pet_item is None:
-                self._pet_item = c.create_image((cw-pw)//2, win_h-ph, image=img, anchor="nw")
-            else:
-                c.coords(self._pet_item, (cw-pw)//2, win_h-ph)
-                if self._pet_image is not img:
-                    c.itemconfigure(self._pet_item, image=img)
-            self._pet_image = img
-        self.bubble.draw((cw-bw)//2, 0, cw//2, win_h-ph-2)
-
-    def _bubble_model(self) -> BubbleModel:
-        m = BubbleModel()
-        target = self.monitor.primary_target()
-        snap = target.snapshot if target else None
-        self._display_key = target.key if target else None
-        if not bool(self.config.get("bubble.enabled", True)):
-            return m
-        if self._toast and time.time() < self._toast[1]:
-            m.visible, m.status, m.text = True, "DeskPet", shorten(self._toast[0], 160)
-            return m
-        self._toast = None
-        if snap is None:
-            return m
-        m.visible = True
-
-        # 标题行：`Codex · Plan · 编码中`（plan §41）
-        head = snap.kind.label
-        mode = mode_text(snap)
-        phase = phase_text(snap)
-        if snap.status == Status.WORKING:
-            label = " · ".join(x for x in (head, mode, phase or "处理中") if x)
-        else:
-            label = " · ".join(x for x in (head, status_text(snap)) if x)
-        m.status = label
-
-        if snap.status == Status.WAITING:
-            m.text = snap.waiting_detail or snap.summary or "等待审批"
-            m.footer = "请在终端处理"
-            m.accent = "#a06b38"
-            return m
-        if snap.status == Status.INPUT:
-            m.text = snap.waiting_detail or snap.summary or "等待你的回复"
-            m.footer = "请在终端回复"
-            m.accent = "#a06b38"
-            return m
-
-        m.text = shorten(snap.summary or "等待新的任务", 160)
-        if snap.goal:
-            m.footer = "目标 · " + shorten(snap.goal, 60)
-        else:
-            m.footer = self._source_footer(target)
-        if snap.status == Status.DONE:
-            m.accent = "#487f73"
-        elif snap.status == Status.ERROR:
-            m.accent = "#a06060"
-        return m
-
-    def _source_footer(self, target) -> str:
-        """气泡 footer：环境而不是 pid（plan §42）。"""
-        inst = target.instance
-        if inst.distro:
-            text = f"DeskPet · WSL {inst.distro}"
-        else:
-            binding = target.terminal
-            title = (binding.title if binding and binding.title else "").strip()
-            if title:
-                text = shorten(title, 40)
-            else:
-                text = "Windows"
-        if target.snapshot.stale:
-            text += " · 状态可能延迟"
-        return text
+        tk.Button(picker, text="绑定", command=_bind).pack(pady=(0, 10))
+        listbox.bind("<Double-Button-1>", _bind)
 
     def toast(self, text: str, sec: float = 3.0):
         self._toast = (text, time.time() + sec)
 
-    def apply_bubble_settings(self):
-        """气泡/字体设置变化后：失效缓存并按锚点重建窗口。"""
-        self.bubble.invalidate()
-        self._win_size = None
-        self._redraw()
+    def _toast_text(self) -> str:
+        if self._toast and time.time() < self._toast[1]:
+            return self._toast[0]
+        self._toast = None
+        return ""
 
-    # ================= 状态机 =================
+    # ================= 主循环 =================
     def _poll_monitor(self):
         self._poll_monitor_after = None
         if self._closing:
@@ -302,101 +177,142 @@ class PetApp:
         self._poll_monitor_after = self.root.after(400, self._poll_monitor)
 
     def _aggregate(self):
+        """每 UI tick：reconcile 呈现事实 + 同步 views + 推进动画（v4plan §6）。"""
         now = time.time()
-        _targets = self.monitor.get_targets()
+        targets = self.monitor.get_targets()
+        state = self.presentation.reconcile(targets, now)
+        self._presentation_state = state
+        self.pet_manager.sync(state, targets, now)
+        force_state = str(self.config.get("force_state") or "")
+        self.pet_manager.apply_animation(state, targets, now, force_state)
+        self._apply_toasts()
+        self.pet_manager.redraw_all()
 
-        # 锁定动画：固定展示五状态之一（仪表盘/菜单可设）
-        locked = str(self.config.get("force_state") or "")
-        if locked in ("walk", "attack", "die", "special", "sleep"):
-            if locked != self.state or self.animator.current is None:
-                self.state = locked
-                self.animator.play(locked, repeat=3 if locked == "special" else 0,
-                                   force=True)
+    def _apply_toasts(self):
+        text = self._toast_text()
+        if not text:
             return
+        for view in self.pet_manager.views.values():
+            view.bubble.model.visible = True
+            view.bubble.model.status = "DeskPet"
+            view.bubble.model.text = text
+            view.bubble.model.footer = ""
+            view.bubble.model.agent_key = ""
+            view.bubble.model.accent = "#487f73"
 
-        bound = [t for t in _targets.values() if self.monitor.is_bound(t.key)]
-
-        if now < self._special_until:
+    def _poll_build(self):
+        self._poll_build_after = None
+        if self._closing:
             return
+        try:
+            self.pet_manager.poll_skin_builds()
+        except Exception:
+            pass
+        self._poll_build_after = self.root.after(300, self._poll_build)
 
-        waiting = [t for t in bound if t.snapshot.status == Status.WAITING]
-        done_now = [t for t in bound if t.snapshot.status == Status.DONE]
-        working = [t for t in bound if t.snapshot.status == Status.WORKING]
+    def _ui_tick(self):
+        """UI 心跳：皮肤未就绪/静态模式下也要能刷新气泡与提示。"""
+        self._ui_after = None
+        if self._closing:
+            return
+        try:
+            self.pet_manager.redraw_all()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        self._ui_after = self.root.after(250, self._ui_tick)
 
-        new_target = None
-        for t in done_now:
-            snap = t.snapshot
-            if now - self._done_seen.get(t.key, 0) > 12 and now - snap.ts < 10:
-                self._done_seen[t.key] = now
-                new_target = "special"
-                break
-        if new_target is None:
-            if waiting:
-                new_target = "die"
-            elif working:
-                new_target = "walk"
-            else:
-                new_target = "sleep"
-
-        if new_target == "special":
-            self._special_until = now + 12
-            self._set_state("special", repeat=3)
-        elif new_target != self.state or self.animator.current is None:
-            # 状态切换，或单次动画（die/attack）播完后重播以维持状态指示
-            self._set_state(new_target, force=self.animator.current is None)
-
-    def _set_state(self, state: str, repeat: int = 0, force: bool = False):
-        self.state = state
-        self.animator.play(state, repeat=repeat, force=force)
-
-    # ================= 交互 =================
-    def interact(self):
-        self.toast(random.choice(INTERACT_LINES), 4)
-
-    def _on_double_click(self):
-        """双击桌宠 = 打开当前 Agent 所在终端（plan §37）。"""
-        if not self._raise_current_terminal():
-            self.interact()
-
-    def _raise_current_terminal(self) -> bool:
-        target = self.monitor.primary_target()
-        if target is None:
-            return False
-        binding = target.terminal
-        if binding is None or not getattr(binding, "hwnd", 0):
-            self.toast("未能定位该 Agent 的终端窗口", 4)
-            return False
-        if not winkeys.validate_terminal_window(binding):
-            # HWND 已失效/被复用：触发一次终端重发现，不盲目唤起
-            self.monitor.rediscover_terminal()
-            self.toast("终端窗口已变化，正在重新识别", 4)
-            return False
-        ok = winkeys.raise_terminal(binding)
-        if ok:
-            self.toast("已唤起终端", 2)
+    # ================= 几何/外观 =================
+    def _on_pet_moved(self, view: PetView):
+        """拖动结束：一次 placement 换算 + 一次 commit（不每 move 写盘）。"""
+        view.anchor = view.anchor_from_window()
+        state = self._presentation_state
+        if state is not None and state.mode is PresentationMode.FLEET:
+            placement = view.window.placement_from_anchor(*view.anchor)
+            slots = list(self.config.get(
+                "presentation.concurrent.slots", []) or [])
+            for slot in slots:
+                if isinstance(slot, dict) and slot.get("id") == view.view_id:
+                    slot["placement"] = placement
+                    break
+            self.config.save()
         else:
-            self.toast("Windows 未允许切换焦点，已提醒任务栏", 4)
-        return ok
+            self.config.set("pet_pos", [view.anchor[0], view.anchor[1]])
+            self.config.save()
+        view.invalidate_dpi()
 
-    def _on_bubble_button(self, tag: str):
-        if tag == "details":
-            self._raise_current_terminal()
-            return
+    def set_scale(self, scale: float):
+        self.config.set("scale", round(max(.5, min(2., scale)), 2))
+        self.config.save()
+        for view in self.pet_manager.views.values():
+            view.bubble.invalidate()
+            view._win_size = None
+        if self._skin_after:
+            self.root.after_cancel(self._skin_after)
+        self._skin_after = self.root.after(300, self._reload_skins)
+
+    def _reload_skins(self):
+        self._skin_after = None
+        for view in self.pet_manager.views.values():
+            view.load_skin(self.pet_manager.build_manager)
+
+    def _switch_skin(self, name: str):
+        self.config.set("skin", name)
+        self.config.save()
+        self._reload_skins()
+
+    def _set_animated(self, flag: bool):
+        self.config.set("animated", bool(flag))
+        self.config.save()
+        for view in self.pet_manager.views.values():
+            view.set_animated(flag)
+
+    def _set_speed(self, v: float):
+        self.config.set("speed", v)
+        self.config.save()
+        for view in self.pet_manager.views.values():
+            view.set_speed(v)
+
+    def _toggle_bubble(self, flag: bool):
+        self.config.set("bubble.enabled", bool(flag))
+        self.config.save()
+
+    def _set_force_state(self, v: str):
+        self.config.set("force_state", v)
+        self.config.save()
+        self.toast("锁定动画：" + (v if v else "自动"), 3)
+
+    def _toggle_terminal_observer(self, flag: bool):
+        self.config.set("monitor.terminal_observer", bool(flag))
+        self.config.save()
+        if flag:
+            self.toast("终端观察将在重启 DeskPet 后启用", 5)
+        else:
+            self.toast("终端观察将在重启 DeskPet 后停用", 5)
+
+    def _rebuild_skin(self):
+        from .config import CACHE_DIR
+        d = skins.cache_dir(self.config.get("skin", "amiya"), 240)
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+        self._reload_skins()
 
     # ================= 显示/隐藏/托盘/自启 =================
     def hide_pet(self):
-        self.animator.set_paused(True)
-        self.win.hide()
+        self.pet_manager.hide_all()
         self.start_tray()   # 隐藏后必须留托盘入口恢复
         self.toast("桌宠已隐藏，点击托盘图标恢复", 4)
+        self._apply_toasts()
 
     def show_pet(self):
-        self.win.show()
-        self.animator.set_paused(False)
-        self._redraw()
+        self.pet_manager.show_all()
+
+    @property
+    def pet_visible(self) -> bool:
+        return self.pet_manager.any_visible()
 
     def toggle_visible(self):
-        if self.win.visible:
+        if self.pet_visible:
             self.hide_pet()
         else:
             self.show_pet()
@@ -421,8 +337,8 @@ class PetApp:
         self.config.save()
 
     def toggle_autostart(self) -> bool:
-        new = not autostart.is_enabled()
-        return autostart.set_enabled(new)
+        result = autostart.toggle()
+        return result.enabled
 
     def _poll_tray_events(self):
         if not self.tray:
@@ -443,18 +359,17 @@ class PetApp:
         menu = tk.Menu(self.root, tearoff=0)
         self._active_menu = menu
         menu.add_command(
-            label="显示桌宠" if not self.win.visible else "隐藏桌宠",
+            label="显示桌宠" if not self.pet_visible else "隐藏桌宠",
             command=self.toggle_visible)
-        menu.add_command(label="打开仪表盘", command=self.open_dashboard)
+        self._agents_submenu(menu)
+        menu.add_command(label="仪表盘", command=self.open_dashboard)
+        menu.add_command(label="重新扫描", command=self.monitor.rescan)
         menu.add_separator()
         menu.add_command(label="退出", command=self.quit)
         try:
             import ctypes
             pt = ctypes.wintypes.POINT()
             ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-            # ``tk_popup`` enters a nested menu loop.  Posting the menu keeps
-            # tray events and shutdown callbacks responsive, while ``quit``
-            # below unposts and destroys the active menu when the app exits.
             menu.post(pt.x, pt.y)
         except (OSError, tk.TclError):
             try:
@@ -463,29 +378,82 @@ class PetApp:
                 pass
             self._active_menu = None
 
-    # ================= 右键菜单 =================
+    def _agents_submenu(self, menu):
+        """Agents 子菜单：每项捕获 exact key（v4plan §14）。"""
+        targets = self.monitor.get_targets()
+        m = tk.Menu(menu, tearoff=0)
+        if not targets:
+            m.add_command(label="（当前没有发现 Agent）", state="disabled")
+        for key, t in sorted(targets.items()):
+            s = t.snapshot
+            m.add_command(
+                label=f"{s.kind.label} · "
+                      f"{t.instance.project or t.instance.source} · "
+                      f"{status_text(s)}",
+                command=lambda k=key: self._focus_and_activate(k))
+        menu.add_cascade(label="Agents", menu=m)
+
+    # ================= 右键菜单（每只桌宠） =================
     def _build_menu(self, menu: tk.Menu):
-        menu.add_command(label="⬆ 打开 Agent 终端（置顶）", command=self._on_double_click)
+        state = self._presentation_state
+        mode = state.mode if state is not None else PresentationMode.SINGLE
+        view = getattr(self, "_menu_view", None)
+        if mode is PresentationMode.FLEET and view is not None:
+            self._fleet_menu(menu, view)
+            return
         menu.add_command(label="🤚 摸摸头（互动）", command=self.interact)
+        self._agents_submenu(menu)
         menu.add_command(label="📊 打开仪表盘", command=self.open_dashboard)
         menu.add_command(
             label="🙈 暂时隐藏桌宠（托盘可恢复）", command=self.hide_pet)
         menu.add_separator()
+        self._appearance_menu(menu)
+        self._system_menu(menu)
+        menu.add_separator()
+        menu.add_command(label="🔄 重建当前皮肤缓存", command=self._rebuild_skin)
+        menu.add_command(label="❌ 退出", command=self.quit)
 
-        targets = self.monitor.get_targets()
-        m_targets = tk.Menu(menu, tearoff=0)
-        m_targets.add_radiobutton(
-            label="自动跟随（按状态优先级）", value="",
-            command=lambda: self.monitor.set_primary("", manual=False))
-        for key, t in sorted(targets.items()):
-            s = t.snapshot
-            label = f"{s.kind.label} · {t.instance.project or t.instance.source} · {status_text(s)}"
-            m_targets.add_radiobutton(
-                label=("★ " if self.monitor.is_bound(key) else "") + label,
-                value=key,
-                command=lambda k=key: self.monitor.set_primary(k, manual=True))
-        menu.add_cascade(label="🎧 监听目标", menu=m_targets)
+    def _fleet_menu(self, menu: tk.Menu, view: PetView):
+        """Fleet 每只 Pet 的菜单（v4plan §14）。"""
+        target = self.monitor.get_target(view.agent_key) if view.agent_key else None
+        if target is not None:
+            s = target.snapshot
+            menu.add_command(
+                label=f"{s.kind.label} · {target.instance.project or ''}")
+            menu.add_command(
+                label="打开此 Agent 终端",
+                command=lambda k=view.agent_key: self.activate_agent(k))
+            menu.add_command(label="更换 Agent",
+                             command=lambda v=view: self._open_agent_picker(
+                                 v.view_id))
+            menu.add_command(label="解除绑定",
+                             command=lambda v=view: self._unbind_view(v))
+        else:
+            menu.add_command(label="（未绑定 Agent）", state="disabled")
+            menu.add_command(label="绑定 Agent",
+                             command=lambda v=view: self._open_agent_picker(
+                                 v.view_id))
+        menu.add_separator()
+        menu.add_command(label="隐藏此桌宠", command=lambda v=view: v.hide())
+        menu.add_command(label="仪表盘", command=self.open_dashboard)
+        menu.add_separator()
+        self._appearance_menu(menu)
+        self._system_menu(menu)
+        menu.add_separator()
+        menu.add_command(label="❌ 退出", command=self.quit)
 
+    def _unbind_view(self, view: PetView):
+        """解除绑定：slot 释放 + 该 Agent 移出并发展示（否则下一轮自动
+        分配会立刻补位，桌宠不会消失）。加入并发入口可再纳入。"""
+        key = view.agent_key
+        self.presentation.unbind_slot(view.view_id)
+        if key:
+            self.presentation.set_instance_included(key, False)
+        view.set_agent("")
+        self._aggregate()
+        self.toast("已解除绑定并移出并发展示", 3)
+
+    def _appearance_menu(self, menu: tk.Menu):
         m_look = tk.Menu(menu, tearoff=0)
         bubble_on = tk.BooleanVar(value=bool(self.config.get("bubble.enabled", True)))
         m_look.add_checkbutton(label="显示气泡（取消=只留桌宠）", variable=bubble_on,
@@ -514,7 +482,7 @@ class PetApp:
         m_look.add_cascade(label="大小", menu=m_scale)
         topmost = tk.BooleanVar(value=bool(self.config.get("topmost", True)))
         m_look.add_checkbutton(label="窗口置顶", variable=topmost,
-                               command=lambda: self.win.set_topmost(topmost.get()))
+                               command=lambda: self._set_topmost(topmost.get()))
         m_skins = tk.Menu(m_look, tearoff=0)
         for name, mf in skins.list_skins().items():
             label = mf.get("title") or name
@@ -523,10 +491,20 @@ class PetApp:
         m_look.add_cascade(label="皮肤", menu=m_skins)
         menu.add_cascade(label="🎨 外观", menu=m_look)
 
+    def _set_topmost(self, flag: bool):
+        self.config.set("topmost", bool(flag))
+        self.config.save()
+        for view in self.pet_manager.views.values():
+            view.window.set_topmost(flag)
+
+    def _system_menu(self, menu: tk.Menu):
         m_sys = tk.Menu(menu, tearoff=0)
-        autostart_on = tk.BooleanVar(value=autostart.is_enabled())
-        m_sys.add_checkbutton(label="开机自启动", variable=autostart_on,
-                              command=lambda: self._toggle_autostart())
+        from .autostart import status as autostart_status
+        st = autostart_status()
+        label = {"healthy": "开机自启动 ✔", "missing": "开机自启动",
+                 "stale": "开机自启动（需要修复）"}.get(st.state, "开机自启动")
+        m_sys.add_checkbutton(label=label,
+                              command=self._toggle_autostart)
         tray_on = tk.BooleanVar(value=bool(self.config.get("tray_enabled", True)))
         m_sys.add_checkbutton(label="托盘图标", variable=tray_on,
                               command=lambda: self._toggle_tray(tray_on.get()))
@@ -534,38 +512,6 @@ class PetApp:
         m_sys.add_checkbutton(label="终端交互观察（UIA）", variable=terminal_on,
                               command=lambda: self._toggle_terminal_observer(terminal_on.get()))
         menu.add_cascade(label="⚙ 设置", menu=m_sys)
-
-        menu.add_separator()
-        menu.add_command(label="🔄 重建当前皮肤缓存", command=self._rebuild_skin)
-        menu.add_command(label="❌ 退出", command=self.quit)
-
-    def _set_animated(self, flag: bool):
-        self.config.set("animated", bool(flag))
-        self.config.save()
-        self.animator.set_static(not flag)
-
-    def _set_speed(self, v: float):
-        self.config.set("speed", v)
-        self.config.save()
-        self.animator.set_speed(v)
-
-    def _toggle_bubble(self, flag: bool):
-        self.config.set("bubble.enabled", bool(flag))
-        self.config.save()
-        self.apply_bubble_settings()
-
-    def _set_force_state(self, v: str):
-        self.config.set("force_state", v)
-        self.config.save()
-        self.toast("锁定动画：" + (v if v else "自动"), 3)
-
-    def _toggle_terminal_observer(self, flag: bool):
-        self.config.set("monitor.terminal_observer", bool(flag))
-        self.config.save()
-        if flag:
-            self.toast("终端观察将在重启 DeskPet 后启用", 5)
-        else:
-            self.toast("终端观察将在重启 DeskPet 后停用", 5)
 
     def _toggle_autostart(self):
         on = self.toggle_autostart()
@@ -576,14 +522,6 @@ class PetApp:
             self.start_tray()
         else:
             self.stop_tray()
-
-    def _rebuild_skin(self):
-        from .config import CACHE_DIR
-        d = skins.cache_dir(self.config.get("skin", "amiya"), self._gif_height())
-        if os.path.isdir(d):
-            import shutil
-            shutil.rmtree(d, ignore_errors=True)
-        self._apply_skin()
 
     # ================= 仪表盘 =================
     def open_dashboard(self):
@@ -603,13 +541,10 @@ class PetApp:
         self.root.mainloop()
 
     def _janitor(self):
-        """定时清理：日志/事件队列、转换临时目录、皮肤缓存。"""
+        """定时清理：日志/事件队列、转换临时目录、皮肤缓存、共享帧缓存。"""
         if self._closing:
             return
         try:
-            import glob
-            import shutil
-            import tempfile
             self.monitor.trim()
             now = time.time()
             tmp = tempfile.gettempdir()
@@ -641,29 +576,15 @@ class PetApp:
             pass
         self._janitor_after = self.root.after(600_000, self._janitor)
 
-    def _ui_tick(self):
-        """UI 心跳：皮肤未就绪/静态模式下动画循环不走，气泡与提示也要能刷新。"""
-        self._ui_after = None
-        if self._closing:
-            return
-        try:
-            self._redraw()
-        except Exception:
-            import traceback
-            traceback.print_exc()
-        self._ui_after = self.root.after(250, self._ui_tick)
-
     def quit(self):
         self._closing = True
         try:
             self.monitor.stop()
-            self.animator.stop()
+            self.pet_manager.stop()
             if self.tray:
                 self.tray.stop()
             self.config.save()
         finally:
-            # Explicitly leave any nested Tk menu/event loop before tearing
-            # down widgets; this also makes tray-driven test exits reliable.
             if self._active_menu is not None:
                 try:
                     self._active_menu.unpost()
@@ -671,7 +592,8 @@ class PetApp:
                 except tk.TclError:
                     pass
                 self._active_menu = None
-            for attr in ("_poll_build_after", "_poll_monitor_after", "_ui_after", "_janitor_after", "_skin_after"):
+            for attr in ("_poll_build_after", "_poll_monitor_after",
+                         "_ui_after", "_janitor_after", "_skin_after"):
                 callback = getattr(self, attr, None)
                 if callback is not None:
                     try:

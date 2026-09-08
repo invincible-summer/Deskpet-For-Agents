@@ -483,6 +483,16 @@ class BaseWatcher:
         else:
             self._runtime_bindings.pop(key, None)
 
+    def drop_instance(self, key: str) -> None:
+        """实例退出的级联清理（v4plan §4.6）。
+
+        删除该 key 的文件映射与运行期 override；不再被任何 live 实例
+        使用的会话文件由下一轮 refresh_files / poll([]) 的全清理关闭
+        tailer（Monitor 保证每个 watcher 每轮都收到 poll 调用）。
+        """
+        self._instance_files.pop(key, None)
+        self._runtime_bindings.pop(key, None)
+
     def diagnostics_for(self, key: str) -> ParserDiagnostics:
         """该实例的会话解析器健康（UI 只看 Snapshot 上的投影，不碰 watcher）。"""
         path = self._instance_files.get(key, "")

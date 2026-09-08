@@ -26,19 +26,23 @@ import re
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclasses_replace
 from typing import Callable
 
 from .matching import best_effort_scores, mutual_unique_matches
 from .models import (
     AgentKind,
     BindingConfidence,
+    BindingOrigin,
     Confidence,
     EvidenceSource,
     Observation,
     Phase,
     Status,
+    TabInfo,
     TerminalBinding,
+    TerminalLocation,
+    WindowIdentity,
 )
 
 # ------------------------------------------------------------- 常量（代码级安全上限）
@@ -63,8 +67,12 @@ WEAK_TRIGGER_RE = re.compile(
 
 # UIA 事件/属性常量（头文件 #define，不在 typelib）
 UIA_TEXT_TEXTCHANGED_EVENT = 20015
+UIA_SELECTION_ITEM_SELECTED_EVENT = 20012   # UIA_SelectionItem_ElementSelectedEventId
 UIA_TEXT_PATTERN_ID = 10014
+UIA_SELECTION_ITEM_PATTERN_ID = 10010
 UIA_CLASSNAME_PROPERTY_ID = 30012
+UIA_CONTROL_TYPE_PROPERTY_ID = 30003
+UIA_TAB_ITEM_CONTROL_TYPE_ID = 50019
 TREE_SCOPE_ELEMENT = 1
 TREE_SCOPE_DESCENDANTS = 4
 WT_WINDOW_CLASS = "CASCADIA_HOSTING_WINDOW_CLASS"
@@ -72,21 +80,44 @@ WT_WINDOW_CLASS = "CASCADIA_HOSTING_WINDOW_CLASS"
 
 @dataclass
 class PaneInfo:
-    """一个 TermControl pane 的稳定身份（runtime id 只在生命周期内有效）。"""
+    """一个 TermControl pane 的稳定身份（runtime id 只在生命周期内有效）。
+
+    tab_id 关联该 pane 所属 Tab（仅 selected Tab 的 TermControl 会
+    attach 到 XAML root，可被遍历）。
+    """
     pane_id: tuple            # (hwnd, runtime_id tuple)
     hwnd: int
     window_pid: int
     title: str
     window_class: str = WT_WINDOW_CLASS
+    tab_id: tuple = ()        # 所属 Tab 的 (hwnd, runtime_id)（未知为 ()）
+    window_created: float = 0.0
 
     def as_key(self) -> tuple:
         return self.pane_id
 
 
 @dataclass
+class TerminalLayout:
+    """一轮 Windows Terminal topology 发现结果（v4plan §5.3）。
+
+    只有当前 selected Tab 的 TermControl 会出现在 XAML root 里
+    （Windows Terminal TabManagement.cpp：选中变化才 attach terminal
+    control），因此 panes 只覆盖 selected tabs——绝不后台切换 Tab 补全。
+    """
+    windows: dict[int, object]        # hwnd → WindowIdentity
+    tabs: dict[tuple, TabInfo]        # tab_id → TabInfo
+    panes: dict[tuple, PaneInfo]      # pane_id → PaneInfo（selected tabs）
+    selected_tabs: dict[int, tuple]   # hwnd → 当前 selected tab_id
+
+    def __bool__(self) -> bool:
+        return bool(self.windows)
+
+
+@dataclass
 class TerminalEvent:
     pane_id: tuple
-    kind: str        # notification / activity / structure
+    kind: str        # notification / activity / structure / tab-selected
     text: str = ""   # notification 的 delta（有界）
     ts: float = 0.0
 
@@ -123,10 +154,15 @@ class PaneSubscription:
 
 @dataclass
 class WindowSubscription:
-    """Windows Terminal 顶层窗口的 StructureChanged 订阅记录。"""
+    """Windows Terminal 顶层窗口的事件订阅记录。
+
+    StructureChanged（pane 开合）+ ElementSelected（用户自然切 Tab，
+    20012）都在窗口 root 上按 TREE_SCOPE_DESCENDANTS 订阅。
+    """
     root: object
     handler: object
     registered: bool = False
+    selected_registered: bool = False
 
 
 # ------------------------------------------------------------- Backend 协议
@@ -142,8 +178,21 @@ class TerminalBackend:
     def stop(self):
         pass
 
-    def discover_panes(self) -> list[PaneInfo]:
-        return []
+    def discover_layout(self) -> "TerminalLayout | None":
+        """topology 发现（必须实现；返回 None 表示本轮失败/不可用）。"""
+        return None
+
+    def selected_tab(self, hwnd: int) -> TabInfo | None:
+        return None
+
+    def focused_location(self) -> TerminalLocation | None:
+        return None
+
+    def select_tab(self, tab_id: tuple) -> bool:
+        return False
+
+    def focus_pane(self, pane_id: tuple) -> bool:
+        return False
 
     def read_visible(self, pane_id: tuple) -> str:
         return ""
@@ -252,8 +301,13 @@ class UiaBackend(TerminalBackend):
 
             def IUIAutomationEventHandler_HandleAutomationEvent(self, sender, eventId):
                 try:
-                    if int(eventId) == UIA_TEXT_TEXTCHANGED_EVENT:
+                    eid = int(eventId)
+                    if eid == UIA_TEXT_TEXTCHANGED_EVENT:
                         backend._emit(backend._pane_of(sender), "activity", "")
+                    elif eid == UIA_SELECTION_ITEM_SELECTED_EVENT:
+                        # 用户（或 Select()）切换了 Tab：只发 topology 脏
+                        # 信号，不读任何终端文本。
+                        backend._emit(None, "tab-selected", "")
                 except Exception:
                     backend.errors += 1
 
@@ -294,11 +348,7 @@ class UiaBackend(TerminalBackend):
                 self._remove_pane_subscription(sub)
                 self._pane_subscriptions.pop(pane_id, None)
             for hwnd, sub in list(self._window_subscriptions.items()):
-                if sub.registered:
-                    try:
-                        self.uia.RemoveStructureChangedEventHandler(sub.root, sub.handler)
-                    except Exception:
-                        pass
+                self._remove_window_subscription(sub)
                 self._window_subscriptions.pop(hwnd, None)
             self._pane_tracker.active.clear()
             self._window_tracker.active.clear()
@@ -370,47 +420,108 @@ class UiaBackend(TerminalBackend):
         return call.result
 
     # ---- 具体操作 ----
-    def _find_term_controls(self, root):
-        cond = self.uia.CreatePropertyCondition(
-            UIA_CLASSNAME_PROPERTY_ID, "TermControl")
+    def _find_elements(self, root, prop_id: int, value):
+        cond = self.uia.CreatePropertyCondition(prop_id, value)
         found = root.FindAll(TREE_SCOPE_DESCENDANTS, cond)
         out = []
         for i in range(found.Length):
             out.append(found.GetElement(i))
         return out
 
-    def discover_panes(self) -> list[PaneInfo]:
+    def _find_term_controls(self, root):
+        return self._find_elements(root, UIA_CLASSNAME_PROPERTY_ID,
+                                   "TermControl")
+
+    def _find_tab_items(self, root):
+        return self._find_elements(root, UIA_CONTROL_TYPE_PROPERTY_ID,
+                                   UIA_TAB_ITEM_CONTROL_TYPE_ID)
+
+    @staticmethod
+    def _runtime_id(el) -> tuple | None:
+        try:
+            return tuple(int(x) for x in el.GetRuntimeId())
+        except Exception:
+            return None
+
+    def discover_layout(self) -> TerminalLayout:
+        """发现全部 WT 窗口的 Window/Tab 拓扑 + selected Tab 的 pane。
+
+        物理限制（TabManagement.cpp）：只有 selected Tab 的 TermControl
+        attach 在 XAML root；background Tab 只有 TabItem。绝不后台切换
+        Tab 补全 pane——用户自然切换时经 20012 事件学习。
+        """
+        from actions import winkeys
+
         def do():
-            from actions import winkeys
-            panes = []
+            layout = TerminalLayout(windows={}, tabs={}, panes={},
+                                    selected_tabs={})
             for hwnd, wpid, _title, cls in winkeys.enum_windows():
                 if cls != WT_WINDOW_CLASS:
                     continue
+                hwnd = int(hwnd)
                 try:
                     root = self.uia.ElementFromHandle(hwnd)
                 except Exception:
                     continue
-                for el in self._find_term_controls(root)[:MAX_PANES]:
+                identity = winkeys.window_identity(hwnd)
+                if identity is None:
+                    continue
+                layout.windows[hwnd] = identity
+                index_hint = 0
+                for el in self._find_tab_items(root):
+                    rid = self._runtime_id(el)
+                    if rid is None:
+                        continue
+                    selected = False
+                    name = ""
                     try:
-                        rid = tuple(int(x) for x in el.GetRuntimeId())
+                        name = str(el.CurrentName or "")
+                        punk = el.GetCurrentPattern(UIA_SELECTION_ITEM_PATTERN_ID)
+                        if punk:
+                            sip = punk.QueryInterface(
+                                self.lib.IUIAutomationSelectionItemPattern)
+                            selected = bool(sip.CurrentIsSelected)
+                    except Exception:
+                        selected = False
+                    tab_id = (hwnd, rid)
+                    layout.tabs[tab_id] = TabInfo(
+                        tab_id=tab_id, hwnd=hwnd, window_pid=identity.pid,
+                        title=name, index_hint=index_hint,
+                        selected=selected, last_seen=time.time())
+                    if selected:
+                        layout.selected_tabs[hwnd] = tab_id
+                    index_hint += 1
+                # 当前 selected Tab 的 TermControl（background tab 没有）
+                selected_tab = layout.selected_tabs.get(hwnd, ())
+                selected_title = (layout.tabs.get(selected_tab).title
+                                  if selected_tab in layout.tabs else "")
+                for el in self._find_term_controls(root)[:MAX_PANES]:
+                    rid = self._runtime_id(el)
+                    if rid is None:
+                        continue
+                    try:
                         name = str(el.CurrentName or "")
                     except Exception:
-                        continue
-                    pane_id = (int(hwnd), rid)
-                    # discover 时同步缓存 element，read_visible 无需订阅即可用
+                        name = ""
+                    if not name:
+                        # TermControl Name 为空时退回 Tab 标题（评分证据）
+                        name = selected_title
+                    pane_id = (hwnd, rid)
                     self._pane_elements[pane_id] = el
-                    panes.append(PaneInfo(
-                        pane_id=pane_id, hwnd=int(hwnd),
-                        window_pid=int(wpid), title=name))
-                    if len(panes) >= MAX_PANES:
-                        return panes
+                    layout.panes[pane_id] = PaneInfo(
+                        pane_id=pane_id, hwnd=hwnd, window_pid=identity.pid,
+                        title=name, tab_id=selected_tab,
+                        window_created=identity.process_created)
+                    if len(layout.panes) >= MAX_PANES:
+                        break
             # 清理已消失 pane 的元素缓存
-            live = {p.pane_id for p in panes}
+            live = set(layout.panes)
             for pane_id in list(self._pane_elements):
                 if pane_id not in live:
                     self._pane_elements.pop(pane_id, None)
-            return panes
-        return self._submit(do) or []
+            return layout
+        return self._submit(do) or TerminalLayout(windows={}, tabs={},
+                                                  panes={}, selected_tabs={})
 
     def _resolve_element(self, pane_id: tuple):
         """按 pane_id 找 UIA element；缓存缺失时从窗口树重新解析。"""
@@ -532,22 +643,48 @@ class UiaBackend(TerminalBackend):
         to_add, to_remove = self._window_tracker.sync(set(hwnds))
         for hwnd in to_remove:
             sub = self._window_subscriptions.pop(hwnd, None)
-            if sub is not None and sub.registered:
-                try:
-                    self.uia.RemoveStructureChangedEventHandler(sub.root, sub.handler)
-                except Exception:
-                    pass
+            if sub is not None:
+                self._remove_window_subscription(sub)
         for hwnd in to_add:
             try:
                 root = self.uia.ElementFromHandle(hwnd)
                 handler = self._handler_cls()
-                self.uia.AddStructureChangedEventHandler(
-                    root, TREE_SCOPE_DESCENDANTS, None, handler)
-                self._window_subscriptions[hwnd] = WindowSubscription(
-                    root=root, handler=handler, registered=True)
+                sub = WindowSubscription(root=root, handler=handler)
+                # StructureChanged：pane 开合 → 重发现
+                try:
+                    self.uia.AddStructureChangedEventHandler(
+                        root, TREE_SCOPE_DESCENDANTS, None, handler)
+                    sub.registered = True
+                except Exception:
+                    self.errors += 1
+                # ElementSelected(20012)：用户自然切 Tab → topology 学习
+                try:
+                    self.uia.AddAutomationEventHandler(
+                        UIA_SELECTION_ITEM_SELECTED_EVENT, root,
+                        TREE_SCOPE_DESCENDANTS, None, handler)
+                    sub.selected_registered = True
+                except Exception:
+                    self.errors += 1
+                if sub.registered or sub.selected_registered:
+                    self._window_subscriptions[hwnd] = sub
+                else:
+                    self._window_tracker.discard(hwnd)
             except Exception:
                 self._window_tracker.discard(hwnd)
                 self.errors += 1
+
+    def _remove_window_subscription(self, sub: WindowSubscription):
+        if sub.registered:
+            try:
+                self.uia.RemoveStructureChangedEventHandler(sub.root, sub.handler)
+            except Exception:
+                pass
+        if sub.selected_registered:
+            try:
+                self.uia.RemoveAutomationEventHandler(
+                    UIA_SELECTION_ITEM_SELECTED_EVENT, sub.root, sub.handler)
+            except Exception:
+                pass
 
     def focused_pane(self) -> PaneInfo | None:
         def do():
@@ -577,6 +714,136 @@ class UiaBackend(TerminalBackend):
                 if parent is None:
                     return None
                 el = parent
+            return None
+        return self._submit(do)
+
+    # ---- Tab/Pane 激活原语（MTA 内执行） ----
+    def _tab_element(self, tab_id: tuple):
+        """按 (hwnd, runtime_id) 精确解析 TabItem element；找不到 None。"""
+        if not tab_id:
+            return None
+        hwnd = int(tab_id[0])
+        try:
+            root = self.uia.ElementFromHandle(hwnd)
+        except Exception:
+            return None
+        for el in self._find_tab_items(root):
+            rid = self._runtime_id(el)
+            if rid is not None and (hwnd, rid) == tuple(tab_id):
+                return el
+        return None
+
+    def select_tab(self, tab_id: tuple) -> bool:
+        """exact TabItem → SelectionItemPattern.Select()（官方语义：
+        清除其他选择并选中该元素）。不用 title/index 猜，不发送键盘。"""
+        def do():
+            el = self._tab_element(tab_id)
+            if el is None:
+                return False
+            try:
+                punk = el.GetCurrentPattern(UIA_SELECTION_ITEM_PATTERN_ID)
+                if not punk:
+                    return False
+                sip = punk.QueryInterface(
+                    self.lib.IUIAutomationSelectionItemPattern)
+                sip.Select()
+                return True
+            except Exception:
+                self.errors += 1
+                return False
+        return bool(self._submit(do, timeout=3.0))
+
+    def focus_pane(self, pane_id: tuple) -> bool:
+        """Pane TermControl → UIA SetFocus（键盘焦点给该 element）。"""
+        def do():
+            el = self._pane_elements.get(tuple(pane_id))
+            if el is None:
+                return False
+            try:
+                el.SetFocus()
+                return True
+            except Exception:
+                self.errors += 1
+                return False
+        if self._resolve_element(tuple(pane_id)) is None:
+            return False
+        return bool(self._submit(do))
+
+    def focused_location(self) -> TerminalLocation | None:
+        """当前键盘焦点所在的 (Window, Tab, Pane)——手工绑定入口。
+
+        从 GetFocusedElement 向上走：TermControl（pane）与 TabItem
+        （tab）都是 UIA 树祖先；窗口经 NativeWindowHandle/TreeWalker
+        归到 WT 顶层窗口。
+        """
+        from actions import winkeys
+
+        def do():
+            try:
+                el = self.uia.GetFocusedElement()
+            except Exception:
+                return None
+            pane_rid = None
+            tab_rid = None
+            hwnd = 0
+            for _ in range(16):
+                try:
+                    cls = str(el.CurrentClassName or "")
+                except Exception:
+                    return None
+                if cls == "TermControl" and pane_rid is None:
+                    pane_rid = self._runtime_id(el)
+                    hwnd = int(el.CurrentNativeWindowHandle or 0) or hwnd
+                elif cls == "TabItem" and tab_rid is None:
+                    tab_rid = self._runtime_id(el)
+                    hwnd = int(el.CurrentNativeWindowHandle or 0) or hwnd
+                elif cls == WT_WINDOW_CLASS:
+                    hwnd = int(el.CurrentNativeWindowHandle or 0) or hwnd
+                    break
+                try:
+                    parent = self.uia.TreeWalker.GetParentElement(el)
+                except Exception:
+                    break
+                if parent is None:
+                    break
+                el = parent
+            if hwnd == 0:
+                hwnd = self._hwnd_of_element(el)
+            if not hwnd:
+                return None
+            identity = winkeys.window_identity(hwnd)
+            if identity is None:
+                return None
+            return TerminalLocation(
+                window=identity,
+                tab_id=(hwnd, tab_rid) if tab_rid else None,
+                pane_id=(hwnd, pane_rid) if pane_rid else None)
+        return self._submit(do)
+
+    def selected_tab(self, hwnd: int) -> TabInfo | None:
+        """某 WT 窗口当前 selected 的 Tab（Select 后验证用）。"""
+        def do():
+            try:
+                root = self.uia.ElementFromHandle(int(hwnd))
+            except Exception:
+                return None
+            for el in self._find_tab_items(root):
+                try:
+                    punk = el.GetCurrentPattern(UIA_SELECTION_ITEM_PATTERN_ID)
+                    if not punk:
+                        continue
+                    sip = punk.QueryInterface(
+                        self.lib.IUIAutomationSelectionItemPattern)
+                    if bool(sip.CurrentIsSelected):
+                        rid = self._runtime_id(el)
+                        if rid is None:
+                            return None
+                        name = str(el.CurrentName or "")
+                        return TabInfo(tab_id=(int(hwnd), rid), hwnd=int(hwnd),
+                                       window_pid=0, title=name, index_hint=-1,
+                                       selected=True, last_seen=time.time())
+                except Exception:
+                    continue
             return None
         return self._submit(do)
 
@@ -730,6 +997,7 @@ class TerminalObserver:
         self.cfg = dict(cfg or {})
         self.enabled = bool(self.cfg.get("terminal_observer", True))
         self.panes: dict[tuple, PaneInfo] = {}
+        self.layout: TerminalLayout | None = None
         self.observations: dict[tuple, Observation] = {}
         self.activity: dict[tuple, float] = {}
         self.rings: dict[tuple, deque] = {}
@@ -743,11 +1011,12 @@ class TerminalObserver:
         self._visible_read_times: deque = deque()   # 全局预算滑动窗口
         self._last_discover = 0.0
         self._structure_dirty = False
+        self._tab_dirty = False
         self._started = False
         # 诊断计数（不含任何终端文本）
         self.stats = {"events": 0, "dropped": 0, "visible_reads": 0,
                       "rediscoveries": 0, "triggers": 0,
-                      "text_fallback_reads": 0}
+                      "text_fallback_reads": 0, "tab_events": 0}
         backend.event_sink = self._on_event
 
     # ---- UIA callback 线程入口：只入队，绝不阻塞 ----
@@ -788,13 +1057,17 @@ class TerminalObserver:
         self._last_discover = now
         self.stats["rediscoveries"] += 1
         try:
-            panes = self.backend.discover_panes()
+            layout = self.backend.discover_layout()
         except Exception:
-            panes = []
+            layout = None
+        if layout is None:
+            return
+        self.layout = layout
         new_map = {}
-        for pane in panes[:MAX_PANES]:
+        for pane in list(layout.panes.values())[:MAX_PANES]:
             new_map[pane.pane_id] = pane
-        if new_map != self.panes:
+        if new_map != self.panes or self._tab_dirty:
+            self._tab_dirty = False
             self.panes = new_map
             sync = getattr(self.backend, "sync_pane_subscriptions", None)
             if sync is not None:
@@ -813,6 +1086,15 @@ class TerminalObserver:
                     if pane_id not in new_map:
                         table.pop(pane_id, None)
 
+    def topology_signature(self) -> tuple:
+        """实例无关的 topology 指纹：pane/tab/selected 变化时让上层重解析。"""
+        layout = self.layout
+        if layout is None:
+            return ()
+        return (tuple(sorted(layout.panes)),
+                tuple(sorted(t.tab_id for t in layout.tabs.values())),
+                tuple(sorted(layout.selected_tabs.items())))
+
     # ---- 事件处理（monitor core 线程调用） ----
     def poll(self, now: float):
         if not self._started:
@@ -825,6 +1107,11 @@ class TerminalObserver:
             self.stats["events"] += 1
             if ev.kind == "structure":
                 self._structure_dirty = True
+                continue
+            if ev.kind == "tab-selected":
+                # 用户（或 Select()）自然切 Tab：topology 需要重学习
+                self.stats["tab_events"] += 1
+                self._tab_dirty = True
                 continue
             pane_id = ev.pane_id
             if pane_id not in self.panes:
@@ -847,8 +1134,8 @@ class TerminalObserver:
                     self._dirty_panes[pane_id] = (min(current, deadline)
                                                   if current else deadline)
 
-        # 事件处理完毕后再判定重发现：structure 事件本轮立即生效
-        if self._structure_dirty:
+        # 事件处理完毕后再判定重发现：structure/tab 事件本轮立即生效
+        if self._structure_dirty or self._tab_dirty:
             self._structure_dirty = False
             self.refresh_panes(force=True)
         else:
@@ -947,36 +1234,36 @@ class TerminalObserver:
     def waiting_observation(self, pane_id: tuple) -> Observation | None:
         return self.observations.get(pane_id)
 
-    def manual_bind_focused(self) -> PaneInfo | None:
-        """高级修复入口：取当前焦点所在 TermControl pane。"""
-        try:
-            return self.backend.focused_pane()
-        except Exception:
-            return None
-
 
 # ------------------------------------------------------------- 终端绑定解析
 
 class TerminalResolver:
-    """Agent ↔ Windows Terminal pane 的置信度绑定（plan §22-§25）。
+    """Agent ↔ Windows Terminal Window/Tab/Pane 的置信度绑定（v4plan §5）。
 
     Windows 原生 Agent：PID 祖先链 → 唯一窗口 → CONFIRMED。
-    WSL Agent：WT_SESSION 没有官方 pane 查询接口，只能用标题/cwd/
-    distro 评分；分配用互相唯一匹配（matching.mutual_unique_matches）：
-    score>=3 且 Agent 对 pane、pane 对 Agent 双向唯一 top-1、双侧分差
-    >=1 才 HIGH。"只有一个 pane + 弱分"不再自动 HIGH——保持 AMBIGUOUS，
-    用户可用"高级：关联当前 Pane"修复。
-    只有 CONFIRMED/HIGH 绑定才允许把终端审批观察归属到该 Agent。
+    WSL Agent：WT_SESSION 没有官方 tab/pane 查询接口，只能用标题/cwd/
+    distro 评分；分配用互相唯一匹配：score>=3 且双向唯一、双侧分差 >=1
+    才 HIGH。证据不足保持 AMBIGUOUS——用户可用"关联当前 Terminal 位置"
+    （Window+Tab+Pane 一次捕获）修复。
+    只有 CONFIRMED/HIGH 绑定才允许 exact activation 与终端审批归属。
     """
 
-    # WSL 评分：kind in title +3 / cwd basename +2 / user@ +1 / distro +1
+    # WSL 评分：kind in title +3 / cwd ~/ 路径匹配 +2 / user@ +1 / distro +1
     HIGH_MIN_SCORE = 3
     HIGH_MIN_MARGIN = 1
+
+    # 标题里的 shell 路径标记：`user@host: ~/a/b/c`（大小写不敏感）
+    _TITLE_PATH_RE = re.compile(r"~/[^\s:·,|]*", re.IGNORECASE)
+    _KIND_WORD_RE = {
+        kind.value: re.compile(rf"\b{re.escape(kind.value)}\b", re.IGNORECASE)
+        for kind in AgentKind
+    }
 
     def __init__(self, enum_windows=None, ancestor_pids=None):
         self._enum_windows = enum_windows
         self._ancestor_pids = ancestor_pids
-        self._manual: dict[str, tuple] = {}   # key → pane_id（运行期）
+        # key → TerminalLocation（运行期手工绑定：Window+Tab+Pane）
+        self._manual: dict[str, TerminalLocation] = {}
         self._last_windows: list = []
         self._windows_ts = 0.0
 
@@ -1008,29 +1295,84 @@ class TerminalResolver:
         except Exception:
             return {pid}
 
-    def set_manual_binding(self, key: str, pane_id: tuple | None):
-        if pane_id is None:
+    # ---- 手工绑定（运行期，不落盘；Agent exit/Window 变化即失效） ----
+    def set_manual_location(self, key: str, location: TerminalLocation | None):
+        """关联当前 Terminal 位置（v4plan §5.10）。None = 清除。"""
+        if location is None:
             self._manual.pop(key, None)
         else:
-            self._manual[key] = pane_id
+            self._manual[key] = location
 
-    def _prune_manual(self, instances: list, panes: dict):
-        """手动绑定也要生命周期：Agent 退出或 pane 消失即清理。"""
+    def manual_location(self, key: str) -> TerminalLocation | None:
+        return self._manual.get(key)
+
+    def _prune_manual(self, instances: list, layout: TerminalLayout | None):
+        """手工绑定生命周期：Agent 退出或 WindowIdentity 失效即清理。
+
+        pane 暂时不可见（所属 Tab 未选中）不算失效——activation 会
+        先选 Tab 再做 pane revalidation。layout 为 None（UIA 降级）时
+        没有窗口知识：不判死，交给 activation 时的 validate_window。
+        """
         live_keys = {getattr(inst, "key", "") for inst in instances}
+        windows = layout.windows if layout is not None else None
         for key in list(self._manual):
-            if key not in live_keys or self._manual[key] not in panes:
+            loc = self._manual[key]
+            if key not in live_keys:
+                self._manual.pop(key, None)
+                continue
+            if windows is None:
+                continue
+            ident = windows.get(loc.window.hwnd)
+            if ident is None or ident != loc.window:
+                # 窗口消失或 HWND/PID/create_time 已变（复用）→ 失效
                 self._manual.pop(key, None)
 
+    def _binding(self, hwnd: int, windows: dict, pane, now: float,
+                 confidence: BindingConfidence, origin, reason: str,
+                 tab_id: tuple | None = None,
+                 score: int = 0, runner_up: int = 0,
+                 agent_margin: int = 0, pane_margin: int = 0) -> TerminalBinding:
+        ident = windows.get(hwnd)
+        return TerminalBinding(
+            provider="windows-terminal",
+            hwnd=hwnd,
+            window_pid=(ident.pid if ident else
+                        (pane.window_pid if pane else 0)),
+            window_created=(ident.process_created if ident else
+                            (pane.window_created if pane else 0.0)),
+            window_class=(ident.window_class if ident else
+                          (pane.window_class if pane else WT_WINDOW_CLASS)),
+            title=(pane.title if pane else ""),
+            tab_id=tab_id if tab_id is not None else (
+                pane.tab_id if pane else None),
+            tab_index_hint=-1,
+            pane_id=(pane.pane_id if pane else None),
+            origin=origin,
+            confidence=confidence,
+            observable=pane is not None,
+            last_seen=now,
+            score=score, runner_up_score=runner_up,
+            agent_margin=agent_margin, pane_margin=pane_margin,
+            reason=reason)
+
     def resolve(self, instances: list, panes: dict[tuple, PaneInfo],
-                now: float) -> dict[str, TerminalBinding]:
-        self._prune_manual(instances, panes)
-        wins = self._windows()
-        by_hwnd: dict[int, tuple[int, str, str]] = {}
-        wt_hwnds: set[int] = set()
-        for hwnd, wpid, title, cls in wins:
-            by_hwnd[int(hwnd)] = (int(wpid), title, cls)
-            if cls == WT_WINDOW_CLASS:
-                wt_hwnds.add(int(hwnd))
+                now: float,
+                layout: TerminalLayout | None = None) -> dict[str, TerminalBinding]:
+        self._prune_manual(instances, layout)
+        windows: dict[int, WindowIdentity] = dict(
+            layout.windows) if layout is not None else {}
+        if not windows:
+            # 无 layout（UIA 降级/测试）：退回 enum_windows 的基本信息
+            for hwnd, wpid, _title, cls in self._windows():
+                if cls == WT_WINDOW_CLASS:
+                    windows[int(hwnd)] = WindowIdentity(
+                        hwnd=int(hwnd), pid=int(wpid),
+                        process_created=0.0, window_class=cls)
+        wt_hwnds: set[int] = set(windows)
+
+        # 祖先匹配用 (hwnd, pid) 平面表
+        wins = [(ident.hwnd, ident.pid) for ident in windows.values()]
+
         panes_by_hwnd: dict[int, list[PaneInfo]] = {}
         for pane in panes.values():
             panes_by_hwnd.setdefault(pane.hwnd, []).append(pane)
@@ -1041,47 +1383,36 @@ class TerminalResolver:
         for inst in instances:
             key = inst.key
             manual = self._manual.get(key)
-            if manual is not None and manual in panes:
-                pane = panes[manual]
-                wpid, _title, cls = by_hwnd.get(pane.hwnd, (0, "", ""))
-                out[key] = TerminalBinding(
-                    provider="windows-terminal", hwnd=pane.hwnd,
-                    window_pid=wpid or pane.window_pid,
-                    window_created=0.0,
-                    window_class=cls or pane.window_class, title=pane.title,
-                    pane_id=pane.pane_id,
-                    confidence=BindingConfidence.CONFIRMED,
-                    observable=True, last_seen=now,
-                    reason="manual")
-                continue
+            if manual is not None:
+                ident = windows.get(manual.window.hwnd)
+                if ident is not None and ident == manual.window:
+                    pane = panes.get(manual.pane_id) if manual.pane_id else None
+                    out[key] = self._binding(
+                        manual.window.hwnd, windows, pane, now,
+                        BindingConfidence.CONFIRMED, BindingOrigin.MANUAL,
+                        "manual-location",
+                        tab_id=manual.tab_id)
+                    continue
+                # 窗口失效：手工绑定已被 prune，走自动路径
             source = str(getattr(inst, "source", ""))
             if source == "windows" and inst.pid:
                 parents = self._ancestors(inst.pid)
                 matches = list(dict.fromkeys(
-                    int(hwnd) for hwnd, wpid, _t, _c in wins if int(wpid) in parents))
+                    int(hwnd) for hwnd, wpid in wins if int(wpid) in parents))
                 if len(matches) == 1:
                     hwnd = matches[0]
-                    wpid, title, cls = by_hwnd.get(hwnd, (0, "", ""))
                     pane_list = panes_by_hwnd.get(hwnd, [])
                     if len(pane_list) == 1:
-                        pane = pane_list[0]
-                        out[key] = TerminalBinding(
-                            provider="windows-terminal", hwnd=hwnd,
-                            window_pid=wpid, window_created=0.0,
-                            window_class=cls, title=pane.title,
-                            pane_id=pane.pane_id,
-                            confidence=BindingConfidence.CONFIRMED,
-                            observable=True, last_seen=now,
-                            reason="windows-ancestor")
+                        out[key] = self._binding(
+                            hwnd, windows, pane_list[0], now,
+                            BindingConfidence.CONFIRMED, BindingOrigin.AUTO,
+                            "windows-ancestor")
                     else:
                         # 窗口唯一但 pane 不唯一：窗口可唤起，审批不可归属
-                        out[key] = TerminalBinding(
-                            provider="windows-terminal", hwnd=hwnd,
-                            window_pid=wpid, window_created=0.0,
-                            window_class=cls, title=title,
-                            confidence=BindingConfidence.AMBIGUOUS,
-                            observable=len(pane_list) > 0, last_seen=now,
-                            reason="multi-pane-window")
+                        out[key] = self._binding(
+                            hwnd, windows, None, now,
+                            BindingConfidence.AMBIGUOUS, BindingOrigin.AUTO,
+                            "multi-pane-window")
                     continue
                 if len(matches) > 1:
                     out[key] = TerminalBinding(
@@ -1094,10 +1425,20 @@ class TerminalResolver:
         # 互相唯一评分分配（结果与实例顺序无关）
         left_keys = [inst.key for inst in scored_instances]
         right_keys = list(panes.keys())
+        # Tab 标题是第二条证据来源：TermControl 的 UIA Name 有时停留在
+        # profile 名（如 "Ubuntu"），而 TabItem 标题已带 shell 设置的
+        # "user@host: ~/path"；两者取较高分（互斥唯一门槛不变）。
+        tabs_by_id = {t.tab_id: t for t in (
+            layout.tabs.values() if layout is not None else [])}
 
         def score_fn(key: str, pane_id: tuple) -> int:
             inst = inst_by_key[key]
-            return self._score_pane(inst, panes[pane_id])[0]
+            pane = panes[pane_id]
+            best = 0
+            for title in self._pane_titles(pane, tabs_by_id):
+                probe = dataclasses_replace(pane, title=title)
+                best = max(best, self._score_pane(inst, probe)[0])
+            return best
 
         inst_by_key = {inst.key: inst for inst in scored_instances}
         decisions = mutual_unique_matches(
@@ -1111,87 +1452,128 @@ class TerminalResolver:
             best_pane, best_score, runner_up = diagnostics.get(
                 key, (None, 0, 0))
             if dec is not None:
-                pane = panes[dec.right]
-                wpid, _title, cls = by_hwnd.get(pane.hwnd, (0, "", ""))
-                out[key] = TerminalBinding(
-                    provider="windows-terminal", hwnd=pane.hwnd,
-                    window_pid=wpid or pane.window_pid, window_created=0.0,
-                    window_class=cls or pane.window_class,
-                    title=pane.title,
-                    pane_id=pane.pane_id,
-                    confidence=BindingConfidence.HIGH,
-                    observable=True, last_seen=now,
-                    score=dec.score, runner_up_score=runner_up,
-                    agent_margin=dec.left_margin, pane_margin=dec.right_margin,
-                    reason=self._score_reason(inst, pane))
+                out[key] = self._binding(
+                    dec.right[0], windows, panes[dec.right], now,
+                    BindingConfidence.HIGH, BindingOrigin.OBSERVED,
+                    self._score_reason(inst, panes[dec.right], tabs_by_id),
+                    score=dec.score, runner_up=runner_up,
+                    agent_margin=dec.left_margin, pane_margin=dec.right_margin)
                 continue
             if best_pane is not None and best_score > 0:
                 # 有正向证据但不满足互相唯一 → AMBIGUOUS（不归属审批）
-                pane = panes[best_pane]
-                wpid, _title, cls = by_hwnd.get(pane.hwnd, (0, "", ""))
-                out[key] = TerminalBinding(
-                    provider="windows-terminal", hwnd=pane.hwnd,
-                    window_pid=wpid or pane.window_pid, window_created=0.0,
-                    window_class=cls or pane.window_class,
-                    title=pane.title,
-                    pane_id=pane.pane_id,
-                    confidence=BindingConfidence.AMBIGUOUS,
-                    observable=True, last_seen=now,
-                    score=best_score, runner_up_score=runner_up,
-                    reason=self._score_reason(inst, pane) + "·非唯一")
+                out[key] = self._binding(
+                    best_pane[0], windows, panes[best_pane], now,
+                    BindingConfidence.AMBIGUOUS, BindingOrigin.AUTO,
+                    self._score_reason(inst, panes[best_pane], tabs_by_id)
+                    + "·非唯一",
+                    score=best_score, runner_up=runner_up)
                 continue
             out[key] = self._fallback_binding(inst, panes, panes_by_hwnd,
-                                              wt_hwnds, now)
+                                              wt_hwnds, windows, now)
         return out
 
+    @staticmethod
+    def _cwd_tilde(cwd: str, user: str) -> str:
+        """WSL cwd → `~/a/b` 形态（无法归一化时返回空）。"""
+        cwd = str(cwd or "").replace("\\", "/").rstrip("/").lower()
+        if not cwd or not user:
+            return ""
+        home = f"/home/{user.lower().strip()}"
+        if cwd == home:
+            return "~"
+        if cwd.startswith(home + "/"):
+            return "~/" + cwd[len(home) + 1:]
+        return ""
+
     def _score_pane(self, inst, pane: PaneInfo) -> tuple[int, str]:
-        """评分与依据：kind+3 / cwd+2 / user@+1 / distro+1。"""
+        """评分与依据（v4plan §5：证据可核验、误报率低）。
+
+        * kind：词边界匹配（防 "pi" 命中 "pip"）+3；
+        * cwd：标题含 `~/a/b` 路径标记时按路径比对（相等或互为前缀）+2；
+          无标记时才退回 basename 出现 +2（basename 与用户名相同则不计，
+          否则 "user@host" 形态的每个标题都会假命中 home 目录）；
+        * user@：标题以 `<user>@` 开头 +1；
+        * distro：词边界匹配 +1。
+        """
         title = _squash(pane.title)
         if not title:
             return 0, ""
         score = 0
         parts: list[str] = []
-        comm = str(getattr(inst, "kind", None).value if getattr(inst, "kind", None) else "")
-        if comm and comm in title:
-            score += 3
-            parts.append("kind")
-        cwd = str(getattr(inst, "cwd", "") or "").rstrip("/")
-        if cwd:
-            base = cwd.rsplit("/", 1)[-1].lower()
-            if base and base in title:
+        kind = getattr(inst, "kind", None)
+        comm = kind.value if kind is not None else ""
+        if comm:
+            word_re = self._KIND_WORD_RE.get(comm)
+            if word_re is not None and word_re.search(title):
+                score += 3
+                parts.append("kind")
+        user = str(getattr(inst, "user", "") or "").strip()
+        cwd = str(getattr(inst, "cwd", "") or "")
+        tilde = self._cwd_tilde(cwd, user)
+        title_match = self._TITLE_PATH_RE.search(title)
+        home_only = tilde == "~" and re.search(r"(?:^|\s)~(?:\s|$)", title)
+        if title_match is not None:
+            title_path = title_match.group(0).rstrip("/").lower()
+            if tilde and tilde != "~" and (
+                    title_path == tilde
+                    or title_path.startswith(tilde + "/")
+                    or tilde.startswith(title_path + "/")):
                 score += 2
                 parts.append("cwd")
-            # user@host:~/path 形态
-            user = str(getattr(inst, "user", "") or "")
-            if user and title.startswith(user + "@"):
-                score += 1
-                parts.append("user@")
-            elif user and (user + "@") in title:
+        elif home_only:
+            score += 2
+            parts.append("cwd")
+        elif cwd:
+            base = cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+            if (base and base != user.lower()
+                    and re.search(rf"(?<!\w){re.escape(base)}(?!\w)", title)):
+                score += 2
+                parts.append("cwd")
+        if user:
+            low = title.lower()
+            if low.startswith(user.lower() + "@") or (user.lower() + "@") in low:
                 score += 1
                 parts.append("user@")
         distro = str(getattr(inst, "distro", "") or "").lower()
-        if distro and distro in title:
+        if distro and re.search(rf"(?<!\w){re.escape(distro)}(?!\w)", title):
             score += 1
             parts.append("distro")
         return score, "+".join(parts)
 
-    def _score_reason(self, inst, pane: PaneInfo) -> str:
+    def _pane_titles(self, pane: PaneInfo, tabs_by_id: dict) -> list[str]:
+        """pane 的证据标题集合：TermControl Name + 所属 Tab 标题。"""
+        titles = []
+        if pane.title:
+            titles.append(pane.title)
+        tab = tabs_by_id.get(pane.tab_id) if pane.tab_id else None
+        if tab is not None and tab.title and tab.title not in titles:
+            titles.append(tab.title)
+        return titles
+
+    def _score_reason(self, inst, pane: PaneInfo,
+                      tabs_by_id: dict | None = None) -> str:
+        tabs = tabs_by_id or {}
+        best = ""
+        for title in self._pane_titles(pane, tabs):
+            if title:
+                reason = self._score_pane(
+                    inst, dataclasses_replace(pane, title=title))[1]
+                if reason and len(reason) > len(best):
+                    best = reason
+        if best:
+            return best
         return self._score_pane(inst, pane)[1] or "no-evidence"
 
-    def _fallback_binding(self, inst, panes, panes_by_hwnd, wt_hwnds, now):
+    def _fallback_binding(self, inst, panes, panes_by_hwnd, wt_hwnds,
+                          windows, now):
         # 唯一 Windows Terminal 窗口时可尽力唤起，但审批观察不归属
         if len(wt_hwnds) == 1:
             hwnd = next(iter(wt_hwnds))
             pane_list = panes_by_hwnd.get(hwnd, [])
             pane = pane_list[0] if len(pane_list) == 1 else None
-            return TerminalBinding(
-                provider="windows-terminal", hwnd=hwnd,
-                window_created=0.0,
-                window_class=WT_WINDOW_CLASS,
-                title=pane.title if pane else "",
-                pane_id=pane.pane_id if pane else None,
-                confidence=BindingConfidence.NONE,
-                observable=pane is not None, last_seen=now)
+            return self._binding(hwnd, windows, pane, now,
+                                 BindingConfidence.NONE, BindingOrigin.AUTO,
+                                 "single-window-fallback")
         return TerminalBinding(confidence=BindingConfidence.NONE, last_seen=now)
 
 

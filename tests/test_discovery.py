@@ -385,10 +385,10 @@ class MultiDistroScanTests(unittest.TestCase):
                 raise RuntimeError("wsl.exe failed (1)")
             rows = [
                 # wrapper（祖先：命令行自身也匹配 codex）
-                (4243, 1, 10, 10, 10, "pts/0", 1000, 60, "npm",
+                (4243, 1, 10, 10, 10, "pts/0", 1000, 60, "S", "npm",
                  "node /usr/lib/codex/codex.js run"),
                 # 真正的 runtime
-                (4242, 4243, 10, 10, 10, "pts/0", 1000, 60, "codex",
+                (4242, 4243, 10, 10, 10, "pts/0", 1000, 60, "S", "codex",
                  "/home/u/.codex/bin/codex"),
             ]
             return rows
@@ -407,15 +407,15 @@ class MultiDistroScanTests(unittest.TestCase):
                                         side_effect=fake_ps), \
              unittest.mock.patch.object(WslProcessProbe, "_metadata",
                                         side_effect=fake_meta):
-            instances, healthy = probe.scan()
+            snap = probe.scan()
 
-        self.assertIn("wsl:Ubuntu", instances)
-        self.assertIn("wsl:Debian", instances)   # Debian 无缓存 → 空
-        self.assertEqual(instances["wsl:Debian"], [])
-        self.assertTrue(healthy["wsl:Ubuntu"])
-        self.assertFalse(healthy["wsl:Debian"])
+        self.assertIn("wsl:Ubuntu", snap)
+        self.assertIn("wsl:Debian", snap)   # Debian ps 失败 → 缓存空 + 不权威
+        self.assertEqual(snap["wsl:Debian"].instances, ())
+        self.assertFalse(snap["wsl:Debian"].authoritative)
+        self.assertTrue(snap["wsl:Ubuntu"].authoritative)
         # wrapper 折叠后只剩 runtime 进程
-        ubantu = instances["wsl:Ubuntu"]
+        ubantu = snap["wsl:Ubuntu"].instances
         self.assertEqual(len(ubantu), 1)
         inst = ubantu[0]
         self.assertEqual(inst.pid, 4242)
@@ -429,7 +429,7 @@ class MultiDistroScanTests(unittest.TestCase):
         probe = WslProcessProbe()
 
         def fake_ps(distro, exclude_pids):
-            return [(50, 1, 10, 10, 10, "pts/0", 1000, 120, "codex",
+            return [(50, 1, 10, 10, 10, "pts/0", 1000, 120, "S", "codex",
                      "/usr/bin/codex")]
 
         def fake_meta(distro, pids):
@@ -443,8 +443,8 @@ class MultiDistroScanTests(unittest.TestCase):
                                         side_effect=fake_ps), \
              unittest.mock.patch.object(WslProcessProbe, "_metadata",
                                         side_effect=fake_meta):
-            instances, healthy = probe.scan()
-        inst = instances["wsl:Ubuntu"][0]
+            snap = probe.scan()
+        inst = snap["wsl:Ubuntu"].instances[0]
         self.assertTrue(inst.process_token)          # 绝不退化成空
         self.assertEqual(inst.process_token_source, "fallback")
         # key 含 fallback token，而不是裸 PID identity
@@ -452,8 +452,8 @@ class MultiDistroScanTests(unittest.TestCase):
                          f"wsl:Ubuntu|codex|50|{inst.process_token}")
 
 
-def _codex_row(pid, ppid=1, etimes=60):
-    return (pid, ppid, 10, 10, 10, "pts/0", 1000, etimes, "codex",
+def _codex_row(pid, ppid=1, etimes=60, stat="S"):
+    return (pid, ppid, 10, 10, 10, "pts/0", 1000, etimes, stat, "codex",
             "/usr/bin/codex")
 
 
@@ -483,56 +483,53 @@ class WslLifecycleTests(unittest.TestCase):
         # 上一轮 Ubuntu 有缓存实例；本轮 quiet list 成功返回空 →
         # 权威确认无 Running distro，绝不能返回旧缓存 Agent。
         probe = WslProcessProbe()
-        instances, healthy = self._scan(
-            probe, DistroInventory(("Ubuntu",), True))
-        self.assertTrue(instances["wsl:Ubuntu"])
-        instances, healthy = self._scan(probe, DistroInventory((), True))
-        self.assertEqual(instances.get("wsl:Ubuntu"), [])
-        self.assertTrue(healthy["wsl:Ubuntu"])
+        snap = self._scan(probe, DistroInventory(("Ubuntu",), True))
+        self.assertTrue(snap["wsl:Ubuntu"].instances)
+        snap = self._scan(probe, DistroInventory((), True))
+        self.assertEqual(snap["wsl:Ubuntu"].instances, ())
+        self.assertTrue(snap["wsl:Ubuntu"].authoritative)
         self.assertTrue(probe.last_ok)
 
     def test_one_of_two_distros_stopped_emits_empty_tombstone(self):
         probe = WslProcessProbe()
         both = DistroInventory(("Ubuntu", "Debian"), True)
-        instances, healthy = self._scan(probe, both)
-        self.assertTrue(instances["wsl:Ubuntu"])
-        self.assertTrue(instances["wsl:Debian"])
-        # Debian 停止：本轮起持续输出空 tombstone + healthy=True
+        snap = self._scan(probe, both)
+        self.assertTrue(snap["wsl:Ubuntu"].instances)
+        self.assertTrue(snap["wsl:Debian"].instances)
+        # Debian 停止：本轮起持续输出 authoritative 空 tombstone
         for _ in range(3):
-            instances, healthy = self._scan(
-                probe, DistroInventory(("Ubuntu",), True))
-            self.assertEqual(instances.get("wsl:Debian"), [])
-            self.assertTrue(healthy["wsl:Debian"])
-            self.assertTrue(instances["wsl:Ubuntu"])
-            self.assertTrue(healthy["wsl:Ubuntu"])
+            snap = self._scan(probe, DistroInventory(("Ubuntu",), True))
+            self.assertEqual(snap["wsl:Debian"].instances, ())
+            self.assertTrue(snap["wsl:Debian"].authoritative)
+            self.assertTrue(snap["wsl:Ubuntu"].instances)
+            self.assertTrue(snap["wsl:Ubuntu"].authoritative)
 
     def test_inventory_failure_keeps_cache_unhealthy(self):
         probe = WslProcessProbe()
-        instances, _ = self._scan(probe, DistroInventory(("Ubuntu",), True))
-        old = instances["wsl:Ubuntu"]
+        snap = self._scan(probe, DistroInventory(("Ubuntu",), True))
+        old = snap["wsl:Ubuntu"].instances
         self.assertTrue(old)
-        # 枚举失败：保留缓存实例、不健康、绝不变成 authoritative empty
-        instances, healthy = self._scan(
+        # 枚举失败：保留缓存实例、不 authoritative，绝不变成空
+        snap = self._scan(
             probe, DistroInventory(("Ubuntu",), False, error="wsl broke"))
-        self.assertEqual(instances["wsl:Ubuntu"], old)
-        self.assertFalse(healthy["wsl:Ubuntu"])
+        self.assertEqual(snap["wsl:Ubuntu"].instances, old)
+        self.assertFalse(snap["wsl:Ubuntu"].authoritative)
         self.assertFalse(probe.last_ok)
         # 失败后恢复：Debian 从未 known，不产生幽灵 tombstone
-        instances, healthy = self._scan(
-            probe, DistroInventory(("Ubuntu",), True))
-        self.assertTrue(healthy["wsl:Ubuntu"])
+        snap = self._scan(probe, DistroInventory(("Ubuntu",), True))
+        self.assertTrue(snap["wsl:Ubuntu"].authoritative)
 
     def test_stopped_distro_clears_fallback_identities(self):
         probe = WslProcessProbe()
-        instances, _ = self._scan(probe, DistroInventory(("Ubuntu",), True))
-        old_key = instances["wsl:Ubuntu"][0].key
-        old_token = instances["wsl:Ubuntu"][0].process_token
+        snap = self._scan(probe, DistroInventory(("Ubuntu",), True))
+        old_key = snap["wsl:Ubuntu"].instances[0].key
+        old_token = snap["wsl:Ubuntu"].instances[0].process_token
         # 停止 → fallback 代次缓存清除
         self._scan(probe, DistroInventory((), True))
         self.assertFalse(probe._fallback)
         # 重启后同 PID 从小整数再来：新代次 token，绝不继承旧 identity
-        instances, _ = self._scan(probe, DistroInventory(("Ubuntu",), True))
-        inst = instances["wsl:Ubuntu"][0]
+        snap = self._scan(probe, DistroInventory(("Ubuntu",), True))
+        inst = snap["wsl:Ubuntu"].instances[0]
         self.assertNotEqual(inst.key, old_key)
         self.assertNotEqual(inst.process_token, old_token)
 
@@ -594,17 +591,17 @@ class WslLifecycleTests(unittest.TestCase):
         # t0：Ubuntu Running → 探测正常进入 distro（wsl -d 被执行是合法的）
         probe = WslProcessProbe()
         state = {"running": ["Ubuntu"]}
-        (inst, healthy), calls = self._subprocess_scan(probe, state)
-        self.assertTrue(healthy["wsl:Ubuntu"])
+        snap, calls = self._subprocess_scan(probe, state)
+        self.assertTrue(snap["wsl:Ubuntu"].authoritative)
         self.assertTrue(self._wsl_d_calls(calls))
         # 用户 terminate Ubuntu：之后每轮 quiet list 都成功返回空
         # （authoritative empty）。不变量：停止后绝不再对 Ubuntu 执行
         # wsl -d —— 那会把它重新启动。
         state["running"] = []
         for _ in range(3):
-            (inst, healthy), calls = self._subprocess_scan(probe, state)
-            self.assertEqual(inst.get("wsl:Ubuntu"), [])
-            self.assertTrue(healthy["wsl:Ubuntu"])
+            snap, calls = self._subprocess_scan(probe, state)
+            self.assertEqual(snap["wsl:Ubuntu"].instances, ())
+            self.assertTrue(snap["wsl:Ubuntu"].authoritative)
             self.assertFalse(self._wsl_d_calls(calls))
         self.assertTrue(probe.last_ok)
 
@@ -616,25 +613,40 @@ class WslLifecycleTests(unittest.TestCase):
         probe._inventory = DistroInventory(("Ubuntu",), True)
         probe._inventory_ts = time.time()
         state = {"running": []}
-        (inst, healthy), calls = self._subprocess_scan(probe, state)
-        self.assertNotIn("wsl:Ubuntu", inst)
+        snap, calls = self._subprocess_scan(probe, state)
+        self.assertNotIn("wsl:Ubuntu", snap)
         self.assertTrue(probe.last_ok)
         self.assertFalse(self._wsl_d_calls(calls))
 
     def test_inventory_failure_does_not_probe_cached_distro(self):
-        # 枚举双路径失败：沿用旧名单输出缓存实例 + unhealthy，但绝不
-        # 进入 distro 执行 wsl -d（无法读取 ≠ 可以探测/重启）。
+        # 枚举双路径失败：沿用旧名单输出缓存实例 + 不 authoritative，
+        # 但绝不进入 distro 执行 wsl -d（无法读取 ≠ 可以探测/重启）。
         probe = WslProcessProbe()
         state = {"running": ["Ubuntu"]}
-        (inst, _), _ = self._subprocess_scan(
+        snap, _ = self._subprocess_scan(
             probe, state, ps_rows=[_codex_row(100)])
-        self.assertEqual(len(inst["wsl:Ubuntu"]), 1)
+        self.assertEqual(len(snap["wsl:Ubuntu"].instances), 1)
         state["fail"] = True
-        (inst, healthy), calls = self._subprocess_scan(probe, state)
-        self.assertEqual(len(inst["wsl:Ubuntu"]), 1)   # 缓存实例保留
-        self.assertFalse(healthy["wsl:Ubuntu"])
+        snap, calls = self._subprocess_scan(probe, state)
+        self.assertEqual(len(snap["wsl:Ubuntu"].instances), 1)  # 缓存保留
+        self.assertFalse(snap["wsl:Ubuntu"].authoritative)
         self.assertFalse(probe.last_ok)
         self.assertFalse(self._wsl_d_calls(calls))
+
+    def test_dead_state_processes_are_not_live_agents(self):
+        # Z/X/x 状态的进程不作为 live Agent（v4plan §4.4）。
+        probe = WslProcessProbe()
+        state = {"running": ["Ubuntu"]}
+        snap, _ = self._subprocess_scan(
+            probe, state,
+            ps_rows=[_codex_row(100, stat="Z"), _codex_row(101, stat="S"),
+                     _codex_row(102, stat="X")])
+        pids = [i.pid for i in snap["wsl:Ubuntu"].instances]
+        self.assertEqual(pids, [101])
+
+    def test_ps_format_includes_stat_column(self):
+        from agents.discovery import _PS_FORMAT
+        self.assertIn("stat=", _PS_FORMAT)
 
 
 class KimiIndexTests(unittest.TestCase):

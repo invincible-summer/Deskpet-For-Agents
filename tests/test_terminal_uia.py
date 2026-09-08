@@ -15,19 +15,25 @@ from agents.terminal_uia import (
     GLOBAL_VISIBLE_READ_LIMIT,
     RING_MAX,
     UIA_CALL_QUEUE_MAX,
+    WT_WINDOW_CLASS,
     CodexTerminalRecognizer,
     ClaudeTerminalRecognizer,
     KimiTerminalRecognizer,
     PaneInfo,
     SubscriptionTracker,
+    TabInfo,
     TerminalBackend,
     TerminalEvent,
+    TerminalLayout,
     TerminalObserver,
     TerminalResolver,
     UiaBackend,
     WEAK_TRIGGER_RE,
 )
-from agents.models import AgentInstance, AgentKind, AgentKind as _AK, BindingConfidence
+from agents.models import (
+    AgentInstance, AgentKind, AgentKind as _AK, BindingConfidence,
+    WindowIdentity,
+)
 
 NOW = 1_000_000.0
 
@@ -63,19 +69,96 @@ progress: 90%
 
 
 class FakeBackend(TerminalBackend):
+    """Window/Tab/Pane 三层 Fake（v4plan §18.2）。
+
+    windows: hwnd → WindowIdentity；tabs: tab_id → TabInfo；
+    panes: pane_id → PaneInfo（只有 selected tab 的 pane 应出现）。
+    """
     available = True
 
     def __init__(self):
         self.panes: dict[tuple, PaneInfo] = {}
+        self.windows: dict[int, WindowIdentity] = {}
+        self.tabs: dict[tuple, TabInfo] = {}
+        self.selected_tabs: dict[int, tuple] = {}
         self.visible: dict[tuple, str] = {}
         self.reads: list[tuple] = []
         self.discover_count = 0
+        self.select_calls: list[tuple] = []
+        self.focus_calls: list[tuple] = []
+        self.select_fails = False
         self.sync_history: list[set] = []
         self.unsubscribed: list[tuple] = []
 
-    def discover_panes(self) -> list[PaneInfo]:
+    def add_window(self, hwnd: int, pid: int = 0, created: float = 1.0) -> WindowIdentity:
+        ident = WindowIdentity(hwnd=hwnd, pid=pid or hwnd + 100,
+                               process_created=created,
+                               window_class=WT_WINDOW_CLASS)
+        self.windows[hwnd] = ident
+        return ident
+
+    def add_tab(self, hwnd: int, rid: tuple, title: str,
+                selected: bool = False, index: int = -1) -> tuple:
+        tab_id = (hwnd, rid)
+        if hwnd not in self.windows:
+            self.add_window(hwnd)
+        self.tabs[tab_id] = TabInfo(
+            tab_id=tab_id, hwnd=hwnd, window_pid=self.windows[hwnd].pid,
+            title=title, index_hint=index if index >= 0 else len(
+                [t for t in self.tabs.values() if t.hwnd == hwnd]),
+            selected=selected, last_seen=NOW)
+        if selected:
+            self.selected_tabs[hwnd] = tab_id
+        return tab_id
+
+    def add_pane(self, hwnd: int, rid: tuple, title: str = "",
+                 tab_id: tuple = ()) -> tuple:
+        pane_id = (hwnd, rid)
+        if hwnd not in self.windows:
+            self.add_window(hwnd)
+        self.panes[pane_id] = PaneInfo(
+            pane_id=pane_id, hwnd=hwnd, window_pid=self.windows[hwnd].pid,
+            title=title, tab_id=tab_id,
+            window_created=self.windows[hwnd].process_created)
+        return pane_id
+
+    def discover_layout(self) -> TerminalLayout:
+        """物理模型（TabManagement.cpp）：只有 selected Tab 的
+        TermControl attach 在 XAML root——pane 只随其所属 Tab 选中而
+        可见。tab_id 为 () 的 pane 视为始终可见（未建模 tab 的旧测试）。
+        """
         self.discover_count += 1
-        return list(self.panes.values())
+        selected = set(self.selected_tabs.values())
+        visible = {pid: p for pid, p in self.panes.items()
+                   if not p.tab_id or p.tab_id in selected}
+        return TerminalLayout(windows=dict(self.windows),
+                              tabs=dict(self.tabs),
+                              panes=visible,
+                              selected_tabs=dict(self.selected_tabs))
+
+    def selected_tab(self, hwnd: int) -> TabInfo | None:
+        tab_id = self.selected_tabs.get(hwnd)
+        return self.tabs.get(tab_id) if tab_id else None
+
+    def select_tab(self, tab_id: tuple) -> bool:
+        self.select_calls.append(tab_id)
+        if self.select_fails or tab_id not in self.tabs:
+            return False
+        hwnd = tab_id[0]
+        old = self.selected_tabs.get(hwnd)
+        if old is not None and old in self.tabs:
+            from dataclasses import replace
+            self.tabs[old] = replace(self.tabs[old], selected=False)
+        from dataclasses import replace
+        self.tabs[tab_id] = replace(self.tabs[tab_id], selected=True)
+        self.selected_tabs[hwnd] = tab_id
+        return True
+
+    def focus_pane(self, pane_id: tuple) -> bool:
+        self.focus_calls.append(pane_id)
+        return pane_id in self.panes
+
+
 
     def read_visible(self, pane_id: tuple) -> str:
         self.reads.append(pane_id)
@@ -334,10 +417,16 @@ class ResolverTests(unittest.TestCase):
         resolver = TerminalResolver(enum_windows=lambda: [])
         inst = AgentInstance(kind=AgentKind.CODEX, pid=1, source="wsl:Ubuntu",
                              process_token="9")
-        pane_id = (33, (7,))
-        panes = {pane_id: PaneInfo(pane_id=pane_id, hwnd=33, window_pid=9, title="x")}
-        resolver.set_manual_binding(inst.key, pane_id)
-        bindings = resolver.resolve([inst], panes, NOW)
+        backend = FakeBackend()
+        ident = backend.add_window(33, pid=9)
+        tab = backend.add_tab(33, (7,), "codex", selected=True)
+        pane_id = backend.add_pane(33, (70,), "x", tab_id=tab)
+        layout = backend.discover_layout()
+        from agents.models import TerminalLocation
+        resolver.set_manual_location(inst.key, TerminalLocation(
+            window=ident, tab_id=tab, pane_id=pane_id))
+        bindings = resolver.resolve([inst], dict(layout.panes), NOW,
+                                    layout=layout)
         self.assertEqual(bindings[inst.key].confidence, BindingConfidence.CONFIRMED)
 
 
@@ -553,22 +642,159 @@ class MutualBindingTests(unittest.TestCase):
         self.assertEqual(bindings[a.key].confidence, BindingConfidence.HIGH)
         self.assertEqual(bindings[b.key].confidence, BindingConfidence.HIGH)
 
-    def test_manual_binding_pruned_when_agent_or_pane_gone(self):
+    def test_manual_location_pruned_when_agent_or_window_gone(self):
+        """v4plan §5.10：manual 绑定在 Agent 退出/WindowIdentity 失效时清理。
+
+        pane 暂时不可见（Tab 未选中）不算失效。
+        """
+        backend = FakeBackend()
+        ident = backend.add_window(33, pid=9, created=1.5)
+        tab = backend.add_tab(33, (7,), "codex", selected=True)
+        pane_id = backend.add_pane(33, (70,), "x", tab_id=tab)
+        layout = backend.discover_layout()
         resolver = TerminalResolver(enum_windows=lambda: [])
         inst = AgentInstance(kind=AgentKind.CODEX, pid=1, source="wsl:Ubuntu",
                              process_token="9")
-        pane_id = (33, (7,))
-        panes = {pane_id: PaneInfo(pane_id=pane_id, hwnd=33, window_pid=9, title="x")}
-        resolver.set_manual_binding(inst.key, pane_id)
-        bindings = resolver.resolve([inst], panes, NOW)
-        self.assertEqual(bindings[inst.key].confidence, BindingConfidence.CONFIRMED)
-        # pane 消失 → manual 清理
-        resolver.resolve([inst], {}, NOW)
+        from agents.models import TerminalLocation
+        resolver.set_manual_location(inst.key, TerminalLocation(
+            window=ident, tab_id=tab, pane_id=pane_id))
+        bindings = resolver.resolve([inst], dict(layout.panes), NOW,
+                                    layout=layout)
+        b = bindings[inst.key]
+        self.assertEqual(b.confidence, BindingConfidence.CONFIRMED)
+        self.assertEqual(b.tab_id, tab)
+        self.assertEqual(b.pane_id, pane_id)
+        # pane 暂不可见（Tab 未选中）：manual 保留（activation 会重验证）
+        backend.panes.pop(pane_id)
+        layout2 = backend.discover_layout()
+        resolver.resolve([inst], dict(layout2.panes), NOW, layout=layout2)
+        self.assertIn(inst.key, resolver._manual)
+        # 窗口 identity 失效（HWND 复用新进程）→ manual 清理
+        backend.windows[33] = WindowIdentity(hwnd=33, pid=999,
+                                             process_created=99.0,
+                                             window_class=WT_WINDOW_CLASS)
+        layout3 = backend.discover_layout()
+        resolver.resolve([inst], dict(layout3.panes), NOW, layout=layout3)
         self.assertEqual(resolver._manual, {})
         # Agent 退出 → manual 清理
-        resolver.set_manual_binding(inst.key, pane_id)
-        resolver.resolve([], panes, NOW)
+        resolver.set_manual_location(inst.key, TerminalLocation(
+            window=ident, tab_id=tab, pane_id=pane_id))
+        resolver.resolve([], {}, NOW, layout=layout3)
         self.assertEqual(resolver._manual, {})
+
+    def test_manual_binding_confirmed(self):
+        """（旧 pane-only 兼容断言）manual 位置绑定仍产 CONFIRMED。"""
+        backend = FakeBackend()
+        ident = backend.add_window(33, pid=9)
+        tab = backend.add_tab(33, (7,), "codex", selected=True)
+        pane_id = backend.add_pane(33, (70,), "x", tab_id=tab)
+        layout = backend.discover_layout()
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        inst = AgentInstance(kind=AgentKind.CODEX, pid=1, source="wsl:Ubuntu",
+                             process_token="9")
+        from agents.models import TerminalLocation
+        resolver.set_manual_location(inst.key, TerminalLocation(
+            window=ident, tab_id=tab, pane_id=pane_id))
+        bindings = resolver.resolve([inst], dict(layout.panes), NOW,
+                                    layout=layout)
+        self.assertEqual(bindings[inst.key].confidence,
+                         BindingConfidence.CONFIRMED)
+
+
+class ScoringRegressionTests(unittest.TestCase):
+    """V4.1.1 评分修正（用户反馈：无法扫描关联终端）。
+
+    * 词边界：kind "pi" 不得命中 "pip"；"codex" 命中 "codex · task"；
+    * ~/路径标记：`user@host: ~/a/b` 按 cwd 归一化比对，不再用裸
+      basename（用户名==家目录名时会造成所有同用户 pane 假命中）；
+    * Tab 标题是第二条证据：TermControl Name 停留在 profile 名时仍可
+      通过 TabItem 标题达成 HIGH；
+    * "Ubuntu" 这类无路径标题不产生假 HIGH（fail-closed，等用户切到
+      该 Tab 自然学习或手动关联）。
+    """
+
+    def _inst(self, kind=AgentKind.CODEX, cwd="/w/x", user="", source="wsl:Ubuntu"):
+        return AgentInstance(kind=kind, pid=1, source=source,
+                             process_token="9", cwd=cwd, user=user)
+
+    def _pane(self, hwnd, rid, title, tab_id=()):
+        return PaneInfo(pane_id=(hwnd, rid), hwnd=hwnd, window_pid=5,
+                        title=title, tab_id=tab_id)
+
+    def test_pi_word_boundary_not_pip(self):
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        inst = self._inst(kind=AgentKind.PI)
+        panes = {11: self._pane(11, (1,), "pip install requests")}
+        score, reason = resolver._score_pane(inst, panes[11])
+        self.assertEqual(score, 0)
+        self.assertNotIn("kind", reason)
+
+    def test_kind_word_boundary_matches(self):
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        inst = self._inst(kind=AgentKind.CODEX)
+        score, _ = resolver._score_pane(inst, self._pane(11, (1,), "codex · 编码中"))
+        self.assertGreaterEqual(score, 3)
+
+    def test_tilde_path_marker_scores_cwd(self):
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        inst = self._inst(cwd="/home/dev/proj/app", user="dev")
+        score, reason = resolver._score_pane(
+            inst, self._pane(11, (1,), "dev@box: ~/proj/app"))
+        self.assertIn("cwd", reason)
+        self.assertIn("user@", reason)
+
+    def test_home_dir_basename_does_not_match_user_host(self):
+        """Agent 在家目录：不得因 basename==用户名 而命中所有 user@host 标题。"""
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        inst = self._inst(cwd="/home/dev", user="dev")
+        p1 = self._pane(11, (1,), "dev@box: ~/proj/app")
+        score, reason = resolver._score_pane(inst, p1)
+        # 只有 user@ 弱证据，绝不能有 cwd（否则两个不同项目的 pane 同分）
+        self.assertNotIn("cwd", reason)
+        self.assertLess(score, 3)
+
+    def test_generic_profile_title_stays_ambiguous(self):
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        inst = self._inst(cwd="/home/dev/proj/app", user="dev")
+        pane = self._pane(11, (1,), "Ubuntu")
+        bindings = resolver.resolve([inst], {pane.pane_id: pane}, NOW)
+        self.assertEqual(bindings[inst.key].confidence,
+                         BindingConfidence.AMBIGUOUS)
+
+    def test_tab_title_is_second_evidence_source(self):
+        """TermControl Name 停在 "Ubuntu"，但 Tab 标题带路径 → 仍可 HIGH。"""
+        from agents.models import TerminalBinding  # noqa: F401
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        inst = self._inst(cwd="/home/dev/proj/app", user="dev")
+        tab_id = (11, (5,))
+        pane = self._pane(11, (1,), "Ubuntu", tab_id=tab_id)
+        panes = {pane.pane_id: pane}
+        layout = TerminalLayout(
+            windows={}, tabs={tab_id: TabInfo(
+                tab_id=tab_id, hwnd=11, window_pid=5,
+                title="dev@box: ~/proj/app", index_hint=0, selected=True,
+                last_seen=NOW)},
+            panes=panes, selected_tabs={11: tab_id})
+        bindings = resolver.resolve([inst], panes, NOW, layout=layout)
+        b = bindings[inst.key]
+        self.assertEqual(b.confidence, BindingConfidence.HIGH)
+        self.assertEqual(b.pane_id, (11, (1,)))
+        self.assertIn("cwd", b.reason)
+
+    def test_two_distinct_paths_both_high(self):
+        """两个不同项目的 pane + 两个对应 Agent → 双向唯一都 HIGH。"""
+        resolver = TerminalResolver(enum_windows=lambda: [])
+        a = self._inst(kind=AgentKind.CODEX, cwd="/home/dev/alpha", user="dev")
+        b = self._inst(kind=AgentKind.CLAUDE, cwd="/home/dev/beta", user="dev")
+        panes = {
+            (11, (1,)): self._pane(11, (1,), "dev@box: ~/alpha"),
+            (11, (2,)): self._pane(11, (2,), "dev@box: ~/beta"),
+        }
+        bindings = resolver.resolve([a, b], panes, NOW)
+        self.assertEqual(bindings[a.key].confidence, BindingConfidence.HIGH)
+        self.assertEqual(bindings[b.key].confidence, BindingConfidence.HIGH)
+        self.assertEqual(bindings[a.key].pane_id, (11, (1,)))
+        self.assertEqual(bindings[b.key].pane_id, (11, (2,)))
 
 
 if __name__ == "__main__":

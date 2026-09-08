@@ -146,6 +146,82 @@ def start_build(skin: str, height: int, fps: int, log=None) -> "queue.Queue":
     return q
 
 
+BuildKey = tuple[str, int, int]   # (skin, height, fps)
+
+
+class SkinBuildManager:
+    """skin build 去重（v4plan §11.4）：同一 (skin,height,fps) 只 build
+    一次；全局最多一个 converter 同时运行。
+
+    request() 记录等待者；poll_results() 由 UI tick 调用，返回
+    [(key, "ok"/"err", payload)]，驱动所有等待中的 PetView。
+    """
+
+    def __init__(self):
+        self._waiters: dict[BuildKey, int] = {}    # key → 等待 view 数
+        self._queue: "queue.Queue | None" = None   # 当前唯一转换
+        self._current: BuildKey | None = None
+        self._pending: list[BuildKey] = []
+        self._results: list[tuple[BuildKey, str, object]] = []
+        self._last_paths: dict[BuildKey, dict] = {}   # 成功结果缓存
+
+    def request(self, skin: str, height: int, fps: int) -> BuildKey:
+        """请求一个 build（幂等）；返回 build key。"""
+        key = (str(skin), int(height), int(fps))
+        if key in self._last_paths:
+            self._results.append((key, "ok", self._last_paths[key]))
+            return key
+        if key in self._waiters:
+            self._waiters[key] += 1
+            return key
+        self._waiters[key] = 1
+        self._pending.append(key)
+        self._maybe_start()
+        return key
+
+    def _maybe_start(self):
+        if self._queue is not None or not self._pending:
+            return
+        key = self._pending.pop(0)
+        self._current = key
+        skin, height, fps = key
+        self._queue = start_build(skin, height, fps, log=None)
+
+    def poll_results(self) -> list[tuple[BuildKey, str, object]]:
+        """非阻塞收割当前转换结果；完成后启动下一个 pending。"""
+        if self._queue is not None:
+            try:
+                kind, payload = self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                self._queue = None
+                key = self._current
+                self._current = None
+                self._waiters.pop(key, None)
+                if kind == "ok":
+                    self._last_paths[key] = payload
+                self._results.append((key, kind, payload))
+                self._maybe_start()
+        results, self._results = self._results, []
+        return results
+
+    def forget(self, key: BuildKey):
+        """slot 不再需要某 build（view 关闭时减引用）。"""
+        if key in self._waiters:
+            self._waiters[key] -= 1
+            if self._waiters[key] <= 0:
+                self._waiters.pop(key, None)
+                if key in self._pending:
+                    self._pending.remove(key)
+
+    def building(self) -> bool:
+        return self._queue is not None or bool(self._pending)
+
+    def pending_count(self) -> int:
+        return len(self._pending) + (1 if self._queue is not None else 0)
+
+
 def prepare_import(src_dir: str, name: str) -> str:
     """皮肤导入第一步：复制素材 + 校验齐全 + 写标准 manifest（快速，可在 UI 线程调用）。"""
     import shutil

@@ -26,13 +26,21 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .models import AgentKind, AgentInstance
+from .models import AgentKind, AgentInstance, SourceProbeSnapshot
 from .paths import ENV_ALLOWLIST
 
 _SELF_PID = os.getpid()
 
 # ps 列顺序（与 _PS_FORMAT 一一对应）
-_PS_FORMAT = "pid=,ppid=,sid=,pgid=,tpgid=,tty=,uid=,etimes=,comm=,args="
+_PS_FORMAT = "pid=,ppid=,sid=,pgid=,tpgid=,tty=,uid=,etimes=,stat=,comm=,args="
+
+# /proc stat 进程状态（proc_pid_stat(5)）：这些状态的进程对象已死/正在回收，
+# 绝不作为 live Agent（v4plan §4.4）。S/T/D/R/I 等只说明当前没跑 CPU。
+_DEAD_STATES = frozenset("ZXx")
+
+
+class ProbeUnavailable(RuntimeError):
+    """进程枚举整体不可用：本轮结果 authoritative=False，不得判死旧实例。"""
 
 
 # ----------------------------------------------------- 进程树 canonicalization
@@ -119,15 +127,21 @@ def _match_kind(name: str, cmd: str) -> AgentKind | None:
 
 
 def scan_windows() -> list[AgentInstance]:
-    """Windows 原生进程扫描：canonicalize 后只为 runtime 进程建实例。"""
+    """Windows 原生进程扫描：canonicalize 后只为 runtime 进程建实例。
+
+    全局 process_iter 失败抛 ProbeUnavailable（authoritative=False），
+    绝不返回空列表冒充"权威确认无 Agent"（v4plan §4.1）。
+    单个进程的 AccessDenied/NoSuchProcess 只跳过该进程，不影响整轮。
+    """
     import psutil
 
-    out: list[AgentInstance] = []
     try:
         procs = list(psutil.process_iter(
             attrs=["pid", "name", "cmdline", "create_time", "ppid"]))
-    except Exception:
-        return out
+    except Exception as exc:
+        raise ProbeUnavailable(f"process_iter failed: {exc!r}") from exc
+
+    out: list[AgentInstance] = []
 
     parent_by_pid: dict[int, int] = {}
     info_by_pid: dict[int, dict] = {}
@@ -362,6 +376,8 @@ class WslProcessProbe:
         # /proc starttime 缺失时的稳定 fallback 代次缓存（防 PID reuse 退化）
         self._fallback: dict[tuple[str, int], _FallbackIdentity] = {}
         self._fallback_gen = 0
+        # 每次 scan() 的单调代次号（写入 SourceProbeSnapshot.generation）
+        self._scan_gen = 0
         # 性能计数
         self.spawn_count = 0    # wsl.exe 调用次数
         self.scan_count = 0
@@ -433,13 +449,17 @@ class WslProcessProbe:
 
     # ---- 第二层：进程表 ----
     def _ps_scan(self, distro: str, exclude_pids: set[int]) -> list[tuple]:
-        """一条 ps 拿全表；返回 (pid,ppid,sid,pgid,tpgid,tty,uid,etimes,comm,args)。"""
+        """一条 ps 拿全表；返回 (pid,ppid,sid,pgid,tpgid,tty,uid,etimes,stat,comm,args)。
+
+        Z/X/x 状态（zombie/dead）的进程对象已不在运行，直接不返回——
+        它们不是 live Agent（v4plan §4.4）。
+        """
         text = _run_wsl(distro, f"ps -eo {_PS_FORMAT} 2>/dev/null")
         self.spawn_count += 1
         rows = []
         for line in text.splitlines():
-            parts = line.split(None, 9)
-            if len(parts) < 10:
+            parts = line.split(None, 10)
+            if len(parts) < 11:
                 continue
             try:
                 pid, ppid, sid, pgid, tpgid = (int(x) for x in parts[:5])
@@ -447,10 +467,13 @@ class WslProcessProbe:
                 etimes = int(parts[7])
             except ValueError:
                 continue
-            tty, comm, args = parts[5], parts[8], parts[9]
+            tty, stat, comm, args = parts[5], parts[8], parts[9], parts[10]
             if pid in exclude_pids:
                 continue
-            rows.append((pid, ppid, sid, pgid, tpgid, tty, uid, etimes, comm, args))
+            if stat[:1] in _DEAD_STATES:
+                continue
+            rows.append((pid, ppid, sid, pgid, tpgid, tty, uid, etimes,
+                         stat, comm, args))
         return rows
 
     @staticmethod
@@ -521,14 +544,14 @@ class WslProcessProbe:
         return token, "fallback"
 
     def scan(self, exclude_pids: set[int] | None = None
-             ) -> tuple[dict[str, list[AgentInstance]], dict[str, bool]]:
-        """全量扫描；返回按真实 source（wsl:Ubuntu 等）分组的结果与健康位。
+             ) -> dict[str, SourceProbeSnapshot]:
+        """全量扫描；返回按真实 source（wsl:Ubuntu 等）键控的三态快照。
 
-        三态语义（V3.1.1）：
-          * healthy + instances —— distro 运行且 Agent 被发现；
-          * healthy + []        —— 权威确认该 distro 当前无 Agent（或已停止），
-            tombstone 每轮持续输出，Monitor 侧经 gone_grace 清除旧实例；
-          * unhealthy           —— 枚举/ps 读取失败，保留上一轮缓存实例
+        三态语义（v4plan §3.2/§4.4）：
+          * authoritative=True + instances —— distro 运行且 Agent 被发现；
+          * authoritative=True + ()     —— 权威确认该 distro 当前无 Agent
+            （或已停止），本结果有资格让 Monitor 立即清除旧实例；
+          * authoritative=False —— 枚举/ps 读取失败，携带上一轮缓存实例
             且绝不判死（无法读取 ≠ 已经不存在）。
 
         只有本轮 fresh --list --running 确认 Running 的 distro 才执行
@@ -538,31 +561,35 @@ class WslProcessProbe:
         """
         t0 = time.perf_counter()
         exclude_pids = {int(pid) for pid in (exclude_pids or set()) if pid}
+        self._scan_gen += 1
+        gen = self._scan_gen
         inv = self._list_running_distros()
-        instances_by_source: dict[str, list[AgentInstance]] = {}
-        healthy: dict[str, bool] = {}
+        out: dict[str, SourceProbeSnapshot] = {}
         if not inv.authoritative:
             # 枚举失败：不更新 known distros、不发 tombstone；
-            # 已知 source 保留缓存实例并全部标记不健康。
+            # 已知 source 保留缓存实例并全部 authoritative=False。
             with self._lock:
                 cached = {d: list(v) for d, v in self._cache.items()}
             for distro in self._known_distros:
-                source = f"wsl:{distro}"
-                instances_by_source[source] = cached.get(distro, [])
-                healthy[source] = False
+                out[f"wsl:{distro}"] = SourceProbeSnapshot(
+                    source=f"wsl:{distro}", generation=gen,
+                    observed_at=time.time(), authoritative=False,
+                    instances=tuple(cached.get(distro, [])),
+                    error=inv.error)
             self.last_ok = False
             self.scan_count += 1
             self.scan_ms = time.perf_counter() - t0
-            return instances_by_source, healthy
+            return out
 
         running = set(inv.running)
         self._known_distros.update(running)
-        # 已停止的 distro：每轮持续输出空 source + healthy=True。只发一次
-        # 会让 Monitor 的 gone timer 下一轮就失去 authoritative 依据。
+        # 已停止的 distro：每轮持续输出 authoritative 空 tombstone。
+        # 只发一次会让 Monitor 下一轮失去 authoritative 依据。
         for distro in self._known_distros - running:
             source = f"wsl:{distro}"
-            instances_by_source[source] = []
-            healthy[source] = True
+            out[source] = SourceProbeSnapshot(
+                source=source, generation=gen, observed_at=time.time(),
+                authoritative=True, instances=())
             with self._lock:
                 self._cache.pop(distro, None)
                 self._distro_ok.pop(distro, None)
@@ -579,18 +606,19 @@ class WslProcessProbe:
                 rows = self._ps_scan(distro, exclude_pids)
             except Exception as exc:
                 scan_ok = False
-                healthy[source] = False
                 with self._lock:
                     self._distro_ok[distro] = False
                     cached = self._cache.get(distro)
                 self.last_error = str(exc)
-                instances_by_source.setdefault(source, [])
-                if cached:
-                    instances_by_source[source] = list(cached)
+                out[source] = SourceProbeSnapshot(
+                    source=source, generation=gen, observed_at=time.time(),
+                    authoritative=False,
+                    instances=tuple(cached or ()), error=str(exc))
                 continue
             matched: list[tuple] = []
             for row in rows:
-                pid, ppid, sid, pgid, tpgid, tty, uid, etimes, comm, args = row
+                (pid, ppid, sid, pgid, tpgid, tty, uid, etimes,
+                 stat, comm, args) = row
                 if "sh -c" in args.lower() or "grep" in args.lower() or "ps -eo" in args.lower():
                     continue
                 kind = self._match_agent(comm, args)
@@ -599,8 +627,8 @@ class WslProcessProbe:
             # 进程树 canonicalization：npm/node wrapper 只保留最深 runtime
             parent_by_pid = {row[0]: row[1] for row in rows}
             candidates = [ProcessCandidate(
-                kind=self._match_agent(r[8], r[9]) or AgentKind.CODEX,
-                pid=r[0], ppid=r[1], comm=r[8], args=r[9]) for r in matched]
+                kind=self._match_agent(r[9], r[10]) or AgentKind.CODEX,
+                pid=r[0], ppid=r[1], comm=r[9], args=r[10]) for r in matched]
             canonical, launchers = canonicalize_agent_processes(
                 candidates, parent_by_pid)
             canonical_rows = [r for r in matched if r[0] in canonical]
@@ -609,7 +637,8 @@ class WslProcessProbe:
             self.metadata_pid_count = len(canonical_rows)
             now = time.time()
             instances = []
-            for pid, ppid, sid, pgid, tpgid, tty, uid, etimes, comm, args in canonical_rows:
+            for (pid, ppid, sid, pgid, tpgid, tty, uid, etimes,
+                 stat, comm, args) in canonical_rows:
                 kind = self._match_agent(comm, args)
                 if kind is None:
                     continue
@@ -648,11 +677,12 @@ class WslProcessProbe:
             with self._lock:
                 self._cache[distro] = instances
                 self._distro_ok[distro] = True
-            instances_by_source[source] = instances
-            healthy[source] = True
+            out[source] = SourceProbeSnapshot(
+                source=source, generation=gen, observed_at=now,
+                authoritative=True, instances=tuple(instances))
         self.last_ok = scan_ok
         if self.last_ok:
             self.last_error = ""
         self.scan_count += 1
         self.scan_ms = time.perf_counter() - t0
-        return instances_by_source, healthy
+        return out

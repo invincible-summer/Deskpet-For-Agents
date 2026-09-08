@@ -4,8 +4,10 @@ assets/pets/*
 assets/cache/
 assets/icon.ico
 
-# ---- 本机配置（含个人路径） ----
+# ---- 本机配置（含个人路径；V4.1 起含备份与写盘临时文件） ----
 config.json
+config.json.bak
+.deskpet-config-*
 
 # ---- Python ----
 __pycache__/

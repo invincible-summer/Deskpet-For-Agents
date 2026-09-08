@@ -1,12 +1,27 @@
-"""动画播放器：tkinter 原生 GIF 逐帧惰性解码 + LRU 缓存（内存友好）。"""
+"""动画播放器：进程级共享缓存 + 每 View 光标 + 单调度器（v4plan §11）。
+
+V4.1 Fleet 合同：
+  * SharedAnimationCache —— 整个 DeskPet 进程一份 decoded PhotoImage
+    预算（默认 48 MB），多个 Pet 复用同一批已解码帧（同一 Tk
+    interpreter 的 PhotoImage 可跨 Toplevel 显示）；
+  * AnimationCursor —— 每只 Pet 一个轻量光标（view_id/帧号/速度/
+    暂停），不持有任何解码数据；
+  * AnimationScheduler —— 只保留一个最早 due 的 root.after()，到期
+    批量推进所有 due 光标；hidden Pet（paused）不推进帧；
+  * 绝不出现 N Pet × N timer × N cache 的线性复制。
+"""
+import json
 import os
+import time
 import tkinter as tk
 from collections import OrderedDict
 
-MAX_CACHED_ANIMS = 2
+MAX_CACHED_ANIMS = 2   # 每个 skin 尺寸组合的 Animation 对象上限（全局）
 
 
 class Animation:
+    """一个 GIF 的元数据 + 惰性解码帧（LRU）。"""
+
     def __init__(self, path: str, meta: dict):
         self.path = path
         try:
@@ -24,6 +39,9 @@ class Animation:
         except (TypeError, ValueError):
             self.width = self.height = 0
         self._frames: OrderedDict[int, tk.PhotoImage] = OrderedDict()
+
+    def frame_bytes(self) -> int:
+        return len(self._frames) * max(1, self.width * self.height * 4)
 
     def frame(self, i: int) -> tk.PhotoImage:
         img = self._frames.get(i)
@@ -46,168 +64,242 @@ class Animation:
         self._frames.clear()
 
 
-class Animator:
-    """负责当前动画的帧推进。静态模式只显示第 0 帧。"""
+class SharedAnimationCache:
+    """进程级共享动画缓存：一条全局 byte 预算（v4plan §11.2）。
 
-    def __init__(self, root: tk.Misc):
-        self.root = root
-        self.speed = 1.0
-        self.static = False
-        self.paused = False
-        self.cache_bytes = 48 * 1024 * 1024
-        self.current: Animation | None = None
-        self._name = ""
-        self._idx = 0
-        self._repeats_left = 0      # 非循环动画剩余播放次数
-        self._on_done = None
-        self._after_id = None
+    多个 Pet 请求同一 (skin,height) 的同一帧 → 返回同一个
+    PhotoImage 对象；预算不足时按 LRU 逐出（正在显示的帧除外——由
+    调用方在 advance 后传入 keep 集合）。
+    """
+
+    def __init__(self, max_bytes: int = 48 * 1024 * 1024):
+        self.max_bytes = int(max_bytes)
         self._pool: OrderedDict[str, Animation] = OrderedDict()
-        self._paths: dict[str, str] = {}
-        self._tick_cb = None        # 帧更新回调
 
-    def bind_tick(self, cb):
-        self._tick_cb = cb
-
-    def load_pool(self, names: dict[str, str]):
-        """把皮肤的全部动画加入池（只记路径，不解码）。"""
-        self._paths = dict(names)
-        self._name = ""   # 允许同名动画立即切换（换肤/换尺寸）
-
-    def play(self, name: str, repeat: int = 0, on_done=None, force: bool = False):
-        """repeat=0 表示按 meta 的循环属性；>0 表示强制播放 N 遍后回调 on_done。"""
-        if name == self._name and not force and repeat == 0:
-            return
-        path = self._paths.get(name)
-        if not path or not os.path.isfile(path):
-            return
-        anim = self._pool_get(path)
-        self._pool_touch(path, anim)
-        self.current = anim
-        self._name = name
-        self._idx = 0
-        self._on_done = on_done
-        self._repeats_left = repeat if repeat > 0 else (0 if anim.loop else 1)
-        if self._after_id:
-            self.root.after_cancel(self._after_id)
-            self._after_id = None
-        self._schedule()
-        if self._tick_cb:
-            self._tick_cb()
-
-    def frame_image(self) -> tk.PhotoImage | None:
-        if not self.current:
+    def animation(self, path: str) -> Animation | None:
+        anim = self._pool.get(path)
+        if anim is not None:
+            self._pool.move_to_end(path)
+            return anim
+        if not path or not os.path.isfile(path + ".json"):
             return None
-        image = self.current.frame(min(self._idx, self.current.n - 1))
-        # Keep the displayed frame, evict least recently used decoded pixels globally.
-        used = sum(len(a._frames) * max(1, a.width*a.height*4) for a in self._pool.values())
-        for a in list(self._pool.values()):
-            for index in list(a._frames):
-                if used <= self.cache_bytes:
-                    return image
-                if a is self.current and a._frames[index] is image:
-                    continue
-                del a._frames[index]
-                used -= max(1, a.width*a.height*4)
-        return image
-
-    def frame_size(self) -> tuple[int, int]:
-        if self.current:
-            return self.current.width, self.current.height
-        return 0, 0
-
-    def _pool_get(self, path: str) -> Animation:
-        for a in self._pool.values():
-            if a.path == path:
-                return a
-        import json
-        with open(path + ".json", encoding="utf-8") as f:
-            meta = json.load(f)
-        return Animation(path, meta)
-
-    def _pool_touch(self, path: str, anim: Animation):
+        try:
+            with open(path + ".json", encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            return None
+        anim = Animation(path, meta)
         self._pool[path] = anim
-        self._pool.move_to_end(path)
-        while len(self._pool) > MAX_CACHED_ANIMS:
-            _, old = self._pool.popitem(last=False)
-            if old is not self.current:
-                old.free()
+        self._enforce_anims()
+        return anim
 
-    def prune(self):
-        """释放不在当前皮肤路径集中的动画（换肤/换尺寸后调用）。"""
-        alive = set(self._paths.values())
+    def frame(self, path: str, index: int, keep_paths: set[str] = frozenset()):
+        """取帧并维持全局字节预算。keep_paths 中的动画不做帧逐出。"""
+        anim = self.animation(path)
+        if anim is None:
+            return None
+        img = anim.frame(index)
+        self._enforce_bytes(keep_paths)
+        return img
+
+    def total_bytes(self) -> int:
+        return sum(a.frame_bytes() for a in self._pool.values())
+
+    def _enforce_anims(self):
+        while len(self._pool) > MAX_CACHED_ANIMS * 8:
+            self._pool.popitem(last=False)
+
+    def _enforce_bytes(self, keep_paths: set[str]):
+        total = self.total_bytes()
         for path in list(self._pool):
-            if path not in alive:
+            if total <= self.max_bytes:
+                return
+            anim = self._pool[path]
+            if path in keep_paths:
+                continue
+            for index in list(anim._frames):
+                if total <= self.max_bytes:
+                    return
+                size = max(1, anim.width * anim.height * 4)
+                del anim._frames[index]
+                total -= size
+            # 帧清空的动画对象保留（元数据很便宜，避免重复读 json）
+
+    def prune(self, alive_paths: set[str], keep_paths: set[str] = frozenset()):
+        """释放不在当前皮肤路径集中的动画（换肤/换尺寸后调用）。"""
+        for path in list(self._pool):
+            if path not in alive_paths:
                 anim = self._pool.pop(path)
-                if anim is not self.current:
+                if path not in keep_paths:
                     anim.free()
 
     def free_all(self):
         for a in self._pool.values():
             a.free()
         self._pool.clear()
-        self.current = None
-        self._name = ""
+
+    def stats(self) -> dict:
+        frames = sum(len(a._frames) for a in self._pool.values())
+        return {"cache_bytes": self.total_bytes(),
+                "cache_budget": self.max_bytes,
+                "cache_anims": len(self._pool),
+                "cache_frames": frames}
+
+
+class AnimationCursor:
+    """一只 Pet 的播放光标：只存状态，不存解码数据（v4plan §11.2）。"""
+
+    def __init__(self, view_id: str):
+        self.view_id = view_id
+        self.state = ""
+        self.path = ""
+        self.frame_index = 0
+        self.speed = 1.0
+        self.static = False
+        self.paused = False
+        self.repeat_left = 0
+        self.next_due = 0.0
+        self.base_delay = 83
+        self.frames = 1
+        self.size = (0, 0)
+        self.on_done = None
+        self.dirty = True   # 需要重绘
+
+    def play(self, path: str, state: str, meta, repeat: int = 0,
+             force: bool = False):
+        if path == self.path and state == self.state and not force and repeat == 0:
+            return
+        self.path = path
+        self.state = state
+        self.frame_index = 0
+        # base_delay 的单位是毫秒（meta delay_ms）
+        self.base_delay = max(1, int(getattr(meta, "base_delay", 83)))
+        self.frames = max(1, int(getattr(meta, "n", 1)))
+        self.size = (getattr(meta, "width", 0), getattr(meta, "height", 0))
+        loop = bool(getattr(meta, "loop", True))
+        self.repeat_left = repeat if repeat > 0 else (0 if loop else 1)
+        self.next_due = time.monotonic()
+        self.dirty = True
+
+    def advance(self, now: float) -> bool:
+        """推进一帧；返回是否仍需继续调度。设置 dirty 供重绘。"""
+        self.frame_index += 1
+        if self.frame_index >= self.frames:
+            if self.repeat_left > 1:
+                self.repeat_left -= 1
+                self.frame_index = 0
+            elif self.repeat_left == 0:      # 循环动画
+                self.frame_index = 0
+            else:                            # 播完停在最后一帧
+                self.frame_index = self.frames - 1
+                self.next_due = 0.0
+                self.dirty = True
+                return False
+        self.dirty = True
+        self.next_due = now + self.frame_delay()
+        return True
+
+    def frame_delay(self) -> float:
+        """帧间隔（秒）：base_delay 是毫秒，next_due 是 monotonic 秒。"""
+        return max(0.02, self.base_delay / 1000.0 / max(0.1, self.speed))
+
+
+class AnimationScheduler:
+    """单调度器：一个 root.after 管理所有 cursor（v4plan §11.3）。
+
+    只保留最早 due 的定时器；到期时批量推进所有 due 光标并回调。
+    hidden Pet（paused）不推进。注册/注销不产生定时器堆积。
+    """
+
+    def __init__(self, root: tk.Misc, cache: SharedAnimationCache):
+        self.root = root
+        self.cache = cache
+        self._cursors: dict[str, AnimationCursor] = {}
+        self._callbacks: dict[str, object] = {}
+        self._after_id = None
+        self._due_target = 0.0
+        self._active_paths: set[str] = set()   # 供缓存 keep 判定
+
+    def register(self, cursor: AnimationCursor, on_frame) -> None:
+        self._cursors[cursor.view_id] = cursor
+        self._callbacks[cursor.view_id] = on_frame
+        if cursor.path:
+            self._active_paths.add(cursor.path)
+        self._schedule()
+
+    def unregister(self, view_id: str) -> None:
+        cursor = self._cursors.pop(view_id, None)
+        self._callbacks.pop(view_id, None)
+        if cursor is not None:
+            self._active_paths.discard(cursor.path)
+        if not self._cursors:
+            self._cancel()
+
+    def cursor(self, view_id: str) -> AnimationCursor | None:
+        return self._cursors.get(view_id)
+
+    def cursors(self) -> dict[str, AnimationCursor]:
+        return dict(self._cursors)
+
+    def frame_image(self, cursor: AnimationCursor):
+        if cursor.path and cursor.path not in self._active_paths:
+            self._active_paths.add(cursor.path)   # play() 换动画后同步 keep 集
+        return self.cache.frame(cursor.path,
+                                min(cursor.frame_index, cursor.frames - 1),
+                                keep_paths=self._active_paths)
+
+    def frame_size(self, cursor: AnimationCursor) -> tuple[int, int]:
+        return cursor.size
+
+    def kick(self, view_id: str):
+        """外部状态变化（play/pause/speed）后立即重排调度。"""
+        cursor = self._cursors.get(view_id)
+        if cursor is not None and not cursor.paused and not cursor.static:
+            cursor.next_due = time.monotonic()
+        self._schedule()
 
     def stop(self):
-        """退出前调用：取消帧定时器。"""
-        if self._after_id:
+        self._cancel()
+
+    # ------------------------------------------------------------ 内部
+    def _cancel(self):
+        if self._after_id is not None:
             try:
                 self.root.after_cancel(self._after_id)
             except Exception:
                 pass
             self._after_id = None
+        self._due_target = 0.0
 
     def _schedule(self):
-        if self.static or self.paused or not self.current:
+        due = [c.next_due for c in self._cursors.values()
+               if not c.paused and not c.static and c.next_due > 0]
+        if not due:
+            self._cancel()
             return
-        delay = max(20, int(self.current.base_delay / self.speed))
-        self._after_id = self.root.after(delay, self._advance)
+        target = min(due)
+        if self._after_id is not None and target >= self._due_target:
+            return   # 已有更早或同时的定时器在等
+        self._cancel()
+        now = time.monotonic()
+        delay_ms = max(10, int((target - now) * 1000))
+        self._due_target = target
+        self._after_id = self.root.after(delay_ms, self._on_due)
 
-    def _advance(self):
+    def _on_due(self):
         self._after_id = None
-        if not self.current:
-            return
-        self._idx += 1
-        if self._idx >= self.current.n:
-            if self._repeats_left > 1:
-                self._repeats_left -= 1
-                self._idx = 0
-            elif self._repeats_left == 0:      # 循环动画
-                self._idx = 0
-            else:                               # 非循环动画播完：释放帧缓存再回调
-                self._idx = self.current.n - 1
-                cb, self._on_done = self._on_done, None
-                if self._tick_cb:
-                    self._tick_cb()
-                if cb:
-                    cb()
-                return                          # 无论有无回调都必须停在这里
-        if self._tick_cb:
-            self._tick_cb()
+        now = time.monotonic()
+        for view_id, cursor in list(self._cursors.items()):
+            if cursor.paused or cursor.static or cursor.next_due <= 0:
+                continue
+            if now + 0.005 < cursor.next_due:
+                continue
+            if cursor.advance(now):
+                pass
+            cb = self._callbacks.get(view_id)
+            if cb is not None:
+                try:
+                    cb(view_id)
+                except Exception:
+                    pass
         self._schedule()
-
-    def set_speed(self, speed: float):
-        self.speed = max(0.1, float(speed))
-
-    def set_static(self, static: bool):
-        self.static = bool(static)
-        if self.current is None:
-            return
-        if self.static:
-            if self._after_id:
-                self.root.after_cancel(self._after_id)
-                self._after_id = None
-            self._idx = 0
-            if self._tick_cb:
-                self._tick_cb()
-        elif not self._after_id:
-            self._schedule()
-
-    def set_paused(self, paused: bool):
-        if self.paused == bool(paused):
-            return
-        self.paused = bool(paused)
-        if self.paused:
-            self.stop()
-        elif not self._after_id:
-            self._schedule()

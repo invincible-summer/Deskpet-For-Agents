@@ -11,7 +11,7 @@ from main import _dpi_aware
 _dpi_aware()
 from pet.config import DEFAULTS
 from pet.bubble import BubbleRenderer, BubbleModel, metrics, wrap_text, fit_text
-from pet.animator import Animation, Animator
+from pet.animator import Animation, AnimationCursor, AnimationScheduler, SharedAnimationCache
 from actions import winkeys
 
 
@@ -65,10 +65,11 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(fit_text('abc', 0, measure), '')
 
     def test_no_key_injection_surface_remains(self):
-        """V3 不变量：winkeys 不提供任何键盘注入入口。"""
-        for banned in ('send_key', 'send_input', 'keybd_event', 'SendInput'):
+        """V4.1 不变量：winkeys 不提供任何键盘注入入口。"""
+        for banned in ('send_key', 'send_input', 'keybd_event', 'SendInput',
+                       'post_message', 'raise_terminal'):
             self.assertFalse(hasattr(winkeys, banned))
-        self.assertTrue(callable(winkeys.raise_window))
+        self.assertTrue(callable(winkeys.try_set_foreground))
 
     def test_ambiguous_windows_do_not_bind_via_ancestors(self):
         """两个同 PID 窗口时祖先链不能唯一定位（由 TerminalResolver 处理 AMBIGUOUS）。"""
@@ -84,6 +85,7 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(bindings[inst.key].confidence, BindingConfidence.AMBIGUOUS)
 
     def test_activation_failure_does_not_retry_or_inject(self):
+        """foreground 被拒：restore→activate→flash 一次，绝不注入。"""
         class User:
             def __init__(self): self.calls = []
 
@@ -91,17 +93,27 @@ class GeometryTests(unittest.TestCase):
 
             def IsIconic(self, h): return True
 
+            def IsWindowVisible(self, h): return True
+
+            def GetWindowThreadProcessId(self, h, out): return 1
+
+            def GetClassNameW(self, h, buf, n): return 1
+
             def ShowWindow(self, *args): self.calls.append('restore')
 
             def SetForegroundWindow(self, h): self.calls.append('activate')
 
             def GetForegroundWindow(self): return 99
 
-            def FlashWindowEx(self, *args): self.calls.append('flash')
+            def FlashWindowEx(self, *args):
+                self.calls.append('flash')
+                return True
         user = User()
         with patch.object(winkeys, 'user32', user):
-            self.assertFalse(winkeys.raise_window(1))
-        self.assertEqual(user.calls, ['restore', 'activate', 'flash'])
+            self.assertFalse(winkeys.try_set_foreground(1))
+            self.assertTrue(winkeys.restore_window(1))
+            self.assertTrue(winkeys.flash_window(1))
+        self.assertEqual(user.calls, ['activate', 'restore', 'flash'])
 
     def test_config_v3_migration_drops_legacy_keys(self):
         import json
@@ -127,12 +139,15 @@ class GeometryTests(unittest.TestCase):
                     json.dump(old, f)
                 cfg = Config()
                 self.assertTrue(cfg.migration_notice)
-                self.assertEqual(cfg.data["config_version"], 3)
+                self.assertEqual(cfg.data["config_version"], 4)
                 for banned in ("connection_mode", "managed", "keys",
                                "auto_approve", "approve_restore_focus",
                                "window_instances"):
                     self.assertNotIn(banned, cfg.data)
-                self.assertEqual(cfg.data["monitor"]["pinned"], "")
+                self.assertNotIn("pinned", cfg.data["monitor"])
+                self.assertNotIn("gone_grace_sec", cfg.data["monitor"])
+                self.assertFalse(cfg.data["presentation"]["concurrent"]["enabled"])
+                self.assertEqual(cfg.data["presentation"]["concurrent"]["slots"][0]["id"], "pet-1")
                 self.assertNotIn("session_bindings", cfg.data["monitor"])
                 self.assertNotIn("waiting_quiet_sec", cfg.data["monitor"])
                 self.assertIn("privacy", cfg.data)
@@ -168,48 +183,70 @@ class TkTests(unittest.TestCase):
                 self.bubble.draw(0, 0, normal[0] // 2, normal[1] + 8)
             self.assertEqual(items, self.canvas.find_all())
 
-    def test_bubble_has_no_approval_buttons(self):
-        """V3：气泡彻底没有 [批准]/[拒绝] 按钮（plan §41）。"""
+    def test_bubble_hit_carries_exact_agent_key(self):
+        """V4.1：气泡无审批按钮；底行命中携带 exact agent_key。"""
         b = self.bubble
         b.model = BubbleModel(visible=True, status='Claude Code · 等待审批',
-                              text='Bash 命令需要确认', footer='请在终端处理')
+                              text='Bash 命令需要确认', footer='请在终端处理',
+                              agent_key='wsl:U|claude|9|tok')
         b.layout()
         b.draw(0, 0, 150, 140)
-        self.assertEqual(set(b.btn_boxes), {'details'})
         self.assertFalse(hasattr(b.model, 'approve_label'))
         self.assertFalse(hasattr(b.model, 'deny_label'))
+        box = b._hit_boxes[0][0]
+        hit = b.hit((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
+        self.assertEqual(hit.action, 'activate_agent')
+        self.assertEqual(hit.agent_key, 'wsl:U|claude|9|tok')
 
     def test_hidden_bubble_clears(self):
         b = self.bubble
-        b.model = BubbleModel(visible=True, text='a', footer='f')
+        b.model = BubbleModel(visible=True, text='a', footer='f',
+                              agent_key='k')
         b.layout()
         b.draw(0, 0, 150, 140)
-        self.assertTrue(b.btn_boxes)
+        self.assertTrue(b._hit_boxes)
         b.model.visible = False
         b.draw(0, 0, 150, 140)
         self.assertEqual(len(self.canvas.find_all()), 0)
-        self.assertFalse(b.btn_boxes)
+        self.assertFalse(b._hit_boxes)
 
-    def test_animation_byte_budget_and_pause(self):
+    def test_shared_cache_byte_budget_and_scheduler(self):
+        """V4.1：进程级共享缓存预算 + 单调度器多光标（v4plan §11）。"""
         import tkinter as tk
-        animator = Animator(self.root)
+        cache = SharedAnimationCache(max_bytes=800)
+        scheduler = AnimationScheduler(self.root, cache)
         anim = Animation('unused', {'width': 10, 'height': 10, 'frames': 10})
-        animator._pool['unused'] = anim
-        animator.current = anim
-        animator.cache_bytes = 800
+        cache._pool['unused'] = anim
         photo_factory = tk.PhotoImage
         with patch('pet.animator.tk.PhotoImage', side_effect=lambda **_: photo_factory(master=self.root, width=10, height=10)):
             for i in range(10):
-                animator._idx = i
-                animator.frame_image()
+                cache.frame('unused', i, keep_paths=set())
+        # 预算 800B、每帧 400B → 最多留 2 帧
         self.assertLessEqual(len(anim._frames), 2)
-        animator._schedule()
-        self.assertIsNotNone(animator._after_id)
-        animator.set_paused(True)
-        self.assertIsNone(animator._after_id)
-        animator.set_paused(False)
-        self.assertIsNotNone(animator._after_id)
-        animator.stop()
+        # 两个 cursor 共享一个调度器；注册即有定时器，注销后清空
+        c1 = AnimationCursor('v1')
+        c2 = AnimationCursor('v2')
+        for c in (c1, c2):
+            c.play('unused', 'walk', anim)
+        scheduler.register(c1, lambda _v: None)
+        scheduler.register(c2, lambda _v: None)
+        self.assertIsNotNone(scheduler._after_id)
+        scheduler.unregister('v1')
+        scheduler.unregister('v2')
+        self.assertIsNone(scheduler._after_id)
+
+    def test_hidden_pet_cursor_paused_not_scheduled(self):
+        cache = SharedAnimationCache()
+        scheduler = AnimationScheduler(self.root, cache)
+        cursor = AnimationCursor('v')
+        cursor.paused = True   # hidden Pet
+        cursor.play('x', 'walk', type('M', (), {'base_delay': 83, 'n': 2,
+                                                 'width': 1, 'height': 1,
+                                                 'loop': True})())
+        scheduler.register(cursor, lambda _v: None)
+        self.assertIsNone(scheduler._after_id)   # paused 不产生定时器
+        scheduler.unregister('v')
+        scheduler.stop()
 
 
 class AppTests(unittest.TestCase):
@@ -217,10 +254,12 @@ class AppTests(unittest.TestCase):
         from pet.app import PetApp
         from agents.models import AgentInstance, AgentKind, Snapshot, Status, Phase, Mode
         cfg = MemoryConfig()
-        with patch.object(PetApp, '_apply_skin', lambda self: None):
+        from pet.petview import PetView
+        with patch.object(PetApp, '_reload_skins', lambda self: None), patch.object(PetView, 'load_skin', lambda self, bm: None):
             app = PetApp(cfg)
         try:
-            app.monitor._terminal = None
+            from agents.terminal_service import WindowsTerminalService
+            app.monitor._terminal_service = WindowsTerminalService(None)
             one = AgentInstance(AgentKind.CODEX, 101, 'windows', process_token='101',
                                 cwd='D:\\proj\\DeskPet')
             two = AgentInstance(AgentKind.CLAUDE, 102, 'windows', process_token='102')
@@ -231,19 +270,20 @@ class AppTests(unittest.TestCase):
             b = Snapshot(two.key, two.kind, two.source, two.pid, status=Status.WAITING,
                          waiting_detail='Bash 命令需要确认')
             app.monitor.snapshots = {a.key: a, b.key: b}
-            app.monitor._select_primary()
-            # 自动跟随：WAITING 抢占 WORKING（plan §31）
-            self.assertEqual(app.monitor.primary_key, b.key)
-            waiting_model = app._bubble_model()
+            # presentation reconcile：WAITING 成为 focused（attention）
+            app._aggregate()
+            state = app._presentation_state
+            self.assertEqual(state.attention_key, b.key)
+            app.presentation.set_focus(b.key)
+            waiting_model = app.pet_manager.views["pet-1"].bubble.model
             self.assertIn('Claude Code', waiting_model.status)
             self.assertIn('等待审批', waiting_model.status)
             self.assertEqual(waiting_model.footer, '请在终端处理')
             self.assertIn('Bash', waiting_model.text)
-            # 钉住 Codex 后气泡显示 Plan/编码中
-            app.monitor.set_primary(a.key, manual=True)
-            target = app.monitor.primary_target()
-            self.assertIsNotNone(target)
-            model = app._bubble_model()
+            # focused 指向 Codex 后气泡显示 Plan/编码中
+            app.presentation.set_focus(a.key)
+            app._aggregate()
+            model = app.pet_manager.views["pet-1"].bubble.model
             self.assertIn('Codex', model.status)
             self.assertIn('Plan', model.status)
             self.assertIn('编码中', model.status)
@@ -251,7 +291,9 @@ class AppTests(unittest.TestCase):
             app.root.update()
             self.assertTrue(app.dashboard.winfo_exists())
             app.hide_pet()
-            self.assertTrue(app.animator.paused)
+            view = app.pet_manager.views["pet-1"]
+            self.assertTrue(view.hidden)
+            self.assertTrue(view.cursor.paused)
         finally:
             app.quit()
 

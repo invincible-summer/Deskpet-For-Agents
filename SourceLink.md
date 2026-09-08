@@ -1,1212 +1,852 @@
-可以。下面这份是我建议直接放进 **DeskPet V3 设计文档的“技术依据 / References”章节**的资料清单。我按截至 **2026-09-07** 的现行资料重新整理，并明确区分“可以作为实现合同的一手资料”和“只能证明当前行为/缺陷的 issue”。
+# DeskPet V4.1 — SourceLink / Evidence Map
 
-## 一、Windows Terminal / UI Automation：V3 TerminalObserver 的核心依据
+> 审计日期：2026-09-08  
+> DeskPet 审计基线：`invincible-summer/DeskPet@af8236d15dc3bfecaa89464e1b77d7f84c2b09be`
+>
+> 本文件是 V4.1 第 1–4 点的证据链与接口依据。链接分为：
+>
+> - **实现合同**：Microsoft/Linux 官方 API 文档，可作为代码语义依据；
+> - **上游当前行为**：Windows Terminal 当前源码，说明现行实现，但必须 feature-detect，不能把内部源码细节当永久公开 ABI；
+> - **能力缺口证据**：Windows Terminal 官方仓库 issue，证明截至当前公开接口仍缺某项能力；issue 本身不是 API 合同；
+> - **DeskPet 内部审计证据**：固定到本次审计 commit，便于之后核对 V3→V4.1 修改。
 
-| 资料                                                              | 权威性                           | 能确认什么                                                                                                                       | 对 V3 的直接意义                                                                          |
-| --------------------------------------------------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| **Microsoft Learn — UI Automation Overview**                    | Microsoft 官方文档                | UIA client 可以读取 UI element、control pattern，并订阅 provider 的事件                                                                 | 证明 DeskPet 作为外部只读 UIA Client 是正规的 Windows API 用法 ([Microsoft Learn][1])             |
-| **Microsoft Learn — UI Automation Events for Clients**          | Microsoft 官方文档                | UIA 支持事件订阅，目的之一就是避免不断轮询整棵 UI tree                                                                                           | 直接支持 V3 的“事件驱动而非 200ms 扫屏”设计 ([Microsoft Learn][2])                                 |
-| **Microsoft Learn — Understanding Threading Issues**            | Microsoft 官方文档                | 与桌面 UI 交互的 UIA client 应在独立线程执行 UIA 调用，避免 UI thread 卡顿                                                                       | 支持 `TerminalUiaObserver` 独立 MTA thread，不放 Tk 主线程 ([Microsoft Learn][3])             |
-| **IUIAutomation5::AddNotificationEventHandler**                 | Microsoft Win32 API           | 官方 Notification event handler API                                                                                           | V3 可以订阅 Terminal notification，而不是不停读取完整窗口 ([Microsoft Learn][4])                    |
-| **IUIAutomationEventHandlerGroup::AddNotificationEventHandler** | Microsoft Win32 API           | Microsoft 当前建议 UIA client 优先使用 handler group 注册事件                                                                           | 实现 UIA backend 时优先采用较新的 handler-group 路线 ([Microsoft Learn][5])                     |
-| **IUIAutomationTextPattern::GetVisibleRanges**                  | Microsoft Win32 API           | 可以取得文本控件当前“可见”的连续文本区域                                                                                                       | V3 approval recognizer 应检查 viewport，而不是整个历史 scrollback ([Microsoft Learn][6])       |
-| **Windows Terminal Accessibility 2023**                         | Windows Terminal 官方源码仓库       | Windows Terminal 在 2022 年加入了携带“实际新输出文本”的 UIA notifications；其目的之一就是减少 screen reader 对整个 buffer 做 diff 的性能成本                  | 这是 V3 `Notification → delta text → 必要时 GetVisibleRanges()` 方案最直接的官方依据 ([GitHub][7]) |
-| **Windows Terminal Discussion #19614**                          | 官方仓库 + Terminal maintainer 回复 | 外部进程无法方便地直接读取 Terminal console HWND；Windows Terminal maintainer Leonard Hecker 明确建议：创建 UIA client，通过 accessibility API 读取窗口 | 直接证明“已有 Windows Terminal 可以事后被 DeskPet 被动读取”，无需从 ConPTY 启动时接管 ([GitHub][8])         |
-| **Windows Terminal UI Automation Scenario #4533**               | 官方仓库                          | Terminal v1.0 就专门建立了 UIA tree、TextRange、GetVisibleRanges 等 accessibility provider                                           | 证明 UIA 并不是偶然暴露出来的能力，而是 Terminal 正式 accessibility 架构的一部分 ([GitHub][9])               |
+## 1. DeskPet 实现基线
 
-推荐直接阅读：
+### 1.0 V4.1 当前实现（2026-09-08 完成，工作树）
 
-[Microsoft UI Automation Overview](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-uiautomationoverview?utm_source=chatgpt.com)
-[UI Automation threading guidance](https://learn.microsoft.com/zh-cn/windows/win32/winauto/uiauto-threading?utm_source=chatgpt.com)
-[GetVisibleRanges API](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationtextpattern-getvisibleranges?utm_source=chatgpt.com)
-[Windows Terminal accessibility design document](https://github.com/microsoft/terminal/blob/main/doc/terminal-a11y-2023.md?utm_source=chatgpt.com)
-[Windows Terminal external screen-buffer reading discussion](https://github.com/microsoft/terminal/discussions/19614?utm_source=chatgpt.com)
+V4.1 新增/重构（`v4plan.md` 的实施产物；上游依据见后续章节）：
 
-### 这里可以得出的确定结论
+- `agents/process_watch.py`：WindowsExitWatcher（一个阻塞等待线程 +
+  OpenProcess(SYNCHRONIZE) + WaitForMultipleObjects，§11 证据）；
+- `agents/terminal_service.py`：WindowsTerminalService 统一 facade +
+  TerminalActivator exact 激活事务（§8/§9/§10 证据）；
+- `agents/models.py`：SourceProbeSnapshot 三态 / WindowIdentity /
+  TabInfo / TerminalLocation / BindingOrigin / ActivationCode /
+  ActivationResult；
+- `agents/monitor.py`：`_commit_exit()` 级联回收；primary/pinned/
+  gone_grace 全部移除（V4.1 审计确认 grep 为零）；
+- `pet/presentation.py`：PresentationController（focused/attention 分离）；
+- `pet/petview.py`：PetView/PetViewManager（N Toplevel 一 interpreter）；
+- `pet/animator.py`：SharedAnimationCache/AnimationCursor/
+  AnimationScheduler（进程级一份预算）；
+- `pet/config.py`：config_version=4 + ConfigSaveResult + backup；
+- `pet/autostart.py`：AutostartStatus 三态 + repair（§14 证据）；
+- `pet/theme.py` + `pet/widgets.py` + `pet/dashboard.py`：左侧导航
+  六页仪表盘（§15 信息架构依据）；
+- `tools/terminal_layout_probe.py`：topology 实机 probe。
 
-**UIA 路线可行。**
+### 1.1 V3 历史审计基线（superseded，保留作证据）
 
-但是 Terminal maintainer 同时提醒：
+- V3 Monitor：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/agents/monitor.py
+- V3 models：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/agents/models.py
+- V3 process discovery：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/agents/discovery.py
+- V3 BaseWatcher：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/agents/base.py
 
-> UIA 通常不是特别高性能。([GitHub][8])
+历史审计结论（V4.1 已全部修复）：
 
-因此 V3 里我提出的：
+1. `Monitor.instances/snapshots/bindings` 已是 multi-target，V4.1 不需要重写事实层。
+2. `primary_key/primary_target/set_primary/is_bound/_FOLLOW_PRIORITY` 是单 UI presentation 逻辑，应从 Monitor 清除。（V4.1：已删除，迁至 PresentationController）
+3. `gone_grace_sec=15` 会在 authoritative absence 后继续保留旧实例。（V4.1：已删除，SourceProbeSnapshot 三态 + `_commit_exit()`）
+4. `scan_windows()` 全局 `process_iter` 失败时返回 `[]`，上层可误标 healthy。（V4.1：抛 ProbeUnavailable，authoritative=False）
+5. Monitor 只给存在实例的 kind 调 watcher，最后一个实例退出后 BaseWatcher 的 `poll([])` 清理路径不会被调用。（V4.1：每 watcher 每轮 poll，含空列表）
 
-```text
-Notification event
-       ↓
-短 delta
-       ↓
-pattern trigger
-       ↓
-必要时 GetVisibleRanges
-```
+### 1.2 UIA observer
 
-明显优于：
+- V3 Terminal UIA：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/agents/terminal_uia.py
+- V3 matching：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/agents/matching.py
+- V3 Win32 window primitive：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/actions/winkeys.py
 
-```text
-500 ms
-↓
-读取整个 UIA document
-↓
-diff 整个 terminal
-```
-
----
-
-# 二、Windows Terminal ↔ WSL identity：`WT_SESSION`
-
-这个是 V3 解决：
-
-> “WSL PID 到底属于哪个 Windows Terminal？”
-
-的重要身份 hint。
-
-### Windows Terminal Session Management spec
-
-Windows Terminal 官方设计文档讨论了：
-
-```text
-WT_SESSION
-```
-
-作为 Terminal session GUID，用于识别命令来自哪个 Terminal session；文档甚至明确讨论通过这个 GUID 找到 hosting window/session。([GitHub][10])
-
-[Windows Terminal Session Management specification](https://github.com/microsoft/terminal/blob/main/doc/specs/%235000%20-%20Process%20Model%202.0/%234472%20-%20Windows%20Terminal%20Session%20Management.md?utm_source=chatgpt.com)
-
-### WT_SESSION 会传播进入 WSL
-
-Windows Terminal 官方 issue #7130 直接记录了：
+V3 已建立、V4.1 必须保留的资源上限：
 
 ```text
-WSLENV =
-WT_SESSION:
-WT_PROFILE_ID:
-...
+DELTA_MAX                   2048
+RING_MAX                    8192 chars / pane
+VISIBLE_MAX                 4096
+MAX_PANES                   16
+EVENT_QUEUE_MAX             256
+UIA_CALL_QUEUE_MAX          32
+APPROVAL_TTL                1.5 s
+RECHECK_SEC                 0.75 s
+PANE_VISIBLE_READ_INTERVAL  0.5 s
+GLOBAL_VISIBLE_READ_LIMIT   6 / s
 ```
 
-并引用了原本专门实现：
+### 1.3 V3 UI / config / animation
 
-> Add WT_SESSION to WSLENV so it propagates into WSL
+- PetApp：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/pet/app.py
+- PetWindow：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/pet/petwindow.py
+- Bubble：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/pet/bubble.py
+- Animator：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/pet/animator.py
+- Skins：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/pet/skins.py
+- Config：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/pet/config.py
+- Autostart：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/pet/autostart.py
+- Dashboard：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/pet/dashboard.py
+- Tray：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/pet/tray.py
+- Main：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/main.py
 
-的 PR。([GitHub][11])
+关键审计证据：
 
-更早的 #3948 也明确说明，Terminal 团队修复过“WT_SESSION 没进入 WSL”的问题。([GitHub][12])
+- `PetApp` 当前一个 `tk.Tk` = 一个 Pet，Bubble/Animator 都直接挂其上。
+- Bubble `details` hitbox 最终调用当前 primary target，而不是携带 target key。
+- 每个 Animator 自己有 `cache_bytes=48MB` 与独立 frame pool；Fleet 必须改成共享 cache。
+- `Config.save()` 使用同目录 temp + `os.replace`，这个原子替换方向正确，但 OSError 被静默吞掉。
+- `PetWindow.set_topmost()` 当前只 `config.set()` 不 `config.save()`。
+- `autostart.is_enabled()` 当前只检查 `HKCU Run` value 是否存在，不验证 command 是否等于当前路径。
+- Dashboard 当前是 Notebook + Treeview + 独立详情 tab，需要为并发重做信息架构。
 
-[WT_SESSION / WT_PROFILE_ID propagation into WSL](https://github.com/microsoft/terminal/issues/7130?utm_source=chatgpt.com)
+### 1.4 V3 benchmark
 
-因此这一条 V3 方案有依据：
+- Monitor benchmark：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/tests/benchmark_monitor.py
+
+该基准已经验证：
+
+- queue bounded；
+- pane bounded；
+- terminal ring bounded；
+- visible-read budget；
+- pane churn subscription 不累积；
+- resolver 不依赖输入顺序。
+
+V4.1 不能降低这些约束。
+
+### 1.5 V3 plan
+
+- V3 plan：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/plan.md
+
+V4.1 明确 supersede：
 
 ```text
-WSL Codex PID
-     ↓
-/proc/<pid>/environ
-     ↓
-只提取 WT_SESSION
-     ↓
-TerminalResolver hint
+V3 §29–31  primary/auto-follow/pinned
+V3 §36–43  single Dashboard/Bubble/window raise
+V3 §44–45  config pinned/gone_grace
 ```
 
-但 **不要把它当绝对真值**。
-
----
-
-# 三、为什么仍不能根据 WT_SESSION 精确操作某个 Windows Terminal Tab
-
-Windows Terminal 目前仍缺少完整的外部：
+继续保留：
 
 ```text
-WT_SESSION
-→ pane/tab
+V3 §14–25  UIA passive observer / confidence
+V3 §26–28  StateReducer evidence semantics
+V3 §32–35  process/session worker与I/O优化
+V3 §47–55  resource/privacy/fail-closed
 ```
 
-查询/激活 API。
+## 2. Git ignore / 本地数据路径
 
-2026 年的 Windows Terminal issue #19783 就直接提出：
+- 当前 `.gitignore`：
+  https://github.com/invincible-summer/DeskPet/blob/af8236d15dc3bfecaa89464e1b77d7f84c2b09be/.gitignore
 
-> external process 无法按照 WT_SESSION programmatically switch 到具体 tab。([GitHub][13])
+当前已经忽略：
 
-该 issue 还明确描述：
+```gitignore
+assets/pets/*
+!assets/pets/README.md
+assets/cache/
+config.json
+```
+
+V4.1 按当前决定不迁 `%LOCALAPPDATA%`。
+
+若新增 last-known-good backup，再加入：
+
+```gitignore
+config.json.bak
+.deskpet-config-*
+```
+
+证据链：
 
 ```text
-WT_SESSION
-= per tab/pane unique GUID
-```
-
-以及当前 workaround 包括 UI Automation，但 tab title 匹配容易脆弱。([GitHub][13])
-
-[Windows Terminal — Focus/Activate Tab by WT_SESSION request](https://github.com/microsoft/terminal/issues/19783?utm_source=chatgpt.com)
-
-所以 V3 里的：
-
-```text
-CONFIRMED
-HIGH
-AMBIGUOUS
-NONE
-```
-
-binding confidence 是必要的，而不是过度设计。
-
-特别是：
-
-```text
-一个 Windows Terminal
-    └── Tab
-         ├── Pane A → Codex
-         └── Pane B → Claude
-```
-
-不能假装现在有官方：
-
-```text
-WT_SESSION → UIAutomationElement
-```
-
-接口。
-
----
-
-# 四、WSL 进程发现：Microsoft + Linux `/proc` 官方依据
-
-### WSL distribution discovery
-
-Microsoft 官方支持：
-
-```powershell
-wsl --list --verbose
-wsl -l -v
-wsl --list --running
-```
-
-用于获得 distro 和 Running/Stopped 状态。([Microsoft Learn][14])
-
-[Microsoft — Basic commands for WSL](https://learn.microsoft.com/en-us/windows/wsl/basic-commands?utm_source=chatgpt.com)
-
-因此 DeskPet：
-
-```text
-每 10~15 秒
-wsl.exe --list --running
-```
-
-是合理的。
-
----
-
-## `/proc/<pid>/cwd`
-
-Linux man-pages 明确：
-
-```text
-/proc/<pid>/cwd
-```
-
-是指向该进程当前 working directory 的 symbolic link。([man7.org][15])
-
-[Linux proc_pid_cwd(5)](https://man7.org/linux/man-pages/man5/proc_pid_cwd.5.html?utm_source=chatgpt.com)
-
-所以 V3 不应该继续只靠 session JSONL 猜 project：
-
-```text
-PID
- ↓
-/proc/PID/cwd
- ↓
-/home/user/DeskPet
- ↓
-project = DeskPet
-```
-
----
-
-## `/proc/<pid>/stat`
-
-Linux 官方 man-pages 明确提供：
-
-```text
-pid
-ppid
-pgrp
-session
-tty_nr
-tpgid
-starttime
-```
-
-其中：
-
-* field 4 = PPID
-* field 5 = process group
-* field 6 = session ID
-* field 7 = controlling TTY
-* field 8 = foreground process group
-* field 22 = process start time since boot
-
-([man7.org][16])
-
-[Linux proc_pid_stat(5)](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html?utm_source=chatgpt.com)
-
-这就是我建议：
-
-```text
-PID + starttime
-```
-
-作为 WSL process incarnation token，而不是只拿 PID 的依据。
-
-例如：
-
-```text
-wsl:Ubuntu|codex|4812|36791842
-```
-
-这样 PID 4812 将来被另一个进程重用，也不会误继承旧绑定。
-
----
-
-# 五、为什么 `/proc/PID/environ` 必须严格 allowlist
-
-Linux man-pages 明确：
-
-```text
-/proc/<pid>/environ
-```
-
-暴露该进程 initial environment，项目之间用 `\0` 分隔。访问也受 ptrace read permissions 控制。([man7.org][17])
-
-[Linux proc_pid_environ(5)](https://man7.org/linux/man-pages/man5/proc_pid_environ.5.html?utm_source=chatgpt.com)
-
-这意味着 DeskPet 技术上能够看到：
-
-```text
-WT_SESSION
-CODEX_HOME
-CLAUDE_CONFIG_DIR
-...
-```
-
-但也可能同时看到：
-
-```text
-OPENAI_API_KEY
-ANTHROPIC_API_KEY
-AWS_SECRET_ACCESS_KEY
-...
-```
-
-所以 V3 必须采用：
-
-```text
-WSL 内部读取 environ
+用户要求保留项目内路径
         ↓
-立即只提取 allowlist
+现有 .gitignore 已防 config/user skins/cache 上传
         ↓
-Python 永远看不到其他变量
+V4.1 只补 backup/temp pattern
+        ↓
+不需要引入路径迁移与额外 migration 风险
+```
+
+## 3. Windows Terminal 命令行：为什么不能把 `wt.exe` 当 exact identity backend
+
+### 3.1 Microsoft Learn — Windows Terminal command-line arguments
+
+https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments
+
+实现合同确认：
+
+- `--window/-w window-id` 可向指定 Windows Terminal window 发命令；
+- `last/0` 是 most recently used window；
+- 若指定 window-id/name 不存在，Windows Terminal 可以创建新 window；
+- `focus-tab/ft --target/-t` 按**整数 tab index**切换；
+- `move-focus` 可以按方向移动 Pane focus。
+
+V4.1 推论：
+
+```text
+DeskPet exact HWND ≠ Windows Terminal CLI window-id
+-w 0 = MRU，不是 exact target
+不存在 id 可能创建 Window
+tab-index 会随 reorder 变化
+```
+
+所以 `wt.exe` 不作为 V4.1 主 exact activation backend。
+
+## 4. Windows Terminal 当前公开能力缺口
+
+### 4.1 Focus/Activate by WT_SESSION — issue #19783
+
+https://github.com/microsoft/terminal/issues/19783
+
+当前状态：`closed / not_planned`。
+
+issue 明确描述的问题就是：
+
+> external process 无法按 `WT_SESSION` 切换到具体 existing tab。
+
+该 issue 还记录现有 workaround：
+
+```text
+UI Automation TabItem
++ SelectionItemPattern.Select()
+```
+
+同时指出 title matching 易碎。
+
+用途：
+
+- 证明 V4.1 不能假设 `WT_SESSION -> Tab` 是公开 API；
+- 支持“UIA runtime identity + 不按 title 猜”的设计。
+
+注意：issue 是能力缺口证据，不是 API 合同。
+
+### 4.2 Query tabs/metadata — issue #19818
+
+https://github.com/microsoft/terminal/issues/19818
+
+截至本次审计仍 open。
+
+需求本身要求增加：
+
+```text
+--list-tabs
+--query-state
+--active-tab
+--query-tabs --detailed
+```
+
+当前 limitation 中明确写：
+
+- 无法 programmatically query open terminal tabs；
+- 无法获得每 Tab cwd/profile。
+
+用途：
+
+> V4.1 不能设计成“先用 wt 查询所有 tab，再按 WT_SESSION 选”。
+
+### 4.3 Current selected tab index — issue #18692
+
+https://github.com/microsoft/terminal/issues/18692
+
+截至本次审计仍 open。
+
+它明确指出：
+
+```text
+focus-tab --target 接受 index
+但不知道当前 selected index / tab count
+```
+
+用途：
+
+> `focus-tab -t index` 是执行接口，不是 identity/query 接口。
+
+### 4.4 Foreground Window ≠ correct Tab — issue #18429
+
+https://github.com/microsoft/terminal/issues/18429
+
+截至本次审计仍 open。
+
+问题：
+
+> BringWindowToTop/foreground window 本身不会恢复正确 active tab。
+
+用途：
+
+> V3 的 `raise_terminal(hwnd)` 对 V4 多 Tab 不够，必须 Window + Tab + Pane。
+
+## 5. Windows Terminal 当前源码：selected Tab content 的 UI 树行为
+
+### 5.1 `TerminalPage::_InitializeTab`
+
+https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalApp/TabManagement.cpp
+
+当前源码在设置：
+
+```cpp
+_tabView.SelectedItem(tabViewItem);
+```
+
+前的注释明确说明，这会触发 `TabView::SelectionChanged`，并在响应过程中把该 Tab 的 terminal XAML control attach 到 XAML root。
+
+这是**当前上游行为证据**，不是公开 ABI。
+
+V4.1 推论：
+
+```text
+所有 TabItem 可作为 topology 元素跟踪
+但不能假设 inactive Tab 的 TermControl 都同时在 root
+```
+
+因此：
+
+- 不后台逐 Tab 自动切换；
+- 只观察 current selected Tab 的 TermControl；
+- 用户自然切换时逐步学习；
+- cold start 同质 background tabs 保持 ambiguous。
+
+### 5.2 Windows Terminal WT_SESSION 来源
+
+当前源码：
+
+https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalConnection/ConptyConnection.cpp
+
+其中 Terminal 为 session environment 设置 `WT_SESSION` GUID。
+
+用途：
+
+- `AgentInstance.wt_session` 继续是有价值的强 hint；
+- 但没有公开 reverse-query，所以不是直接 Tab locator。
+
+### 5.3 Current `focus-tab` / `focus-pane` parser
+
+https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalApp/AppCommandlineArgs.cpp
+
+当前源码包含：
+
+```text
+focus-tab
+focus-pane
+move-focus
+```
+
+用途：
+
+- 证明 Windows Terminal 内部有这些 focus action；
+- 同时说明 DeskPet 的障碍不是“Terminal 不能切”，而是外部没有可靠 identity mapping。
+
+## 6. UI Automation Threading — 单 MTA 是正确架构
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading
+
+实现合同：
+
+- 与 desktop 上所有 UI element 交互的 UIA client 应把 UIA calls 放独立 thread；
+- 该 thread 不应拥有 window；
+- 应为 COM MTA；
+- event handler add/remove 应在非 UI/MTA thread，并在同一 thread 管理；
+- 不建议多个 thread 同时 add/remove UIA event handlers。
+
+V4.1 证据链：
+
+```text
+V3 已有一个 UiaBackend MTA
+        ↓
+Tab discovery/select/pane focus 继续封送到该线程
+        ↓
+不能为 Tab/Fleet/Pet 再建 UIA thread
+```
+
+## 7. UIA RuntimeId — 只能是运行期 identity
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-getruntimeid
+
+官方语义：
+
+- only guaranteed unique within the desktop UI where generated；
+- identifiers may be reused over time；
+- format may change；
+- treat as opaque and use only for comparison。
+
+V4.1 直接合同：
+
+```text
+Tab RuntimeId / Pane RuntimeId
+    = runtime-only
+
+禁止：
+    写入 config
+    跨 DeskPet restart 恢复
+    当作永久 UUID
+```
+
+## 8. UIA Tab selection
+
+### 8.1 SelectionItemPattern.Select
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationselectionitempattern-select
+
+官方语义：
+
+> Clears any selected items and then selects the current element.
+
+V4.1 用法：
+
+```text
+exact TabItem RuntimeId
+    ↓
+SelectionItemPattern.Select()
+```
+
+不使用：
+
+```text
+Ctrl+Tab
+Ctrl+1
+SendInput
+keybd_event
+```
+
+### 8.2 SelectionItemPattern interface
+
+https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nn-uiautomationclient-iuiautomationselectionitempattern
+
+确认可读取：
+
+```text
+CurrentIsSelected
+CurrentSelectionContainer
+Select()
+```
+
+### 8.3 Selection event ID
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-event-ids
+
+`UIA_SelectionItem_ElementSelectedEventId = 20012`。
+
+V4.1 用法：
+
+```text
+用户自然切 Tab
+    ↓
+selection event
+    ↓
+topology dirty
+    ↓
+bounded current-tab refresh
+```
+
+而不是 200ms 枚举所有 Tab。
+
+## 9. UIA Pane focus
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-setfocus
+
+官方语义：
+
+> Sets keyboard focus to this UI Automation element.
+
+V4.1 使用顺序：
+
+```text
+Select exact Tab
+        ↓
+restore / foreground exact HWND
+        ↓
+确认 foreground 成功
+        ↓
+SetFocus(exact pane)
+```
+
+不把 `SetFocus` 当绕过 Windows foreground policy 的手段。
+
+## 10. Windows foreground policy
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow
+
+官方说明：
+
+- Windows restricts which processes can set foreground；
+- 即使满足条件也可能被拒绝；
+- 当用户正在使用另一个 window，应用不能任意强制抢 foreground；
+- 可用 taskbar flashing 通知用户。
+
+V4.1 合同：
+
+```text
+DeskPet 保证“选的是正确 Window/Tab/Pane”
+≠ 保证 OS 一定允许抢前台
+
+foreground denied:
+    FlashWindowEx
+    return FOREGROUND_DENIED
+```
+
+不使用输入模拟绕过。
+
+## 11. Windows process exit event
+
+### 11.1 Process object becomes signaled on termination
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process
+
+官方语义：
+
+> When a process terminates, the process object becomes signaled, releasing threads waiting for termination.
+
+这是 `WindowsExitWatcher` 的核心依据。
+
+### 11.2 OpenProcess
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess
+
+用途：
+
+- 获取 local process object handle；
+- V4.1 只申请 wait 所需最小权限；
+- 不申请 VM_READ/VM_WRITE。
+
+### 11.3 WaitForMultipleObjects
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects
+
+官方语义：
+
+- 等待多个 kernel object 进入 signaled state；
+- process handle 是支持的 object 类型；
+- 最大数量 `MAXIMUM_WAIT_OBJECTS`。
+
+V4.1：
+
+```text
+一个 WindowsExitWatcher thread
++ ≤16 Agent process handles
++ one control event
+```
+
+远小于系统上限，不需要 per-Agent thread。
+
+## 12. Linux / WSL process identity
+
+### 12.1 `/proc/PID/stat`
+
+Linux man-pages：
+
+https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+
+关键字段：
+
+- process state；
+- PPID；
+- process group/session；
+- TTY/foreground process group；
+- `starttime`。
+
+Process state 包括：
+
+```text
+Z zombie
+X/x dead
+```
+
+V4.1：
+
+- `starttime` 继续作为 WSL process incarnation token；
+- `Z/X/x` 不作为 live Agent；
+- 不因为 `S/T/D` 等“当前没执行 CPU”而判退出。
+
+### 12.2 `/proc/PID/cwd`
+
+https://man7.org/linux/man-pages/man5/proc_pid_cwd.5.html
+
+继续作为 Agent cwd/project evidence。
+
+## 13. WSL lifecycle：fresh running inventory
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/wsl/wsl-config
+
+官方文档说明：
+
+- WSL subsystem 在最后实例关闭后仍可能约 8 秒才完全停止；
+- `wsl --list --running` 可检查当前仍 running 的 distribution；
+- `wsl --terminate <distro>` 可立即终止指定 distribution。
+
+Microsoft Learn Basic Commands：
+
+https://learn.microsoft.com/en-us/windows/wsl/basic-commands
+
+V4.1 继续 V3.1.2 规则：
+
+```text
+只有本轮 fresh inventory 确认 Running 的 distro
+才允许进入 distro 做 ps/metadata
+```
+
+枚举失败：
+
+```text
+无法读取 ≠ distro stopped
+```
+
+不宣布旧 Agent 退出。
+
+## 14. Autostart — HKCU Run
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys
+
+官方语义：
+
+- `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 每次该用户登录时运行；
+- value 是 command line；
+- command line 最大 260 chars。
+
+V4.1 因此继续 HKCU Run，不引入 admin/service。
+
+需要修的不是机制，而是当前 DeskPet 的 verification：
+
+```text
+旧：
+value 存在 → enabled
+
+V4.1：
+value 存在
+AND command == 当前 expected
+AND exe/main.py path exists
+AND length合法
+→ healthy
+```
+
+## 15. Dashboard 信息架构依据
+
+DeskPet 仍用 ttk，以下 Microsoft 文档只作为**信息架构/可访问性设计指导**，不是要求换 WinUI。
+
+### 15.1 NavigationView
+
+https://learn.microsoft.com/en-us/windows/apps/design/controls/navigationview
+
+当前 Microsoft 指南说明 NavigationView 适合：
+
+- 顶级导航；
+- 多个 navigation categories；
+- left/top adaptive navigation。
+
+V4.1 ttk Dashboard 模仿其信息架构：
+
+```text
+Overview
+Agents
+Deskpet & Appearance
+Monitoring & Privacy
+Diagnostics
+Settings
+```
+
+不引入 WinUI runtime。
+
+### 15.2 App settings layout
+
+https://learn.microsoft.com/en-us/windows/apps/design/app-settings/guidelines-for-app-settings
+
+当前指南：
+
+- Navigation pane layout 时 Settings 适合放底部；
+- settings content 使用可滚动、受限最大宽度；
+- 约 1000–1100 px 可读宽度。
+
+V4.1 Dashboard 默认 1120×760，与此阅读密度接近。
+
+### 15.3 Accessible text
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/apps/design/accessibility/accessible-text-requirements
+
+V4.1 UI 规则：
+
+- 普通文字按 WCAG/Windows guidance 保持足够 contrast；
+- 不只靠颜色表达 Waiting/Error/Working；
+- 状态同时有 text/icon/accent。
+
+## 16. 多显示器 / DPI（Fleet 持久位置）
+
+### 16.1 MonitorFromWindow / MonitorFromPoint
+
+Microsoft Learn：
+
+https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfromwindow
+
+### 16.2 GetMonitorInfo
+
+https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmonitorinfow
+
+用途：
+
+- 获取 Pet 所在 monitor；
+- 用 work area 保存/恢复相对 placement；
+- monitor 消失时 clamp 到可见 work area。
+
+### 16.3 GetDpiForWindow
+
+https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdpiforwindow
+
+用途：
+
+- Fleet 每个 Toplevel 可以位于不同 DPI monitor；
+- 每 Pet 缓存自己的 DPI；
+- 只在 create/move/debounced geometry change 时刷新；
+- DPI 变化才请求新 skin pixel height。
+
+## 17. V4.1 证据链总表
+
+| 设计判断 | 证据强度 | 依据 | 实现后果 |
+|---|---|---|---|
+| UIA 必须一个独立 MTA | 官方 API 指南 | UIA threading | 继续 V3 单 UiaBackend |
+| Tab 可用 SelectionItem.Select | 官方 API | SelectionItemPattern | 不发送键盘 |
+| RuntimeId 不能持久化 | 官方 API | GetRuntimeId | Tab/Pane runtime-only |
+| Pane 可用 UIA SetFocus | 官方 API | SetFocus | foreground成功后 exact pane focus |
+| OS 可能拒绝抢前台 | 官方 API | SetForegroundWindow | Flash + typed failure |
+| Windows process可阻塞等待退出 | 官方 API | process signaled + WaitForMultipleObjects | 一线程 exit watcher |
+| Run key command有260字符限制 | 官方 API | Run/RunOnce | autostart预校验 |
+| `focus-tab` 只有 index | 官方 WT docs | command-line args | index只能 hint |
+| WT_SESSION→Tab query缺失 | 官方仓库 issue | #19783/#19818/#18692 | UIA topology + ambiguous |
+| Bring Window不等于正确Tab | 官方仓库 issue | #18429 | Window→Tab两层不可省 |
+| selected Tab content attach XAML root | WT当前源码 | TabManagement.cpp | 不扰动 background tabs |
+| V3 UIA 已有有界 observer | DeskPet固定commit | terminal_uia.py | 扩展而不重写 |
+| V3 primary在 Monitor | DeskPet固定commit | monitor.py | presentation拆层 |
+| V3 config save可静默失败 | DeskPet固定commit | config.py | commit result/backup |
+| V3 Animator cache是per-instance | DeskPet固定commit | animator.py | Fleet共享cache |
+| config/skins/cache已gitignore | DeskPet固定commit | .gitignore | 暂不迁LocalAppData |
+
+## 18. 需要实机验证、不能伪装成已知事实的点
+
+V4.1 剩余真正需要 compatibility probe 的主要问题只有这些：
+
+1. Windows Terminal 当前版本中，Tab reorder 前后 `TabItem RuntimeId` 的实际稳定性；
+2. inactive Tab detach、再 selected/attach 后 `TermControl RuntimeId` 是否保持；
+3. split pane 中 `TermControl.SetFocus()` 的实际焦点行为；
+4. Terminal 在不同版本/设置（tabs in titlebar、focus mode、fullscreen）下 TabItem UIA tree 的结构差异。
+
+这些都不能写成永久假设。
+
+### 18.1 2026-09-08 实机 probe 结果（tools/terminal_layout_probe.py）
+
+在真实 Windows Terminal（两同 title "Ubuntu" Tab）上验证：
+
+* `discover_layout()`：Window（HWND/PID/create_time/class）+ TabItem
+  （index/RuntimeId/selected/name）+ TermControl（仅 selected tab）全部正常；
+* 两个同 title Tab 拥有不同 RuntimeId → 同 title 不影响 exact 定位；
+* `SelectionItemPattern.Select()` 对两个 Tab 均成功且 selected 验证通过；
+* `TermControl.SetFocus()` 在窗口非前台时调用成功但焦点不转移 →
+  证实 v4plan §5.9 "foreground 成功后才 SetFocus" 顺序是必要的；
+* 切换 Tab 后 TermControl 是新 RuntimeId 实例（不同 Tab 的 pane rid
+  不同）→ 证实 sole-pane revalidation/rebind 设计是必要的。
+
+### 18.2 2026-09-08 绑定评分实机验证（V4.1.1 修复）
+
+在真实 WT（私有窗口 + OSC 固定标题）上验证的补充事实：
+
+* **TermControl 的 UIA Name 可能停留在 profile 名**（实测为
+  "Ubuntu"），而 TabItem 标题已带 shell 设置的
+  "user@host: ~/path" → 标题评分必须把 TabItem 标题作为第二条证据
+  （`_pane_titles`，两者取高分，互斥唯一门槛不变）；
+* 裸 basename 匹配在真实环境必然假命中：用户名==家目录名时
+  （invincible + /home/invincible），每个 "user@host: ~/x" 标题都
+  含该 basename → 必须按 `~/a/b` 路径标记归一化比对；
+* `wt -w _new` 不总是新开窗口（复用已有窗口），关闭多 Tab 窗口会弹
+  确认框 → 探针/自动化需自记录基线窗口集；
+* 端到端（真实 UIA + 私有 WT 窗口 + 合成 WSL Agent）：Tab 标题证据 →
+  `cwd+user@` 评分 3 → HIGH → `TerminalActivator` 返回 OK 且前台
+  正确（2026-09-08 实测通过）。
+
+实现按上述事实 feature-detect + fail-closed，无键盘模拟。
+
+实现必须：
+
+```text
+feature detect
+→ use exact capability
+→ refresh once
+→ safe fallback
+→ ambiguous/fail
 ```
 
 而不是：
 
-```python
-env = read_all_environ()
+```text
+版本不一样
+→ title guess
+→ keyboard guess
 ```
 
-再在 Python 里过滤。
+## 19. V4.1 不允许使用的“替代方案”
 
-这是 privacy architecture 的重要区别。
-
----
-
-# 六、Codex CLI：最重要的一手源码
-
-Codex 是三者中最容易从官方源码精确验证的，因为 `openai/codex` 是开放源码仓库。
-
-## 1. Codex rollout 的持久化策略
-
-这是整个 V3 **“不能用 rollout 判断 Waiting Approval”** 最关键的资料。
-
-Codex 官方源码：
+即使看似能工作，也不进入主实现：
 
 ```text
-codex-rs/rollout/src/policy.rs
-```
-
-明确把这些事件标记为 transient、不持久化：
-
-```text
-TerminalInteraction
-ExecCommandOutputDelta
-
-ExecApprovalRequest
-RequestPermissions
-RequestUserInput
-ElicitationRequest
-ApplyPatchApprovalRequest
-
-...
-```
-
-即：
-
-```rust
-=> false
-```
-
-([GitHub][18])
-
-[OpenAI Codex — rollout persistence policy](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/policy.rs?utm_source=chatgpt.com)
-
-这是 V3 最重要的一条事实依据。
-
-因此：
-
-```text
-rollout silence
-```
-
-绝对不能推断：
-
-```text
-Waiting For Approve
-```
-
----
-
-## 2. UserMessage 会进入 rollout
-
-同一个官方 persistence policy 说明：
-
-```text
-EventMsg::UserMessage
-```
-
-在 legacy history 中是持久化事件；新的 paginated history 则通过 canonical ResponseItem 表达 user turn。官方 recorder tests 也明确构造并写入 `UserMessageEvent.message`。([GitHub][18])
-
-因此：
-
-> **DeskPet 把“当前真实 user turn 的文本”解释成 Goal**
-
-是有数据基础的。
-
-但需要明确：
-
-```text
-Goal
-```
-
-是 **DeskPet semantic derived field**，
-
-不是 Codex 官方保证存在一个：
-
-```json
-"goal": "..."
-```
-
-字段。
-
-这是 V3 设计里应该写清楚的。
-
----
-
-# 七、Codex Plan Mode
-
-Codex 官方 source 中 `TurnStartedEvent` 有：
-
-```text
-collaboration_mode_kind
-```
-
-Codex 在创建 `TurnStartedEvent` 时直接：
-
-```rust
-collaboration_mode_kind: ctx.mode()
-```
-
-另外协议源码/讨论也可以看到：
-
-```rust
-pub struct TurnStartedEvent {
-    ...
-    pub collaboration_mode_kind: ModeKind,
-}
-```
-
-([GitHub][19])
-
-所以：
-
-```text
-Codex Plan
-```
-
-不应该通过终端 OCR/UIA 猜。
-
-应该首先从：
-
-```text
-TurnStartedEvent
-```
-
-获得。
-
----
-
-# 八、Codex Approval UI 确实存在于 TUI 层
-
-Codex 官方：
-
-```text
-codex-rs/tui/src/bottom_pane/approval_overlay.rs
-```
-
-定义：
-
-```rust
-ApprovalOverlay
-```
-
-并处理：
-
-```text
-ApprovalRequest::Exec
-ApprovalRequest::Permissions
-ApprovalRequest::ApplyPatch
-ApprovalRequest::McpElicitation
-```
-
-当前界面字符串包括：
-
-> `Would you like to run the following command?`
-
-以及 permissions approval UI。([GitHub][20])
-
-[OpenAI Codex — approval_overlay.rs](https://github.com/openai/codex/blob/main/codex-rs/tui/src/bottom_pane/approval_overlay.rs?utm_source=chatgpt.com)
-
-这直接支持：
-
-```text
-rollout
-→ 不知道 approval
-
-Terminal visible UI
-→ 能看到 approval overlay
-```
-
-的双信号设计。
-
-但是 V3 **不能只 hardcode 一句话**。
-
-例如不要只写：
-
-```python
-if "Would you like to run" in text:
-```
-
-而应该：
-
-```text
-标题模式
-+
-选项结构
-+
-当前可见 viewport
-+
-短 TTL
-```
-
-因为 UI 文案未来可能变化。
-
----
-
-# 九、Codex 自定义数据根：CODEX_HOME
-
-Codex 官方配置代码明确使用：
-
-```text
-CODEX_HOME
-```
-
-作为用户配置和相关本地数据 root；配置 stack 中用户配置也是：
-
-```text
-${CODEX_HOME}/config.toml
-```
-
-([GitHub][21])
-
-[OpenAI Codex config implementation](https://github.com/openai/codex/blob/main/codex-rs/core/src/config/mod.rs?utm_source=chatgpt.com)
-
-因此 DeskPet 不能只写死：
-
-```text
-~/.codex
-```
-
-必须：
-
-```text
-CODEX_HOME
-否则 ~/.codex
-```
-
----
-
-# 十、Claude Code：官方文档能确认的部分
-
-Claude Code 不像 Codex 那样完整开源，因此要严格区分官方文档与 bug report。
-
-## Claude session transcript 路径
-
-Anthropic 官方 sessions 文档明确：
-
-```text
-~/.claude/projects/<project>/<session-id>.jsonl
-```
-
-每行是：
-
-```text
-message
-tool use
-metadata
-```
-
-并且 `CLAUDE_CONFIG_DIR` 可以改变这一根目录。([Claude][22])
-
-[Claude Code — Manage sessions](https://code.claude.com/docs/en/sessions?utm_source=chatgpt.com)
-
----
-
-# 十一、Claude CLAUDE_CONFIG_DIR
-
-Anthropic 官方环境变量文档：
-
-```text
-CLAUDE_CONFIG_DIR
-```
-
-会覆盖默认：
-
-```text
-~/.claude
-```
-
-而且：
-
-> settings、credentials、session history、plugins 都存放在这个目录下。([Claude][23])
-
-[Claude Code environment variables](https://code.claude.com/docs/en/env-vars?utm_source=chatgpt.com)
-
-因此 V3 `/proc/PID/environ` allowlist 应包含：
-
-```text
-CLAUDE_CONFIG_DIR
-```
-
----
-
-# 十二、Claude Plan / Permission Mode
-
-Anthropic 官方 Permission Modes 文档当前明确列出：
-
-```text
-default
-acceptEdits
-plan
-auto
-dontAsk
-bypassPermissions
-```
-
-并明确：
-
-```text
-plan
-```
-
-是正式 mode，不是简单 UI 状态。([Claude][24])
-
-[Claude Code permission modes](https://code.claude.com/docs/en/permission-modes?utm_source=chatgpt.com)
-
-所以 V3 模型：
-
-```text
-mode = PLAN
-status = WORKING
-phase = READING
-```
-
-是正确的，而不是：
-
-```text
-status = PLAN
-```
-
----
-
-# 十三、Claude PID → Session registry：有证据，但不是稳定官方 API
-
-这一部分一定要降级为 **implementation hint**。
-
-2026 年 Claude Code 上游 issue 提供了明确实例：
-
-```text
-~/.claude/sessions/57116.json
-
-{
-  "pid": 57116,
-  "sessionId": "...",
-  ...
-}
-```
-
-([GitHub][25])
-
-另一个上游 bug report 也确认 Claude Code 使用：
-
-```text
-~/.claude/sessions/<pid>.json
-```
-
-记录 running sessions。([GitHub][26])
-
-所以可以用于：
-
-```text
-PID
- ↓
-sessionId hint
-```
-
-但不能当唯一真值。
-
----
-
-# 十四、为什么 Claude PID registry 不能当唯一真值
-
-官方 issue #53037 / #56766 已经复现：
-
-```text
-/clear
-```
-
-后：
-
-```text
-新的 transcript sessionId
-```
-
-发生了变化，但：
-
-```text
-~/.claude/sessions/<PID>.json
-```
-
-里面的 `sessionId` 仍然是旧值，只是 `updatedAt` 刷新。([GitHub][27])
-
-[Claude PID registry stale after /clear](https://github.com/anthropics/claude-code/issues/53037?utm_source=chatgpt.com)
-
-因此 V3 应：
-
-```text
-PID registry = strong hint
-+
-active transcript mtime
-+
-cwd
-+
-new user events
-```
-
-进行交叉验证。
-
-而不是：
-
-```text
-PID file says session A
-→ 永远 session A
-```
-
----
-
-# 十五、为什么 Claude 还需要 Terminal UIA fallback
-
-Claude Code 2026 年曾有 WSL/Linux regression：
-
-```text
-interactive session
-```
-
-运行期间：
-
-```text
-~/.claude/projects/...jsonl
-```
-
-只创建 stub 或不实时追加，直到 session 结束/修复后才正常。([GitHub][28])
-
-这类资料属于：
-
-> **现状/回归证据，不是稳定协议。**
-
-但它非常重要，因为它证明：
-
-```text
-“只依赖 Claude JSONL”
-```
-
-并不足以成为长期可靠的实时 observer architecture。
-
-另一个 Claude issue 也能看到 permission/question dialog 属于 TUI 独立交互层：dialog 未渲染时 CLI 会保持 `Waiting…`。([GitHub][29])
-
-所以：
-
-```text
-Claude transcript
-+
-Terminal UIA
-```
-
-比：
-
-```text
-Claude transcript only
-```
-
-鲁棒得多。
-
----
-
-# 十六、Kimi Code：官方数据位置
-
-Kimi 是 V3 中资料最完整的一家。
-
-Kimi Code 官方文档明确：
-
-```text
-默认：
-~/.kimi-code/
-
-可覆盖：
-KIMI_CODE_HOME
-```
-
-([Kimi][30])
-
-[Kimi Code — Data locations](https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/data-locations.html?utm_source=chatgpt.com)
-
-所以当前 DeskPet V2 的：
-
-```text
-~/.kimi/sessions
-```
-
-需要升级。
-
----
-
-# 十七、Kimi session 目录结构
-
-Kimi 官方文档明确给出了：
-
-```text
-$KIMI_CODE_HOME/
-├── session_index.jsonl
-└── sessions/
-    └── <workDirKey>/<sessionId>/
-         ├── state.json
-         └── agents/
-              └── main/
-                   └── wire.jsonl
-```
-
-其中：
-
-### `session_index.jsonl`
-
-包含：
-
-```text
-sessionId
-sessionDir
-workDir
-```
-
-### `state.json`
-
-包含：
-
-```text
-title
-lastPrompt
-timestamps
-```
-
-### `agents/main/wire.jsonl`
-
-是：
-
-> main Agent 的完整 communication record，用于 session resume/replay。([Kimi][30])
-
-因此 Kimi 不需要 DeskPet：
-
-```text
-递归扫描所有 JSONL
-```
-
-而应该：
-
-```text
-cwd
- ↓
-session_index.jsonl
- ↓
-sessionDir
- ↓
-wire.jsonl
-```
-
----
-
-# 十八、Kimi Plan Mode
-
-Kimi 当前 runtime source 的 `StatusUpdate` 明确包含：
-
-```typescript
-payload: {
-    model: status.model,
-    thinking_effort: status.thinkingEffort,
-    plan_mode: status.planMode,
-}
-```
-
-([GitHub][31])
-
-[Kimi Code session runtime — StatusUpdate](https://github.com/MoonshotAI/kimi-code/blob/main/apps/vscode/src/runtime/session-runtime.ts?utm_source=chatgpt.com)
-
-Kimi changelog 也明确记录：
-
-* 加入 Plan mode
-* `plan_mode` 保存到 SessionState
-* resume 后恢复
-* `EnterPlanMode` / `ExitPlanMode` 后重新发正确 StatusUpdate
-
-([GitHub][32])
-
-因此：
-
-```text
-Kimi mode = PLAN
-```
-
-属于非常高可信的结构化状态。
-
----
-
-# 十九、Kimi ApprovalRequest
-
-Kimi Agent SDK 官方仓库文档明确列出 wire 类型：
-
-```text
-TurnBegin
-StepBegin
-ThinkPart
-ToolCall
-ToolResult
-StatusUpdate
-ApprovalRequest
-ApprovalRequestResolved
-```
-
-并明确：
-
-> 未处理的 ApprovalRequest 会阻塞当前 turn。([GitHub][33])
-
-[Kimi Agent SDK — session/wire messages](https://github.com/MoonshotAI/kimi-agent-sdk/blob/main/guides/python/session.md?utm_source=chatgpt.com)
-
-所以对于 Kimi：
-
-```text
-wire ApprovalRequest
-→ WAITING_APPROVAL
-```
-
-是 **EXACT**。
-
-不需要 UIA 猜。
-
----
-
-# 二十、Kimi Plan approval 本身也有官方说明
-
-Kimi 官方 tools reference：
-
-```text
-EnterPlanMode
-ExitPlanMode
-```
-
-并明确说明：
-
-> `ExitPlanMode` 会把 plan 展示给用户审批，再退出 Plan mode。([GitHub][34])
-
-[Kimi Code — Plan Mode tools reference](https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/reference/tools.md?utm_source=chatgpt.com)
-
-这对 DeskPet 非常有价值：
-
-```text
-plan_mode=true
-+
-ApprovalRequest
-```
-
-就可以准确展示：
-
-```text
-Kimi · Plan · 等待计划确认
-```
-
----
-
-# 二十一、DeskPet 当前代码本身的审计依据
-
-当前仓库基线仍是：
-
-```text
-main
-4707d90b87a9b75a587ed5f9dc2a9c0eae599164
-commit: v2
-```
-
-当前 V2 `agents/discovery.py` 的 WSL scanner 确实只执行：
-
-```text
-ps -eo pid=,etimes=,args=
-```
-
-最终只有：
-
-```text
-kind
-pid
-source
-started_at
-```
-
-并没有：
-
-```text
-cwd
-tty
-uid
-sid
-WT_SESSION
-```
-
-当前 `Monitor` 仍包含 Managed/Readonly 双路聚合。
-
-Dashboard 当前也仍然提供：
-
-```text
-新建 Codex 会话
-绑定终端
-绑定会话文件
-自动批准
-发送任务
-```
-
-等 V2 模型。
-
-[DeskPet repository](https://github.com/invincible-summer/DeskPet?utm_source=chatgpt.com)
-
----
-
-# 二十二、我建议实际开发时按这个“资料可信度等级”执行
-
-### A — 可以当实现合同
-
-这些可以直接指导代码：
-
-**Microsoft：**
-
-* UI Automation API
-* UIA threading
-* UIA event subscription
-* GetVisibleRanges
-* WSL CLI
-
-**Linux：**
-
-* `/proc/PID/stat`
-* `/proc/PID/cwd`
-* `/proc/PID/environ`
-
-**OpenAI Codex：**
-
-* `rollout/src/policy.rs`
-* `protocol.rs`
-* `approval_overlay.rs`
-* config source
-
-**Anthropic：**
-
-* sessions docs
-* permission modes
-* env vars / `CLAUDE_CONFIG_DIR`
-
-**Kimi：**
-
-* Data Locations
-* Sessions
-* Wire/SDK types
-* Plan tools
-* StatusUpdate source
-
----
-
-### B — 可以作为强实现 hint，但必须有 fallback
-
-例如：
-
-```text
-Claude ~/.claude/sessions/<PID>.json
-```
-
-有非常明确的上游实例，但当前并不是一个公开“外部 tooling API”。
-
-所以：
-
-```text
-使用 ✅
-依赖它作为唯一真值 ❌
-```
-
----
-
-### C — Issue / bug report 只能说明边界
-
-例如：
-
-```text
-Claude transcript 不实时刷新
-Claude PID registry /clear 后 stale
-Windows Terminal 没有 WT_SESSION → tab external API
-```
-
-这些用于回答：
-
-> “为什么 V3 必须有 fallback / confidence？”
-
-但不能在代码里假定：
-
-> “这个 bug 永远存在。”
-
----
-
-## 最值得你优先自己核对的 12 个链接
-
-1. [Windows Terminal accessibility / UIA notifications](https://github.com/microsoft/terminal/blob/main/doc/terminal-a11y-2023.md?utm_source=chatgpt.com)
-2. [Windows Terminal maintainer：外部程序用 UIA 读取 Terminal](https://github.com/microsoft/terminal/discussions/19614?utm_source=chatgpt.com)
-3. [Microsoft UIA threading requirements](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading?utm_source=chatgpt.com)
-4. [UIA GetVisibleRanges](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationtextpattern-getvisibleranges?utm_source=chatgpt.com)
-5. [WT_SESSION → WSLENV evidence](https://github.com/microsoft/terminal/issues/7130?utm_source=chatgpt.com)
-6. [Linux /proc PID stat specification](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html?utm_source=chatgpt.com)
-7. [Codex rollout persistence policy](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/policy.rs?utm_source=chatgpt.com)
-8. [Codex approval TUI implementation](https://github.com/openai/codex/blob/main/codex-rs/tui/src/bottom_pane/approval_overlay.rs?utm_source=chatgpt.com)
-9. [Claude Code session storage documentation](https://code.claude.com/docs/en/sessions?utm_source=chatgpt.com)
-10. [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes?utm_source=chatgpt.com)
-11. [Kimi Code data locations](https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/data-locations.html?utm_source=chatgpt.com)
-12. [Kimi Wire ApprovalRequest documentation](https://github.com/MoonshotAI/kimi-agent-sdk/blob/main/guides/python/session.md?utm_source=chatgpt.com)
-
-用这些资料交叉验证以后，V3 最核心的三路监听架构基本是站得住的：
-
-```text
-/proc / psutil
-→ WHO / WHERE
-
-Agent persistence
-→ WHAT IT IS DOING
-
-Windows Terminal UIA
-→ WHAT THE TERMINAL IS CURRENTLY ASKING
-```
-
-其中最关键的事实也得到了相当直接的一手支持：**Codex approval 事件明确不持久化到 rollout，而 Windows Terminal 明确提供 UIA 文本/notification 能力；因此用 UIA 补 Codex/Claude 的终端交互态并不是 workaround 式猜测，而是当前“不改 Agent、不用 hooks、旁路监听已有 CLI”约束下最有依据的实现路线。** ([GitHub][18])
-
----
-
-# 二十三、V3.1.1 Core Hardening Closure 补充依据
-
-## WSL：`--list --running` / `--quiet` 的语义
-
-Microsoft Learn "Basic commands for WSL"：`wsl --list --running` 只列出**当前正在运行**的 distribution，`--quiet` 只输出发行版名字。因此：
-
-> 命令成功且返回空集合 = 已成功确认当前没有 Running distribution（authoritative empty），
-> 绝不能解释为“不知道状态所以保留旧 Agent”。
-
-依据：([Microsoft Learn][35])
-
-## Win32：`GetWindowThreadProcessId`
-
-Microsoft Learn：成功时返回创建窗口的 thread ID；**无效 HWND / 失败时返回 0**，且失败时输出 PID 变量保持不变。因此唤起前的属主验证必须 fail-closed：返回 0 或 PID=0 都视为“未完成验证”而不是“匹配”。依据：([Microsoft Learn][36])
-
-## Win32：`GetClassNameW`
-
-Microsoft Learn：成功返回复制的字符数，**失败返回 0**。class 读取失败必须拒绝唤起。依据：([Microsoft Learn][37])
-
-## UIA：Threading（延续 V3.1）
-
-Microsoft Learn "Understanding Threading Issues"：跨桌面的 UIA client 应使用不拥有窗口的 MTA 线程，event handler 的 Add/Remove 须在线程模型上保持一致。V3.1 的 UIA 架构（独立 MTA + 同线程增删 handler）继续保持，本轮不重写。依据：([Microsoft Learn][38])
-
-## CI：workflow run logs
-
-GitHub Docs "Using workflow run logs"：失败的 workflow 应通过具体 job/step logs 定位失败原因；benchmark 步骤保持 blocking（`--report` JSON 以 artifact 上传，失败也可诊断），不得 `continue-on-error`。依据：([GitHub Docs][39])
-
-## WSL：探测的被动性（V3.1.2 passive-WSL lifecycle closure）
-
-Microsoft Learn "Accessing network applications with WSL" 对 `wsl.exe --distribution <DistroName> <command>` 的官方解释是原文"host command wsl.exe **launches the target instance** and executes Linux command"——即 `wsl -d <distro> --exec`（ps/metadata 探测所用形式）本身就具有启动目标发行版的能力。依据：([Microsoft Learn][40])
-
-Microsoft Learn "Advanced settings configuration in WSL" 的 "The 8 second rule"：关闭发行版全部 shell 后，子系统通常还需要约 8 秒才完全停止，并明确推荐用 `wsl --list --running` 检查（宿主侧查询，不会启动任何发行版）。因此 V3.1.1 的 15 秒 Running 正缓存违反被动性：用户 terminate 后，过期缓存继续授权 `wsl -d` 探测，3 秒 probe 间隔小于 8 秒空闲关机，形成"探测保活"循环。V3.1.2 修复：每轮全新 `--list --running --quiet`，只有本轮确认 Running 的 distro 才执行 `wsl -d`。依据：([Microsoft Learn][41])
-
-
-[1]: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-uiautomationoverview?utm_source=chatgpt.com "UI Automation Overview - Win32 apps | Microsoft Learn"
-[2]: https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/ui-automation-events-for-clients?utm_source=chatgpt.com "UI Automation Events for Clients - .NET Framework | Microsoft Learn"
-[3]: https://learn.microsoft.com/zh-cn/windows/win32/winauto/uiauto-threading?utm_source=chatgpt.com "了解线程问题 - Win32 apps | Microsoft Learn"
-[4]: https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomation5-addnotificationeventhandler?utm_source=chatgpt.com "IUIAutomation5::AddNotificationEventHandler (uiautomationclient.h) - Win32 apps | Microsoft Learn"
-[5]: https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationeventhandlergroup-addnotificationeventhandler?utm_source=chatgpt.com "IUIAutomationEventHandlerGroup::AddNotificationEventHandler (uiautomationclient.h) - Win32 apps | Microsoft Learn"
-[6]: https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationtextpattern-getvisibleranges?utm_source=chatgpt.com "IUIAutomationTextPattern::GetVisibleRanges (uiautomationclient.h) - Win32 apps | Microsoft Learn"
-[7]: https://github.com/microsoft/terminal/blob/main/doc/terminal-a11y-2023.md?plain=1&utm_source=chatgpt.com "terminal/doc/terminal-a11y-2023.md at main · microsoft/terminal · GitHub"
-[8]: https://github.com/microsoft/terminal/discussions/19614?utm_source=chatgpt.com "Read terminal screen buffer programmatically? · microsoft terminal · Discussion #19614 · GitHub"
-[9]: https://github.com/microsoft/terminal/issues/4533?utm_source=chatgpt.com "Scenario: Add Support for UI Automation · Issue #4533 · microsoft/terminal · GitHub"
-[10]: https://github.com/microsoft/terminal/blob/main/doc/specs/%235000%20-%20Process%20Model%202.0/%234472%20-%20Windows%20Terminal%20Session%20Management.md?utm_source=chatgpt.com "terminal/doc/specs/#5000 - Process Model 2.0/#4472 - Windows Terminal Session Management.md at main · microsoft/terminal · GitHub"
-[11]: https://github.com/microsoft/terminal/issues/7130?utm_source=chatgpt.com "Duplicate WT_SESSION and WT_PROFILE_ID in WSLENV env var · Issue #7130 · microsoft/terminal · GitHub"
-[12]: https://github.com/microsoft/terminal/issues/3948?utm_source=chatgpt.com "WT_SESSION doesn’t appear in WSL · Issue #3948 · microsoft/terminal · GitHub"
-[13]: https://github.com/microsoft/terminal/issues/19783?utm_source=chatgpt.com "Feature Request: Focus/Activate Tab by WT_SESSION · Issue #19783 · microsoft/terminal · GitHub"
-[14]: https://learn.microsoft.com/zh-cn/windows/wsl/basic-commands?utm_source=chatgpt.com "WSL 的基本命令 | Microsoft Learn"
-[15]: https://www.man7.org/linux/man-pages/man5/proc_pid_cwd.5.html?utm_source=chatgpt.com "proc_pid_cwd(5) - Linux manual page"
-[16]: https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html "proc_pid_stat(5) - Linux manual page"
-[17]: https://man7.org/linux/man-pages/man5/proc_pid_environ.5.html "proc_pid_environ(5) - Linux manual page"
-[18]: https://github.com/openai/codex/blob/main/codex-rs/rollout/src/policy.rs?utm_source=chatgpt.com "codex/codex-rs/rollout/src/policy.rs at main · openai/codex · GitHub"
-[19]: https://github.com/openai/codex/discussions/11261?utm_source=chatgpt.com "[Question] Clarify TurnStartedEvent.model_context_window optionality · openai codex · Discussion #11261 · GitHub"
-[20]: https://github.com/openai/codex/blob/main/codex-rs/tui/src/bottom_pane/approval_overlay.rs?utm_source=chatgpt.com "codex/codex-rs/tui/src/bottom_pane/approval_overlay.rs at main · openai/codex · GitHub"
-[21]: https://github.com/openai/codex/blob/main/codex-rs/core/src/config/mod.rs?utm_source=chatgpt.com "codex/codex-rs/core/src/config/mod.rs at main · openai/codex · GitHub"
-[22]: https://code.claude.com/docs/en/sessions?utm_source=chatgpt.com "Manage sessions - Claude Code Docs"
-[23]: https://code.claude.com/docs/en/env-vars?utm_source=chatgpt.com "Environment variables - Claude Code Docs"
-[24]: https://code.claude.com/docs/en/permission-modes?utm_source=chatgpt.com "Choose a permission mode - Claude Code Docs"
-[25]: https://github.com/anthropics/claude-code/issues/47018?utm_source=chatgpt.com "Expose CLAUDE_SESSION_ID as environment variable in tool execution context · Issue #47018 · anthropics/claude-code · GitHub"
-[26]: https://github.com/anthropics/claude-code/issues/74566?utm_source=chatgpt.com "[BUG] Starting claude inside a sandbox deletes the session records of every other running session · Issue #74566 · anthropics/claude-code · GitHub"
-[27]: https://github.com/anthropics/claude-code/issues/53037?utm_source=chatgpt.com "~/.claude/sessions/{PID}.json sessionId field doesn't refresh on /clear — only updatedAt does · Issue #53037 · anthropics/claude-code · GitHub"
-[28]: https://github.com/anthropics/claude-code/issues/66486?utm_source=chatgpt.com "[BUG] 2.1.169: interactive sessions write no JSONL transcript (only ai-title stub) — reproduced on WSL2 + macOS; breaks --resume/history · Issue #66486 · anthropics/claude-code · GitHub"
-[29]: https://github.com/anthropics/claude-code/issues/64289?utm_source=chatgpt.com "Permission/question dialogs do not render in Ctrl+O transcript mode (UI hangs indefinitely) · Issue #64289 · anthropics/claude-code · GitHub"
-[30]: https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/data-locations.html?utm_source=chatgpt.com "Data locations | Kimi Code Docs"
-[31]: https://github.com/MoonshotAI/kimi-code/blob/main/apps/vscode/src/runtime/session-runtime.ts?utm_source=chatgpt.com "kimi-code/apps/vscode/src/runtime/session-runtime.ts at main · MoonshotAI/kimi-code · GitHub"
-[32]: https://github.com/bon3less/MoonshotAI_kimi-cli/blob/main/CHANGELOG.md?utm_source=chatgpt.com "MoonshotAI_kimi-cli/CHANGELOG.md at main · bon3less/MoonshotAI_kimi-cli · GitHub"
-[33]: https://github.com/MoonshotAI/kimi-agent-sdk/blob/main/guides/python/session.md?utm_source=chatgpt.com "kimi-agent-sdk/guides/python/session.md at main · MoonshotAI/kimi-agent-sdk · GitHub"
-[34]: https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/reference/tools.md?utm_source=chatgpt.com "kimi-code/docs/en/reference/tools.md at main · MoonshotAI/kimi-code · GitHub"
-[35]: https://learn.microsoft.com/en-us/windows/wsl/basic-commands?utm_source=chatgpt.com "Basic commands for WSL | Microsoft Learn"
-[36]: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowthreadprocessid?utm_source=chatgpt.com "GetWindowThreadProcessId function (winuser.h) - Win32 apps | Microsoft Learn"
-[37]: https://learn.microsoft.com/zh-cn/windows/win32/api/winuser/nf-winuser-getclassnamew?utm_source=chatgpt.com "GetClassNameW 函数 （winuser.h） - Win32 apps | Microsoft Learn"
-[38]: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading?utm_source=chatgpt.com "Understanding Threading Issues - Win32 apps | Microsoft Learn"
-[39]: https://docs.github.com/en/actions/how-tos/monitor-workflows/use-workflow-run-logs?utm_source=chatgpt.com "Using workflow run logs - GitHub Docs"
-[40]: https://learn.microsoft.com/en-us/windows/wsl/networking?utm_source=chatgpt.com "Accessing network applications with WSL | Microsoft Learn"
-[41]: https://learn.microsoft.com/en-us/windows/wsl/wsl-config?utm_source=chatgpt.com "Advanced settings configuration in WSL | Microsoft Learn"
+wt -w 0                   # MRU，不 exact
+focus-tab by remembered index
+Ctrl+Tab / Ctrl+number
+SendInput / keybd_event
+title substring as exact identity
+后台自动轮询并切遍所有 tabs
+ReadProcessMemory 取 Terminal internals
+持久化 UIA RuntimeId
+每 Agent 开一个 WSL helper
+每 Pet 开一份 Monitor/UIA
+OCR/screenshot terminal
+```
+
+原因分别由本文件前述 API/上游限制/DeskPet 轻量与安全合同支持。
+
+## 20. 文档更新规则
+
+完成 V4.1 后：
+
+- `v4plan.md` 是 V4.1 的实施合同；
+- `SourceLink.md` 用本文件替换/更新，保留每项依据的“权威等级”；
+- `README.md` 只写用户可见行为，不把内部 RuntimeId/PID 当产品概念；
+- 如果未来 Windows Terminal 发布正式 session/tab query API：
+  1. 先在 SourceLink 记录正式 API；
+  2. 新增 backend；
+  3. 保留 UIA fallback；
+  4. 不改变 `TerminalService.activate(target)` 上层接口。

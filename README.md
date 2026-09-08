@@ -1,8 +1,15 @@
-# DeskPet V3 — 被动 Agent 观察桌宠
+# DeskPet V4.1 — 被动 Agent 观察桌宠（exact 终端定位 + 并发呈现）
 
 一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
 
-V3 不创建、不托管、不控制任何 Agent：不配置 hooks、不注入进程、不发送键盘事件、不自动审批。
+DeskPet 不创建、不托管、不控制任何 Agent：不配置 hooks、不注入进程、不发送键盘事件、不自动审批。
+
+V4.1 新增四项能力：
+
+1. **exact 终端定位**：点击某 Agent 时精确恢复到它所在的 Windows Terminal 窗口 → Tab → Pane（不再只前置窗口）；位置不唯一时明确提示修复入口，绝不猜。
+2. **并发呈现（手动开启）**：仪表盘"桌宠与外观"页可开启；支持"单宠聚合"（一只桌宠显示当前最需要注意的 Agent，气泡与单个监听完全一致）与"多宠分离"（每个 Agent 一只桌宠，**自动绑定**现有 Agent，没有绑定的槽位不显示桌宠——不是"设了 3 就唤起 3 只"）。
+3. **可靠设置持久化 + 自启修复**：设置写入失败会明确提示；开机自启能识别"注册路径已失效"并一键修复。
+4. **精确退出生命周期**：Agent CLI 进程退出即从列表消失（terminal/shell 还开着也不会"复活"）；Windows 上事件驱动、零轮询。
 
 ```
 Process tells us WHO.          /proc + psutil（含 cwd/tty/uid/启动 token）
@@ -21,7 +28,7 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 桌宠动画 + 气泡（Codex · Plan · 编码中 / 目标 / 当前活动）
 ```
 
-等待审批时气泡提示"请在终端处理"；双击桌宠唤起该 Agent 所在终端。
+等待审批时气泡提示"请在终端处理"；双击桌宠精确回到该 Agent 所在的 Tab/Pane（聚合模式下点击具体 Agent 卡片激活，桌宠身体只用于互动）。
 
 ## 功能
 

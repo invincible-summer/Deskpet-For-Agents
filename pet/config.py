@@ -1,26 +1,41 @@
-"""配置模块：V3 默认值、加载、保存、v2→v3 迁移（plan.md §44/§45）。"""
+"""配置模块：V4.1 schema（config_version=4）、原子保存、备份、normalize。
+
+v4plan §9 合同：
+  * 继续使用项目内路径（config.json / assets/pets / assets/cache），
+    不迁 %LOCALAPPDATA%；
+  * save 永不静默吞错：commit() 返回 ConfigSaveResult；
+  * 临时文件 → flush → 可选 fsync → backup → os.replace；
+  * 主文件损坏 → 尝试 config.json.bak → DEFAULTS；
+  * 加载后对用户可修改字段 clamp；未知键保留（向前兼容）；
+  * 绝不持久化 runtime identity（PID/HWND/RuntimeId/WT_SESSION/
+    exact key）；V3 的 monitor.pinned / gone_grace_sec 被清除。
+"""
 import copy
 import json
 import os
 import tempfile
 import threading
+from dataclasses import dataclass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
+BACKUP_PATH = os.path.join(ROOT, "config.json.bak")
 ASSETS_DIR = os.path.join(ROOT, "assets")
 PETS_DIR = os.path.join(ASSETS_DIR, "pets")
 CACHE_DIR = os.path.join(ASSETS_DIR, "cache")
 
+CONFIG_VERSION = 4
+
 DEFAULTS = {
     "skin": "amiya",
-    "scale": 1.0,                # 宠物+气泡整体缩放（改变后会重新生成对应尺寸的 GIF 缓存）
+    "scale": 1.0,                # 宠物+气泡整体缩放（改变后重新生成 GIF 缓存）
     "speed": 1.0,                # 动画播放速度倍率
     "animated": True,            # 动态 / 静态（静态=只播第 0 帧）
     "topmost": True,             # 窗口置顶
     "tray_enabled": True,        # 托盘图标
-    "pet_pos": None,             # [x, y] 锚点（桌宠底部中心）位置
+    "pet_pos": None,             # [x, y] 锚点（桌宠底部中心）
     "bubble": {
-        "enabled": True,         # 气泡总开关（右键可暂时关闭只留桌宠）
+        "enabled": True,
         "font_family": "Microsoft YaHei UI",
         "font_size": 11,
         "font_color": "#1f2430",
@@ -30,8 +45,8 @@ DEFAULTS = {
         "relative_width": 1.0,
         "relative_height": 1.0,
         "relative_font": 1.0,
-        "width": 300,            # 固定宽度（不再自适应）
-        "max_lines": 2,          # 固定行数
+        "width": 300,
+        "max_lines": 2,
         "autohide_sec": 8,
         "always_visible": True,
     },
@@ -43,28 +58,41 @@ DEFAULTS = {
         "wsl_scan_sec": 3.0,
         "file_poll_sec": 0.5,
         "session_scan_sec": 3.0,
-        "gone_grace_sec": 15.0,       # 进程消失宽限期：扫描抖动不立刻判定退出
-        "activity_grace_sec": 10.0,   # 活动型 WORKING 证据的宽限（plan §28）
+        "activity_grace_sec": 10.0,   # 活动型 WORKING 证据的宽限（活 Agent）
         "active_file_window_sec": 180,
         "terminal_observer": True,
-        "pinned": "",                 # 手动钉住的主绑定实例 key（空=自动跟随）
+        # V4.1 删除：gone_grace_sec（authoritative absence 立即退出）、
+        # pinned（runtime focus 不持久化）
+    },
+    "presentation": {
+        "concurrent": {
+            "enabled": False,         # 并发必须用户手动开启（v4plan §6.1）
+            "mode": "aggregate",      # aggregate | fleet
+            "max_targets": 3,        # 展示上限 1..8（不是 Monitor 发现上限）
+            "eligible_kinds": {"codex": True, "claude": True,
+                               "kimi": True, "pi": True},
+            "slots": [
+                {"id": "pet-1", "selector": None,
+                 "appearance": None,
+                 "placement": {"monitor": "", "u": None, "v": None,
+                               "anchor": None, "manual": False}},
+            ],
+        },
     },
     "privacy": {
         "terminal_text_to_disk": False,
         "session_text_to_disk": False,
-        # 默认绝不使用 WSL root 读取进程 metadata；仅在用户显式开启后
-        # 允许一次 root retry（只读 cwd/启动 token/uid/HOME/allowlist env）
         "wsl_root_metadata_fallback": False,
         "goal_max_chars": 120,
         "summary_max_chars": 160,
     },
-    "animation_cache_mb": 48,
-    "config_version": 3,
-    "force_state": "",           # 锁定动画：空=自动；walk/attack/die/special/sleep
+    "animation_cache_mb": 48,     # 全进程共享预算（v4plan §11）
+    "config_version": CONFIG_VERSION,
+    "force_state": "",            # 锁定动画：空=自动
     "convert": {"height": 240, "fps": 12},
 }
 
-# V2 → V3 迁移时删除的旧键（plan §45）
+# V2 → V3 迁移时删除的旧键（保留历史兼容）
 _LEGACY_KEYS = (
     "connection_mode",
     "managed",
@@ -75,7 +103,20 @@ _LEGACY_KEYS = (
     "monitor.session_bindings",
     "monitor.waiting_quiet_sec",
     "monitor.working_hold_sec",
+    # V3 → V4.1 删除（v4plan §21）
+    "monitor.pinned",
+    "monitor.gone_grace_sec",
 )
+
+_KIND_KEYS = ("claude", "codex", "kimi", "pi")
+_MODES = ("aggregate", "fleet")
+
+
+@dataclass(frozen=True)
+class ConfigSaveResult:
+    ok: bool
+    path: str
+    error: str = ""
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -90,60 +131,205 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
-def _drop_legacy(data: dict):
+def _drop_path(data: dict, dotted: str):
+    parts = dotted.split(".")
+    node = data
+    for part in parts[:-1]:
+        if not isinstance(node, dict) or part not in node:
+            return
+        node = node[part]
+    if isinstance(node, dict):
+        node.pop(parts[-1], None)
+
+
+def _clamp(value, lo, hi):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return lo
+    return max(lo, min(hi, v))
+
+
+def normalize(data: dict) -> dict:
+    """加载后 clamp 用户可修改字段（v4plan §9.5）；未知键保留。"""
+    data["scale"] = round(_clamp(data.get("scale", 1.0), 0.5, 2.0), 2)
+    data["speed"] = round(_clamp(data.get("speed", 1.0), 0.1, 3.0), 2)
+    data["animation_cache_mb"] = int(_clamp(
+        data.get("animation_cache_mb", 48), 8, 256))
+    bubble = data.get("bubble")
+    if isinstance(bubble, dict):
+        bubble["font_size"] = int(_clamp(bubble.get("font_size", 11), 8, 24))
+        bubble["width"] = int(_clamp(bubble.get("width", 300), 160, 520))
+        bubble["height"] = int(_clamp(bubble.get("height", 132), 112, 220))
+        bubble["relative_width"] = _clamp(
+            bubble.get("relative_width", 1.0), 0.7, 1.6)
+        bubble["relative_height"] = _clamp(
+            bubble.get("relative_height", 1.0), 0.8, 1.6)
+    monitor = data.get("monitor")
+    if isinstance(monitor, dict):
+        agents = monitor.get("agents")
+        if not isinstance(agents, dict):
+            monitor["agents"] = {k: True for k in _KIND_KEYS}
+        else:
+            monitor["agents"] = {k: bool(agents.get(k, True))
+                                 for k in _KIND_KEYS}
+    concurrent = ((data.get("presentation") or {}).get("concurrent"))
+    if isinstance(concurrent, dict):
+        if concurrent.get("mode") not in _MODES:
+            concurrent["mode"] = "aggregate"
+        concurrent["enabled"] = bool(concurrent.get("enabled", False))
+        concurrent["max_targets"] = int(_clamp(
+            concurrent.get("max_targets", 3), 1, 8))
+        eligible = concurrent.get("eligible_kinds")
+        if not isinstance(eligible, dict):
+            concurrent["eligible_kinds"] = {k: True for k in _KIND_KEYS}
+        else:
+            concurrent["eligible_kinds"] = {
+                k: bool(eligible.get(k, True)) for k in _KIND_KEYS}
+        slots = concurrent.get("slots")
+        if not isinstance(slots, list) or not slots:
+            slots = [copy.deepcopy(DEFAULTS["presentation"]["concurrent"]
+                                   ["slots"][0])]
+        seen = set()
+        clean_slots = []
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            slot_id = str(slot.get("id") or "").strip()
+            if not slot_id or slot_id in seen:
+                continue   # slot id 必须唯一非空
+            seen.add(slot_id)
+            clean_slots.append(slot)
+        concurrent["slots"] = clean_slots or [copy.deepcopy(
+            DEFAULTS["presentation"]["concurrent"]["slots"][0])]
+    return data
+
+
+def migrate(loaded: dict) -> tuple[dict, bool]:
+    """V3 → V4.1 迁移；返回 (data, migrated)。"""
+    migrated = False
+    version = loaded.get("config_version", 0)
+    if not isinstance(version, int) or version < 3:
+        migrated = True   # V2 → V3 路径由调用方提示
     for key in _LEGACY_KEYS:
-        parts = key.split(".")
-        node = data
-        for part in parts[:-1]:
-            if not isinstance(node, dict) or part not in node:
-                node = None
-                break
-            node = node[part]
-        if isinstance(node, dict):
-            node.pop(parts[-1], None)
-    if isinstance(data.get("monitor"), dict):
-        # 旧 pinned key 不含进程 incarnation token，一律清空（plan §45）。
-        data["monitor"]["pinned"] = ""
+        _drop_path(loaded, key)
+    # 运行期 identity 绝不加载（纵深防御：外部注入的也清掉）
+    for banned in ("pinned", "gone_grace_sec"):
+        _drop_path(loaded, f"monitor.{banned}")
+    concurrent = ((loaded.get("presentation") or {}).get("concurrent"))
+    if not isinstance(concurrent, dict):
+        concurrent = {}
+        migrated = True
+    if "enabled" not in concurrent:
+        # V3 → V4.1：默认不开启并发，保持单目标视觉习惯（v4plan §21）
+        concurrent["enabled"] = False
+        migrated = True
+    concurrent.setdefault("mode", "aggregate")
+    concurrent.setdefault("max_targets", 3)
+    if "eligible_kinds" not in concurrent:
+        agents = ((loaded.get("monitor") or {}).get("agents")
+                  if isinstance(loaded.get("monitor"), dict) else None)
+        concurrent["eligible_kinds"] = (
+            dict(agents) if isinstance(agents, dict)
+            else {k: True for k in _KIND_KEYS})
+        migrated = True
+    if "slots" not in concurrent:
+        concurrent["slots"] = [copy.deepcopy(
+            DEFAULTS["presentation"]["concurrent"]["slots"][0])]
+        migrated = True
+    loaded.setdefault("presentation", {})["concurrent"] = concurrent
+    loaded["config_version"] = CONFIG_VERSION
+    if loaded.get("skin") == "default":     # 旧版皮肤名迁移
+        loaded["skin"] = "amiya"
+    return loaded, migrated
 
 
 class Config:
-    def __init__(self):
+    """V4.1 配置：dotted get/set、dirty 跟踪、commit 返回结果。"""
+
+    def __init__(self, path: str = ""):
         self._lock = threading.RLock()
+        self.path = path or CONFIG_PATH
         self.data = copy.deepcopy(DEFAULTS)
-        self.migration_notice = False       # v2→v3 一次性提示
+        self.migration_notice = False
+        self._dirty = False
+        self._last_save: ConfigSaveResult | None = None
         self.load()
 
+    # ------------------------------------------------------------ 加载
     def load(self):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-        except (OSError, ValueError):
-            self.data = copy.deepcopy(DEFAULTS)
-            return
+        loaded = self._load_json(self.path)
+        notice = False
+        if loaded is None:
+            backup = BACKUP_PATH if self.path == CONFIG_PATH else (
+                self.path + ".bak")
+            loaded = self._load_json(backup)
+            if loaded is None:
+                self.data = copy.deepcopy(DEFAULTS)
+                return
+            notice = True   # 主文件损坏 → backup 兜底
         if not isinstance(loaded, dict):
             self.data = copy.deepcopy(DEFAULTS)
             return
-        version = loaded.get("config_version", 0)
-        if not isinstance(version, int) or version < 3:
-            # V2 → V3：废弃旧审批/受控配置，清空运行期绑定
-            _drop_legacy(loaded)
-            loaded["config_version"] = 3
-            self.migration_notice = True
-        self.data = _deep_merge(DEFAULTS, loaded)
-        if self.data.get("skin") == "default":     # 旧版皮肤名迁移
-            self.data["skin"] = "amiya"
+        old_version = loaded.get("config_version", 0)
+        loaded, migrated = migrate(loaded)
+        self.data = normalize(_deep_merge(DEFAULTS, loaded))
+        self.migration_notice = notice or migrated or (
+            not isinstance(old_version, int) or old_version < CONFIG_VERSION)
+        self._dirty = False
 
-    def save(self):
-        # Same-directory atomic replacement avoids half-written settings on exit.
+    @staticmethod
+    def _load_json(path: str):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    # ------------------------------------------------------------ 保存
+    def save(self) -> ConfigSaveResult:
+        """兼容入口：等价 commit()（V3 调用点逐步迁移）。"""
+        return self.commit()
+
+    def commit(self, fsync: bool = False) -> ConfigSaveResult:
+        """原子保存：temp → flush →（可选 fsync）→ backup → replace。
+
+        绝不静默吞错（v4plan §9.4）；成功才清 dirty。
+        """
         with self._lock:
+            directory = os.path.dirname(self.path) or "."
             temporary = None
             try:
-                fd, temporary = tempfile.mkstemp(prefix=".deskpet-config-", dir=ROOT)
+                fd, temporary = tempfile.mkstemp(
+                    prefix=".deskpet-config-", dir=directory)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2)
-                os.replace(temporary, CONFIG_PATH)
-            except OSError:
-                pass
+                    f.flush()
+                    if fsync:
+                        os.fsync(f.fileno())
+                # 已有有效主文件 → 先备份（last-known-good）
+                if os.path.isfile(self.path):
+                    existing = self._load_json(self.path)
+                    if existing is not None:
+                        backup_path = (BACKUP_PATH
+                                       if self.path == CONFIG_PATH
+                                       else self.path + ".bak")
+                        try:
+                            if os.path.isfile(backup_path):
+                                os.unlink(backup_path)
+                            os.replace(self.path, backup_path)
+                        except OSError:
+                            pass   # 备份失败不阻塞主保存
+                os.replace(temporary, self.path)
+                temporary = None
+                self._dirty = False
+                self._last_save = ConfigSaveResult(ok=True, path=self.path)
+                return self._last_save
+            except OSError as exc:
+                result = ConfigSaveResult(ok=False, path=self.path,
+                                          error=str(exc))
+                self._last_save = result
+                return result
             finally:
                 if temporary and os.path.exists(temporary):
                     try:
@@ -151,7 +337,24 @@ class Config:
                     except OSError:
                         pass
 
-    # 便捷访问
+    def set_and_commit(self, path, value) -> ConfigSaveResult:
+        self.set(path, value)
+        return self.commit()
+
+    def update_many(self, values: dict) -> None:
+        """批量 set（一次 commit，v4plan §9.6 集中写入）。"""
+        for path, value in values.items():
+            self.set(path, value)
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    @property
+    def last_save_result(self) -> ConfigSaveResult | None:
+        return self._last_save
+
+    # ------------------------------------------------------------ 访问
     def get(self, path, default=None):
         with self._lock:
             node = self.data
@@ -172,3 +375,4 @@ class Config:
                     node[part] = child
                 node = child
             node[parts[-1]] = copy.deepcopy(value)
+            self._dirty = True

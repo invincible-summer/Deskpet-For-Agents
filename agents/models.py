@@ -262,6 +262,25 @@ class AgentInstance:
         return ""
 
 
+@dataclass(frozen=True)
+class SourceProbeSnapshot:
+    """一个 process source 一轮探测的不可拆开结果（v4plan §3.2）。
+
+    三态语义（不存在第四种组合的解释空间）：
+      authoritative=True + instances —— 权威发现；
+      authoritative=True + ()      —— 权威确认该 source 当前无匹配 Agent
+                                      （本结果有资格宣布旧实例"不存在"）；
+      authoritative=False          —— 无法读取；不得根据本轮结果判死，
+                                      旧实例保留并标记 stale。
+    """
+    source: str
+    generation: int
+    observed_at: float
+    authoritative: bool
+    instances: tuple[AgentInstance, ...] = ()
+    error: str = ""
+
+
 class BindingConfidence(str, Enum):
     CONFIRMED = "confirmed"
     HIGH = "high"
@@ -269,24 +288,77 @@ class BindingConfidence(str, Enum):
     NONE = "none"
 
 
+@dataclass(frozen=True)
+class WindowIdentity:
+    """Windows Terminal 顶层窗口的完整 incarnation 身份（v4plan §3.3）。
+
+    HWND 会被系统复用；pid+create_time 组成 process incarnation，
+    window_class 进一步收紧。四者同时一致才认为"还是发现时的那个窗口"。
+    """
+    hwnd: int
+    pid: int
+    process_created: float
+    window_class: str
+
+
+@dataclass(frozen=True)
+class TabInfo:
+    """一个 Windows Terminal TabItem 的运行期身份。
+
+    tab_id 只在本 desktop/UI 生命周期内有效，绝不写配置。
+    index_hint 只是展示提示：用户拖动 Tab 后 index 会变，不能当 identity。
+    """
+    tab_id: tuple               # (hwnd, tuple(runtime_id))
+    hwnd: int
+    window_pid: int
+    title: str
+    index_hint: int
+    selected: bool
+    last_seen: float
+
+
+@dataclass(frozen=True)
+class TerminalLocation:
+    """一次手工/观察捕获的精确 Terminal 位置（Window → Tab → Pane）。"""
+    window: WindowIdentity
+    tab_id: tuple | None
+    pane_id: tuple | None
+
+
+class BindingOrigin(str, Enum):
+    AUTO = "auto"
+    OBSERVED = "observed"
+    MANUAL = "manual"
+
+
 @dataclass
 class TerminalBinding:
-    """Agent ↔ 终端窗口/Pane 的关联（plan.md §24）。
+    """Agent ↔ 终端 Window/Tab/Pane 的关联（v4plan §3.3 扩展）。
 
-    WT_SESSION 没有官方 pane 查询接口，因此 confidence 是必须的：
-    只有 CONFIRMED/HIGH 的绑定才允许把终端审批观察归属到该 Agent。
+    WT_SESSION 没有官方 tab 查询接口，confidence 是必须的：
+    只有 CONFIRMED/HIGH 的绑定才允许 exact activation 与终端审批归属。
+    tab_id/pane_id 是 runtime-only UIA RuntimeId，绝不持久化。
     """
     provider: str = "windows-terminal"
     hwnd: int = 0
     window_pid: int = 0
     window_created: float = 0.0
     window_class: str = ""
+
     title: str = ""
-    # runtime-only UIA pane identity（TermControl RuntimeId）
+
+    # runtime-only：仅本次 desktop/UI 生命周期有效
+    tab_id: tuple | None = None
+    tab_index_hint: int = -1
     pane_id: tuple | None = None
+
+    origin: BindingOrigin = BindingOrigin.AUTO
     confidence: BindingConfidence = BindingConfidence.NONE
     observable: bool = False     # 该 pane 的可见文本是否可经 UIA 读取
+
     last_seen: float = 0.0
+    validated_at: float = 0.0
+
     # 绑定依据诊断（dashboard 高级诊断展示；score=最佳评分，runner_up=次佳）
     score: int = 0
     runner_up_score: int = 0
@@ -294,8 +366,11 @@ class TerminalBinding:
     pane_margin: int = 0        # 该 pane 的 top1-top2 分差
     reason: str = ""            # 如 "kind+cwd+distro"
 
-    def raise_target(self) -> int:
-        return self.hwnd
+    def window_identity(self) -> WindowIdentity:
+        return WindowIdentity(
+            hwnd=self.hwnd, pid=self.window_pid,
+            process_created=self.window_created,
+            window_class=self.window_class)
 
 
 @dataclass
@@ -349,3 +424,26 @@ class AgentTarget:
     instance: AgentInstance
     snapshot: Snapshot
     terminal: TerminalBinding | None = None
+
+
+class ActivationCode(str, Enum):
+    """exact activation 的结果码（v4plan §3.4）。fail-closed，不猜。"""
+    OK = "ok"
+    AGENT_GONE = "agent_gone"       # Agent 进程已退出（exact key 不再 live）
+    NO_BINDING = "no_binding"       # 没有任何 Terminal 绑定
+    AMBIGUOUS = "ambiguous"         # 绑定证据不足，禁止 exact activate
+
+    STALE_WINDOW = "stale_window"   # WindowIdentity 校验失败（HWND/PID 复用等）
+    STALE_TAB = "stale_tab"         # tab runtime id 已消失且无法重解析
+    STALE_PANE = "stale_pane"       # pane 失效且多 pane 无法唯一定位
+
+    UIA_UNAVAILABLE = "uia_unavailable"   # UIA 后端不可用/Tab 无 Select pattern
+    FOREGROUND_DENIED = "foreground_denied"  # OS 拒绝抢前台（已 Flash 提醒）
+
+
+@dataclass(frozen=True)
+class ActivationResult:
+    """激活事务结果；detail 只含安全诊断，不含 terminal 原文。"""
+    code: ActivationCode
+    repaired: bool = False      # 是否经过一次 refresh/re-resolve 后成功
+    detail: str = ""

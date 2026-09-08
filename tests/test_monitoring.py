@@ -22,9 +22,42 @@ from agents.models import (
     Observation,
     Phase,
     Snapshot,
+    SourceProbeSnapshot,
     Status,
 )
+
+
+def probe(sources: dict, gen: int = 1, t: float = 1000.0):
+    """构造 dict[str, SourceProbeSnapshot] 的便捷 helper。"""
+    out = {}
+    for src, (auth, insts) in sources.items():
+        out[src] = SourceProbeSnapshot(
+            source=src, generation=gen, observed_at=t,
+            authoritative=auth, instances=tuple(insts),
+            error="" if auth else "probe failed")
+    return out
+from agents.discovery import scan_windows
 from agents.monitor import Monitor
+from agents.terminal_service import WindowsTerminalService
+from agents.terminal_uia import TerminalEvent
+
+
+class _FakeExitWatcher:
+    def __init__(self, events):
+        self._events = events
+
+    def drain(self):
+        events, self._events = self._events, []
+        return events
+
+    def register(self, inst):
+        return True
+
+    def unregister(self, key):
+        pass
+
+    def watched_count(self):
+        return 0
 from agents.summarize import classify_tool, fmt_command, shorten
 from agents.tailer import FileTailer
 
@@ -513,13 +546,13 @@ class MonitorPassiveTests(unittest.TestCase):
     def test_monitor_fuses_session_and_terminal_observation(self):
         config = MemoryConfig()
         monitor = Monitor(config)
-        monitor._terminal = None   # 无 UIA 环境
+        monitor._terminal_service = WindowsTerminalService(None)   # 无 UIA 环境
         inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w",
                              process_token="999")
         watcher = monitor._watchers[AgentKind.CODEX]
         with patch.object(watcher, "poll") as wpoll, \
              patch.object(monitor._probe, "snapshot",
-                          return_value=({"windows": [inst]}, {"windows": True, "wsl": True})):
+                          return_value=probe({"windows": (True, [inst])})):
             def fake_poll(instances):
                 obs = Observation(
                     source=EvidenceSource.SESSION, timestamp=time.time(),
@@ -535,7 +568,6 @@ class MonitorPassiveTests(unittest.TestCase):
         self.assertEqual(target.snapshot.status, Status.WORKING)
         self.assertEqual(target.snapshot.phase, Phase.CODING)
         self.assertEqual(target.snapshot.mode, Mode.PLAN)
-        self.assertEqual(monitor.primary_key, inst.key)
 
     def test_terminal_waiting_preempts_session_working(self):
         """终端可见审批（HIGH 绑定）覆盖会话 WORKING（plan §26 优先级）。"""
@@ -554,7 +586,7 @@ class MonitorPassiveTests(unittest.TestCase):
             confidence=Confidence.HIGH, summary="命令执行需要确认",
             expires_at=time.time() + 1.5)
         observer._last_discover = time.time()   # 阻止空发现清掉预置 pane
-        monitor._terminal = observer
+        monitor._terminal_service = WindowsTerminalService(observer)
         inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
         from agents.models import BindingConfidence, TerminalBinding
         fake_binding = TerminalBinding(
@@ -562,9 +594,10 @@ class MonitorPassiveTests(unittest.TestCase):
             observable=True, last_seen=time.time())
         watcher = monitor._watchers[AgentKind.CODEX]
         with patch.object(watcher, "poll") as wpoll, \
-             patch.object(monitor._resolver, "resolve", return_value={inst.key: fake_binding}), \
+             patch.object(monitor._terminal_service, "resolve",
+                          return_value={inst.key: fake_binding}), \
              patch.object(monitor._probe, "snapshot",
-                          return_value=({"windows": [inst]}, {"windows": True, "wsl": True})):
+                          return_value=probe({"windows": (True, [inst])})):
             wpoll.return_value = {inst.key: Observation(
                 source=EvidenceSource.SESSION, timestamp=time.time(),
                 status=Status.WORKING, phase=Phase.CODING,
@@ -590,7 +623,7 @@ class MonitorPassiveTests(unittest.TestCase):
             status=Status.WAITING, phase=Phase.APPROVAL,
             confidence=Confidence.HIGH, expires_at=time.time() + 1.5)
         observer._last_discover = time.time()
-        monitor._terminal = observer
+        monitor._terminal_service = WindowsTerminalService(observer)
         inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
         from agents.models import BindingConfidence, TerminalBinding
         fake_binding = TerminalBinding(
@@ -598,9 +631,10 @@ class MonitorPassiveTests(unittest.TestCase):
             observable=True)
         watcher = monitor._watchers[AgentKind.CODEX]
         with patch.object(watcher, "poll") as wpoll, \
-             patch.object(monitor._resolver, "resolve", return_value={inst.key: fake_binding}), \
+             patch.object(monitor._terminal_service, "resolve",
+                          return_value={inst.key: fake_binding}), \
              patch.object(monitor._probe, "snapshot",
-                          return_value=({"windows": [inst]}, {"windows": True, "wsl": True})):
+                          return_value=probe({"windows": (True, [inst])})):
             wpoll.return_value = {inst.key: Observation(
                 source=EvidenceSource.SESSION, timestamp=time.time(),
                 status=Status.WORKING, turn_active=True,
@@ -627,7 +661,7 @@ class MonitorPassiveTests(unittest.TestCase):
             agent_kind=AgentKind.CLAUDE,
             confidence=Confidence.HIGH, summary="Bash 命令需要确认",
             expires_at=time.time() + 1.5)
-        monitor._terminal = observer
+        monitor._terminal_service = WindowsTerminalService(observer)
         inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
         from agents.models import BindingConfidence, TerminalBinding
         fake_binding = TerminalBinding(
@@ -635,9 +669,10 @@ class MonitorPassiveTests(unittest.TestCase):
             observable=True, last_seen=time.time())
         watcher = monitor._watchers[AgentKind.CODEX]
         with patch.object(watcher, "poll") as wpoll, \
-             patch.object(monitor._resolver, "resolve", return_value={inst.key: fake_binding}), \
+             patch.object(monitor._terminal_service, "resolve",
+                          return_value={inst.key: fake_binding}), \
              patch.object(monitor._probe, "snapshot",
-                          return_value=({"wsl:Ubuntu": [inst]}, {"wsl:Ubuntu": True})):
+                          return_value=probe({"wsl:Ubuntu": (True, [inst])})):
             wpoll.return_value = {inst.key: Observation(
                 source=EvidenceSource.SESSION, timestamp=time.time(),
                 status=Status.WORKING, turn_active=True,
@@ -658,7 +693,7 @@ class MonitorPassiveTests(unittest.TestCase):
                                            window_pid=50, title="codex")
         observer._last_discover = time.time()
         observer.activity[pane_id] = time.time()   # 泛化终端活动（无 agent_kind）
-        monitor._terminal = observer
+        monitor._terminal_service = WindowsTerminalService(observer)
         inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w", process_token="9")
         from agents.models import BindingConfidence, TerminalBinding
         fake_binding = TerminalBinding(
@@ -666,9 +701,10 @@ class MonitorPassiveTests(unittest.TestCase):
             observable=True, last_seen=time.time())
         watcher = monitor._watchers[AgentKind.CODEX]
         with patch.object(watcher, "poll") as wpoll, \
-             patch.object(monitor._resolver, "resolve", return_value={inst.key: fake_binding}), \
+             patch.object(monitor._terminal_service, "resolve",
+                          return_value={inst.key: fake_binding}), \
              patch.object(monitor._probe, "snapshot",
-                          return_value=({"wsl:Ubuntu": [inst]}, {"wsl:Ubuntu": True})):
+                          return_value=probe({"wsl:Ubuntu": (True, [inst])})):
             wpoll.return_value = {inst.key: Observation(
                 source=EvidenceSource.SESSION, timestamp=time.time(),
                 status=Status.DONE, confidence=Confidence.EXACT,
@@ -681,131 +717,174 @@ class MonitorPassiveTests(unittest.TestCase):
         """Ubuntu 扫描失败只影响 Ubuntu 实例的 stale 标记。"""
         config = MemoryConfig()
         monitor = Monitor(config)
-        monitor._terminal = None
+        monitor._terminal_service = WindowsTerminalService(None)
         ubuntu = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
                                process_token="1")
         win = AgentInstance(AgentKind.CODEX, 2, "windows", process_token="2")
         watcher = monitor._watchers[AgentKind.CODEX]
         with patch.object(watcher, "poll") as wpoll, \
              patch.object(monitor._probe, "snapshot",
-                          return_value=({"windows": [win], "wsl:Ubuntu": [ubuntu]},
-                                        {"windows": True, "wsl:Ubuntu": False})):
+                          return_value=probe({"windows": (True, [win]),
+                                          "wsl:Ubuntu": (False, [ubuntu])})):
             wpoll.return_value = {}
             monitor._tick()
         self.assertTrue(monitor.get_target(ubuntu.key).snapshot.stale)
         self.assertFalse(monitor.get_target(win.key).snapshot.stale)
 
-    def test_authoritative_empty_source_starts_gone_grace(self):
-        """权威空 source：实例进入 gone grace，本轮仍保留。"""
+    def test_authoritative_absence_commits_exit_immediately(self):
+        """权威空 source：exact key 本轮即退出（v4plan §4.2，无 grace）。"""
         config = MemoryConfig()
         monitor = Monitor(config)
-        monitor._terminal = None
+        monitor._terminal_service = WindowsTerminalService(None)
         debian = AgentInstance(AgentKind.CODEX, 1, "wsl:Debian",
                                process_token="1")
         monitor.instances = {debian.key: debian}
+        monitor.snapshots = {debian.key: Snapshot(
+            debian.key, debian.kind, debian.source, debian.pid)}
         with patch.object(monitor._probe, "snapshot",
-                          return_value=({"wsl:Debian": []}, {"wsl:Debian": True})):
+                          return_value=probe({"wsl:Debian": (True, [])})):
             monitor._merge_instances(1000.0)
-        self.assertIn(debian.key, monitor.instances)
-        self.assertIn(debian.key, monitor._gone_since)
-
-    def test_authoritative_empty_source_removes_after_grace(self):
-        config = MemoryConfig()
-        monitor = Monitor(config)
-        monitor._terminal = None
-        debian = AgentInstance(AgentKind.CODEX, 1, "wsl:Debian",
-                               process_token="1")
-        monitor.instances = {debian.key: debian}
-        result = ({"wsl:Debian": []}, {"wsl:Debian": True})
-        with patch.object(monitor._probe, "snapshot", return_value=result):
-            monitor._merge_instances(1000.0)
-        self.assertIn(debian.key, monitor.instances)
-        # MemoryConfig 的 gone_grace_sec=30；超过后清除（tombstone 每轮持续输出）
-        with patch.object(monitor._probe, "snapshot", return_value=result):
-            monitor._merge_instances(1010.0)
-        self.assertIn(debian.key, monitor.instances)
-        with patch.object(monitor._probe, "snapshot", return_value=result):
-            monitor._merge_instances(1031.0)
         self.assertNotIn(debian.key, monitor.instances)
+        self.assertNotIn(debian.key, monitor.snapshots)
 
-    def test_failed_source_never_advances_gone_grace(self):
-        """source 不健康：实例永远保留（无法读取 ≠ 已经退出）。"""
+    def test_windows_global_scan_failure_is_not_authoritative_empty(self):
+        """Windows 全局枚举失败：authoritative=False，旧实例保留（v4plan §4.1）。"""
         config = MemoryConfig()
         monitor = Monitor(config)
-        monitor._terminal = None
-        debian = AgentInstance(AgentKind.CODEX, 1, "wsl:Debian",
-                               process_token="1")
-        monitor.instances = {debian.key: debian}
-        result = ({"wsl:Debian": [debian]}, {"wsl:Debian": False})
-        for t in (1000.0, 1100.0, 1200.0):
-            with patch.object(monitor._probe, "snapshot", return_value=result):
-                monitor._merge_instances(t)
-            self.assertIn(debian.key, monitor.instances)
-        self.assertEqual(monitor._gone_since, {})
+        monitor._terminal_service = WindowsTerminalService(None)
+        win = AgentInstance(AgentKind.CODEX, 5, "windows", process_token="5")
+        monitor.instances = {win.key: win}
+        with patch.object(monitor._probe, "snapshot",
+                          return_value=probe({"windows": (False, [])})):
+            monitor._merge_instances(1000.0)
+        self.assertIn(win.key, monitor.instances)   # 保留，绝不判死
+        # 再来一轮仍然失败：依旧保留
+        with patch.object(monitor._probe, "snapshot",
+                          return_value=probe({"windows": (False, [])})):
+            monitor._merge_instances(1100.0)
+        self.assertIn(win.key, monitor.instances)
+
+    def test_scan_windows_global_failure_raises_probe_unavailable(self):
+        """process_iter 整体失败必须抛 ProbeUnavailable，绝不返回空列表。"""
+        import psutil
+        from agents.discovery import ProbeUnavailable
+        with patch.object(psutil, "process_iter",
+                          side_effect=RuntimeError("enumeration broken")):
+            with self.assertRaises(ProbeUnavailable):
+                scan_windows()
 
     def test_one_distro_stopped_does_not_affect_other(self):
         config = MemoryConfig()
         monitor = Monitor(config)
-        monitor._terminal = None
+        monitor._terminal_service = WindowsTerminalService(None)
         ubuntu = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
                                process_token="1")
         debian = AgentInstance(AgentKind.CLAUDE, 2, "wsl:Debian",
                                process_token="2")
         monitor.instances = {ubuntu.key: ubuntu, debian.key: debian}
-        result = ({"wsl:Ubuntu": [ubuntu], "wsl:Debian": []},
-                  {"wsl:Ubuntu": True, "wsl:Debian": True})
-        for t in (1000.0, 1010.0, 1031.0):
+        result = probe({"wsl:Ubuntu": (True, [ubuntu]), "wsl:Debian": (True, [])})
+        for t in (1000.0, 1010.0):
             with patch.object(monitor._probe, "snapshot", return_value=result):
                 monitor._merge_instances(t)
         self.assertIn(ubuntu.key, monitor.instances)   # Ubuntu 不受影响
-        self.assertNotIn(debian.key, monitor.instances)  # Debian grace 后消失
+        self.assertNotIn(debian.key, monitor.instances)  # Debian 权威空 → 立即退出
 
     def test_one_distro_failed_does_not_affect_other(self):
         config = MemoryConfig()
         monitor = Monitor(config)
-        monitor._terminal = None
+        monitor._terminal_service = WindowsTerminalService(None)
         ubuntu = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
                                process_token="1")
         debian = AgentInstance(AgentKind.CLAUDE, 2, "wsl:Debian",
                                process_token="2")
         monitor.instances = {ubuntu.key: ubuntu, debian.key: debian}
-        result = ({"wsl:Ubuntu": [ubuntu], "wsl:Debian": [debian]},
-                  {"wsl:Ubuntu": True, "wsl:Debian": False})
+        result = probe({"wsl:Ubuntu": (True, [ubuntu]),
+                        "wsl:Debian": (False, [debian])})
         for t in (1000.0, 1100.0):
             with patch.object(monitor._probe, "snapshot", return_value=result):
                 monitor._merge_instances(t)
         self.assertIn(ubuntu.key, monitor.instances)
         self.assertIn(debian.key, monitor.instances)   # 失败源不判死
 
-    def test_pinned_and_auto_follow(self):
+    def test_exit_event_for_replaced_incarnation_is_ignored(self):
+        """exit 事件晚到且 key 已被新 incarnation 替换：不删新实例。"""
+        from agents.process_watch import ProcessExitEvent
         config = MemoryConfig()
         monitor = Monitor(config)
-        monitor._terminal = None
-        a = AgentInstance(AgentKind.CODEX, 1, "windows", process_token="1", started_at=100)
-        b = AgentInstance(AgentKind.CLAUDE, 2, "windows", process_token="2", started_at=200)
-        monitor.instances = {a.key: a, b.key: b}
-        monitor.snapshots = {
-            a.key: Snapshot(a.key, a.kind, a.source, a.pid, status=Status.WORKING),
-            b.key: Snapshot(b.key, b.kind, b.source, b.pid, status=Status.WAITING),
-        }
-        monitor._select_primary()
-        self.assertEqual(monitor.primary_key, b.key)   # WAITING 抢占 WORKING
-        # 双 WORKING：同优先级保持粘性，不因另一个普通 Working 切走
-        monitor.snapshots[b.key].status = Status.WORKING
-        monitor._select_primary()
-        self.assertEqual(monitor.primary_key, b.key)
-        monitor.set_primary(a.key, manual=True)
-        self.assertEqual(monitor.primary_key, a.key)
-        monitor.reset_primary()
-        monitor._select_primary()
-        first_pick = monitor.primary_key
-        monitor._select_primary()
-        self.assertEqual(monitor.primary_key, first_pick)   # 双 Working 下稳定不闪跳
-        # 出现 WAITING 仍可抢占
-        monitor.snapshots[b.key].status = Status.WAITING
-        monitor._select_primary()
-        self.assertEqual(monitor.primary_key, b.key)
+        monitor._terminal_service = WindowsTerminalService(None)
+        new = AgentInstance(AgentKind.CODEX, 7, "windows",
+                            process_token="new-token")
+        monitor.instances = {new.key: new}
+        monitor._exit_watcher = _FakeExitWatcher([
+            ProcessExitEvent(key=new.key, pid=7,
+                             process_token="old-token",
+                             timestamp=time.time())])
+        monitor._drain_exit_events(time.time())
+        self.assertIn(new.key, monitor.instances)   # token 不匹配 → 忽略
 
+    def test_exit_event_commits_exit_for_exact_incarnation(self):
+        from agents.process_watch import ProcessExitEvent
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        monitor._terminal_service = WindowsTerminalService(None)
+        inst = AgentInstance(AgentKind.CODEX, 7, "windows",
+                             process_token="tok")
+        monitor.instances = {inst.key: inst}
+        monitor.snapshots = {inst.key: Snapshot(
+            inst.key, inst.kind, inst.source, inst.pid)}
+        monitor._exit_watcher = _FakeExitWatcher([
+            ProcessExitEvent(key=inst.key, pid=7, process_token="tok",
+                             timestamp=time.time())])
+        monitor._drain_exit_events(time.time())
+        self.assertNotIn(inst.key, monitor.instances)
+        self.assertNotIn(inst.key, monitor.snapshots)
+
+    def test_terminal_activity_after_exit_does_not_revive_agent(self):
+        """Agent 退出后 terminal shell 继续输出：不得复活 AgentTarget。"""
+        from agents.terminal_uia import PaneInfo, TerminalObserver, TerminalBackend
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        observer = TerminalObserver(TerminalBackend(), cfg={})
+        observer._started = True
+        pane_id = (11, (1,))
+        observer.panes[pane_id] = PaneInfo(pane_id=pane_id, hwnd=11,
+                                           window_pid=50, title="shell")
+        observer._last_discover = time.time()
+        monitor._terminal_service = WindowsTerminalService(observer)
+        gone = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu",
+                             cwd="/w", process_token="9")
+        live = AgentInstance(AgentKind.CLAUDE, 202, "wsl:Ubuntu",
+                             cwd="/w", process_token="10")
+        watcher = monitor._watchers[AgentKind.CODEX]
+        with patch.object(watcher, "poll") as wpoll, patch.object(
+                monitor._probe, "snapshot",
+                return_value=probe({"wsl:Ubuntu": (True, [live])})):
+            wpoll.return_value = {}
+            monitor._tick()
+            # gone 实例 authoritative absence → commit exit
+            self.assertNotIn(gone.key, monitor.instances)
+        # terminal shell 继续产生活动事件
+        observer._on_event(TerminalEvent(pane_id=pane_id, kind="activity",
+                                         ts=time.time()))
+        observer.poll(time.time())
+        self.assertNotIn(gone.key, monitor.instances)
+
+    def test_last_instance_exit_triggers_zero_kind_poll_cleanup(self):
+        """最后一个某 kind Agent 退出后 poll([]) 仍被调用（v4plan §4.6）。"""
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        monitor._terminal_service = WindowsTerminalService(None)
+        inst = AgentInstance(AgentKind.CODEX, 1, "windows", process_token="1")
+        calls = []
+        watcher = monitor._watchers[AgentKind.CODEX]
+        with patch.object(watcher, "poll",
+                          side_effect=lambda insts: (calls.append(list(insts)), {})[1]), patch.object(
+                monitor._probe, "snapshot",
+                return_value=probe({"windows": (True, [])})):
+            monitor.instances = {inst.key: inst}
+            monitor._tick()
+        self.assertEqual(calls, [[]])   # kind 为 0 也必须 poll([])
+        self.assertNotIn(inst.key, monitor.instances)
 
 if __name__ == "__main__":
     unittest.main()

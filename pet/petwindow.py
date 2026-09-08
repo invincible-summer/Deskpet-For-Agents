@@ -1,16 +1,25 @@
-"""桌宠窗口：透明无边框置顶，画布上同时承载气泡与宠物动画。
+"""桌宠窗口：透明无边框置顶 Toplevel，画布上同时承载气泡与宠物动画。
 
-位置模型：窗口位置永远由“锚点”（桌宠底部中心的屏幕坐标）反推，
+V4.1（v4plan §8.1）：PetWindow 是 Toplevel（master 是隐藏的 controller
+root）；所有 PetView 同属一个 Tk interpreter。
+
+位置模型：窗口位置永远由"锚点"（桌宠底部中心的屏幕坐标）反推，
 不读取 winfo_x/y，彻底避免气泡高度变化/缩放时的位置漂移。
+
+placement（v4plan §12）：拖动结束时经 MonitorFromPoint/GetMonitorInfo
+换算成相对 work-area 的 (u, v)，monitor 消失时回退 anchor + clamp。
 """
 import tkinter as tk
+
+from actions import winkeys
 
 MAGIC = "#101011"  # 与 tools/convert.MAGIC 一致：画布背景色=桌面透明色
 
 
 class PetWindow:
-    def __init__(self, root: tk.Tk, config):
-        self.root = root
+    def __init__(self, master: tk.Misc, config):
+        self.master = master
+        self.root = tk.Toplevel(master)
         self.config = config
         self.root.title("DeskPet")
         self.root.overrideredirect(True)
@@ -24,7 +33,7 @@ class PetWindow:
         except tk.TclError:
             pass
 
-        self.canvas = tk.Canvas(root, bg=MAGIC, highlightthickness=0, bd=0)
+        self.canvas = tk.Canvas(self.root, bg=MAGIC, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
 
         self._drag_off: tuple[int, int] | None = None
@@ -35,10 +44,10 @@ class PetWindow:
         self.canvas.bind("<Button-3>", self._on_menu)
         self.canvas.bind("<Double-Button-1>", self._on_double)
 
-        self.on_click_button = None   # cb(tag)  批复按钮点击
+        self.on_click_button = None   # cb(tag)  气泡按钮点击
         self.on_menu = None           # cb(menu) 右键菜单构建
         self.on_interact = None       # cb()     双击互动
-        self.on_moved = None          # cb(anchor_x, anchor_y) 拖动结束
+        self.on_moved = None          # cb()     拖动结束
 
     @property
     def dragging(self) -> bool:
@@ -70,6 +79,50 @@ class PetWindow:
             self.root.winfo_x(), self.root.winfo_y())
         return (px + win_w // 2, py + win_h)
 
+    @staticmethod
+    def placement_from_anchor(ax: int, ay: int) -> dict:
+        """锚点 → 相对 work-area 的 placement（monitor/u/v/anchor）。
+
+        拖动结束才调用一次（不每 mouse move 调 Win32，v4plan §12）。
+        """
+        monitor, work = winkeys.monitor_work_area(ax, ay)
+        if not monitor:
+            return {"monitor": "", "u": None, "v": None,
+                    "anchor": (ax, ay), "manual": True}
+        left, top, right, bottom = work
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+        u = min(1.0, max(0.0, (ax - left) / width))
+        v = min(1.0, max(0.0, (ay - top) / height))
+        return {"monitor": monitor, "u": round(u, 4), "v": round(v, 4),
+                "anchor": (ax, ay), "manual": True}
+
+    @staticmethod
+    def anchor_from_placement(placement: dict,
+                               fallback: tuple[int, int]) -> tuple[int, int]:
+        """placement → 恢复锚点；monitor 不存在/无 u,v → anchor fallback。"""
+        if not isinstance(placement, dict):
+            return fallback
+        anchor = placement.get("anchor")
+        u, v = placement.get("u"), placement.get("v")
+        if u is None or v is None:
+            return tuple(anchor) if anchor and len(anchor) == 2 else fallback
+        monitor = placement.get("monitor") or ""
+        for probe in (fallback, ):
+            _name, work = winkeys.monitor_work_area(probe[0], probe[1])
+            if monitor and _name != monitor:
+                break   # monitor 不在：fallback 位置
+            if not work:
+                break
+            left, top, right, bottom = work
+            ax = int(left + u * (right - left))
+            ay = int(top + v * (bottom - top))
+            # clamp 到可见 work area
+            ax = min(max(ax, left + 40), right - 40)
+            ay = min(max(ay, top + 40), bottom - 20)
+            return (ax, ay)
+        return tuple(anchor) if anchor and len(anchor) == 2 else fallback
+
     def _apply_topmost(self):
         try:
             self.root.attributes("-topmost", bool(self.config.get("topmost", True)))
@@ -77,7 +130,6 @@ class PetWindow:
             pass
 
     def set_topmost(self, flag: bool):
-        self.config.set("topmost", bool(flag))
         self._apply_topmost()
 
     # ---- 交互 ----
@@ -112,8 +164,7 @@ class PetWindow:
             self.on_interact()
 
     def _on_menu(self, ev):
-        import tkinter as tk_m
-        menu = tk_m.Menu(self.root, tearoff=0)
+        menu = tk.Menu(self.root, tearoff=0)
         if self.on_menu:
             self.on_menu(menu)
         try:
@@ -121,7 +172,7 @@ class PetWindow:
         finally:
             menu.grab_release()
 
-    def hit_button(self, x: int, y: int) -> str | None:
+    def hit_button(self, x: int, y: int):
         if self._hit_cb:
             return self._hit_cb(x, y)
         return None

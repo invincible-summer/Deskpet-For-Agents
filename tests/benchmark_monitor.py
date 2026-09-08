@@ -25,7 +25,7 @@ from agents.terminal_uia import (
     DELTA_MAX, EVENT_QUEUE_MAX, GLOBAL_VISIBLE_READ_LIMIT, MAX_PANES,
     RING_MAX, UIA_CALL_QUEUE_MAX, VISIBLE_MAX,
     PaneInfo, SubscriptionTracker, TerminalObserver, TerminalBackend,
-    TerminalEvent, TerminalResolver,
+    TerminalEvent, TerminalLayout, TerminalResolver,
 )
 
 
@@ -37,8 +37,10 @@ class SyntheticBackend(TerminalBackend):
         self.visible = {}
         self.read_count = 0
 
-    def discover_panes(self):
-        return list(self.panes.values())
+    def discover_layout(self):
+        return TerminalLayout(windows={}, tabs={},
+                              panes=dict(self.panes),
+                              selected_tabs={})
 
     def read_visible(self, pane_id):
         self.read_count += 1
