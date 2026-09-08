@@ -15,3 +15,5 @@ __pycache__/
 
 # Local UI snapshots and measurements
 .test-artifacts/
+
+.zcode/
