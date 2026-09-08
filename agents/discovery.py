@@ -1,8 +1,8 @@
 """V3 进程发现层：Windows 原生（psutil）+ WSL ProcessProbe（plan.md §7-§9）。
 
 只读、无 hooks、无注入。WSL 探测分三层：
-  1. wsl.exe --list --running --quiet → Running 发行版（15s 缓存；失败时回退
-     解析 -l -v 表格）
+  1. wsl.exe --list --running --quiet → Running 发行版（每轮全新查询，
+     绝不缓存正结果；失败时回退解析 -l -v 表格）
   2. 每发行版一条 ps → pid/ppid/sid/pgid/tpgid/tty/uid/etimes/comm/args
   3. 仅对 canonical Agent PID 做一次批量 metadata 查询：
      /proc/<pid>/cwd、/proc/<pid>/stat（starttime ticks = 进程 token）、
@@ -357,9 +357,8 @@ class WslProcessProbe:
         self._distro_ok: dict[str, bool] = {}
         # 应用生命周期内见过（running 过）的 distro：停止后持续发空 tombstone
         self._known_distros: set[str] = set()
-        # 最近一次权威 inventory（≤15s 内直接复用；失败不缓存，下轮即重试）
-        self._inventory: DistroInventory | None = None
-        self._inventory_ts = 0.0
+        # 注意：running 清单不做正结果缓存（V3.1.2）——过期 "Running" 会经
+        # wsl -d 探测把用户刚停止的 distro 重新启动。
         # /proc starttime 缺失时的稳定 fallback 代次缓存（防 PID reuse 退化）
         self._fallback: dict[tuple[str, int], _FallbackIdentity] = {}
         self._fallback_gen = 0
@@ -373,13 +372,13 @@ class WslProcessProbe:
     def _list_running_distros(self) -> DistroInventory:
         """枚举 Running 发行版；成功空输出 = 权威确认无 Running（V3.1.1）。
 
-        15s 权威缓存命中时原样返回（最多 15 秒旧，仍 authoritative）；
-        枚举失败不缓存，下一轮立即重试。
+        每次调用都发起全新查询，绝不缓存正结果（V3.1.2 被动性闭环）：
+        缓存里的 "Running" 可能刚被用户停止，而 wsl -d <distro> --exec
+        本身会启动目标发行版——用过期清单授权 ps/metadata 探测会把用户
+        刚停止的 distro 重新拉起，且 probe 间隔（3s）小于 WSL 空闲关机
+        延迟，会形成自维持的 "探测保活" 循环。--list --running 是宿主侧
+        查询，不会启动任何发行版，每轮重查的代价因此是安全的。
         """
-        with self._lock:
-            if (self._inventory is not None and self._inventory.authoritative
-                    and time.time() - self._inventory_ts < 15):
-                return self._inventory
         error = ""
         distros: list[str] | None = None
         try:
@@ -410,14 +409,11 @@ class WslProcessProbe:
             self.last_error = error
             with self._lock:
                 return DistroInventory(tuple(self._distros), False, error)
-        inv = DistroInventory(tuple(distros), True, "")
         self.last_error = ""
         with self._lock:
             self._distros = list(distros)
             self._distros_ts = time.time()
-            self._inventory = inv
-            self._inventory_ts = time.time()
-        return inv
+        return DistroInventory(tuple(distros), True, "")
 
     def _list_running_distros_verbose(self) -> list[str]:
         """兼容 fallback：`wsl -l -v` 表格解析；失败抛异常。
@@ -535,7 +531,10 @@ class WslProcessProbe:
           * unhealthy           —— 枚举/ps 读取失败，保留上一轮缓存实例
             且绝不判死（无法读取 ≠ 已经不存在）。
 
-        每 distro 每 cycle 约 1×ps + 1×metadata 批查询（只查 canonical PID）。
+        只有本轮 fresh --list --running 确认 Running 的 distro 才执行
+        wsl -d（V3.1.2：过期的 Running 清单绝不授权进入 distro——那会
+        把用户刚停止的发行版重新启动）。每 cycle 1×--list --running +
+        每 Running distro 1×ps + 1×metadata 批查询（只查 canonical PID）。
         """
         t0 = time.perf_counter()
         exclude_pids = {int(pid) for pid in (exclude_pids or set()) if pid}

@@ -82,7 +82,7 @@ Windows Terminal 没有 `WT_SESSION → pane` 公开接口：
   1. **healthy + instances** —— 发行版运行且 Agent 被发现；
   2. **healthy + empty** —— 已权威确认当前发行版没有 Agent，或发行版已停止（`wsl --list --running --quiet` 成功且输出为空即是权威空结果）；旧实例经 `gone_grace_sec`（默认 15s）后清除，同时清掉该 distro 的进程缓存与 fallback 代次 token——重启后 Linux PID 从小整数再来也不会继承旧绑定；
   3. **unhealthy** —— WSL 枚举/ps 读取失败：DeskPet 保留上一轮缓存并显示"状态可能延迟"，绝不误判退出（无法读取 ≠ 已经不存在）。
-  停止检测的最坏延迟约为 15s 发行版清单缓存 + 3s 调度 + 15s 消失宽限 ≈ 33s，这是当前轻量设计的既定取舍。
+  Running 清单**每轮全新查询，绝不缓存正结果**（V3.1.2 被动性闭环）：`wsl -d <distro> --exec` 本身会启动目标发行版（Microsoft 官方 networking 文档原文），而 probe 间隔 3s 小于 WSL 空闲关机延迟（官方 "8 second rule"），一份过期的 Running 缓存会把用户刚停止的 distro 重新拉起并形成"探测保活"循环——因此只有**本轮刚确认 Running** 的发行版才会被 `wsl -d` 探测；`--list --running` 是宿主侧查询，不会启动任何发行版。停止检测的最坏延迟约为 3s 调度 + 15s 消失宽限 ≈ 18s。
 - **状态语义**：已知 active turn → 无限保持 WORKING；仅活动证据 → 10s 宽限后回 UNKNOWN（不伪造）；DONE 展示 8s；IDLE 只在明确见过 turn 结束后出现；**泛化终端活动（pane 有文本变化）永远不能推翻结构化 Session 的 DONE/IDLE/ERROR/INPUT**
 - **Status/Phase/Mode 正交**：Mode 是独立维度（Plan/Default/UNKNOWN+原始值），终端 WAITING 成为状态胜者时无权擦除 Session 已解析的 Mode——`WAITING + APPROVAL + PLAN` 是合法且必要的最终状态；优先级为 Session 结构化 Mode → 胜者明确携带的 Mode → NONE
 - **会话解析**：绑定用互相唯一匹配（source/session_id/cwd/started_at 评分，结果与实例遍历顺序无关），同分竞争保持未绑定；late-start 每 15s 无窗 fallback（最近 12 候选）；目录重扫有绑定时降为 15s
@@ -135,7 +135,7 @@ tests/                  单元/隐私/UIA/匹配/基准/实机探针/回归
 ## 测试
 
 ```bat
-D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（170+）
+D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（175+）
 D:\miniconda3\envs\deskpet\python.exe tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json    # 合成基准（队列/预算/churn 上限）
 D:\miniconda3\envs\deskpet\python.exe tests\uia_probe.py                         # UIA 实机冒烟（--verbose-text 才打印原文）
 D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\regression.py                # 位置/气泡/缩放/托盘/自启

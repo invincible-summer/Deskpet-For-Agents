@@ -4,10 +4,13 @@ V3.1：进程树 canonicalization、fallback 代次 token、root metadata 默认
 按真实 source 的健康隔离、--running --quiet 解析、输出解码。
 """
 from __future__ import annotations
+import subprocess
+import time
 import unittest
 import unittest.mock
 
 from agents import paths
+from agents import discovery as discovery_mod
 from agents.discovery import (
     DistroInventory,
     ProcessCandidate,
@@ -540,6 +543,98 @@ class WslLifecycleTests(unittest.TestCase):
         self._scan(probe, DistroInventory((), True))
         self.assertNotIn("Ubuntu", probe._cache)
         self.assertNotIn("Ubuntu", probe._distro_ok)
+
+    # ---- V3.1.2：探测绝不重启用户已停止的 distro ----
+    # 旧缺陷在 _list_running_distros 内部的 15s 正缓存，所以这组测试
+    # patch 在 subprocess 边界，走真实的枚举/解析/门控代码路径。
+
+    def _subprocess_scan(self, probe, state, ps_rows=None):
+        """真实执行 scan()，仅在 subprocess.run 边界模拟 wsl.exe。
+
+        state["running"]：--list --running --quiet 的当前结果（测试在两轮
+        之间修改它，模拟用户 terminate）；state["fail"]=True 时两条枚举
+        路径（--quiet 与 -l -v）都 rc=1。返回 (scan 结果, 全部 wsl.exe
+        argv 记录)——`-d` 出现在 argv 里 = 一次会启动目标 distro 的调用。
+        """
+        calls: list[list[str]] = []
+        ps_text = "".join(
+            "\t".join(str(x) for x in row) + "\n" for row in (ps_rows or []))
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            rc, out = 0, b""
+            if "--list" in argv:
+                if state.get("fail"):
+                    rc = 1
+                else:
+                    out = "".join(n + "\n" for n in state["running"]).encode("utf-16")
+            elif len(argv) >= 2 and argv[1] == "-l":
+                if state.get("fail"):
+                    rc = 1
+                else:
+                    out = "".join(
+                        f"  {n}    Running    2\n" for n in state["running"]
+                    ).encode("utf-8")
+            else:                       # wsl -d <distro> --exec ...
+                out = ps_text.encode("utf-8")
+            return subprocess.CompletedProcess(argv, rc, stdout=out)
+
+        with unittest.mock.patch.object(discovery_mod.subprocess, "run",
+                                        side_effect=fake_run), \
+             unittest.mock.patch.object(WslProcessProbe, "_metadata",
+                                        side_effect=_no_ticks_meta):
+            result = probe.scan()
+        return result, calls
+
+    @staticmethod
+    def _wsl_d_calls(calls):
+        return [c for c in calls if "-d" in c]
+
+    def test_stopped_distro_is_never_relaunched_by_probe(self):
+        # t0：Ubuntu Running → 探测正常进入 distro（wsl -d 被执行是合法的）
+        probe = WslProcessProbe()
+        state = {"running": ["Ubuntu"]}
+        (inst, healthy), calls = self._subprocess_scan(probe, state)
+        self.assertTrue(healthy["wsl:Ubuntu"])
+        self.assertTrue(self._wsl_d_calls(calls))
+        # 用户 terminate Ubuntu：之后每轮 quiet list 都成功返回空
+        # （authoritative empty）。不变量：停止后绝不再对 Ubuntu 执行
+        # wsl -d —— 那会把它重新启动。
+        state["running"] = []
+        for _ in range(3):
+            (inst, healthy), calls = self._subprocess_scan(probe, state)
+            self.assertEqual(inst.get("wsl:Ubuntu"), [])
+            self.assertTrue(healthy["wsl:Ubuntu"])
+            self.assertFalse(self._wsl_d_calls(calls))
+        self.assertTrue(probe.last_ok)
+
+    def test_cached_running_inventory_never_authorizes_wsl_exec(self):
+        # 锁死回归：即使存在"15 秒内 Ubuntu Running"的过期权威缓存
+        # （旧字段直接注入，模拟缓存机制被重新引入），只要本轮 fresh
+        # 枚举成功返回空，就绝不能据此执行任何 wsl -d。
+        probe = WslProcessProbe()
+        probe._inventory = DistroInventory(("Ubuntu",), True)
+        probe._inventory_ts = time.time()
+        state = {"running": []}
+        (inst, healthy), calls = self._subprocess_scan(probe, state)
+        self.assertNotIn("wsl:Ubuntu", inst)
+        self.assertTrue(probe.last_ok)
+        self.assertFalse(self._wsl_d_calls(calls))
+
+    def test_inventory_failure_does_not_probe_cached_distro(self):
+        # 枚举双路径失败：沿用旧名单输出缓存实例 + unhealthy，但绝不
+        # 进入 distro 执行 wsl -d（无法读取 ≠ 可以探测/重启）。
+        probe = WslProcessProbe()
+        state = {"running": ["Ubuntu"]}
+        (inst, _), _ = self._subprocess_scan(
+            probe, state, ps_rows=[_codex_row(100)])
+        self.assertEqual(len(inst["wsl:Ubuntu"]), 1)
+        state["fail"] = True
+        (inst, healthy), calls = self._subprocess_scan(probe, state)
+        self.assertEqual(len(inst["wsl:Ubuntu"]), 1)   # 缓存实例保留
+        self.assertFalse(healthy["wsl:Ubuntu"])
+        self.assertFalse(probe.last_ok)
+        self.assertFalse(self._wsl_d_calls(calls))
 
 
 class KimiIndexTests(unittest.TestCase):

@@ -1162,6 +1162,12 @@ Microsoft Learn "Understanding Threading Issues"：跨桌面的 UIA client 应�
 
 GitHub Docs "Using workflow run logs"：失败的 workflow 应通过具体 job/step logs 定位失败原因；benchmark 步骤保持 blocking（`--report` JSON 以 artifact 上传，失败也可诊断），不得 `continue-on-error`。依据：([GitHub Docs][39])
 
+## WSL：探测的被动性（V3.1.2 passive-WSL lifecycle closure）
+
+Microsoft Learn "Accessing network applications with WSL" 对 `wsl.exe --distribution <DistroName> <command>` 的官方解释是原文"host command wsl.exe **launches the target instance** and executes Linux command"——即 `wsl -d <distro> --exec`（ps/metadata 探测所用形式）本身就具有启动目标发行版的能力。依据：([Microsoft Learn][40])
+
+Microsoft Learn "Advanced settings configuration in WSL" 的 "The 8 second rule"：关闭发行版全部 shell 后，子系统通常还需要约 8 秒才完全停止，并明确推荐用 `wsl --list --running` 检查（宿主侧查询，不会启动任何发行版）。因此 V3.1.1 的 15 秒 Running 正缓存违反被动性：用户 terminate 后，过期缓存继续授权 `wsl -d` 探测，3 秒 probe 间隔小于 8 秒空闲关机，形成"探测保活"循环。V3.1.2 修复：每轮全新 `--list --running --quiet`，只有本轮确认 Running 的 distro 才执行 `wsl -d`。依据：([Microsoft Learn][41])
+
 
 [1]: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-uiautomationoverview?utm_source=chatgpt.com "UI Automation Overview - Win32 apps | Microsoft Learn"
 [2]: https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/ui-automation-events-for-clients?utm_source=chatgpt.com "UI Automation Events for Clients - .NET Framework | Microsoft Learn"
@@ -1202,3 +1208,5 @@ GitHub Docs "Using workflow run logs"：失败的 workflow 应通过具体 job/s
 [37]: https://learn.microsoft.com/zh-cn/windows/win32/api/winuser/nf-winuser-getclassnamew?utm_source=chatgpt.com "GetClassNameW 函数 （winuser.h） - Win32 apps | Microsoft Learn"
 [38]: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading?utm_source=chatgpt.com "Understanding Threading Issues - Win32 apps | Microsoft Learn"
 [39]: https://docs.github.com/en/actions/how-tos/monitor-workflows/use-workflow-run-logs?utm_source=chatgpt.com "Using workflow run logs - GitHub Docs"
+[40]: https://learn.microsoft.com/en-us/windows/wsl/networking?utm_source=chatgpt.com "Accessing network applications with WSL | Microsoft Learn"
+[41]: https://learn.microsoft.com/en-us/windows/wsl/wsl-config?utm_source=chatgpt.com "Advanced settings configuration in WSL | Microsoft Learn"
