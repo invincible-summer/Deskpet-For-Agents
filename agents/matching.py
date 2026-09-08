@@ -16,13 +16,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable, Hashable, Iterable
 
 
 @dataclass
 class MatchDecision:
-    left: str
-    right: object | None
+    left: Hashable
+    right: Hashable | None
     score: int = 0
     left_margin: int = 0   # 该 left 的 top1-top2 分差
     right_margin: int = 0  # 该 right 的 top1-top2 分差
@@ -84,6 +84,9 @@ def mutual_unique_matches(left_keys: Iterable, right_keys: Iterable,
                           min_margin: int = 1) -> dict:
     """互相唯一的一对一匹配；结果与输入顺序无关。
 
+    接口契约：left/right 是 hashable identity key，匹配判定用 key 的
+    值相等（== / hash），不依赖对象 identity。
+
     返回 {left_key: MatchDecision}；未匹配的 left 不出现在结果里。
     """
     lefts, rights = list(left_keys), list(right_keys)
@@ -100,7 +103,7 @@ def mutual_unique_matches(left_keys: Iterable, right_keys: Iterable,
             continue
         r = top
         r_top, _r_score, right_margin, r_unique = by_right[r]
-        if r_top is not l or not r_unique:
+        if r_top != l or not r_unique:
             continue
         if right_margin < min_margin:
             continue

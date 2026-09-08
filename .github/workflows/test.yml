@@ -8,6 +8,9 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      # windows runner 默认代码页 cp1252，中文输出会 UnicodeEncodeError
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,6 +23,14 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover tests -p "test_*.py"
       - name: Monitor benchmark
-        run: python tests/benchmark_monitor.py --ticks 5000
+        run: python tests/benchmark_monitor.py --ticks 5000 --report benchmark-report.json
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-benchmark
+          path: benchmark-report.json
       # 真实 UIA / Windows Terminal 验收（tests/uia_probe.py）属于
       # 本机 manual acceptance，不在 CI 中操作真实终端。
+      # benchmark 保持 blocking（无 continue-on-error）：失败时靠上传的
+      # benchmark-report.json 定位具体不变量。

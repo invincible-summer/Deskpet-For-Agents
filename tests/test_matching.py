@@ -13,6 +13,22 @@ def matrix_fn(matrix: dict):
     return lambda l, r: matrix.get((l, r), -1)
 
 
+class Key:
+    """equal-but-not-identical 的自定义 key：验证匹配用值相等语义。"""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __eq__(self, other):
+        return isinstance(other, Key) and self.value == other.value
+
+    def __hash__(self):
+        return hash(self.value)
+
+    def __repr__(self):
+        return f"Key({self.value!r})"
+
+
 class MutualUniqueTests(unittest.TestCase):
     def test_mutual_top1_matches(self):
         matrix = {("A", "X"): 5, ("A", "Y"): 1, ("B", "X"): 1, ("B", "Y"): 4}
@@ -89,6 +105,19 @@ class MutualUniqueTests(unittest.TestCase):
         matrix = {("A", "X"): 5, ("A", "Y"): 3}
         diag = best_effort_scores(["A"], ["X", "Y"], matrix_fn(matrix))
         self.assertEqual(diag["A"], ("X", 5, 3))
+
+    def test_mutual_match_uses_equality_not_identity(self):
+        # 接口契约是 key 值相等（== / hash）而非对象 identity：
+        # 自定义 key 类的等值实例（非 interned、非同对象）必须正常
+        # 完成互相唯一匹配，且用全新等值 key 能取回判定。
+        la, lb = Key("A"), Key("B")
+        rx, ry = Key("X"), Key("Y")
+        matrix = {(la, rx): 5, (la, ry): 1, (lb, rx): 1, (lb, ry): 4}
+        out = mutual_unique_matches([la, lb], [rx, ry], matrix_fn(matrix))
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[Key("A")].right, Key("X"))
+        self.assertEqual(out[Key("B")].right, Key("Y"))
+        self.assertEqual(out[Key("A")].score, 5)
 
 
 if __name__ == "__main__":

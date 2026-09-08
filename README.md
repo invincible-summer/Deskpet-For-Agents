@@ -78,8 +78,13 @@ Windows Terminal 没有 `WT_SESSION → pane` 公开接口：
 
 - **线程架构**：Tk UI ｜ Monitor Core（0.5s）｜ ProcessProbe worker（3s，single-slot）｜ UIA MTA —— WSL 卡顿不卡气泡
 - **进程身份**：key 含启动 token（`wsl:Ubuntu|codex|4812|<ticks>`），PID 复用不继承旧绑定；wrapper/runtime 折叠（npm shim → node 只保留最深 runtime，不跨 kind 折叠）；`/proc` ticks 缺失时用稳定 fallback 代次 token，绝不退化成裸 PID；消失宽限 15s
-- **来源隔离**：探测健康按真实 source（`windows` / `wsl:Ubuntu` / `wsl:Debian`…）判定，一个 distro 扫描失败不污染其他来源的实例与"状态可能延迟"标记
+- **来源隔离与三态生命周期**：探测健康按真实 source（`windows` / `wsl:Ubuntu` / `wsl:Debian`…）判定，一个 distro 扫描失败不污染其他来源的实例与"状态可能延迟"标记。WSL source 有三种内部语义（V3.1.1）：
+  1. **healthy + instances** —— 发行版运行且 Agent 被发现；
+  2. **healthy + empty** —— 已权威确认当前发行版没有 Agent，或发行版已停止（`wsl --list --running --quiet` 成功且输出为空即是权威空结果）；旧实例经 `gone_grace_sec`（默认 15s）后清除，同时清掉该 distro 的进程缓存与 fallback 代次 token——重启后 Linux PID 从小整数再来也不会继承旧绑定；
+  3. **unhealthy** —— WSL 枚举/ps 读取失败：DeskPet 保留上一轮缓存并显示"状态可能延迟"，绝不误判退出（无法读取 ≠ 已经不存在）。
+  停止检测的最坏延迟约为 15s 发行版清单缓存 + 3s 调度 + 15s 消失宽限 ≈ 33s，这是当前轻量设计的既定取舍。
 - **状态语义**：已知 active turn → 无限保持 WORKING；仅活动证据 → 10s 宽限后回 UNKNOWN（不伪造）；DONE 展示 8s；IDLE 只在明确见过 turn 结束后出现；**泛化终端活动（pane 有文本变化）永远不能推翻结构化 Session 的 DONE/IDLE/ERROR/INPUT**
+- **Status/Phase/Mode 正交**：Mode 是独立维度（Plan/Default/UNKNOWN+原始值），终端 WAITING 成为状态胜者时无权擦除 Session 已解析的 Mode——`WAITING + APPROVAL + PLAN` 是合法且必要的最终状态；优先级为 Session 结构化 Mode → 胜者明确携带的 Mode → NONE
 - **会话解析**：绑定用互相唯一匹配（source/session_id/cwd/started_at 评分，结果与实例遍历顺序无关），同分竞争保持未绑定；late-start 每 15s 无窗 fallback（最近 12 候选）；目录重扫有绑定时降为 15s
 - **兼容性诊断**：会话解析器按已知记录类型集合判定 `OK / PARTIAL / UNKNOWN`，上游格式变化会在仪表盘显示"未知记录"而不是静默失败；Mode 出现未知原始值时显示 `Unknown（原始值：…）`
 
@@ -99,7 +104,7 @@ agents/
   terminal_uia.py       UIA 观察器 + 审批识别器 + TerminalResolver（订阅生命周期有界）
   monitor.py            ProcessProbeWorker + Monitor Core + AgentTarget API
   tailer.py summarize.py
-actions/winkeys.py      仅终端唤起（公共 Win32 + HWND PID/class 复用验证；无任何键盘注入）
+actions/winkeys.py      仅终端唤起（公共 Win32 + HWND 属主 PID/窗口类一致性验证，fail-closed：任何一步无法证明身份即拒绝并触发重识别；无任何键盘注入）
 tools/convert.py        素材→透明GIF 管线
 tests/                  单元/隐私/UIA/匹配/基准/实机探针/回归
 .github/workflows/      CI（windows-latest：compileall + unittest + benchmark）
@@ -130,14 +135,14 @@ tests/                  单元/隐私/UIA/匹配/基准/实机探针/回归
 ## 测试
 
 ```bat
-D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（140+）
-D:\miniconda3\envs\deskpet\python.exe tests\benchmark_monitor.py --ticks 5000    # 合成基准（队列/预算/churn 上限）
+D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（170+）
+D:\miniconda3\envs\deskpet\python.exe tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json    # 合成基准（队列/预算/churn 上限）
 D:\miniconda3\envs\deskpet\python.exe tests\uia_probe.py                         # UIA 实机冒烟（--verbose-text 才打印原文）
 D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\regression.py                # 位置/气泡/缩放/托盘/自启
 D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\replay_real.py               # 真实会话数据回放
 ```
 
-CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试 + benchmark 5000 ticks；真实 UIA 验收属于本机 manual acceptance。
+CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试 + benchmark 5000 ticks（`PYTHONUTF8=1`，benchmark 报告以 artifact 上传）；真实 UIA 验收属于本机 manual acceptance。**Release acceptance requires GitHub Actions green**：workflow conclusion=success 是发布验收的必要条件，CI 红期间不标记版本完成。
 
 ## 已知边界（如实说明）
 

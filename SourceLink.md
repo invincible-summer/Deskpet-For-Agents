@@ -1133,6 +1133,36 @@ Windows Terminal UIA
 
 其中最关键的事实也得到了相当直接的一手支持：**Codex approval 事件明确不持久化到 rollout，而 Windows Terminal 明确提供 UIA 文本/notification 能力；因此用 UIA 补 Codex/Claude 的终端交互态并不是 workaround 式猜测，而是当前“不改 Agent、不用 hooks、旁路监听已有 CLI”约束下最有依据的实现路线。** ([GitHub][18])
 
+---
+
+# 二十三、V3.1.1 Core Hardening Closure 补充依据
+
+## WSL：`--list --running` / `--quiet` 的语义
+
+Microsoft Learn "Basic commands for WSL"：`wsl --list --running` 只列出**当前正在运行**的 distribution，`--quiet` 只输出发行版名字。因此：
+
+> 命令成功且返回空集合 = 已成功确认当前没有 Running distribution（authoritative empty），
+> 绝不能解释为“不知道状态所以保留旧 Agent”。
+
+依据：([Microsoft Learn][35])
+
+## Win32：`GetWindowThreadProcessId`
+
+Microsoft Learn：成功时返回创建窗口的 thread ID；**无效 HWND / 失败时返回 0**，且失败时输出 PID 变量保持不变。因此唤起前的属主验证必须 fail-closed：返回 0 或 PID=0 都视为“未完成验证”而不是“匹配”。依据：([Microsoft Learn][36])
+
+## Win32：`GetClassNameW`
+
+Microsoft Learn：成功返回复制的字符数，**失败返回 0**。class 读取失败必须拒绝唤起。依据：([Microsoft Learn][37])
+
+## UIA：Threading（延续 V3.1）
+
+Microsoft Learn "Understanding Threading Issues"：跨桌面的 UIA client 应使用不拥有窗口的 MTA 线程，event handler 的 Add/Remove 须在线程模型上保持一致。V3.1 的 UIA 架构（独立 MTA + 同线程增删 handler）继续保持，本轮不重写。依据：([Microsoft Learn][38])
+
+## CI：workflow run logs
+
+GitHub Docs "Using workflow run logs"：失败的 workflow 应通过具体 job/step logs 定位失败原因；benchmark 步骤保持 blocking（`--report` JSON 以 artifact 上传，失败也可诊断），不得 `continue-on-error`。依据：([GitHub Docs][39])
+
+
 [1]: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-uiautomationoverview?utm_source=chatgpt.com "UI Automation Overview - Win32 apps | Microsoft Learn"
 [2]: https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/ui-automation-events-for-clients?utm_source=chatgpt.com "UI Automation Events for Clients - .NET Framework | Microsoft Learn"
 [3]: https://learn.microsoft.com/zh-cn/windows/win32/winauto/uiauto-threading?utm_source=chatgpt.com "了解线程问题 - Win32 apps | Microsoft Learn"
@@ -1167,3 +1197,8 @@ Windows Terminal UIA
 [32]: https://github.com/bon3less/MoonshotAI_kimi-cli/blob/main/CHANGELOG.md?utm_source=chatgpt.com "MoonshotAI_kimi-cli/CHANGELOG.md at main · bon3less/MoonshotAI_kimi-cli · GitHub"
 [33]: https://github.com/MoonshotAI/kimi-agent-sdk/blob/main/guides/python/session.md?utm_source=chatgpt.com "kimi-agent-sdk/guides/python/session.md at main · MoonshotAI/kimi-agent-sdk · GitHub"
 [34]: https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/reference/tools.md?utm_source=chatgpt.com "kimi-code/docs/en/reference/tools.md at main · MoonshotAI/kimi-code · GitHub"
+[35]: https://learn.microsoft.com/en-us/windows/wsl/basic-commands?utm_source=chatgpt.com "Basic commands for WSL | Microsoft Learn"
+[36]: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowthreadprocessid?utm_source=chatgpt.com "GetWindowThreadProcessId function (winuser.h) - Win32 apps | Microsoft Learn"
+[37]: https://learn.microsoft.com/zh-cn/windows/win32/api/winuser/nf-winuser-getclassnamew?utm_source=chatgpt.com "GetClassNameW 函数 （winuser.h） - Win32 apps | Microsoft Learn"
+[38]: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading?utm_source=chatgpt.com "Understanding Threading Issues - Win32 apps | Microsoft Learn"
+[39]: https://docs.github.com/en/actions/how-tos/monitor-workflows/use-workflow-run-logs?utm_source=chatgpt.com "Using workflow run logs - GitHub Docs"

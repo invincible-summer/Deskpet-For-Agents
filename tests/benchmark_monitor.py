@@ -1,4 +1,4 @@
-"""Monitor 合成基准（plan.md §64 + V3.1 审核 §22）。
+"""Monitor 合成基准（plan.md §64 + V3.1 审核 §22 + V3.1.1 §26）。
 
 断言：
   * 队列不增长（事件队列 ≤256、UIA 命令队列 ≤32）
@@ -8,8 +8,12 @@
   * pane 开关 1000 次后订阅账本回到当前 pane 数量级
   * resolver 结果不随 Agent 输入顺序变化
 
-用法：python tests/benchmark_monitor.py --ticks N
+用法：python tests/benchmark_monitor.py [--ticks N] [--report PATH]
+
+--report：把全部计数与逐项 check 写成 JSON（失败时也写出再退出 1），
+供 CI artifact 与失败诊断使用；不传时行为不变。
 """
+import json
 import sys
 import time
 from pathlib import Path
@@ -41,7 +45,7 @@ class SyntheticBackend(TerminalBackend):
         return self.visible.get(pane_id, "")
 
 
-def run(ticks: int = 20000) -> int:
+def run(ticks: int = 20000, report_path: str = "") -> int:
     # ---- 构造 6 Agent：3 WSL + 3 Windows
     instances = []
     for i in range(3):
@@ -159,6 +163,26 @@ def run(ticks: int = 20000) -> int:
     failed = [name for name, ok in checks if not ok]
     for name, ok in checks:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+    if report_path:
+        # 失败也写出（先写再判退出码），供 CI artifact 诊断定位
+        report = {
+            "ticks": ticks,
+            "elapsed": round(elapsed, 3),
+            "ticks_per_sec": round(ticks / max(elapsed, 1e-9), 1),
+            "panes": len(observer.panes),
+            "queue_high": queue_high,
+            "budget_high": budget_high,
+            "dirty_high": dirty_high,
+            "dropped": observer.stats["dropped"],
+            "events": observer.stats["events"],
+            "visible_reads": observer.stats["visible_reads"],
+            "fallback_reads": observer.stats["text_fallback_reads"],
+            "fallback_rate_per_sec": round(fallback_rate, 4),
+            "checks": {name: bool(ok) for name, ok in checks},
+        }
+        Path(report_path).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"report written: {report_path}")
     if failed:
         print("BENCHMARK FAILED:", failed)
         return 1
@@ -166,8 +190,30 @@ def run(ticks: int = 20000) -> int:
     return 0
 
 
-if __name__ == "__main__":
+def _parse_args(argv):
     ticks = 20000
-    if len(sys.argv) > 2 and sys.argv[1] == "--ticks":
-        ticks = int(sys.argv[2])
-    sys.exit(run(ticks))
+    report = ""
+    i = 1
+    while i < len(argv):
+        if argv[i] == "--ticks" and i + 1 < len(argv):
+            ticks = int(argv[i + 1])
+            i += 2
+        elif argv[i] == "--report" and i + 1 < len(argv):
+            report = argv[i + 1]
+            i += 2
+        else:
+            i += 1
+    return ticks, report
+
+
+if __name__ == "__main__":
+    # 非 UTF-8 locale 的控制台（如 windows-latest 的 cp1252）打印中文
+    # 检查名会 UnicodeEncodeError：统一按 UTF-8 输出，无法编码时替换。
+    for _stream in (sys.stdout, sys.stderr):
+        if _stream and hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+    _ticks, _report = _parse_args(sys.argv)
+    sys.exit(run(_ticks, _report))
