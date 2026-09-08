@@ -11,14 +11,17 @@ user32 = ctypes.windll.user32 if os.name == 'nt' else None
 if user32:
     user32.GetForegroundWindow.restype = wt.HWND
     user32.IsWindow.argtypes = [wt.HWND]
+    user32.IsWindow.restype = wt.BOOL
     user32.IsWindowVisible.argtypes = [wt.HWND]
     user32.IsIconic.argtypes = [wt.HWND]
     user32.ShowWindow.argtypes = [wt.HWND,ctypes.c_int]
     user32.SetForegroundWindow.argtypes = [wt.HWND]
-    user32.GetWindowThreadProcessId.argtypes = [wt.HWND,ctypes.POINTER(wt.DWORD)]
+    user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wt.DWORD
     user32.GetWindowTextLengthW.argtypes = [wt.HWND]
     user32.GetWindowTextW.argtypes = [wt.HWND,wt.LPWSTR,ctypes.c_int]
     user32.GetClassNameW.argtypes = [wt.HWND,wt.LPWSTR,ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
 
 
 def enum_windows():
@@ -55,23 +58,44 @@ def validate_terminal_window(binding) -> bool:
     """唤起前的 HWND 复用验证：IsWindow + 属主 PID + 窗口类三者一致。
 
     Windows 会复用 HWND；终端已关闭而 resolver 尚未更新时，旧 HWND
-    可能指向别的窗口——不符合即拒绝唤起（绝不 SendInput/PostMessage）。
+    可能指向别的窗口。本函数的职责是证明"目标仍是发现阶段记录的那个
+    终端窗口"——任何一步无法完成验证即失败（fail-closed），绝不
+    SendInput/PostMessage，也绝不在 action 层做第二套 heuristic 推测。
+
+    Win32 契约（Microsoft Learn）：
+      * GetWindowThreadProcessId 失败/无效 HWND 返回 0，且输出变量
+        保持不变——返回 0 时读到的 PID 不是可信验证结果；
+      * GetClassNameW 失败返回 0。
+    因此：thread_id==0、actual_pid<=0（0 是"未完成验证"不是"匹配"）、
+    GetClassNameW 返回 <=0、期望 PID/class 缺失，全部拒绝。
     """
-    hwnd = int(getattr(binding, "hwnd", 0) or 0)
-    if not hwnd or not user32 or not user32.IsWindow(hwnd):
+    if not user32:
         return False
-    wpid = int(getattr(binding, "window_pid", 0) or 0)
-    if wpid:
-        pid = wt.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value and pid.value != wpid:
-            return False
-    cls = str(getattr(binding, "window_class", "") or "")
-    if cls:
-        buf = ctypes.create_unicode_buffer(64)
-        user32.GetClassNameW(hwnd, buf, 64)
-        if buf.value and buf.value != cls:
-            return False
+    hwnd = int(getattr(binding, "hwnd", 0) or 0)
+    if not hwnd:
+        return False
+    if not user32.IsWindow(hwnd):
+        return False
+    expected_pid = int(getattr(binding, "window_pid", 0) or 0)
+    if expected_pid <= 0:
+        return False    # 没有期望属主就无法完成身份验证
+    expected_class = str(getattr(binding, "window_class", "") or "")
+    if not expected_class:
+        return False
+    pid = wt.DWORD(0)
+    thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not thread_id:
+        return False
+    if pid.value <= 0:
+        return False
+    if pid.value != expected_pid:
+        return False
+    buf = ctypes.create_unicode_buffer(128)
+    length = user32.GetClassNameW(hwnd, buf, len(buf))
+    if length <= 0:
+        return False
+    if buf.value != expected_class:
+        return False
     return True
 
 

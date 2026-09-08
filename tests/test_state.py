@@ -181,5 +181,65 @@ class FusionFieldTests(unittest.TestCase):
         self.assertFalse(snap.session_bound)
 
 
+class ModeOrthogonalityTests(unittest.TestCase):
+    """Status / Phase / Mode 是三个独立维度（V3.1.1）。
+
+    终端 WAITING（审批识别器命中）成为状态胜者时，无权擦除 Session
+    已解析出的独立 Mode——WAITING + APPROVAL + PLAN 是合法且必要的状态。
+    """
+
+    def test_terminal_waiting_preserves_session_plan_mode(self):
+        inst = make_instance()
+        snap = reduce_state(inst,
+                            session_obs(Status.WORKING, mode=Mode.PLAN),
+                            terminal_obs(Status.WAITING), None, 1000.0)
+        self.assertEqual(snap.status, Status.WAITING)
+        self.assertEqual(snap.phase, Phase.APPROVAL)
+        self.assertEqual(snap.mode, Mode.PLAN)
+
+    def test_terminal_waiting_preserves_unknown_mode_raw(self):
+        inst = make_instance()
+        session = session_obs(Status.WORKING, mode=Mode.UNKNOWN,
+                              mode_raw="delegate")
+        snap = reduce_state(inst, session, terminal_obs(Status.WAITING),
+                            None, 1000.0)
+        self.assertEqual(snap.status, Status.WAITING)
+        self.assertEqual(snap.mode, Mode.UNKNOWN)
+        self.assertEqual(snap.mode_raw, "delegate")
+
+    def test_terminal_waiting_preserves_default_mode(self):
+        # 不只为 PLAN 特判：任何 Session 结构化 Mode 都保留
+        inst = make_instance()
+        session = session_obs(Status.WORKING, mode=Mode.ACCEPT_EDITS)
+        snap = reduce_state(inst, session, terminal_obs(Status.WAITING),
+                            None, 1000.0)
+        self.assertEqual(snap.status, Status.WAITING)
+        self.assertEqual(snap.mode, Mode.ACCEPT_EDITS)
+
+    def test_explicit_winner_mode_can_override_none(self):
+        # 为未来携带 Mode 的 semantic observation 留接口语义：
+        # 胜者自身明确携带 Mode 时覆盖 Session 的 NONE。
+        inst = make_instance()
+        session = session_obs(Status.WORKING, mode=Mode.NONE)
+        terminal = terminal_obs(Status.WAITING, mode=Mode.PLAN,
+                                mode_raw="plan")
+        snap = reduce_state(inst, session, terminal, None, 1000.0)
+        self.assertEqual(snap.status, Status.WAITING)
+        self.assertEqual(snap.mode, Mode.PLAN)
+        self.assertEqual(snap.mode_raw, "plan")
+
+    def test_generic_activity_keeps_session_mode(self):
+        # 泛化终端活动胜出（无会话状态时）也不伪造/清除 Mode
+        inst = make_instance()
+        session = session_obs(Status.WORKING, turn_active=False,
+                              expires_at=990.0, ts=980.0, mode=Mode.PLAN,
+                              confidence=Confidence.MEDIUM)
+        terminal = terminal_obs(Status.WORKING, phase=Phase.NONE,
+                                confidence=Confidence.MEDIUM, summary="终端活动",
+                                expires_at=1008.0)
+        snap = reduce_state(inst, session, terminal, None, 1000.0)
+        self.assertEqual(snap.mode, Mode.PLAN)
+
+
 if __name__ == "__main__":
     unittest.main()

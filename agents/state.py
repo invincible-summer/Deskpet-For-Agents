@@ -23,6 +23,7 @@ from .models import (
     AgentInstance,
     Confidence,
     EvidenceSource,
+    Mode,
     Observation,
     Phase,
     Snapshot,
@@ -105,8 +106,10 @@ def reduce_state(instance: AgentInstance,
             snap.summary = session.summary
         if session.title:
             snap.title = session.title
-        if session.mode_raw:
-            snap.mode_raw = session.mode_raw
+        # Mode 是独立维度：在状态胜者判定前先落 Session 结构化 Mode，
+        # 之后只有"胜者自身携带明确 Mode"才允许覆盖（V3.1.1）。
+        snap.mode = session.mode
+        snap.mode_raw = session.mode_raw
 
     session_live = _live(session, now)
     terminal_live = _live(terminal, now)
@@ -131,8 +134,12 @@ def reduce_state(instance: AgentInstance,
     snap.status = winner.status or Status.UNKNOWN
     snap.evidence = winner.source
     snap.confidence = winner.confidence
-    if winner.mode:
+    # 优先级：Session structured Mode → winner explicit Mode → NONE。
+    # 必须显式比较枚举，不用 truthiness（Status 胜者无权擦除独立 Mode）。
+    if winner.mode is not Mode.NONE:
         snap.mode = winner.mode
+        if winner.mode_raw:
+            snap.mode_raw = winner.mode_raw
 
     # Phase：优先采用胜出观察自己的 phase（如 WAITING→APPROVAL）；
     # 胜出是终端活动证据（无 phase）时保留会话结构化 phase，
