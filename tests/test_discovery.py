@@ -9,6 +9,7 @@ import unittest.mock
 
 from agents import paths
 from agents.discovery import (
+    DistroInventory,
     ProcessCandidate,
     WslProcessProbe,
     build_metadata_script,
@@ -251,6 +252,18 @@ class CanonicalizationTests(unittest.TestCase):
         self.assertEqual(canonical, {300})
         self.assertEqual(launchers[300], (100,))
 
+    def test_launcher_pids_never_cross_agent_kind(self):
+        # Claude 100 是 Claude 150 的 wrapper，也是 Codex 300 的祖先：
+        # 300 的 launcher_pids 绝不能混入跨 kind 的 100（诊断必须可信）。
+        cands = [self._cand(AgentKind.CLAUDE, 100, 1),
+                 self._cand(AgentKind.CLAUDE, 150, 100),
+                 self._cand(AgentKind.CODEX, 300, 100)]
+        canonical, launchers = canonicalize_agent_processes(
+            cands, {100: 1, 150: 100, 300: 100})
+        self.assertEqual(canonical, {150, 300})
+        self.assertEqual(launchers.get(150), (100,))   # 同 kind wrapper 保留
+        self.assertEqual(launchers.get(300, ()), ())   # 跨 kind 不得混入
+
 
 class DistroListParsingTests(unittest.TestCase):
     def test_running_quiet_parsing(self):
@@ -385,7 +398,8 @@ class MultiDistroScanTests(unittest.TestCase):
                            "env": {"WT_SESSION": "g1"}}}
 
         with unittest.mock.patch.object(WslProcessProbe, "_list_running_distros",
-                                        return_value=["Ubuntu", "Debian"]), \
+                                        return_value=DistroInventory(
+                                            ("Ubuntu", "Debian"), True)), \
              unittest.mock.patch.object(WslProcessProbe, "_ps_scan",
                                         side_effect=fake_ps), \
              unittest.mock.patch.object(WslProcessProbe, "_metadata",
@@ -420,7 +434,8 @@ class MultiDistroScanTests(unittest.TestCase):
                          "env": {}}}
 
         with unittest.mock.patch.object(WslProcessProbe, "_list_running_distros",
-                                        return_value=["Ubuntu"]), \
+                                        return_value=DistroInventory(
+                                            ("Ubuntu",), True)), \
              unittest.mock.patch.object(WslProcessProbe, "_ps_scan",
                                         side_effect=fake_ps), \
              unittest.mock.patch.object(WslProcessProbe, "_metadata",
@@ -432,6 +447,99 @@ class MultiDistroScanTests(unittest.TestCase):
         # key 含 fallback token，而不是裸 PID identity
         self.assertEqual(inst.key,
                          f"wsl:Ubuntu|codex|50|{inst.process_token}")
+
+
+def _codex_row(pid, ppid=1, etimes=60):
+    return (pid, ppid, 10, 10, 10, "pts/0", 1000, etimes, "codex",
+            "/usr/bin/codex")
+
+
+def _no_ticks_meta(distro, pids):
+    return {p: {"cwd": "/w", "ticks": "", "uid": "", "home": "",
+                "env": {}} for p in pids}
+
+
+class WslLifecycleTests(unittest.TestCase):
+    """V3.1.1：Running / Stopped / Failed 三态彻底分离。"""
+
+    def _scan(self, probe, inventory, ps_rows=None, ps_error=None):
+        def fake_ps(distro, exclude_pids):
+            if ps_error is not None:
+                raise ps_error
+            return ps_rows if ps_rows is not None else [_codex_row(100)]
+
+        with unittest.mock.patch.object(WslProcessProbe, "_list_running_distros",
+                                        return_value=inventory), \
+             unittest.mock.patch.object(WslProcessProbe, "_ps_scan",
+                                        side_effect=fake_ps), \
+             unittest.mock.patch.object(WslProcessProbe, "_metadata",
+                                        side_effect=_no_ticks_meta):
+            return probe.scan()
+
+    def test_successful_empty_running_list_is_authoritative(self):
+        # 上一轮 Ubuntu 有缓存实例；本轮 quiet list 成功返回空 →
+        # 权威确认无 Running distro，绝不能返回旧缓存 Agent。
+        probe = WslProcessProbe()
+        instances, healthy = self._scan(
+            probe, DistroInventory(("Ubuntu",), True))
+        self.assertTrue(instances["wsl:Ubuntu"])
+        instances, healthy = self._scan(probe, DistroInventory((), True))
+        self.assertEqual(instances.get("wsl:Ubuntu"), [])
+        self.assertTrue(healthy["wsl:Ubuntu"])
+        self.assertTrue(probe.last_ok)
+
+    def test_one_of_two_distros_stopped_emits_empty_tombstone(self):
+        probe = WslProcessProbe()
+        both = DistroInventory(("Ubuntu", "Debian"), True)
+        instances, healthy = self._scan(probe, both)
+        self.assertTrue(instances["wsl:Ubuntu"])
+        self.assertTrue(instances["wsl:Debian"])
+        # Debian 停止：本轮起持续输出空 tombstone + healthy=True
+        for _ in range(3):
+            instances, healthy = self._scan(
+                probe, DistroInventory(("Ubuntu",), True))
+            self.assertEqual(instances.get("wsl:Debian"), [])
+            self.assertTrue(healthy["wsl:Debian"])
+            self.assertTrue(instances["wsl:Ubuntu"])
+            self.assertTrue(healthy["wsl:Ubuntu"])
+
+    def test_inventory_failure_keeps_cache_unhealthy(self):
+        probe = WslProcessProbe()
+        instances, _ = self._scan(probe, DistroInventory(("Ubuntu",), True))
+        old = instances["wsl:Ubuntu"]
+        self.assertTrue(old)
+        # 枚举失败：保留缓存实例、不健康、绝不变成 authoritative empty
+        instances, healthy = self._scan(
+            probe, DistroInventory(("Ubuntu",), False, error="wsl broke"))
+        self.assertEqual(instances["wsl:Ubuntu"], old)
+        self.assertFalse(healthy["wsl:Ubuntu"])
+        self.assertFalse(probe.last_ok)
+        # 失败后恢复：Debian 从未 known，不产生幽灵 tombstone
+        instances, healthy = self._scan(
+            probe, DistroInventory(("Ubuntu",), True))
+        self.assertTrue(healthy["wsl:Ubuntu"])
+
+    def test_stopped_distro_clears_fallback_identities(self):
+        probe = WslProcessProbe()
+        instances, _ = self._scan(probe, DistroInventory(("Ubuntu",), True))
+        old_key = instances["wsl:Ubuntu"][0].key
+        old_token = instances["wsl:Ubuntu"][0].process_token
+        # 停止 → fallback 代次缓存清除
+        self._scan(probe, DistroInventory((), True))
+        self.assertFalse(probe._fallback)
+        # 重启后同 PID 从小整数再来：新代次 token，绝不继承旧 identity
+        instances, _ = self._scan(probe, DistroInventory(("Ubuntu",), True))
+        inst = instances["wsl:Ubuntu"][0]
+        self.assertNotEqual(inst.key, old_key)
+        self.assertNotEqual(inst.process_token, old_token)
+
+    def test_stopped_distro_clears_process_cache(self):
+        probe = WslProcessProbe()
+        self._scan(probe, DistroInventory(("Ubuntu",), True))
+        self.assertIn("Ubuntu", probe._cache)
+        self._scan(probe, DistroInventory((), True))
+        self.assertNotIn("Ubuntu", probe._cache)
+        self.assertNotIn("Ubuntu", probe._distro_ok)
 
 
 class KimiIndexTests(unittest.TestCase):

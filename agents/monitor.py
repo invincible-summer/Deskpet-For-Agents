@@ -142,11 +142,8 @@ class ProcessProbeWorker:
             try:
                 by_source, healthy = self._wsl.scan()
                 with self._lock:
-                    # 清掉已消失的 wsl source 键
-                    for key in list(self._snapshot):
-                        if key.startswith("wsl:") and key not in by_source:
-                            self._snapshot.pop(key, None)
-                            self._ok.pop(key, None)
+                    # WslProcessProbe 为所有 known distro 持续输出 source 键
+                    #（停止的 distro = 空 + healthy），无需删除"消失"键。
                     self._snapshot.update(by_source)
                     self._ok.update(healthy)
             except Exception:

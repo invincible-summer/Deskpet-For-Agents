@@ -79,8 +79,12 @@ def canonicalize_agent_processes(
     canonical = {c.pid for c in candidates if c.pid not in wrappers}
     launchers: dict[int, tuple[int, ...]] = {}
     for pid in canonical:
+        canonical_kind = by_pid[pid].kind
         anc = matched_ancestors.get(pid, ())
-        same_kind = tuple(p for p in anc if p in wrappers)
+        # launcher 诊断必须严格同 kind：跨 kind 的祖先（即使它是别处的
+        # wrapper）绝不能显示成本实例的 launcher。
+        same_kind = tuple(p for p in anc
+                          if p in wrappers and by_pid[p].kind == canonical_kind)
         if same_kind:
             launchers[pid] = same_kind
     return canonical, launchers
@@ -312,6 +316,21 @@ def parse_list_verbose(text: str) -> list[str]:
     return distros
 
 
+@dataclass(frozen=True)
+class DistroInventory:
+    """一轮 WSL 发行版清单的权威性结论（V3.1.1）。
+
+    authoritative=True 表示枚举成功（--list --running --quiet 或 -l -v
+    任一路径成功）。此时 running==() 必须解释为"已成功确认当前没有
+    Running 发行版"，绝不是"不知道所以保留旧 Agent"。
+    authoritative=False 表示枚举失败：只能沿用旧名单 best-effort，
+    不得据此判定任何 distro 停止（无法读取 ≠ 已经不存在）。
+    """
+    running: tuple[str, ...]
+    authoritative: bool
+    error: str = ""
+
+
 @dataclass
 class _FallbackIdentity:
     kind: AgentKind
@@ -336,6 +355,11 @@ class WslProcessProbe:
         # 每 distro 的最后成功结果，供扫描失败时保留缓存
         self._cache: dict[str, list[AgentInstance]] = {}
         self._distro_ok: dict[str, bool] = {}
+        # 应用生命周期内见过（running 过）的 distro：停止后持续发空 tombstone
+        self._known_distros: set[str] = set()
+        # 最近一次权威 inventory（≤15s 内直接复用；失败不缓存，下轮即重试）
+        self._inventory: DistroInventory | None = None
+        self._inventory_ts = 0.0
         # /proc starttime 缺失时的稳定 fallback 代次缓存（防 PID reuse 退化）
         self._fallback: dict[tuple[str, int], _FallbackIdentity] = {}
         self._fallback_gen = 0
@@ -346,11 +370,18 @@ class WslProcessProbe:
         self.metadata_pid_count = 0
 
     # ---- 第一层：发行版 ----
-    def _list_running_distros(self) -> list[str]:
+    def _list_running_distros(self) -> DistroInventory:
+        """枚举 Running 发行版；成功空输出 = 权威确认无 Running（V3.1.1）。
+
+        15s 权威缓存命中时原样返回（最多 15 秒旧，仍 authoritative）；
+        枚举失败不缓存，下一轮立即重试。
+        """
         with self._lock:
-            if time.time() - self._distros_ts < 15:
-                return list(self._distros)
-        text = ""
+            if (self._inventory is not None and self._inventory.authoritative
+                    and time.time() - self._inventory_ts < 15):
+                return self._inventory
+        error = ""
+        distros: list[str] | None = None
         try:
             r = subprocess.run(
                 ["wsl.exe", "--list", "--running", "--quiet"],
@@ -365,38 +396,44 @@ class WslProcessProbe:
             distros = parse_running_quiet(text)
             if not distros and text.strip():
                 # 某些版本 --quiet 仍打印表头：交给 fallback 判定
-                raise RuntimeError("empty --running --quiet output")
-            self.last_error = ""
+                raise RuntimeError("unparseable --running --quiet output")
         except Exception as exc:
-            self.last_error = str(exc)
-            distros = self._list_running_distros_verbose()
-            if distros:
-                with self._lock:
-                    self._distros = distros
-                    self._distros_ts = time.time()
-                return distros
+            error = str(exc)
+            try:
+                distros = self._list_running_distros_verbose()
+            except Exception as exc2:
+                error = f"{error}; {exc2}"
+                distros = None
+        if distros is None:
+            # 两条路径都失败：无法读取 ≠ 已经不存在。不更新已知名单，
+            # 沿用旧 running 名单让 scan() 走"保留缓存 + 不判死"分支。
+            self.last_error = error
             with self._lock:
-                return list(self._distros)
+                return DistroInventory(tuple(self._distros), False, error)
+        inv = DistroInventory(tuple(distros), True, "")
+        self.last_error = ""
         with self._lock:
-            self._distros = distros
+            self._distros = list(distros)
             self._distros_ts = time.time()
-        return distros
+            self._inventory = inv
+            self._inventory_ts = time.time()
+        return inv
 
     def _list_running_distros_verbose(self) -> list[str]:
-        """兼容 fallback：`wsl -l -v` 表格解析。"""
-        try:
-            r = subprocess.run(
-                ["wsl.exe", "-l", "-v"], capture_output=True, timeout=8,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            self.spawn_count += 1
-            rc = getattr(r, "returncode", 0)
-            if rc not in (0, None):
-                raise RuntimeError(f"wsl.exe -l failed ({rc})")
-            return parse_list_verbose(_decode_wsl_output(r.stdout))
-        except Exception as exc:
-            self.last_error = str(exc)
-            return []
+        """兼容 fallback：`wsl -l -v` 表格解析；失败抛异常。
+
+        成功但没有 Running 行 = 所有已安装 distro 都处于 Stopped，
+        结果为空列表（合法且权威）。
+        """
+        r = subprocess.run(
+            ["wsl.exe", "-l", "-v"], capture_output=True, timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.spawn_count += 1
+        rc = getattr(r, "returncode", 0)
+        if rc not in (0, None):
+            raise RuntimeError(f"wsl -l failed ({rc})")
+        return parse_list_verbose(_decode_wsl_output(r.stdout))
 
     # ---- 第二层：进程表 ----
     def _ps_scan(self, distro: str, exclude_pids: set[int]) -> list[tuple]:
@@ -491,37 +528,63 @@ class WslProcessProbe:
              ) -> tuple[dict[str, list[AgentInstance]], dict[str, bool]]:
         """全量扫描；返回按真实 source（wsl:Ubuntu 等）分组的结果与健康位。
 
+        三态语义（V3.1.1）：
+          * healthy + instances —— distro 运行且 Agent 被发现；
+          * healthy + []        —— 权威确认该 distro 当前无 Agent（或已停止），
+            tombstone 每轮持续输出，Monitor 侧经 gone_grace 清除旧实例；
+          * unhealthy           —— 枚举/ps 读取失败，保留上一轮缓存实例
+            且绝不判死（无法读取 ≠ 已经不存在）。
+
         每 distro 每 cycle 约 1×ps + 1×metadata 批查询（只查 canonical PID）。
         """
         t0 = time.perf_counter()
         exclude_pids = {int(pid) for pid in (exclude_pids or set()) if pid}
-        distros = self._list_running_distros()
+        inv = self._list_running_distros()
         instances_by_source: dict[str, list[AgentInstance]] = {}
         healthy: dict[str, bool] = {}
-        if not self.last_error and not distros:
-            # 无 Running distro：保留上一轮各 source 缓存（不判死）
+        if not inv.authoritative:
+            # 枚举失败：不更新 known distros、不发 tombstone；
+            # 已知 source 保留缓存实例并全部标记不健康。
             with self._lock:
-                for distro, cached in self._cache.items():
-                    instances_by_source[f"wsl:{distro}"] = list(cached)
-                    healthy[f"wsl:{distro}"] = self._distro_ok.get(distro, True)
-            self.last_ok = True
-            return instances_by_source, healthy
-        if not distros and self.last_error and not self._cache:
+                cached = {d: list(v) for d, v in self._cache.items()}
+            for distro in self._known_distros:
+                source = f"wsl:{distro}"
+                instances_by_source[source] = cached.get(distro, [])
+                healthy[source] = False
             self.last_ok = False
-            return {}, {}
+            self.scan_count += 1
+            self.scan_ms = time.perf_counter() - t0
+            return instances_by_source, healthy
+
+        running = set(inv.running)
+        self._known_distros.update(running)
+        # 已停止的 distro：每轮持续输出空 source + healthy=True。只发一次
+        # 会让 Monitor 的 gone timer 下一轮就失去 authoritative 依据。
+        for distro in self._known_distros - running:
+            source = f"wsl:{distro}"
+            instances_by_source[source] = []
+            healthy[source] = True
+            with self._lock:
+                self._cache.pop(distro, None)
+                self._distro_ok.pop(distro, None)
+                # 整个 distro 已停止：旧 Linux PID incarnation 的 fallback
+                # 代次没有保留意义（重启后 PID 从小整数重来也不继承旧 token）
+                for key in list(self._fallback):
+                    if key[0] == distro:
+                        self._fallback.pop(key, None)
 
         scan_ok = True
-        for distro in distros:
+        for distro in inv.running:
             source = f"wsl:{distro}"
             try:
                 rows = self._ps_scan(distro, exclude_pids)
             except Exception as exc:
-                self._distro_ok[distro] = False
-                self.last_error = str(exc)
                 scan_ok = False
                 healthy[source] = False
                 with self._lock:
+                    self._distro_ok[distro] = False
                     cached = self._cache.get(distro)
+                self.last_error = str(exc)
                 instances_by_source.setdefault(source, [])
                 if cached:
                     instances_by_source[source] = list(cached)
@@ -583,12 +646,12 @@ class WslProcessProbe:
             for key in list(self._fallback):
                 if key[0] == distro and key not in seen:
                     self._fallback.pop(key, None)
-            self._cache[distro] = instances
-            self._distro_ok[distro] = True
+            with self._lock:
+                self._cache[distro] = instances
+                self._distro_ok[distro] = True
             instances_by_source[source] = instances
             healthy[source] = True
-        self.last_ok = scan_ok and all(
-            self._distro_ok.get(d, True) for d in distros) if distros else scan_ok
+        self.last_ok = scan_ok
         if self.last_ok:
             self.last_error = ""
         self.scan_count += 1

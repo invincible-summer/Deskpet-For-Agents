@@ -695,6 +695,88 @@ class MonitorPassiveTests(unittest.TestCase):
         self.assertTrue(monitor.get_target(ubuntu.key).snapshot.stale)
         self.assertFalse(monitor.get_target(win.key).snapshot.stale)
 
+    def test_authoritative_empty_source_starts_gone_grace(self):
+        """权威空 source：实例进入 gone grace，本轮仍保留。"""
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        monitor._terminal = None
+        debian = AgentInstance(AgentKind.CODEX, 1, "wsl:Debian",
+                               process_token="1")
+        monitor.instances = {debian.key: debian}
+        with patch.object(monitor._probe, "snapshot",
+                          return_value=({"wsl:Debian": []}, {"wsl:Debian": True})):
+            monitor._merge_instances(1000.0)
+        self.assertIn(debian.key, monitor.instances)
+        self.assertIn(debian.key, monitor._gone_since)
+
+    def test_authoritative_empty_source_removes_after_grace(self):
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        monitor._terminal = None
+        debian = AgentInstance(AgentKind.CODEX, 1, "wsl:Debian",
+                               process_token="1")
+        monitor.instances = {debian.key: debian}
+        result = ({"wsl:Debian": []}, {"wsl:Debian": True})
+        with patch.object(monitor._probe, "snapshot", return_value=result):
+            monitor._merge_instances(1000.0)
+        self.assertIn(debian.key, monitor.instances)
+        # MemoryConfig 的 gone_grace_sec=30；超过后清除（tombstone 每轮持续输出）
+        with patch.object(monitor._probe, "snapshot", return_value=result):
+            monitor._merge_instances(1010.0)
+        self.assertIn(debian.key, monitor.instances)
+        with patch.object(monitor._probe, "snapshot", return_value=result):
+            monitor._merge_instances(1031.0)
+        self.assertNotIn(debian.key, monitor.instances)
+
+    def test_failed_source_never_advances_gone_grace(self):
+        """source 不健康：实例永远保留（无法读取 ≠ 已经退出）。"""
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        monitor._terminal = None
+        debian = AgentInstance(AgentKind.CODEX, 1, "wsl:Debian",
+                               process_token="1")
+        monitor.instances = {debian.key: debian}
+        result = ({"wsl:Debian": [debian]}, {"wsl:Debian": False})
+        for t in (1000.0, 1100.0, 1200.0):
+            with patch.object(monitor._probe, "snapshot", return_value=result):
+                monitor._merge_instances(t)
+            self.assertIn(debian.key, monitor.instances)
+        self.assertEqual(monitor._gone_since, {})
+
+    def test_one_distro_stopped_does_not_affect_other(self):
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        monitor._terminal = None
+        ubuntu = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
+                               process_token="1")
+        debian = AgentInstance(AgentKind.CLAUDE, 2, "wsl:Debian",
+                               process_token="2")
+        monitor.instances = {ubuntu.key: ubuntu, debian.key: debian}
+        result = ({"wsl:Ubuntu": [ubuntu], "wsl:Debian": []},
+                  {"wsl:Ubuntu": True, "wsl:Debian": True})
+        for t in (1000.0, 1010.0, 1031.0):
+            with patch.object(monitor._probe, "snapshot", return_value=result):
+                monitor._merge_instances(t)
+        self.assertIn(ubuntu.key, monitor.instances)   # Ubuntu 不受影响
+        self.assertNotIn(debian.key, monitor.instances)  # Debian grace 后消失
+
+    def test_one_distro_failed_does_not_affect_other(self):
+        config = MemoryConfig()
+        monitor = Monitor(config)
+        monitor._terminal = None
+        ubuntu = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
+                               process_token="1")
+        debian = AgentInstance(AgentKind.CLAUDE, 2, "wsl:Debian",
+                               process_token="2")
+        monitor.instances = {ubuntu.key: ubuntu, debian.key: debian}
+        result = ({"wsl:Ubuntu": [ubuntu], "wsl:Debian": [debian]},
+                  {"wsl:Ubuntu": True, "wsl:Debian": False})
+        for t in (1000.0, 1100.0):
+            with patch.object(monitor._probe, "snapshot", return_value=result):
+                monitor._merge_instances(t)
+        self.assertIn(ubuntu.key, monitor.instances)
+        self.assertIn(debian.key, monitor.instances)   # 失败源不判死
+
     def test_pinned_and_auto_follow(self):
         config = MemoryConfig()
         monitor = Monitor(config)
