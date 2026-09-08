@@ -17,3 +17,5 @@ __pycache__/
 .test-artifacts/
 
 .zcode/
+# 本地 benchmark 运行产物（CI 在 runner 上生成并以 artifact 上传）
+benchmark-report.json
