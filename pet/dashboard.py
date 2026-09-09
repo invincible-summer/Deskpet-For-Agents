@@ -1,16 +1,12 @@
-"""V4.1.2 Dashboard：左侧导航 + 六页（v4plan §13，v4.1.1 收敛）。
+"""Dashboard v4.3（plan2 §10-§17）：信息架构完全重做。
 
-  概览 / Agents / 桌宠与外观 / 监听与隐私 / 诊断 / 设置
-
-  * ttk.Notebook 旧结构已删除；
-  * 状态同时有文字/icon，不只靠颜色；
-  * 技术 ID（PID/HWND）只在高级诊断折叠区；不展示 UIA RuntimeId；
-  * "打开终端"永远用 exact agent_key → Monitor.activate_target，
-    只恢复并前置该 Agent 所在的 Windows Terminal 顶层窗口；
-  * 激活入口不直接 import winkeys；
-  * 布局自适应窗口大小：文本 wraplength 跟随实际宽度、页面纵向
-    铺满、滚动条只在内容超出时出现（非阻塞轻量刷新）。
+7 页导航：概览 / Agents / 桌宠 / 外观 / 监听与隐私 / 诊断 + 底部设置。
+shell 尺寸按 96-DPI 逻辑像素定义（DashboardMetrics 换算）；页面 lazy
+build + retained rows（状态变化只 configure，不整页重建）；只有当前页
+刷新（refresh_current_page，由 UiCoordinator 驱动）；滚轮只在页面
+canvas 范围内滚动（无 bind_all）。
 """
+from __future__ import annotations
 import os
 import tkinter as tk
 import time
@@ -26,32 +22,46 @@ from .ui_coordinator import UiDirty
 from .version import APP_LABEL as APP_VERSION
 from .widgets import (
     Card,
+    DashboardMetrics,
+    DiscreteSlider,
     Expander,
-    HelpDot,
+    InfoButton,
     NavButton,
-    ScrollableFrame,
-    SegmentedControl,
+    SettingRow,
     StatusChip,
+    Stepper,
+    SurfacePanel,
+    TooltipController,
     bind_wraplength,
 )
 
-NAV_WIDTH = 184
-
 PAGE_OVERVIEW = "概览"
 PAGE_AGENTS = "Agents"
-PAGE_LOOK = "桌宠与外观"
+PAGE_PETS = "桌宠"
+PAGE_LOOK = "外观"
 PAGE_MONITOR = "监听与隐私"
 PAGE_DIAG = "诊断"
 PAGE_SETTINGS = "设置"
 
-# APP_VERSION 由 pet.version.APP_LABEL 提供（v4.2.3 §10.1 统一版本源）
+# §10.2 shell 常量（96-DPI 逻辑像素）
+DEFAULT_WINDOW_W = 1120
+DEFAULT_WINDOW_H = 760
+NAV_WIDTH = 196
+BRAND_HEIGHT = 64
+NAV_ITEM_HEIGHT = 40
+PAGE_HEADER_HEIGHT = 64
+PAGE_CONTENT_MAX_WIDTH = 960
+PAGE_PAD_X = 24
+PAGE_PAD_Y = 20
+SECTION_GAP = 12
+ROW_GAP = 8
 
-_BINDING_LABELS = {
-    WindowBindingConfidence.CONFIRMED: "已确认",
-    WindowBindingConfidence.HIGH: "高置信",
-    WindowBindingConfidence.AMBIGUOUS: "候选窗口（可唤起）",
-    WindowBindingConfidence.NONE: "未定位",
-}
+# §13.2 固定离散值（默认点 1.00）
+SCALE_STEPS = (0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00)
+SPEED_STEPS = (0.50, 0.75, 1.00, 1.25, 1.50, 2.00, 3.00)
+BUBBLE_W_STEPS = (0.70, 0.85, 1.00, 1.15, 1.30, 1.45, 1.60)
+BUBBLE_H_STEPS = (0.80, 0.90, 1.00, 1.15, 1.30, 1.45, 1.60)
+BUBBLE_FONT_STEPS = (0.75, 0.85, 1.00, 1.10, 1.20, 1.30, 1.40)
 
 
 def _binding_conf_value(binding):
@@ -59,929 +69,1135 @@ def _binding_conf_value(binding):
     return value.value if hasattr(value, "value") else str(value)
 
 
-class Dashboard(tk.Toplevel):
-    def __init__(self, app):
-        self.app = app
-        super().__init__(app.root)
-        self.title("DeskPet · 仪表盘")
-        self.geometry("1000x680")
-        self.minsize(820, 560)
-        self.configure(bg=LIGHT.page)
-        self.protocol("WM_DELETE_WINDOW", self.hide_dashboard)
-        self.selected_key = ""
-        self._page = PAGE_OVERVIEW
-        # v4.3 §4.5：不再有 500ms 全页 refresh timer；当前页刷新由
-        # UiCoordinator 的 render flush 驱动（AC43-UI-02）
-        self._closing = False
-        # 失焦自动收起（v4.3 用户反馈）：只有真正拿到过焦点的仪表盘
-        # 才会在焦点离开时 withdraw——CI/测试中从未获得焦点的窗口
-        # 不受影响，避免无焦环境误收起。
-        self._had_focus = False
-        self._native_dialog_open = False
-        self.bind("<FocusIn>", lambda _e: setattr(self, "_had_focus", True))
-        self.bind("<FocusOut>", self._on_focus_lost)
-        # 诊断页 ≥1s 节流的时间戳（bridge 规则 5 读取，monotonic）
-        self.last_diag_refresh = 0.0
+def _section_title(parent, text: str):
+    tk.Label(parent, text=text, bg=parent["bg"], fg=LIGHT.text,
+             font=pick_font(parent, 11, True), anchor="w").pack(
+        fill="x", pady=(0, ROW_GAP))
 
-        # ---- 布局：左导航 + 右内容
-        nav = tk.Frame(self, bg=LIGHT.page, width=NAV_WIDTH)
-        nav.pack(side="left", fill="y")
-        nav.pack_propagate(False)
-        header = tk.Label(nav, text=APP_VERSION, bg=LIGHT.page,
-                          fg=LIGHT.text, font=pick_font(self, 12, True),
-                          anchor="w", padx=16)
-        header.pack(fill="x", pady=(18, 10))
-        self._nav_buttons: dict[str, NavButton] = {}
-        for page in (PAGE_OVERVIEW, PAGE_AGENTS, PAGE_LOOK, PAGE_MONITOR,
-                     PAGE_DIAG):
-            btn = NavButton(nav, page,
-                            command=lambda p=page: self._show_page(p))
-            btn.pack(fill="x")
-            self._nav_buttons[page] = btn
-        tk.Frame(nav, bg=LIGHT.page, height=16).pack()
-        btn = NavButton(nav, PAGE_SETTINGS,
-                        command=lambda p=PAGE_SETTINGS: self._show_page(p))
-        btn.pack(fill="x", side="bottom")
-        self._nav_buttons[PAGE_SETTINGS] = btn
 
-        self.content = ScrollableFrame(self)
-        self.content.pack(side="left", fill="both", expand=True)
-        self._pages: dict[str, tk.Frame] = {}
-        self._build_overview()
-        self._build_agents()
-        self._build_look()
-        self._build_monitor()
-        self._build_diag()
-        self._build_settings()
-        self._show_page(PAGE_OVERVIEW)
+class DashboardPage:
+    """统一页面接口（plan2 §15）：lazy build + retained 复用。"""
 
-    # ================================================== 页面切换
-    def _show_page(self, page: str):
-        self._page = page
-        for name, frame in self._pages.items():
-            if name == page:
-                # fill both + expand：页面随窗口缩放（诊断日志纵向铺满）
-                frame.pack(fill="both", expand=True, padx=24, pady=16)
-            else:
-                frame.pack_forget()
-        for name, btn in self._nav_buttons.items():
-            btn.set_active(name == page)
+    name = ""
 
-    def _new_page(self, name: str) -> tk.Frame:
-        frame = tk.Frame(self.content.inner, bg=LIGHT.page)
-        self._pages[name] = frame
-        return frame
+    def __init__(self, dash: "Dashboard"):
+        self.dash = dash
+        self.built = False
+        self.holder = None      # 页面容器（grid 进 content 区）
 
-    # ================================================== 概览
-    def _build_overview(self):
-        page = self._new_page(PAGE_OVERVIEW)
-        header = tk.Frame(page, bg=LIGHT.page)
-        header.pack(fill="x")
-        tk.Label(header, text=APP_VERSION, bg=LIGHT.page, fg=LIGHT.text,
-                 font=pick_font(self, 14, True)).pack(side="left")
-        self.ov_summary = tk.Label(header, text="", bg=LIGHT.page,
-                                   fg=LIGHT.text_secondary,
-                                   font=pick_font(self, 10))
-        self.ov_summary.pack(side="left", padx=16, pady=(6, 0))
+    # 子类契约
+    def build(self, parent): ...
+    def on_show(self): ...
+    def on_hide(self): ...
+    def refresh(self, reason: UiDirty): ...
+    def reflow(self, width: int): ...
 
-        stats = Card(page)
-        stats.pack(fill="x", pady=(8, 0))
-        self.ov_stats = tk.Label(stats.body, text="", bg=LIGHT.surface,
-                                 fg=LIGHT.text, font=pick_font(self, 11),
-                                 anchor="w", justify="left")
-        self.ov_stats.pack(fill="x", padx=4, pady=4)
+    def ensure_built(self, parent):
+        if not self.built:
+            self.built = True
+            self.holder = tk.Frame(parent, bg=LIGHT.page)
+            self.build(self.holder)
+        return self.holder
 
-        tk.Label(page, text="Agent Cards", bg=LIGHT.page,
-                 fg=LIGHT.text_secondary,
-                 font=pick_font(self, 10, True),
-                 anchor="w").pack(side="left", pady=(16, 4))
-        HelpDot(page, "当前被动发现的全部 Agent（Monitor 层），每张卡："
-                      "名称与项目目录、状态徽标、当前活动摘要；\"打开终端\""
-                      "按 exact agent_key 恢复并前置该 Agent 所在的 "
-                      "Windows Terminal 窗口（不切换标签页、不发送键盘"
-                      "输入）。",
-                bg=LIGHT.page).pack(side="left", pady=(16, 4))
-        self.ov_cards = tk.Frame(page, bg=LIGHT.page)
-        self.ov_cards.pack(fill="x")
-        self._ov_card_sig = None
 
-    def _refresh_overview(self, targets):
-        waiting = sum(1 for t in targets.values()
-                      if t.snapshot.status in (Status.WAITING, Status.INPUT))
+class OverviewPage(DashboardPage):
+    """§12.1：SummaryGrid + 需要注意 + 全量 Agent retained rows。"""
+
+    name = PAGE_OVERVIEW
+
+    def build(self, parent):
+        header = self.dash.page_header(parent, PAGE_OVERVIEW)
+        header.add_action("重新扫描", self.dash.app.monitor.rescan,
+                          primary=False)
+        body = self.dash.page_body(parent)
+        # SummaryGrid：4 个轻量 metric panel（wide 4 列 / compact 2×2）
+        grid = tk.Frame(body, bg=LIGHT.page)
+        grid.pack(fill="x", pady=(0, SECTION_GAP))
+        self._metric_cells = {}
+        for key, label in (("live", "Live"), ("working", "Working"),
+                           ("waiting", "Waiting"), ("terminal", "Terminal")):
+            panel = SurfacePanel(grid, padding=12)
+            tk.Label(panel.body, text=label, bg=LIGHT.surface,
+                     fg=LIGHT.text_secondary,
+                     font=pick_font(panel, 9)).pack(anchor="w")
+            value = tk.Label(panel.body, text="0", bg=LIGHT.surface,
+                             fg=LIGHT.text,
+                             font=pick_font(panel, 15, True))
+            value.pack(anchor="w")
+            self._metric_cells[key] = (panel, value)
+        # 需要注意
+        attn = SurfacePanel(body)
+        attn.pack(fill="x", pady=(0, SECTION_GAP))
+        attn_row = tk.Frame(attn.body, bg=LIGHT.surface)
+        attn_row.pack(fill="x")
+        self._attn_label = tk.Label(attn_row, text="当前没有需要处理的请求",
+                                    bg=LIGHT.surface, fg=LIGHT.text,
+                                    font=pick_font(attn, 10), anchor="w")
+        self._attn_label.pack(side="left", fill="x", expand=True)
+        self._attn_btn = ttk.Button(attn_row, text="打开终端", width=12,
+                                    command=self._open_attention)
+        self._attn_btn.pack(side="right")
+        self._attn_key = ""
+        # 当前 Agents（retained keyed rows）
+        self._agents_panel = SurfacePanel(body)
+        self._agents_panel.pack(fill="x")
+        _section_title(self._agents_panel.body, "当前 Agents")
+        self._rows_frame = tk.Frame(self._agents_panel.body, bg=LIGHT.surface)
+        self._rows_frame.pack(fill="x")
+        self._rows: dict[str, dict] = {}
+        self._row_order: list[str] = []
+
+    def _open_attention(self):
+        if self._attn_key:
+            self.dash.app.activate_agent(self._attn_key)
+
+    def refresh(self, reason: UiDirty):
+        targets = self.dash.app.monitor.get_targets()
         working = sum(1 for t in targets.values()
                       if t.snapshot.status == Status.WORKING)
-        ambiguous = sum(1 for t in targets.values()
-                        if t.terminal_window
-                        and _binding_conf_value(t.terminal_window)
-                        == "ambiguous")
-        uia = "UIA ✓" if self.app.monitor.terminal_available() else "UIA ✗"
-        self.ov_summary.configure(
-            text=f"{len(targets)} Agents · {waiting} 等待 · {uia}")
-        self.ov_stats.configure(text=(
-            f"Live {len(targets)}     Waiting {waiting}     "
-            f"Working {working}     候选窗口 {ambiguous}"))
-
-        entries = []
-        for key, t in sorted(targets.items()):
-            snap = t.snapshot
-            chip = (f"{snap.kind.label} · "
-                    f"{t.instance.project or t.instance.source}")
-            detail = snap.waiting_detail or snap.summary or "—"
-            env = t.instance.environment_label
-            if snap.stale:
-                env += " · 状态可能延迟"
-            entries.append((key, chip, status_text(snap), detail, env,
-                            snap.status.value))
-        sig = tuple(entries)
-        if sig == self._ov_card_sig:
-            return
-        self._ov_card_sig = sig
-        for child in self.ov_cards.winfo_children():
-            child.destroy()
-        for key, chip, status, detail, env, status_value in entries:
-            card = Card(self.ov_cards, padding=12)
-            card.pack(fill="x", pady=4)
-            row = tk.Frame(card.body, bg=LIGHT.surface)
-            row.pack(fill="x")
-            tk.Label(row, text=chip, bg=LIGHT.surface, fg=LIGHT.text,
-                     font=pick_font(self, 10, True)).pack(side="left")
-            StatusChip(row, text=status,
-                       color=STATUS_COLOR.get(status_value,
-                                              LIGHT.unknown)).pack(
-                side="right")
-            detail_label = tk.Label(card.body, text=detail, bg=LIGHT.surface,
-                                    fg=LIGHT.text, font=pick_font(self, 10),
-                                    anchor="w", justify="left",
-                                    wraplength=560)
-            detail_label.pack(fill="x", pady=(2, 0))
-            bind_wraplength(detail_label)   # 自适应卡片实际宽度
-            foot = tk.Frame(card.body, bg=LIGHT.surface)
-            foot.pack(fill="x", pady=(4, 0))
-            env_label = tk.Label(foot, text=env, bg=LIGHT.surface,
-                                 fg=LIGHT.text_secondary,
-                                 font=pick_font(self, 9))
-            env_label.pack(side="left")
-            ttk.Button(foot, text="详情",
-                       command=lambda k=key: self._goto_agent(k)).pack(
-                side="right")
-            ttk.Button(foot, text="打开终端",
-                       command=lambda k=key: self._open_terminal(k)).pack(
-                side="right", padx=6)
-
-    # ================================================== Agents master-detail
-    def _build_agents(self):
-        page = self._new_page(PAGE_AGENTS)
-        body = tk.Frame(page, bg=LIGHT.page)
-        body.pack(fill="both", expand=True)
-
-        left = Card(body, padding=8)
-        left.pack(side="left", fill="y", padx=(0, 8), expand=False)
-        self.ag_list = tk.Frame(left.body, bg=LIGHT.surface)
-        self.ag_list.pack(fill="both", expand=True)
-        self._ag_list_sig = None
-
-        right = Card(body, padding=16)
-        right.pack(side="left", fill="both", expand=True)
-        # 操作行先 pack 且拆两行（窄窗口下按钮也绝不被挤出视口），
-        # 详情占剩余空间
-        bar = tk.Frame(right.body, bg=LIGHT.surface)
-        bar.pack(fill="x", pady=(0, 6))
-        ttk.Button(bar, text="打开终端",
-                   command=lambda: self._open_terminal(
-                       self.selected_key)).pack(side="left")
-        HelpDot(bar, "打开该 Agent 所在的 Windows Terminal 窗口。DeskPet "
-                     "不切换标签页、不发送键盘输入。若 Windows 阻止后台"
-                     "程序抢前台，会闪烁任务栏提醒。").pack(
-            side="left", padx=(6, 0))
-        ttk.Button(bar, text="重新扫描",
-                   command=self.app.monitor.rescan).pack(side="left",
-                                                          padx=10)
-        bar2 = tk.Frame(right.body, bg=LIGHT.surface)
-        bar2.pack(fill="x", pady=(0, 8))
-        self.include_btn = ttk.Button(
-            bar2, text="加入并发", command=self._include_selected)
-        self.include_btn.pack(side="left")
-        self.exclude_btn = ttk.Button(
-            bar2, text="移出并发", command=self._exclude_selected)
-        self.exclude_btn.pack(side="left", padx=6)
-        HelpDot(bar2, "运行期控制该 Agent 是否参与并发展示（不写配置、不"
-                      "影响监听）：移出后它的桌宠/卡片消失，Monitor 仍继续"
-                      "观察；重新加入即恢复。").pack(side="left", padx=(6, 0))
-        self.ag_detail = tk.Label(right.body, text="在左侧选择一个 Agent",
-                                  bg=LIGHT.surface, fg=LIGHT.text,
-                                  font=pick_font(self, 11),
-                                  anchor="nw", justify="left", wraplength=480)
-        self.ag_detail.pack(fill="both", expand=True)
-        bind_wraplength(self.ag_detail)   # 详情文本自适应右侧卡实际宽度
-        self._detail_sig = None
-
-    def _goto_agent(self, key: str):
-        self.selected_key = key
-        self._show_page(PAGE_AGENTS)
-
-    def _refresh_agents(self, targets):
-        entries = []
-        for key, t in sorted(targets.items()):
-            snap = t.snapshot
-            title = f"{snap.kind.label} · " \
-                    f"{t.instance.project or t.instance.source}"
-            if len(title) > 26:
-                title = title[:25] + "…"   # 列表项截断；详情见右侧
-            entries.append((key, title, status_text(snap),
-                            snap.status.value))
-        sig = tuple(entries)
-        if sig != self._ag_list_sig:
-            self._ag_list_sig = sig
-            for child in self.ag_list.winfo_children():
-                child.destroy()
-            if not entries:
-                tk.Label(self.ag_list, text="（没有发现 Agent）",
-                         bg=LIGHT.surface, fg=LIGHT.text_secondary,
-                         font=pick_font(self, 10), padx=8, pady=8).pack()
-            for key, title, status, status_value in entries:
-                row = tk.Frame(self.ag_list, bg=LIGHT.surface, cursor="hand2")
-                row.pack(fill="x", pady=1)
-                tk.Label(row, text=title, bg=LIGHT.surface, fg=LIGHT.text,
-                         font=pick_font(self, 10)).pack(side="left", padx=8)
-                StatusChip(row, text=status,
-                           color=STATUS_COLOR.get(status_value,
-                                                  LIGHT.unknown)).pack(
-                    side="right", padx=8)
-                row.bind("<Button-1>",
-                         lambda _e, k=key: self._select_agent(k))
-        if self.selected_key and self.selected_key not in targets:
-            self.selected_key = ""
-        target = targets.get(self.selected_key)
-        if target is not None:
-            content = self._detail_text(target)
-            if content != self._detail_sig:
-                self._detail_sig = content
-                self.ag_detail.configure(text=content)
+        waiting = sum(1 for t in targets.values()
+                      if t.snapshot.status in (Status.WAITING,
+                                               Status.INPUT))
+        error = sum(1 for t in targets.values()
+                    if t.snapshot.status == Status.ERROR)
+        wakeable = sum(1 for t in targets.values()
+                       if t.terminal_window is not None
+                       and t.terminal_window.wakeable)
+        values = {"live": len(targets), "working": working,
+                  "waiting": waiting + error, "terminal": wakeable}
+        for key, (_panel, label) in self._metric_cells.items():
+            label.configure(text=str(values[key]))
+        # 需要注意：WAITING/INPUT/ERROR 首要 Agent
+        priority = None
+        for status_order in (Status.WAITING, Status.INPUT, Status.ERROR):
+            for t in targets.values():
+                if t.snapshot.status == status_order:
+                    priority = t
+                    break
+            if priority is not None:
+                break
+        if priority is not None:
+            self._attn_key = priority.key
+            self._attn_label.configure(
+                text=f"{priority.snapshot.kind.label} · "
+                     f"{priority.instance.project or '?'} · "
+                     f"{status_text(priority.snapshot)}")
         else:
-            self.ag_detail.configure(text="在左侧选择一个 Agent")
-            self._detail_sig = None
+            self._attn_key = ""
+            self._attn_label.configure(text="当前没有需要处理的请求")
+        self._refresh_rows(targets)
 
-    def _select_agent(self, key: str):
-        self.selected_key = key
-        self._refresh_agents(self.app.monitor.get_targets())
+    def _refresh_rows(self, targets):
+        frame = self._rows_frame
+        keys = list(targets)
+        # 删除消失的行
+        for key in list(self._rows):
+            if key not in targets:
+                row = self._rows.pop(key)
+                for widget in row.values():
+                    widget.destroy()
+                self._row_order.remove(key)
+        order_changed = False
+        for key in keys:
+            if key not in self._rows:
+                self._create_row(key, targets[key])
+                order_changed = True
+        if order_changed or self._row_order != keys:
+            self._row_order = list(keys)
+            # 排序变化：re-pack 现有 row（§16.1 不 recreate）
+            for widget in frame.winfo_children():
+                widget.pack_forget()
+            for key in keys:
+                self._rows[key]["frame"].pack(fill="x", pady=2)
+        for key in keys:
+            self._update_row(key, targets[key])
 
-    def _include_selected(self):
-        """运行期加入并发（不写 exact key 到配置，v4plan §6.2）。"""
-        if self.selected_key:
-            self.app.presentation.set_instance_included(
-                self.selected_key, True)
-            self.app._aggregate()
-            self.app.ui.request(UiDirty.PRESENTATION)
+    def _create_row(self, key, target):
+        frame = tk.Frame(self._rows_frame, bg=LIGHT.surface)
+        title = tk.Label(frame, text="", bg=LIGHT.surface, fg=LIGHT.text,
+                         font=pick_font(frame, 10, True), anchor="w")
+        title.pack(side="left", fill="x", expand=True)
+        chip = StatusChip(frame)
+        chip.pack(side="right", padx=(8, 0))
+        open_btn = ttk.Button(frame, text="打开终端", width=10,
+                              command=lambda k=key:
+                              self.dash.app.activate_agent(k))
+        open_btn.pack(side="right", padx=(8, 0))
+        self._rows[key] = {"frame": frame, "title": title, "chip": chip}
 
-    def _exclude_selected(self):
-        """运行期移出并发：卡片消失但 Monitor 继续监听。"""
-        if self.selected_key:
-            self.app.presentation.set_instance_included(
-                self.selected_key, False)
-            self.app._aggregate()
-            self.app.ui.request(UiDirty.PRESENTATION)
+    def _update_row(self, key, target):
+        row = self._rows[key]
+        snap = target.snapshot
+        title = (f"{snap.kind.label} · "
+                 f"{target.instance.project or target.instance.source}")
+        if row["title"]["text"] != title:
+            row["title"].configure(text=title)
+        chip_text = status_text(snap)
+        if row["chip"]["text"] != chip_text:
+            row["chip"].set(chip_text,
+                            STATUS_COLOR.get(snap.status.value,
+                                             LIGHT.unknown))
 
-    def _detail_text(self, target) -> str:
-        inst, snap = target.instance, target.snapshot
+    def reflow(self, width: int):
+        cols = 4 if width >= 720 else 2
+        for i, cell in enumerate(self._metric_cells.values()):
+            cell[0].grid_forget()
+        for i, cell in enumerate(self._metric_cells.values()):
+            cell[0].grid(row=i // cols, column=i % cols, sticky="nsew",
+                         padx=6, pady=6)
+        for col in range(cols):
+            self._metric_cells["live"][0].master.grid_columnconfigure(
+                col, weight=1)
+
+
+class AgentsPage(DashboardPage):
+    """§12.2：list + retained 字段 detail；高级诊断 Expander。"""
+
+    name = PAGE_AGENTS
+
+    def build(self, parent):
+        header = self.dash.page_header(parent, PAGE_AGENTS)
+        header.add_action("重新扫描", self.dash.app.monitor.rescan)
+        body = self.dash.page_body(parent)
+        self._split = tk.Frame(body, bg=LIGHT.page)
+        self._split.pack(fill="both", expand=True)
+        # 左列
+        self._list_panel = SurfacePanel(self._split)
+        _section_title(self._list_panel.body, "Agents")
+        self._list_frame = tk.Frame(self._list_panel.body, bg=LIGHT.surface)
+        self._list_frame.pack(fill="x")
+        self._rows: dict[str, dict] = {}
+        # 右列
+        self._detail_panel = SurfacePanel(self._split)
+        self._detail_head = tk.Frame(self._detail_panel.body,
+                                     bg=LIGHT.surface)
+        self._detail_head.pack(fill="x")
+        self._detail_title = tk.Label(self._detail_head, text="未选择 Agent",
+                                      bg=LIGHT.surface, fg=LIGHT.text,
+                                      font=pick_font(self._detail_head, 11,
+                                                     True), anchor="w")
+        self._detail_title.pack(side="left")
+        self._detail_chip = StatusChip(self._detail_head)
+        self._detail_chip.pack(side="left", padx=(8, 0))
+        actions = tk.Frame(self._detail_panel.body, bg=LIGHT.surface)
+        actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(actions, text="打开终端", width=14,
+                   command=self._activate_selected).pack(side="left")
+        InfoButton(actions,
+                   "恢复并前置该 Agent 所在的 Windows Terminal 窗口"
+                   "（窗口级语义：两个 Agent 同属一个 Terminal 窗口 → "
+                   "前置同一窗口，不切换标签页、不发送键盘输入）。",
+                   self.dash.tooltip).pack(side="left", padx=(6, 0))
+        self._include_btn = ttk.Button(actions, text="加入并发", width=14,
+                                       command=self._toggle_include)
+        self._include_btn.pack(side="left", padx=8)
+        ttk.Button(actions, text="重新扫描", width=10,
+                   command=self.dash.app.monitor.rescan).pack(side="left")
+        self._fields_frame = tk.Frame(self._detail_panel.body,
+                                      bg=LIGHT.surface)
+        self._fields_frame.pack(fill="x", pady=(8, 0))
+        self._fields: dict[str, tk.Label] = {}
+        self._advanced = Expander(self._detail_panel.body, "高级诊断")
+        self._advanced.pack(fill="x", pady=(8, 0))
+        self._advanced_label = tk.Label(
+            self._advanced.body, text="（未选择）", bg=LIGHT.surface,
+            fg=LIGHT.text, font=pick_font(self._advanced, 9, mono=True),
+            justify="left", anchor="nw")
+        self._advanced_label.pack(fill="x")
+        self._detail_key = ""
+
+    # ------------------------------------------------------------ actions
+    def _activate_selected(self):
+        if self._detail_key:
+            self.dash.app._focus_and_activate(self._detail_key)
+
+    def _toggle_include(self):
+        app = self.dash.app
+        if not self._detail_key:
+            return
+        current = app.presentation.instance_included(self._detail_key)
+        app.presentation.set_instance_included(
+            self._detail_key, current is False)
+        app._aggregate()
+        app.ui.request(UiDirty.PRESENTATION)
+        self.refresh(UiDirty.PRESENTATION)
+
+    def select(self, key: str):
+        self._detail_key = key
+        self.refresh(UiDirty.MONITOR)
+
+    def refresh(self, reason: UiDirty):
+        targets = self.dash.app.monitor.get_targets()
+        # retained list rows
+        for key in list(self._rows):
+            if key not in targets:
+                row = self._rows.pop(key)
+                row["frame"].destroy()
+        for key in targets:
+            if key not in self._rows:
+                frame = tk.Frame(self._list_frame, bg=LIGHT.surface,
+                                 cursor="hand2")
+                title = tk.Label(frame, text="", bg=LIGHT.surface,
+                                 fg=LIGHT.text, anchor="w",
+                                 font=pick_font(frame, 10, True))
+                title.pack(side="left", fill="x", expand=True)
+                chip = StatusChip(frame)
+                chip.pack(side="right")
+                frame.bind("<Button-1>",
+                           lambda _e, k=key: self.select(k))
+                title.bind("<Button-1>",
+                           lambda _e, k=key: self.select(k))
+                self._rows[key] = {"frame": frame, "title": title,
+                                   "chip": chip}
+        for key, target in targets.items():
+            row = self._rows[key]
+            snap = target.snapshot
+            text = (f"{snap.kind.label} · "
+                    f"{target.instance.project or target.instance.source}")
+            if row["title"]["text"] != text:
+                row["title"].configure(text=text)
+            chip_text = status_text(snap)
+            if row["chip"]["text"] != chip_text:
+                row["chip"].set(chip_text,
+                                STATUS_COLOR.get(snap.status.value,
+                                                 LIGHT.unknown))
+        ordered = sorted(targets)
+        if [k for k in self._rows] != ordered:
+            for widget in self._list_frame.winfo_children():
+                widget.pack_forget()
+            for key in ordered:
+                self._rows[key]["frame"].pack(fill="x", pady=2, ipady=4)
+        # detail
+        target = targets.get(self._detail_key)
+        if target is None:
+            if self._rows and self._detail_key == "":
+                self.select(ordered[0])
+                return
+            self._detail_title.configure(text="未选择 Agent")
+            self._detail_chip.set("—")
+            return
+        snap = target.snapshot
+        inst = target.instance
         binding = target.terminal_window
-        lines = []
-        mode_label = mode_text(snap)
-        if mode_label == "Unknown" and snap.mode_raw:
-            mode_label += f"（原始值：{snap.mode_raw}）"
-        lines.append(f"{snap.kind.label} · {status_text(snap)}"
-                     + (f" · {phase_text(snap)}" if phase_text(snap) else "")
-                     + (f" · Mode: {mode_label}" if mode_label else ""))
-        if snap.policy:
-            lines.append(f"审批策略：{snap.policy}")
-        if snap.goal:
-            lines.append(f"目标：{snap.goal}")
-        if snap.summary:
-            lines.append(f"当前活动：{snap.summary}")
-        if snap.waiting_detail:
-            lines.append(f"等待内容：{snap.waiting_detail}（请在终端处理）")
-        lines.append("")
-        lines.append(f"项目目录：{inst.cwd or '?'}")
-        lines.append(f"环境：{inst.environment_label}")
-        parser_map = {"OK": "正常", "PARTIAL": "部分识别", "UNKNOWN": "未解析"}
-        if snap.parser_health:
-            line = (f"Session parser："
-                    f"{parser_map.get(snap.parser_health, snap.parser_health)}")
-            if snap.parser_detail:
-                line += f"（{snap.parser_detail}）"
-            lines.append(line)
-        if binding is not None:
-            lines.append("")
-            lines.append("Terminal")
-            if binding.window is not None:
-                lines.append("Window　可打开"
-                             + (f" · {binding.title[:30]}"
-                                if binding.title else ""))
-                if binding.confidence is WindowBindingConfidence.AMBIGUOUS:
-                    lines.append("· 候选窗口（可唤起）：证据不足以直接授予"
-                                 "终端审批观察归属")
-                if binding.confidence is WindowBindingConfidence.NONE:
-                    lines.append("· 唯一 Terminal 窗口兜底（可唤起）：不作为"
-                                 "审批归属依据")
-            else:
-                lines.append("Window　未定位")
-        if not self.app.monitor.terminal_available():
-            err = self.app.monitor.terminal_startup_error()
-            lines.append("终端观察不可用（UIA）"
-                         + (f"：{err[:80]}" if err else "")
-                         + "；会话监听不受影响")
-        if snap.stale:
-            lines.append("状态可能延迟（该来源进程扫描失败）")
-
-        # ---- 高级诊断（技术 ID 只在这里展示；不含 UIA RuntimeId）
-        lines.append("")
-        lines.append("—— 高级诊断（技术 ID）——")
-        token_src = {"proc": "/proc", "create_time": "create_time",
-                     "fallback": "fallback"}.get(inst.process_token_source, "")
-        token_line = f"PID {inst.pid} · token {inst.process_token or '?'}"
-        if token_src:
-            token_line += f"（{token_src}）"
-        lines.append(token_line)
-        if inst.launcher_pids:
-            lines.append("launcher pids："
-                         + ", ".join(str(p) for p in inst.launcher_pids))
-        if inst.tty:
-            lines.append(f"TTY {inst.tty} · SID {inst.sid} · PGID {inst.pgid}")
-        if inst.uid is not None:
-            lines.append(f"uid {inst.uid} · user {inst.user or '?'} "
-                         f"· HOME {inst.home or '?'}")
-        if inst.wt_session:
-            lines.append(f"WT_SESSION {inst.wt_session}")
-        if inst.wt_profile_id:
-            lines.append(f"WT_PROFILE_ID {inst.wt_profile_id}")
-        if snap.session_id:
-            lines.append(f"session_id {snap.session_id}")
-        if snap.session_file:
-            bound = "已绑定" if snap.session_bound else "未解析"
-            lines.append(f"会话文件（{bound}）：{snap.session_file}")
-        if binding is not None:
-            # confidence 只在高级诊断展示（§22：普通详情只说可打开/未定位）
-            conf = _BINDING_LABELS.get(binding.confidence,
-                                       _binding_conf_value(binding))
-            line = f"Window 绑定：{conf}"
-            if binding.reason:
-                line += f" · {binding.reason}"
-            if binding.score:
-                line += f" · score {binding.score}/{binding.runner_up_score}"
-            lines.append(line)
+        title = f"{snap.kind.label} · {inst.project or inst.source}"
+        if self._detail_title["text"] != title:
+            self._detail_title.configure(text=title)
+        chip_text = status_text(snap)
+        if self._detail_chip["text"] != chip_text:
+            self._detail_chip.set(chip_text,
+                                  STATUS_COLOR.get(snap.status.value,
+                                                   LIGHT.unknown))
+        fields = [
+            ("状态", status_text(snap)),
+            ("模式 / 阶段", " / ".join(x for x in (mode_text(snap),
+                                                  phase_text(snap)) if x)
+             or "—"),
+            ("目标", snap.goal or "—"),
+            ("当前活动", snap.summary or "—"),
+            ("等待内容", snap.waiting_detail or "—"),
+            ("环境", f"{'WSL ' + inst.distro if inst.distro else 'Windows'}"
+                     f" · {inst.source}"),
+            ("项目路径", inst.cwd or "—"),
+            ("终端", ("可打开"
+                      if binding is not None and binding.wakeable
+                      else "未定位")),
+        ]
+        for label_text, value_text in fields:
+            label = self._fields.get(label_text)
+            if label is None:
+                rowf = tk.Frame(self._fields_frame, bg=LIGHT.surface)
+                rowf.pack(fill="x", pady=2)
+                tk.Label(rowf, text=label_text, width=10, anchor="nw",
+                         bg=LIGHT.surface, fg=LIGHT.text_secondary,
+                         font=pick_font(rowf, 9)).pack(side="left")
+                label = tk.Label(rowf, text="", anchor="w", justify="left",
+                                 bg=LIGHT.surface, fg=LIGHT.text,
+                                 font=pick_font(rowf, 10), wraplength=420)
+                label.pack(side="left", fill="x", expand=True)
+                bind_wraplength(label, min_width=160)
+                self._fields[label_text] = label
+            if label["text"] != value_text:
+                label.configure(text=value_text)
+        # 高级诊断（PID/HWND 等运行期身份只在收起的 expander 展示）
+        adv = [f"kind={snap.kind.value}", f"source={inst.source}",
+               f"pid={inst.pid}",
+               f"process_token={inst.process_token}",
+               f"started_at={inst.started_at:.0f}"]
         if binding is not None and binding.window is not None:
-            lines.append(f"HWND {binding.window.hwnd} · window_pid "
-                         f"{binding.window.pid} · created "
-                         f"{binding.window.process_created:.0f} · class "
-                         f"{binding.window.window_class}")
-        return "\n".join(lines)
+            adv.append(f"hwnd={binding.window.hwnd}")
+            adv.append(f"binding={_binding_conf_value(binding)}")
+            adv.append(f"title={binding.title or ''}")
+        adv.append(f"parser={snap.parser_health or 'UNKNOWN'}"
+                   + (f"（{snap.parser_detail}）" if snap.parser_detail
+                      else ""))
+        self._advanced_label.configure(text="\n".join(adv))
+        # include 状态 → 按钮文案（None = 未显式设置，按默认参与展示）
+        included = self.dash.app.presentation.instance_included(
+            self._detail_key)
+        self._include_btn.configure(
+            text="移出并发" if included is not False else "加入并发")
 
-    def _open_terminal(self, key: str):
-        """§20：所有 UI 激活统一走 PetApp.activate_agent（exact key），
-        本页不再复制 toast/激活逻辑。"""
-        if key:
-            self.app.activate_agent(key)
+    def reflow(self, width: int):
+        wide = width >= 780
+        if wide:
+            self._list_panel.pack_forget()
+            self._detail_panel.pack_forget()
+            self._list_panel.pack(side="left", fill="y",
+                                  padx=(0, SECTION_GAP))
+            self._list_panel.configure(width=304)
+            self._list_panel.pack_propagate(False)
+            self._detail_panel.pack(side="left", fill="both", expand=True)
+        else:
+            self._list_panel.pack_forget()
+            self._detail_panel.pack_forget()
+            self._list_panel.pack(fill="x")
+            self._list_panel.pack_propagate(False)
+            self._list_panel.configure(height=210)
+            self._detail_panel.pack(fill="both", expand=True, pady=(
+                SECTION_GAP, 0))
 
-    # ================================================== 桌宠与外观
-    def _build_look(self):
-        page = self._new_page(PAGE_LOOK)
-        cfg = self.app.config
 
-        head = Card(page)
-        head.pack(fill="x")
-        row = tk.Frame(head.body, bg=LIGHT.surface)
-        row.pack(fill="x")
-        tk.Label(row, text="并发监听显示", bg=LIGHT.surface, fg=LIGHT.text,
-                 font=pick_font(self, 11, True)).pack(side="left")
-        HelpDot(row, "每次启动固定开启（默认单宠聚合）。开关仅对本次运行"
-                     "有效，下次启动恢复；不增加每 Agent 线程。").pack(
-            side="left", padx=(6, 0))
+class PetsPage(DashboardPage):
+    """§12.3 桌宠页：并发显示 + 当前展示（retained slot cards）。"""
+
+    name = PAGE_PETS
+
+    def build(self, parent):
+        self.dash.page_header(parent, PAGE_PETS)
+        body = self.dash.page_body(parent)
+        from .presentation import PresentationMode
+        self._mode_enum = PresentationMode
+        app = self.dash.app
+        # ---- Section A 并发显示
+        panel_a = SurfacePanel(body)
+        panel_a.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(panel_a.body, "并发显示")
+        r1 = SettingRow(panel_a.body, "同时展示多个 Agent",
+                        "多宠并发不会增加每 Agent 线程：全部桌宠共享同一"
+                        "个 Monitor/调度器/动画缓存。",
+                        self.dash.tooltip)
         self.concurrent_var = tk.BooleanVar(
-            value=self.app.presentation.concurrent_enabled)
-        ttk.Checkbutton(row, text="（OFF / ON，仅本次运行）",
-                        variable=self.concurrent_var,
-                        command=self._toggle_concurrent).pack(side="right")
-
-        self.concurrent_detail = tk.Frame(page, bg=LIGHT.page)
-        self.concurrent_detail.pack(fill="x", pady=(8, 0))
-        mode_card = Card(self.concurrent_detail)
-        mode_card.pack(fill="x")
-        mrow = tk.Frame(mode_card.body, bg=LIGHT.surface)
-        mrow.pack(fill="x")
-        tk.Label(mrow, text="展示方式", bg=LIGHT.surface,
-                 fg=LIGHT.text).pack(side="left")
-        HelpDot(mrow, "单宠聚合：一只桌宠显示当前最需要注意的 Agent（气泡与"
-                      "单个监听一致）。多宠分离：每个 Agent 一只桌宠，自动"
-                      "绑定，没绑定 Agent 的桌宠不显示。").pack(
-            side="left", padx=(6, 0))
-        self.mode_seg = SegmentedControl(
-            mrow, ["单宠聚合", "多宠分离"],
+            value=app.presentation.concurrent_enabled)
+        self.concurrent_toggle = ttk.Checkbutton(
+            r1._control_cell, variable=self.concurrent_var,
+            command=self._toggle_concurrent)
+        r1.set_control(self.concurrent_toggle)
+        r1.reflow("wide")
+        r1.pack(fill="x")
+        r2 = SettingRow(panel_a.body, "展示方式", "", self.dash.tooltip)
+        from .widgets import SegmentedControl
+        self.mode_segment = SegmentedControl(
+            r2._control_cell, ["单宠聚合", "多宠分离"],
             command=self._on_mode_segment)
-        self.mode_seg.pack(side="right")
-        cap_card = Card(self.concurrent_detail)
-        cap_card.pack(fill="x", pady=8)
-        crow = tk.Frame(cap_card.body, bg=LIGHT.surface)
-        crow.pack(fill="x")
-        tk.Label(crow, text="最大并发数（1..8，只是展示上限）",
-                 bg=LIGHT.surface,
-                 fg=LIGHT.text).pack(side="left")
-        HelpDot(crow, "同时展示的桌宠/卡片上限。超过上限的 Agent 仍被正常"
-                      "监听（可在 Agents 页看到）；这不是\"强制唤起 N 只"
-                      "桌宠\"——没绑定 Agent 的槽位不显示桌宠。").pack(
-            side="left", padx=(6, 0))
-        self.max_var = tk.IntVar(
-            value=int(cfg.get("presentation.concurrent.max_targets", 3)))
-        ttk.Spinbox(crow, from_=1, to=8, textvariable=self.max_var,
-                    width=4, command=self._save_max_targets).pack(side="right")
-        kind_card = Card(self.concurrent_detail)
-        kind_card.pack(fill="x")
-        tk.Label(kind_card.body, text="参与并发", bg=LIGHT.surface,
-                 fg=LIGHT.text).pack(anchor="w")
-        tk.Label(kind_card.body,
-                 text="这里控制\"并发展示\"；Agent 是否被发现由\"监听与隐私\"页控制。",
+        r2.set_control(self.mode_segment)
+        r2.reflow("wide")
+        r2.pack(fill="x")
+        self.mode_segment.select(1 if app.presentation.mode
+                                 is PresentationMode.FLEET else 0)
+        tk.Label(panel_a.body,
+                 text="并发开关和展示方式仅对本次运行有效；下次启动恢复"
+                      "“并行监听 + 单宠聚合”",
                  bg=LIGHT.surface, fg=LIGHT.text_secondary,
-                 font=pick_font(self, 9)).pack(anchor="w", pady=(2, 4))
-        kinds_row = tk.Frame(kind_card.body, bg=LIGHT.surface)
-        kinds_row.pack(fill="x")
-        HelpDot(kinds_row, "勾选的 Agent 类型才参与并发展示（自动分配与"
-                           "聚合卡片都只从这里取候选）。只影响显示，不影响"
-                           "监听与发现。").pack(side="left")
+                 font=pick_font(panel_a, 9), anchor="w").pack(
+            fill="x", pady=(4, 0))
+        r3 = SettingRow(panel_a.body, "展示上限", "最多同时显示的桌宠数"
+                        "（1..8）；slot 配置持久化，绑定只在本运行期。",
+                        self.dash.tooltip)
+        self.max_stepper = Stepper(
+            r3._control_cell,
+            int(app.config.get("presentation.concurrent.max_targets", 3)
+                or 3), 1, 8, command=self._save_max_targets)
+        r3.set_control(self.max_stepper)
+        r3.reflow("wide")
+        r3.pack(fill="x")
+        r4 = SettingRow(panel_a.body, "参与展示",
+                        "勾选的 Agent 类型才会参与并发展示（发现监听仍"
+                        "继续）。", self.dash.tooltip)
+        grid = tk.Frame(r4._control_cell, bg=LIGHT.surface)
+        grid.pack(fill="x")
         self.eligible_vars = {}
-        for kind, label in (("codex", "Codex"), ("claude", "Claude"),
-                            ("kimi", "Kimi"), ("pi", "pi")):
-            var = tk.BooleanVar(value=bool(cfg.get(
+        for i, (kind, label) in enumerate(
+                (("codex", "Codex"), ("claude", "Claude"),
+                 ("kimi", "Kimi"), ("pi", "pi"))):
+            var = tk.BooleanVar(value=bool(app.config.get(
                 f"presentation.concurrent.eligible_kinds.{kind}", True)))
             self.eligible_vars[kind] = var
-            ttk.Checkbutton(kinds_row, text=label, variable=var,
-                            command=lambda k=kind: self._save_eligible(k)
-                            ).pack(side="left", padx=8)
+            ttk.Checkbutton(grid, text=label, variable=var,
+                            command=lambda k=kind: self._save_eligible(
+                                k)).grid(row=i // 2, column=i % 2,
+                                         sticky="w", padx=(0, 24),
+                                         pady=2)
+        r4.set_control(grid)
+        r4.reflow("wide")
+        r4.pack(fill="x")
+        # ---- Section B 当前展示
+        panel_b = SurfacePanel(body)
+        panel_b.pack(fill="x")
+        _section_title(panel_b.body, "当前展示")
+        self.summary_label = tk.Label(panel_b.body, text="", bg=LIGHT.surface,
+                                      fg=LIGHT.text,
+                                      font=pick_font(panel_b, 10), anchor="w")
+        self.summary_label.pack(fill="x", pady=(0, ROW_GAP))
+        self.fallback_label = tk.Label(
+            panel_b.body, text="", bg=LIGHT.surface,
+            fg=LIGHT.text_secondary, font=pick_font(panel_b, 9), anchor="w")
+        self.cards_frame = tk.Frame(panel_b.body, bg=LIGHT.surface)
+        self.cards_frame.pack(fill="x")
+        self._slot_cards: dict[str, dict] = {}
+        self._rows: list[SettingRow] = [r1, r2, r3, r4]
 
-        self.fleet_frame = tk.Frame(page, bg=LIGHT.page)
-        self._fleet_sig = None
-
-        # 外观（全局默认）
-        look_card = Card(page)
-        look_card.pack(fill="x", pady=(16, 0))
-        lrow = tk.Frame(look_card.body, bg=LIGHT.surface)
-        lrow.pack(fill="x")
-        tk.Label(lrow, text="外观（全局默认）", bg=LIGHT.surface,
-                 fg=LIGHT.text, font=pick_font(self, 11, True)).pack(
-            side="left")
-        HelpDot(lrow, "对所有桌宠生效的全局外观。多宠分离模式下单个槽位的"
-                      "个性化覆盖在外观菜单/后续版本提供。改完点\"应用外观\""
-                      "一次性写入。").pack(side="left", padx=(6, 0))
-        opts = tk.Frame(look_card.body, bg=LIGHT.surface)
-        opts.pack(fill="x", pady=6)
-        self.look_vars = {}
-        _SLIDER_HELP = {
-            "scale": "桌宠与气泡的整体缩放（0.5~2.0）。皮肤会按新尺寸"
-                     "重新构建（几十秒），期间保持当前画面。",
-            "bubble.relative_width": "气泡宽度的相对系数（0.7~1.6）。",
-            "bubble.relative_height": "气泡高度的相对系数（0.8~1.6）。",
-            "bubble.relative_font": "气泡字号相对系数（0.75~1.4）。",
-            "speed": "动画播放速度倍率（0.3~3.0）：1.0 为皮肤原始节奏。",
-        }
-        options = [("scale", "整体大小", .5, 2., 1.),
-                   ("bubble.relative_width", "气泡相对宽度", .7, 1.6, 1.),
-                   ("bubble.relative_height", "气泡相对高度", .8, 1.6, 1.),
-                   ("bubble.relative_font", "相对字号", .75, 1.4, 1.),
-                   ("speed", "动画速度", .3, 3., 1.)]
-        for r, (path, label, lo, hi, default) in enumerate(options):
-            lrow2 = tk.Frame(opts, bg=LIGHT.surface)
-            lrow2.grid(row=r, column=0, columnspan=3, sticky="ew")
-            tk.Label(lrow2, text=label, bg=LIGHT.surface,
-                     fg=LIGHT.text).pack(side="left", padx=8, pady=6)
-            HelpDot(lrow2, _SLIDER_HELP.get(path, "")).pack(side="left")
-            var = tk.DoubleVar(value=float(cfg.get(path, default)))
-            self.look_vars[path] = var
-            scale = ttk.Scale(lrow2, from_=lo, to=hi, variable=var,
-                              length=280)
-            scale.pack(side="left")
-            scale.bind("<ButtonRelease-1>",
-                       lambda _e: self._apply_look())
-            tk.Label(lrow2, textvariable=var, width=7,
-                     bg=LIGHT.surface).pack(side="left", padx=6)
-        row2 = tk.Frame(look_card.body, bg=LIGHT.surface)
-        row2.pack(fill="x", pady=6)
-        self.font_var = tk.StringVar(value=cfg.get("bubble.font_family"))
-        tk.Label(row2, text="字体", bg=LIGHT.surface).pack(side="left")
-        HelpDot(row2, "气泡文字字体与字号（8~24）。中文建议 Microsoft "
-                      "YaHei UI；等宽字体对长路径更友好。").pack(
-            side="left", padx=(6, 8))
-        try:
-            import tkinter.font as tkfont
-            families = sorted(set(tkfont.families(self)))
-        except Exception:
-            families = []
-        ttk.Combobox(row2, textvariable=self.font_var, values=families,
-                     width=22).pack(side="left", padx=8)
-        self.size_var = tk.IntVar(value=int(cfg.get("bubble.font_size", 11)))
-        ttk.Spinbox(row2, from_=8, to=24, textvariable=self.size_var,
-                    width=5).pack(side="left", padx=4)
-        self.bubble_on_var = tk.BooleanVar(value=cfg.get("bubble.enabled", True))
-        ttk.Checkbutton(row2, text="显示气泡",
-                        variable=self.bubble_on_var).pack(side="left",
-                                                          padx=10)
-        HelpDot(row2, "关闭后只保留桌宠动画，不再显示任何状态气泡。").pack(
-            side="left")
-        self.anim_var = tk.BooleanVar(value=cfg.get("animated", True))
-        ttk.Checkbutton(row2, text="播放动画",
-                        variable=self.anim_var).pack(side="left")
-        HelpDot(row2, "关闭=静态模式（每段动画停在第一帧，更省电）。").pack(
-            side="left")
-        # 第二行：动画锁定 + 应用（窄窗口下按钮不被挤出）
-        row3 = tk.Frame(look_card.body, bg=LIGHT.surface)
-        row3.pack(fill="x", pady=6)
-        self.lock_var = tk.StringVar(value=cfg.get("force_state") or "auto")
-        tk.Label(row3, text="动画", bg=LIGHT.surface).pack(side="left",
-                                                           padx=(0, 2))
-        ttk.Combobox(row3, textvariable=self.lock_var,
-                     values=["auto", "walk", "attack", "die", "special",
-                             "sleep"], state="readonly", width=9).pack(
-            side="left")
-        HelpDot(row3, "锁定某段动画用于观察：auto=按监听状态自动（工作中="
-                      "walk、等待批复=die、完成=special、空闲=sleep）。"
-                      "锁定只影响显示。").pack(side="left", padx=(6, 0))
-        ttk.Button(row3, text="应用外观",
-                   command=self._apply_look).pack(side="right")
-
-        # 皮肤
-        skin_card = Card(page)
-        skin_card.pack(fill="x", pady=(16, 0))
-        srow = tk.Frame(skin_card.body, bg=LIGHT.surface)
-        srow.pack(fill="x")
-        tk.Label(srow, text="皮肤", bg=LIGHT.surface, fg=LIGHT.text,
-                 font=pick_font(self, 11, True)).pack(side="left")
-        HelpDot(srow, "皮肤目录需含 walk/attack/die/special/sleep 五段素材"
-                      "（.webm/.mp4/.gif），黑底或绿底自动抠透明；点\"应用"
-                      "皮肤\"后按当前尺寸构建（几十秒）。").pack(
-            side="left", padx=(6, 0))
-        self.skin_var = tk.StringVar(
-            value=str(cfg.get("skin", skins.BUILTIN_SKIN)))
-        self._skin_combo = ttk.Combobox(
-            srow, textvariable=self.skin_var,
-            values=sorted(skins.list_skins()),
-            state="readonly", width=22)
-        self._skin_combo.pack(side="right")
-        # v4.3 §9：catalog revision 变化（导入完成）→ 刷新 values
-        self._skin_catalog_revision = skins.catalog_revision()
-        srow2 = tk.Frame(skin_card.body, bg=LIGHT.surface)
-        srow2.pack(fill="x", pady=(6, 0))
-        ttk.Button(srow2, text="应用皮肤",
-                   command=self._apply_skin).pack(side="left")
-        HelpDot(srow2, "切换皮肤并保存；构建完成前保持当前画面。").pack(
-            side="left")
-        ttk.Button(srow2, text="导入皮肤（5 个 webm/gif）…",
-                   command=self._import_skin).pack(side="left", padx=8)
-        HelpDot(srow2, "选择包含 5 段素材的文件夹导入为新皮肤（本地保存，"
-                       "不上传）。").pack(side="left")
-        tk.Label(skin_card.body,
-                 text="皮肤规范：目录下放 walk / attack / die / special / sleep "
-                      "五个素材（.webm/.mp4/.gif），黑底或绿底自动抠透明。",
-                 bg=LIGHT.surface, fg=LIGHT.text_secondary,
-                 font=pick_font(self, 9)).pack(anchor="w", pady=(4, 0))
-
+    # ------------------------------------------------------------ actions
     def _toggle_concurrent(self):
-        # v4.3 §18.1：并发开关是运行期 session state，不写 config；
-        # 每次进程启动固定恢复"并行监听 + 单宠聚合"。
+        app = self.dash.app
         enabled = self.concurrent_var.get()
-        self.app.presentation.set_concurrent_enabled(enabled)
-        if enabled:
-            self.app.toast("并发监听已开启（默认单宠聚合；仅本次运行有效）", 4)
-        else:
-            self.app.toast("并发监听已关闭（回到单目标；仅本次运行有效）", 4)
-        self.app._aggregate()
-        self.app.ui.request(UiDirty.PRESENTATION)
-        if enabled:
-            self.concurrent_detail.pack(fill="x", pady=(8, 0))
-        else:
-            self.concurrent_detail.pack_forget()
+        app.presentation.set_concurrent_enabled(enabled)
+        app.toast("并发监听已" + ("开启" if enabled else "关闭")
+                  + "（仅本次运行有效）", 4)
+        app._aggregate()
+        app.ui.request(UiDirty.PRESENTATION)
 
     def _on_mode_segment(self, index: int):
-        # v4.3 §18.1：展示方式同样是运行期 session state，不写 config。
-        mode = PresentationMode.FLEET if index == 1 else PresentationMode.AGGREGATE
+        app = self.dash.app
+        mode = (PresentationMode.FLEET if index == 1
+                else PresentationMode.AGGREGATE)
         if mode is PresentationMode.FLEET:
-            # 保证持久化 slot 存在（appearance/placement 可跨模式保留）
-            slots = list(self.app.config.get(
+            slots = list(app.config.get(
                 "presentation.concurrent.slots") or [])
             if len(slots) < 2:
-                self.app.config.ensure_fleet_slots(3)
-                self.app.config_saver.request_save()
-        self.app.presentation.set_concurrent_mode(mode)
-        # v4.3：显式触发呈现 flush（即时切换，不等 bridge 收割 revision）
-        self.app.ui.request(UiDirty.PRESENTATION)
+                app.config.ensure_fleet_slots(3)
+                app.config_saver.request_save()
+        app.presentation.set_concurrent_mode(mode)
+        app.ui.request(UiDirty.PRESENTATION)
 
-    def _save_max_targets(self):
-        try:
-            value = max(1, min(8, int(self.max_var.get())))
-        except (ValueError, tk.TclError):
-            return
-        # v4.3 §7.2：先确保 pet-1..pet-N 均有持久化 slot，再更新上限
-        self.app.config.ensure_fleet_slots(value)
-        self.app.config.set("presentation.concurrent.max_targets", value)
-        self.app.config_saver.request_save()
-        # max_targets 影响 reconcile 的 slot_keys 计算：无周期 tick 兜底，
-        # 必须显式触发
-        self.app.ui.request(UiDirty.PRESENTATION)
+    def _save_max_targets(self, value: int):
+        app = self.dash.app
+        app.config.ensure_fleet_slots(value)
+        app.config.set("presentation.concurrent.max_targets", value)
+        app.config_saver.request_save()
+        app.ui.request(UiDirty.PRESENTATION)
 
     def _save_eligible(self, kind: str):
-        # 隐私/发现开关：内存立即生效；磁盘经 debounce 保存器
-        self.app.config.set(
+        app = self.dash.app
+        app.config.set(
             f"presentation.concurrent.eligible_kinds.{kind}",
             bool(self.eligible_vars[kind].get()))
-        self.app.config_saver.request_save()
-        self.app.ui.request(UiDirty.PRESENTATION)
+        app.config_saver.request_save()
+        app.ui.request(UiDirty.PRESENTATION)
 
-    def _refresh_look_skins(self):
-        """v4.3 §9：SkinCatalog revision 变化 → 只 configure values。"""
-        revision = skins.catalog_revision()
-        if revision == self._skin_catalog_revision:
-            return
-        self._skin_catalog_revision = revision
-        self._skin_combo.configure(values=sorted(skins.list_skins()))
+    def _unbind_slot(self, slot_id: str):
+        app = self.dash.app
+        key = app.presentation.slot_binding(slot_id)
+        app.presentation.unbind_slot(slot_id)
+        if key:
+            app.presentation.set_instance_included(key, False)
+        app._aggregate()
+        app.ui.request(UiDirty.PRESENTATION)
 
-    def _refresh_fleet(self, state):
-        if state is None or state.mode is not PresentationMode.FLEET:
-            self.fleet_frame.pack_forget()
+    # ------------------------------------------------------------ refresh
+    def refresh(self, reason: UiDirty):
+        app = self.dash.app
+        state = app._presentation_state
+        if state is None:
             return
-        self.fleet_frame.pack(fill="x", pady=(8, 0))
-        targets = self.app.monitor.get_targets()
-        rows = []
-        for slot_id in self.app.presentation.slot_ids():
+        self.concurrent_var.set(app.presentation.concurrent_enabled)
+        target_index = (1 if app.presentation.mode is PresentationMode.FLEET
+                        else 0)
+        if self.mode_segment.selected() != target_index:
+            initialized = self.mode_segment._initialized
+            self.mode_segment._initialized = False
+            self.mode_segment.select(target_index)
+            self.mode_segment._initialized = initialized
+        max_targets = int(app.config.get(
+            "presentation.concurrent.max_targets", 3) or 3)
+        self.max_stepper.set_external(max_targets)
+        for kind, var in self.eligible_vars.items():
+            var.set(bool(app.config.get(
+                f"presentation.concurrent.eligible_kinds.{kind}", True)))
+        if state.mode is PresentationMode.FLEET:
+            bound = len(state.slot_keys)
+            summary = (f"{bound or 1} 只桌宠 · Fleet 模式"
+                       + (f" · 绑定 {bound}/{max_targets}"
+                          if bound else ""))
+            overflow = max(0, len(state.cards) - max_targets)
+            if overflow:
+                summary += f" · overflow {overflow}"
+            self.summary_label.configure(text=summary)
+            if not state.slot_keys:
+                self.fallback_label.configure(
+                    text="1 只 idle fallback 桌宠（pet-1）：不占用 Agent "
+                         "slot，Agent 出现后自动复用/替换。")
+                self.fallback_label.pack(fill="x", pady=(0, ROW_GAP))
+            else:
+                self.fallback_label.pack_forget()
+            self._refresh_slot_cards(state, max_targets)
+        else:
+            if (app.presentation.concurrent_enabled
+                    and state.mode is PresentationMode.AGGREGATE):
+                overflow = max(0, len(state.cards) - max_targets)
+                text = (f"1 只桌宠 / 最多 {max_targets} 张卡"
+                        + (f" / overflow {overflow}" if overflow else ""))
+                if not state.cards:
+                    text = "1 只桌宠 · 暂无 Agent"
+            elif not app.presentation.concurrent_enabled:
+                text = "1 只桌宠 · 单目标模式"
+            else:
+                text = "1 只桌宠"
+            self.summary_label.configure(text=text)
+            self.fallback_label.pack_forget()
+            self._clear_slot_cards()
+
+    def _clear_slot_cards(self):
+        for card in self._slot_cards.values():
+            card["panel"].destroy()
+        self._slot_cards.clear()
+
+    def _refresh_slot_cards(self, state, max_targets: int):
+        app = self.dash.app
+        slot_ids = app.presentation.slot_ids()[:max(max_targets, 1)]
+        for slot_id in list(self._slot_cards):
+            if slot_id not in slot_ids:
+                self._slot_cards.pop(slot_id)["panel"].destroy()
+        targets = app.monitor.get_targets()
+        for index, slot_id in enumerate(slot_ids, start=1):
+            card = self._slot_cards.get(slot_id)
+            if card is None:
+                card = self._create_slot_card(slot_id, index)
             key = state.slot_keys.get(slot_id, "")
             target = targets.get(key) if key else None
+            # header chips
             if target is not None:
                 agent = (f"{target.snapshot.kind.label} · "
                          f"{target.instance.project or ''}")
-                status = ("自动分配" if self.app.presentation.is_auto_bound(slot_id)
-                          else "手动绑定")
+                chip = ("自动分配" if app.presentation.is_auto_bound(slot_id)
+                        else "手动绑定")
+                chip_color = LIGHT.done
             elif key:
                 agent = "绑定的 Agent 已退出"
-                status = "vacant"
+                chip = "vacant"
+                chip_color = LIGHT.unknown
             else:
-                agent = "未显示（无绑定的 Agent 时不创建桌宠）"
-                status = "vacant"
-            rows.append((slot_id, agent, status))
-        sig = tuple(rows)
-        if sig == self._fleet_sig:
-            return
-        self._fleet_sig = sig
-        for child in self.fleet_frame.winfo_children():
-            child.destroy()
-        tk.Label(self.fleet_frame, text="Fleet 桌宠（多宠分离）",
-                 bg=LIGHT.page, fg=LIGHT.text_secondary,
-                 font=pick_font(self, 10, True), anchor="w").pack(fill="x")
-        for slot_id, agent, status in rows:
-            card = Card(self.fleet_frame, padding=12)
-            card.pack(fill="x", pady=4)
-            row = tk.Frame(card.body, bg=LIGHT.surface)
-            row.pack(fill="x")
-            tk.Label(row, text=f"{slot_id}　{agent}", bg=LIGHT.surface,
-                     fg=LIGHT.text, font=pick_font(self, 10)).pack(
-                side="left")
-            StatusChip(row, text=status).pack(side="right")
-            actions = tk.Frame(card.body, bg=LIGHT.surface)
-            actions.pack(fill="x", pady=(4, 0))
-            ttk.Button(actions, text="更换 Agent",
-                       command=lambda s=slot_id:
-                       self.app._open_agent_picker(s)).pack(side="left")
-            ttk.Button(actions, text="解除绑定",
-                       command=lambda s=slot_id: self._unbind_slot(
-                           s)).pack(side="left", padx=6)
+                agent = "未绑定"
+                chip = "空闲"
+                chip_color = LIGHT.unknown
+            if card["agent"]["text"] != agent:
+                card["agent"].configure(text=agent)
+            if card["chip"]["text"] != chip:
+                card["chip"].set(chip, chip_color)
+            # skin 状态
+            view = app.pet_manager.views.get(slot_id)
+            if view is not None:
+                build_state = view.skin_build_state
+                skin_text = {"ready": "已就绪", "queued": "排队中",
+                             "building": "构建中", "error": "构建失败",
+                             "fallback": "缺失（已回退内置猫）"}.get(
+                                build_state, build_state)
+                if view.skin_build_error and build_state in (
+                        "error", "fallback"):
+                    skin_text += f" · {view.skin_build_error[:40]}"
+            else:
+                skin_text = "—"
+            if card["skin_state"]["text"] != skin_text:
+                card["skin_state"].configure(text=skin_text)
+            # combobox 当前值
+            override = app.pet_manager.slot_skin_overridden(slot_id)
+            current = (view.skin_requested_name
+                       if view is not None and override else
+                       "跟随全局")
+            if card["skin_var"].get() != current:
+                card["skin_var"].set(current)
 
-    def _unbind_slot(self, slot_id: str):
-        """解除绑定：slot 释放 + 该 Agent 移出并发展示（防止自动分配立即
-        补位；从 Agents 页"加入并发"可再纳入）。"""
-        key = self.app.presentation.slot_binding(slot_id)
-        self.app.presentation.unbind_slot(slot_id)
-        if key:
-            self.app.presentation.set_instance_included(key, False)
-        self.app._aggregate()
-        self.app.ui.request(UiDirty.PRESENTATION)
+    def _create_slot_card(self, slot_id: str, index: int) -> dict:
+        app = self.dash.app
+        panel = SurfacePanel(self.cards_frame)
+        panel.pack(fill="x", pady=4)
+        head = tk.Frame(panel.body, bg=LIGHT.surface)
+        head.pack(fill="x")
+        tk.Label(head, text=f"桌宠 {index}", bg=LIGHT.surface,
+                 fg=LIGHT.text, font=pick_font(head, 10, True)).pack(
+            side="left")
+        chip = StatusChip(head)
+        chip.pack(side="left", padx=(8, 0))
+        ttk.Button(head, text="更换 Agent", width=12,
+                   command=lambda s=slot_id: app._open_agent_picker(
+                       s)).pack(side="right")
+        ttk.Button(head, text="解除绑定", width=10,
+                   command=lambda s=slot_id: self._unbind_slot(
+                       s)).pack(side="right", padx=(0, 8))
+        agent = tk.Label(panel.body, text="", bg=LIGHT.surface,
+                         fg=LIGHT.text_secondary,
+                         font=pick_font(panel, 9), anchor="w")
+        agent.pack(fill="x", pady=(4, 0))
+        skin_row = tk.Frame(panel.body, bg=LIGHT.surface)
+        skin_row.pack(fill="x", pady=(4, 0))
+        tk.Label(skin_row, text="皮肤", bg=LIGHT.surface,
+                 fg=LIGHT.text, font=pick_font(skin_row, 10)).pack(
+            side="left")
+        InfoButton(skin_row, "本桌宠独立皮肤；同一皮肤可被多个桌宠重复"
+                   "选择。选择后立即请求构建，完成前保持当前画面。",
+                   self.dash.tooltip).pack(side="left", padx=(6, 0))
+        skin_var = tk.StringVar(value="跟随全局")
+        values = ["跟随全局"] + sorted(skins.list_skins())
+        combo = ttk.Combobox(skin_row, textvariable=skin_var, width=28,
+                             values=values, state="readonly")
+        combo.pack(side="left", padx=(6, 0))
+        skin_state = tk.Label(skin_row, text="—", bg=LIGHT.surface,
+                              fg=LIGHT.text_secondary,
+                              font=pick_font(skin_row, 9))
+        skin_state.pack(side="left", padx=(6, 0))
 
-    def _apply_look(self):
-        cfg = self.app.config
+        def _on_select(_evt=None, s=slot_id, v=skin_var):
+            choice = v.get()
+            app.appearance.set_slot_skin(
+                s, None if choice == "跟随全局" else choice)
+
+        combo.bind("<<ComboboxSelected>>", _on_select)
+        footer = tk.Frame(panel.body, bg=LIGHT.surface)
+        footer.pack(fill="x")
+        reset_btn = ttk.Button(footer, text="恢复跟随全局",
+                               command=lambda s=slot_id:
+                               app.appearance.set_slot_skin(s, None))
+        reset_btn.pack(side="right")
+        card = {"panel": panel, "chip": chip, "agent": agent,
+                "skin_var": skin_var, "skin_combo": combo,
+                "skin_state": skin_state, "reset_btn": reset_btn}
+        self._slot_cards[slot_id] = card
+        return card
+
+    def reflow(self, width: int):
+        mode = "wide" if width >= SettingRow.COMPACT_BREAK else "compact"
+        for row in getattr(self, "_rows", ()):
+            row.reflow(mode)
+
+
+class AppearancePage(DashboardPage):
+    """§12.4 外观页：皮肤 / 桌宠 / 气泡；无 Apply 按钮，live apply。"""
+
+    name = PAGE_LOOK
+
+    def build(self, parent):
+        header = self.dash.page_header(parent, PAGE_LOOK)
+        self.save_status = tk.Label(header.frame, text="已自动保存",
+                                    bg=LIGHT.page, fg=LIGHT.text_secondary,
+                                    font=pick_font(header.frame, 9))
+        self.save_status.pack(side="right", padx=(0, 12))
+        header.add_action("重置全部外观", self._confirm_reset, primary=True)
+        body = self.dash.page_body(parent)
+        app = self.dash.app
+        cfg = app.config
+        self._rows: list[SettingRow] = []
+
+        def row(parent_panel, label, info=""):
+            r = SettingRow(parent_panel, label, info, self.dash.tooltip)
+            r.pack(fill="x")
+            self._rows.append(r)
+            return r
+
+        # ---- Section A 皮肤
+        panel_skin = SurfacePanel(body)
+        panel_skin.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(panel_skin.body, "皮肤")
+        r = row(panel_skin.body, "全局皮肤", "所有未单独设置皮肤的桌宠"
+                "使用此皮肤；选择立即生效，构建完成前保持当前画面。")
+        self.skin_var = tk.StringVar(
+            value=str(cfg.get("skin", skins.BUILTIN_SKIN)))
+        self.skin_combo = ttk.Combobox(
+            r._control_cell, textvariable=self.skin_var,
+            values=sorted(skins.list_skins()), state="readonly")
+        self.skin_combo.pack(fill="x")
+        self.skin_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: app.appearance.set_global(
+                "skin", self.skin_var.get()))
+        r.reflow("wide")
+        ir = row(panel_skin.body, "导入", "选择包含 5 段素材的文件夹；"
+                 "复制/校验/构建全部在后台进行，不阻塞界面。")
+        ttk.Button(ir._control_cell, text="导入皮肤…", width=12,
+                   command=self._import_skin).pack(side="left")
+        self.skin_build_state = tk.Label(
+            ir._value_cell, text="", bg=LIGHT.surface,
+            fg=LIGHT.text_secondary, font=pick_font(ir._value_cell, 9))
+        self.skin_build_state.pack()
+        ir.reflow("wide")
+        self._skin_catalog_revision = skins.catalog_revision()
+        # ---- Section B 桌宠
+        panel_pet = SurfacePanel(body)
+        panel_pet.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(panel_pet.body, "桌宠")
+        r = row(panel_pet.body, "整体大小")
+        self.scale_slider = DiscreteSlider(
+            r._control_cell, SCALE_STEPS,
+            command=lambda v: app.appearance.set_global("scale", v))
+        r.set_control(self.scale_slider)
+        r.reflow("wide")
+        r = row(panel_pet.body, "动画速度")
+        self.speed_slider = DiscreteSlider(
+            r._control_cell, SPEED_STEPS,
+            command=lambda v: app.appearance.set_global("speed", v))
+        r.set_control(self.speed_slider)
+        r.reflow("wide")
+        r = row(panel_pet.body, "播放动画", "关闭后显示第 0 帧静态图。")
+        self.animated_var = tk.BooleanVar(
+            value=bool(cfg.get("animated", True)))
+        ttk.Checkbutton(r._control_cell, variable=self.animated_var,
+                        command=lambda: app.appearance.set_global(
+                            "animated", self.animated_var.get())
+                        ).pack(side="left")
+        r.reflow("wide")
+        r = row(panel_pet.body, "动画状态", "锁定后不随监听状态切换"
+                "（walk/attack/die/special/sleep）。")
+        self.force_var = tk.StringVar(
+            value=str(cfg.get("force_state") or "") or "自动")
+        combo = ttk.Combobox(
+            r._control_cell, textvariable=self.force_var, width=12,
+            values=["自动", "walk", "attack", "die", "special", "sleep"],
+            state="readonly")
+        combo.pack(side="left")
+        combo.bind("<<ComboboxSelected>>",
+                   lambda _e: app.appearance.set_global(
+                       "force_state",
+                       "" if self.force_var.get() == "自动"
+                       else self.force_var.get()))
+        r.reflow("wide")
+        # ---- Section C 气泡
+        panel_bub = SurfacePanel(body)
+        panel_bub.pack(fill="x")
+        _section_title(panel_bub.body, "气泡")
+        r = row(panel_bub.body, "显示气泡", "关闭后桌宠仍显示动画。")
+        self.bubble_var = tk.BooleanVar(
+            value=bool(cfg.get("bubble.enabled", True)))
+        ttk.Checkbutton(r._control_cell, variable=self.bubble_var,
+                        command=lambda: app.appearance.set_global(
+                            "bubble.enabled", self.bubble_var.get())
+                        ).pack(side="left")
+        r.reflow("wide")
+        r = row(panel_bub.body, "气泡宽度")
+        self.bw_slider = DiscreteSlider(
+            r._control_cell, BUBBLE_W_STEPS,
+            command=lambda v: app.appearance.set_global(
+                "bubble.relative_width", v))
+        r.set_control(self.bw_slider)
+        r.reflow("wide")
+        r = row(panel_bub.body, "气泡高度")
+        self.bh_slider = DiscreteSlider(
+            r._control_cell, BUBBLE_H_STEPS,
+            command=lambda v: app.appearance.set_global(
+                "bubble.relative_height", v))
+        r.set_control(self.bh_slider)
+        r.reflow("wide")
+        r = row(panel_bub.body, "文字缩放")
+        self.bf_slider = DiscreteSlider(
+            r._control_cell, BUBBLE_FONT_STEPS,
+            command=lambda v: app.appearance.set_global(
+                "bubble.relative_font", v))
+        r.set_control(self.bf_slider)
+        r.reflow("wide")
+        r = row(panel_bub.body, "字体")
+        from .theme import _available_families
+        families = ["Microsoft YaHei UI", "Segoe UI", "SimHei", "Consolas"]
+        available = sorted(f for f in _available_families(self.dash)
+                           if f in set(families)) or families[:1]
+        self.font_var = tk.StringVar(
+            value=str(cfg.get("bubble.font_family",
+                              "Microsoft YaHei UI")))
+        ttk.Combobox(r._control_cell, textvariable=self.font_var,
+                     values=available, width=22,
+                     state="readonly").pack(side="left")
+        r.reflow("wide")
+        r = row(panel_bub.body, "字号")
+        self.size_stepper = Stepper(
+            r._control_cell, int(cfg.get("bubble.font_size", 11) or 11),
+            8, 24, command=lambda v: app.appearance.set_global(
+                "bubble.font_size", v), width_chars=4)
+        r.set_control(self.size_stepper)
+        r.reflow("wide")
+        self._sync_from_config(initial=True)
+
+    # ------------------------------------------------------------ actions
+    def _confirm_reset(self):
+        app = self.dash.app
+        self.dash._native_dialog_open = True
         try:
-            font_size = max(8, min(24, int(self.size_var.get())))
-        except (ValueError, tk.TclError):
-            return
-        values = {}
-        for path, var in self.look_vars.items():
-            values[path] = round(var.get(), 2)
-        cfg.update_many(values)
-        cfg.set("bubble.font_family", self.font_var.get())
-        cfg.set("bubble.font_size", font_size)
-        cfg.set("bubble.enabled", self.bubble_on_var.get())
-        cfg.set("animated", self.anim_var.get())
-        cfg.set("force_state",
-                "" if self.lock_var.get() == "auto" else self.lock_var.get())
-        self.app.config_saver.request_save()
-        for view in self.app.pet_manager.views.values():
-            view.set_animated(self.anim_var.get())
-            view.set_speed(values.get("speed", 1.0))
-            view.bubble.invalidate()
-            view._win_size = None
-        new_scale = values.get("scale")
-        if new_scale and new_scale != cfg.get("scale"):
-            cfg.set("scale", new_scale)
-            self.app.set_scale(new_scale)
-        # v4.3：bubble.*/force_state 需要 reconcile 级 flush（无周期
-        # tick 兜底）；外观页自身也要刷新
-        self.app.ui.request(UiDirty.APPEARANCE | UiDirty.PRESENTATION)
-
-    def _apply_skin(self):
-        self.app._switch_skin(self.skin_var.get())
+            ok = messagebox.askyesno(
+                "重置全部外观",
+                "恢复默认皮肤（内置猫）与全部视觉参数；不影响监听、隐私、"
+                "slot 绑定与摆放。确定重置？",
+                parent=self.dash)
+        finally:
+            self.dash._native_dialog_open = False
+        if ok:
+            app.appearance.reset_all()
+            self._sync_from_config()
+            self.refresh(UiDirty.APPEARANCE)
 
     def _import_skin(self):
-        # 选择目录是用户主动的系统 file dialog（保留同步）；
-        # 校验/copy2/manifest/catalog 刷新全部转入单 background lane
-        # （v4.3 §9），UI 立即非模态反馈"正在导入…"，失败走 toast
-        self._native_dialog_open = True
+        dash = self.dash
+        dash._native_dialog_open = True
         try:
             src = filedialog.askdirectory(
-                title="选择包含 5 个素材文件的文件夹", parent=self)
+                title="选择包含 5 个素材文件的文件夹", parent=dash)
         finally:
-            self._native_dialog_open = False
+            dash._native_dialog_open = False
         if not src:
             return
         import re
         default = re.split(r"[\\/]+", src.rstrip("/\\"))[-1] or "myskin"
         name = default.strip() or "myskin"
-        self.app.begin_skin_import(src, name)
+        dash.app.begin_skin_import(src, name)
         self.skin_var.set(name)
 
-    # ================================================== 监听与隐私
-    def _build_monitor(self):
-        page = self._new_page(PAGE_MONITOR)
-        cfg = self.app.config
+    # ------------------------------------------------------------ refresh
+    def on_show(self):
+        pass   # 字体枚举已由 theme 全局缓存（首次调用发生在页面 build）
 
-        card = Card(page)
-        card.pack(fill="x")
-        drow = tk.Frame(card.body, bg=LIGHT.surface)
-        drow.pack(fill="x")
-        tk.Label(drow, text="Agent discovery（是否发现/解析）",
-                 bg=LIGHT.surface,
-                 fg=LIGHT.text, font=pick_font(self, 11, True)).pack(
-            side="left", pady=(0, 4))
-        HelpDot(drow, "勾选的 Agent 类型才会被扫描发现并解析会话状态；"
-                      "取消后该类型立即停止发现（现有实例按退出清理）。只读 "
-                      "Agent 自己落盘的会话文件，绝不写任何 Agent 配置。").pack(
-            side="left", pady=(0, 4))
-        row = tk.Frame(card.body, bg=LIGHT.surface)
-        row.pack(fill="x")
+    def refresh(self, reason: UiDirty):
+        self._sync_from_config()
+        self._refresh_skin_state()
+        saver = self.dash.app.config_saver
+        if saver.pending():
+            text, color = "正在保存…", LIGHT.waiting
+        else:
+            last = saver.last_result or getattr(
+                self.dash.app.config, "last_save_result", None)
+            if last is not None and getattr(last, "ok", True) is False:
+                text, color = "保存失败（设置页可重试）", LIGHT.error
+            else:
+                text, color = "已自动保存", LIGHT.text_secondary
+        self.save_status.configure(text=text, fg=color)
+
+    def _refresh_skin_state(self):
+        revision = skins.catalog_revision()
+        if revision != self._skin_catalog_revision:
+            self._skin_catalog_revision = revision
+            self.skin_combo.configure(values=sorted(skins.list_skins()))
+        app = self.dash.app
+        state_text = ""
+        for view in app.pet_manager.views.values():
+            s = view.skin_build_state
+            if s in ("queued", "building", "error"):
+                state_text = {"queued": "排队构建中…",
+                              "building": "构建中…",
+                              "error": view.skin_build_error[:40] or
+                              "构建失败"}.get(s, s)
+                break
+        if self.skin_build_state["text"] != state_text:
+            self.skin_build_state.configure(text=state_text)
+
+    def _sync_from_config(self, initial: bool = False):
+        cfg = self.dash.app.config
+        self.scale_slider.set_external(float(cfg.get("scale", 1.0) or 1.0))
+        self.speed_slider.set_external(float(cfg.get("speed", 1.0) or 1.0))
+        self.bw_slider.set_external(float(
+            cfg.get("bubble.relative_width", 1.0) or 1.0))
+        self.bh_slider.set_external(float(
+            cfg.get("bubble.relative_height", 1.0) or 1.0))
+        self.bf_slider.set_external(float(
+            cfg.get("bubble.relative_font", 1.0) or 1.0))
+        self.size_stepper.set_external(int(
+            cfg.get("bubble.font_size", 11) or 11))
+        self.animated_var.set(bool(cfg.get("animated", True)))
+        self.bubble_var.set(bool(cfg.get("bubble.enabled", True)))
+        self.force_var.set(str(cfg.get("force_state") or "") or "自动")
+        self.font_var.set(str(cfg.get("bubble.font_family",
+                                      "Microsoft YaHei UI")))
+        skin = str(cfg.get("skin", skins.BUILTIN_SKIN))
+        if self.skin_var.get() != skin:
+            self.skin_var.set(skin)
+
+    def reflow(self, width: int):
+        mode = "wide" if width >= SettingRow.COMPACT_BREAK else "compact"
+        for r in self._rows:
+            r.reflow(mode)
+
+
+class MonitorPage(DashboardPage):
+    """§12.5 监听与隐私：来源/类型/终端观察/隐私/高级节奏（折叠）。"""
+
+    name = PAGE_MONITOR
+
+    def build(self, parent):
+        self.dash.page_header(parent, PAGE_MONITOR)
+        body = self.dash.page_body(parent)
+        app = self.dash.app
+        cfg = app.config
+
+        def save(path, value):
+            cfg.set(path, value)
+            app.config_saver.request_save()
+
+        # A 监听来源
+        panel = SurfacePanel(body)
+        panel.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(panel.body, "监听来源")
+        r = SettingRow(panel.body, "来源",
+                       "Windows=原生进程（psutil 枚举）；WSL=各发行版内"
+                       "只读 /proc。关闭立即停止发现。", self.dash.tooltip)
+        cell = tk.Frame(r._control_cell)
+        cell.pack(fill="x")
+        self.windows_var = tk.BooleanVar(
+            value=bool(cfg.get("monitor.windows_enabled", True)))
+        ttk.Checkbutton(cell, text="Windows",
+                        variable=self.windows_var,
+                        command=lambda: save("monitor.windows_enabled",
+                                             self.windows_var.get())
+                        ).pack(side="left", padx=(0, 16))
+        self.wsl_var = tk.BooleanVar(
+            value=bool(cfg.get("monitor.wsl_enabled", True)))
+        ttk.Checkbutton(cell, text="WSL", variable=self.wsl_var,
+                        command=lambda: save("monitor.wsl_enabled",
+                                             self.wsl_var.get())
+                        ).pack(side="left")
+        r.reflow("wide")
+        r.pack(fill="x")
+        # B Agent 类型
+        panel = SurfacePanel(body)
+        panel.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(panel.body, "Agent 类型")
+        r = SettingRow(panel.body, "参与发现解析",
+                       "勾选的 Agent 类型才会被扫描/解析；取消立即停止"
+                       "发现（现有实例按退出清理）。", self.dash.tooltip)
+        grid = tk.Frame(r._control_cell)
+        grid.pack(fill="x")
         self.kind_vars = {}
-        for kind, label in (("claude", "Claude"), ("codex", "Codex"),
-                            ("kimi", "Kimi"), ("pi", "pi")):
+        for i, (kind, label) in enumerate(
+                (("codex", "Codex"), ("claude", "Claude"),
+                 ("kimi", "Kimi"), ("pi", "pi"))):
             var = tk.BooleanVar(
                 value=bool(cfg.get(f"monitor.agents.{kind}", True)))
             self.kind_vars[kind] = var
-            ttk.Checkbutton(row, text=label, variable=var,
-                            command=lambda k=kind: self._save(
+            ttk.Checkbutton(grid, text=label, variable=var,
+                            command=lambda k=kind: save(
                                 f"monitor.agents.{k}",
-                                self.kind_vars[k].get())).pack(
-                side="left", padx=8)
-
-        env = Card(page)
-        env.pack(fill="x", pady=8)
-        erow0 = tk.Frame(env.body, bg=LIGHT.surface)
-        erow0.pack(fill="x")
-        tk.Label(erow0, text="Environment", bg=LIGHT.surface,
-                 fg=LIGHT.text, font=pick_font(self, 11, True)).pack(
-            side="left", pady=(0, 4))
-        HelpDot(erow0, "在哪些环境里寻找 Agent 进程：Windows=原生进程"
-                       "（psutil 枚举）；WSL=各发行版内只读 /proc。终端观察"
-                       "见右侧说明。").pack(side="left", pady=(0, 4))
-        erow = tk.Frame(env.body, bg=LIGHT.surface)
-        erow.pack(fill="x")
-        self.windows_var = tk.BooleanVar(
-            value=bool(cfg.get("monitor.windows_enabled", True)))
-        ttk.Checkbutton(erow, text="Windows", variable=self.windows_var,
-                        command=lambda: self._save(
-                            "monitor.windows_enabled",
-                            self.windows_var.get())).pack(side="left",
-                                                          padx=8)
-        self.wsl_var = tk.BooleanVar(
-            value=bool(cfg.get("monitor.wsl_enabled", True)))
-        ttk.Checkbutton(erow, text="WSL", variable=self.wsl_var,
-                        command=lambda: self._save(
-                            "monitor.wsl_enabled",
-                            self.wsl_var.get())).pack(side="left", padx=8)
-        terminal_var = tk.BooleanVar(
+                                self.kind_vars[k].get())).grid(
+                row=i // 2, column=i % 2, sticky="w", padx=(0, 24), pady=2)
+        r.reflow("wide")
+        r.pack(fill="x")
+        # C 终端观察
+        panel = SurfacePanel(body)
+        panel.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(panel.body, "终端观察")
+        r = SettingRow(panel.body, "终端交互观察（UIA）",
+                       "用系统官方 UI Automation 被动观察 Windows Terminal "
+                       "当前可见区域（识别“等待审批”等）。只读可见文本、"
+                       "有频率上限；不模拟键盘、不截图、不读 scrollback。"
+                       "关闭需重启 DeskPet 生效。",
+                       self.dash.tooltip)
+        self.uia_var = tk.BooleanVar(
             value=bool(cfg.get("monitor.terminal_observer", True)))
-        ttk.Checkbutton(erow, text="Terminal UIA observation（重启生效）",
-                        variable=terminal_var,
-                        command=lambda: self._save(
-                            "monitor.terminal_observer",
-                            terminal_var.get())).pack(side="left", padx=8)
-        HelpDot(erow, "用系统官方 UI Automation 接口被动观察 Windows "
-                      "Terminal 当前可见区域（识别\"等待审批\"等）。只读"
-                      "可见文本、有频率上限，不模拟键盘、不截图、不读 "
-                      "scrollback。关闭需重启 DeskPet 生效。").pack(
-            side="left")
-
-        priv = Card(page)
-        priv.pack(fill="x")
-        prow0 = tk.Frame(priv.body, bg=LIGHT.surface)
-        prow0.pack(fill="x")
-        tk.Label(prow0, text="Privacy", bg=LIGHT.surface,
-                 fg=LIGHT.text, font=pick_font(self, 11, True)).pack(
-            side="left", pady=(0, 4))
-        HelpDot(prow0, "DeskPet 只做被动观察：读 cwd、进程启动 token、"
-                       "uid/HOME 与 allowlist 内环境变量；终端文本只做"
-                       "字符串匹配归类，绝不写进磁盘/日志/配置。").pack(
-            side="left", pady=(0, 4))
-        prow = tk.Frame(priv.body, bg=LIGHT.surface)
-        prow.pack(fill="x")
-        root_meta = tk.BooleanVar(
-            value=bool(cfg.get("privacy.wsl_root_metadata_fallback", False)))
-        ttk.Checkbutton(prow,
-                        text="允许 WSL root metadata fallback（默认关闭）",
-                        variable=root_meta,
-                        command=lambda: self._save(
-                            "privacy.wsl_root_metadata_fallback",
-                            root_meta.get())).pack(side="left")
-        HelpDot(prow, "WSL 里 root 用户的 /proc 元数据默认拒绝读取（安全"
-                      "默认）。开启后用受控 fallback 读取 root Agent 的"
-                      "元数据；关闭时这类 Agent 仍会被发现，只是详情"
-                      "较少。").pack(side="left")
-
-        adv = Card(page)
-        adv.pack(fill="x", pady=8)
-        expander = Expander(adv.body, "高级：扫描间隔")
-        expander.pack(fill="x")
-        arow = tk.Frame(expander.body, bg=LIGHT.surface)
+        ttk.Checkbutton(r._control_cell, variable=self.uia_var,
+                        command=lambda: save("monitor.terminal_observer",
+                                             self.uia_var.get())
+                        ).pack(side="left")
+        r.reflow("wide")
+        r.pack(fill="x")
+        self.uia_state = tk.Label(panel.body, text="", bg=LIGHT.surface,
+                                  fg=LIGHT.text_secondary,
+                                  font=pick_font(panel, 9), anchor="w")
+        self.uia_state.pack(fill="x", pady=(4, 0))
+        # D 隐私
+        panel = SurfacePanel(body)
+        panel.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(panel.body, "隐私")
+        tk.Label(panel.body, text="DeskPet 只做被动观察：读 cwd、进程启动"
+                 " token、uid/HOME 与 allowlist 内环境变量；终端文本只做"
+                 "字符串匹配归类，绝不写进磁盘/日志/配置；不启动 Agent、"
+                 "不配置 hooks、不发送键盘、不自动审批。",
+                 bg=LIGHT.surface, fg=LIGHT.text, justify="left",
+                 wraplength=560,
+                 font=pick_font(panel, 9)).pack(fill="x")
+        expander = Expander(panel.body, "高级")
+        expander.pack(fill="x", pady=(8, 0))
+        erow = tk.Frame(expander.body, bg=LIGHT.surface)
+        erow.pack(fill="x")
+        self.root_meta_var = tk.BooleanVar(
+            value=bool(cfg.get("privacy.wsl_root_metadata_fallback",
+                               False)))
+        ttk.Checkbutton(
+            erow, text="允许 WSL root metadata fallback（默认关闭）",
+            variable=self.root_meta_var,
+            command=lambda: save("privacy.wsl_root_metadata_fallback",
+                                 self.root_meta_var.get())).pack(side="left")
+        InfoButton(erow, "WSL 里 root 用户的 /proc 元数据默认拒绝读取。"
+                   "开启后用受控 fallback 读取 root Agent 元数据；关闭时"
+                   "这类 Agent 仍被发现，只是详情较少。",
+                   self.dash.tooltip).pack(side="left", padx=(6, 0))
+        # E 高级节奏
+        panel = SurfacePanel(body)
+        panel.pack(fill="x")
+        _section_title(panel.body, "高级节奏")
+        adv = Expander(panel.body, "扫描间隔（默认折叠）")
+        adv.pack(fill="x")
+        arow = tk.Frame(adv.body, bg=LIGHT.surface)
         arow.pack(fill="x")
-        HelpDot(arow, "扫描节奏微调（秒）：Windows/WSL=进程枚举间隔，文件"
-                      "轮询=会话文件读取间隔。加大更省电，减小响应更快。").pack(
+        InfoButton(arow, "扫描节奏微调（秒）：加大更省电，减小响应更快。"
+                   "值保持 plan1 的 clamp 范围。", self.dash.tooltip).pack(
             side="left")
         self.interval_vars = {}
         for path, label, lo, hi in (
                 ("windows_scan_sec", "Windows 扫描", 1.0, 30.0),
                 ("wsl_scan_sec", "WSL 扫描", 1.0, 60.0),
                 ("file_poll_sec", "文件轮询", 0.2, 5.0)):
-            tk.Label(arow, text=label, bg=LIGHT.surface).pack(side="left",
-                                                              padx=6)
-            var = tk.DoubleVar(value=float(cfg.get(f"monitor.{path}", 3.0)))
+            tk.Label(arow, text=label, bg=LIGHT.surface).pack(
+                side="left", padx=6)
+            var = tk.DoubleVar(value=float(
+                cfg.get(f"monitor.{path}", 3.0)))
             self.interval_vars[path] = var
             spin = ttk.Spinbox(arow, from_=lo, to=hi, increment=0.5,
                                textvariable=var, width=5,
-                               command=lambda p=path: self._save(
+                               command=lambda p=path: save(
                                    f"monitor.{p}",
                                    self.interval_vars[p].get()))
             spin.pack(side="left", padx=2)
-        tk.Label(page, text="DeskPet 只被动监听：不启动 Agent、不配置 hooks、"
-                            "不发送键盘、不自动审批。",
-                 bg=LIGHT.page, fg=LIGHT.text_secondary,
-                 font=pick_font(self, 9)).pack(anchor="w", pady=8)
 
-    def _save(self, path, value):
-        # Monitor/privacy 开关：内存立即生效；磁盘经 debounce 保存器
-        self.app.config.set(path, value)
-        self.app.config_saver.request_save()
+    def refresh(self, reason: UiDirty):
+        available = self.dash.app.monitor.terminal_available()
+        self.uia_state.configure(
+            text=f"当前状态：{'可用' if available else '不可用'}"
+                 f"（开关更改在重启 DeskPet 后生效）")
 
-    # ================================================== 诊断
-    def _build_diag(self):
-        page = self._new_page(PAGE_DIAG)
-        card = Card(page)
-        card.pack(fill="x")
-        tk.Label(card.body, text="健康摘要", bg=LIGHT.surface,
-                 fg=LIGHT.text, font=pick_font(self, 11, True)).pack(
-            anchor="w")
-        self.diag_health = tk.Label(card.body, text="", bg=LIGHT.surface,
+    def reflow(self, width: int): ...
+
+
+class DiagnosticsPage(DashboardPage):
+    """§12.6 诊断：Health / Performance / Log（1s 仅当前页可见）。"""
+
+    name = PAGE_DIAG
+
+    def build(self, parent):
+        self.dash.page_header(parent, PAGE_DIAG)
+        body = self.dash.page_body(parent)
+        health = SurfacePanel(body)
+        health.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(health.body, "健康")
+        self.diag_health = tk.Label(health.body, text="", bg=LIGHT.surface,
                                     fg=LIGHT.text,
-                                    font=pick_font(self, 10, mono=True),
+                                    font=pick_font(health, 9, mono=True),
                                     anchor="nw", justify="left")
-        self.diag_health.pack(fill="x", pady=(6, 0))
-        perf = Card(page)
-        perf.pack(fill="x", pady=8)
-        tk.Label(perf.body, text="性能", bg=LIGHT.surface, fg=LIGHT.text,
-                 font=pick_font(self, 11, True)).pack(anchor="w")
+        self.diag_health.pack(fill="x")
+        perf = SurfacePanel(body)
+        perf.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(perf.body, "性能")
         self.diag_perf = tk.Label(perf.body, text="", bg=LIGHT.surface,
                                   fg=LIGHT.text,
-                                  font=pick_font(self, 10, mono=True),
+                                  font=pick_font(perf, 9, mono=True),
                                   anchor="nw", justify="left")
-        self.diag_perf.pack(fill="x", pady=(6, 0))
-        logs = Card(page)
-        logs.pack(fill="both", expand=True, pady=8)   # 纵向铺满剩余高度
+        self.diag_perf.pack(fill="x")
+        logs = SurfacePanel(body)
+        logs.pack(fill="both", expand=True)
         bar = tk.Frame(logs.body, bg=LIGHT.surface)
         bar.pack(fill="x")
-        tk.Label(bar, text="日志（不含终端原文）", bg=LIGHT.surface,
-                 fg=LIGHT.text, font=pick_font(self, 11, True)).pack(
-            side="left")
+        _section_title(bar, "日志（不含终端原文）")
         ttk.Button(bar, text="清空诊断",
-                   command=self._clear_diagnostics).pack(side="right")
-        HelpDot(bar, "清空诊断日志环形缓冲（只影响本页显示，不删任何文件）。").pack(
-            side="right", padx=(0, 6))
+                   command=self._clear).pack(side="right")
         self.log_text = tk.Text(logs.body, wrap="word", bg=LIGHT.surface,
                                 fg=LIGHT.text,
-                                font=pick_font(self, 9, mono=True),
-                                height=12, state="disabled",
-                                relief="flat")
+                                font=pick_font(logs, 9, mono=True),
+                                height=12, state="disabled", relief="flat")
         self.log_text.pack(fill="both", expand=True, pady=(6, 0))
         self._logs_signature = None
         self._health_signature = None
 
-    def _clear_diagnostics(self):
-        monitor = self.app.monitor
+    def _clear(self):
+        monitor = self.dash.app.monitor
         monitor._log_ring.clear()
         try:
             while True:
@@ -989,14 +1205,15 @@ class Dashboard(tk.Toplevel):
         except Exception:
             pass
         self._logs_signature = None
-        self.refresh()
+        self.refresh(UiDirty.DASHBOARD)
 
-    def _refresh_diag(self):
-        # 诊断页 ≥1s 节流的时间戳（bridge 规则 5 读取）
-        self.last_diag_refresh = time.monotonic()
-        monitor = self.app.monitor
+    def refresh(self, reason: UiDirty):
+        # ≥1s 节流时间戳（bridge 规则 5 读取）
+        self.dash.last_diag_refresh = time.monotonic()
+        app = self.dash.app
+        monitor = app.monitor
         stats = dict(monitor.stats())
-        stats.update(self.app.pet_manager.stats())
+        stats.update(app.pet_manager.stats())
         targets = monitor.get_targets()
 
         def _count(value: str) -> int:
@@ -1038,24 +1255,30 @@ class Dashboard(tk.Toplevel):
             self._health_signature = text
             self.diag_health.configure(text=text)
 
-        perf = (f"targets={stats.get('targets', 0)}"
-                f" · wsl调用={stats.get('wsl_spawn_count', 0)}"
-                f" · wsl扫描={stats.get('wsl_scan_count', 0)}"
-                f"（{stats.get('wsl_scan_ms', 0)}ms"
-                f"/win {stats.get('windows_scan_ms', 0)}ms）"
-                f" · metadata={stats.get('metadata_pid_count', 0)}"
-                f" · uia事件={stats.get('events', 0)}"
-                f" · 可见读取={stats.get('visible_reads', 0)}"
-                f"（pending {stats.get('pending_visible_reads', 0)}"
-                f" · retry {stats.get('subscription_retry_count', 0)}）"
-                f" · uia队列丢弃={stats.get('uia_queue_dropped', 0)}\n"
-                f"pet_views={stats.get('pet_views', 0)}"
-                f" · cache {stats.get('cache_bytes', 0) // 1024}KB"
-                f"/{stats.get('cache_budget', 0) // 1024}KB"
-                f"（{stats.get('cache_frames', 0)} 帧）"
-                f" · skin_build_pending={stats.get('skin_build_pending', 0)}"
-                f" · exit_watched={stats.get('exit_watched', 0)}"
-                f" · detached过滤={stats.get('detached_filtered_count', 0)}")
+        ui = app.ui
+        saver = app.config_saver
+        scheduler = app.pet_manager.scheduler
+        perf = (
+            f"monitor ticks={stats.get('ticks', 0)}"
+            f" · wsl调用={stats.get('wsl_spawn_count', 0)}"
+            f" · 可见读取={stats.get('visible_reads', 0)}"
+            f"（pending {stats.get('pending_visible_reads', 0)}"
+            f" · retry {stats.get('subscription_retry_count', 0)}）\n"
+            f"ui_bridge_ticks={ui.bridge_count}"
+            f"（last {ui.bridge_last_ms:.2f}ms）"
+            f" · render_flushes={ui.render_count}"
+            f"（last {ui.render_last_ms:.2f}ms"
+            f" · dirty_views {ui.render_dirty_views_last}）\n"
+            f"cold_decode_queue={scheduler.decode_queue_len()}"
+            f" · cold_decodes={scheduler.cold_decode_count}"
+            f" · cache {stats.get('cache_bytes', 0) // 1024}KB"
+            f"/{stats.get('cache_budget', 0) // 1024}KB"
+            f"（{stats.get('cache_frames', 0)} 帧）"
+            f" · build队列={stats.get('skin_build_pending', 0)}\n"
+            f"config_save_pending={1 if saver.pending() else 0}"
+            f" · config_saves={saver.save_count}"
+            f" · exit_watched={stats.get('exit_watched', 0)}"
+            f" · detached过滤={stats.get('detached_filtered_count', 0)}")
         self.diag_perf.configure(text=perf)
 
         logs = "\n".join(monitor.recent_logs())
@@ -1066,118 +1289,117 @@ class Dashboard(tk.Toplevel):
             self.log_text.insert("1.0", logs)
             self.log_text.configure(state="disabled")
 
-    # ================================================== 设置
-    def _build_settings(self):
-        page = self._new_page(PAGE_SETTINGS)
-        from .config import CONFIG_PATH
+    def reflow(self, width: int): ...
 
-        auto = Card(page)
-        auto.pack(fill="x")
-        arow0 = tk.Frame(auto.body, bg=LIGHT.surface)
-        arow0.pack(fill="x")
-        tk.Label(arow0, text="开机启动", bg=LIGHT.surface,
-                 fg=LIGHT.text, font=pick_font(self, 11, True)).pack(
-            side="left")
-        HelpDot(arow0, "注册表 HKCU Run 键开机启动（当前用户级）。会校验"
-                       "登记的命令与当前 pythonw/程序路径一致；DeskPet "
-                       "移动位置后显示\"需要修复\"，一键修复重新登记。").pack(
-            side="left", padx=(6, 0))
+
+class SettingsPage(DashboardPage):
+    """§12.7 设置：自启/窗口托盘/保存健康/版本；无周期 polling。"""
+
+    name = PAGE_SETTINGS
+
+    def build(self, parent):
+        self.dash.page_header(parent, PAGE_SETTINGS)
+        body = self.dash.page_body(parent)
+        from .config import CONFIG_PATH
+        app = self.dash.app
+        auto = SurfacePanel(body)
+        auto.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(auto.body, "开机启动")
         self.autostart_state = tk.Label(auto.body, text="", bg=LIGHT.surface,
                                         fg=LIGHT.text,
-                                        font=pick_font(self, 10))
-        self.autostart_state.pack(anchor="w", pady=(4, 0))
-        self.autostart_detail = tk.Label(auto.body, text="", bg=LIGHT.surface,
-                                         fg=LIGHT.text_secondary,
-                                         font=pick_font(self, 9),
-                                         wraplength=480, justify="left")
+                                        font=pick_font(auto, 10))
+        self.autostart_state.pack(anchor="w")
+        self.autostart_detail = tk.Label(
+            auto.body, text="", bg=LIGHT.surface, fg=LIGHT.text_secondary,
+            font=pick_font(auto, 9), wraplength=480, justify="left")
         self.autostart_detail.pack(anchor="w")
         bind_wraplength(self.autostart_detail)
         arow = tk.Frame(auto.body, bg=LIGHT.surface)
         arow.pack(fill="x", pady=(6, 0))
+        self._autostart_row = arow
         self.autostart_btn = ttk.Button(arow, text="开启",
                                         command=self._toggle_autostart)
         self.autostart_btn.pack(side="left")
-        HelpDot(arow, "开启/关闭开机启动（写入当前用户注册表 Run 键，写后"
-                      "回读校验）。").pack(side="left")
         self.autostart_repair_btn = ttk.Button(arow, text="修复",
-                                               command=self._repair_autostart)
-        HelpDot(arow, "登记路径与当前程序不一致（如 DeskPet 被移动过）时，"
-                      "重新写入正确命令。").pack(side="left")
-
-        win = Card(page)
-        win.pack(fill="x", pady=8)
-        tk.Label(win.body, text="窗口与托盘", bg=LIGHT.surface,
-                 fg=LIGHT.text, font=pick_font(self, 11, True)).pack(
-            anchor="w")
+                                               command=self._repair)
+        InfoButton(arow, "注册表 HKCU Run 键（当前用户级）。移动 DeskPet "
+                   "位置后显示\"需要修复\"，一键重新登记。",
+                   self.dash.tooltip).pack(side="left", padx=(6, 0))
+        win = SurfacePanel(body)
+        win.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(win.body, "窗口与托盘")
         wrow = tk.Frame(win.body, bg=LIGHT.surface)
-        wrow.pack(fill="x", pady=4)
-        topmost = tk.BooleanVar(value=bool(
-            self.app.config.get("topmost", True)))
-        ttk.Checkbutton(wrow, text="窗口置顶（立即生效并保存）",
-                        variable=topmost,
-                        command=lambda: self._save(
-                            "topmost", topmost.get())).pack(side="left")
-        HelpDot(wrow, "桌宠窗口始终保持在其他窗口之上。").pack(side="left")
+        wrow.pack(fill="x", pady=2)
+        topmost = tk.BooleanVar(value=bool(app.config.get("topmost", True)))
+        ttk.Checkbutton(wrow, text="窗口置顶", variable=topmost,
+                        command=lambda: app._set_topmost(
+                            topmost.get())).pack(side="left")
+        InfoButton(wrow, "桌宠窗口始终保持在其他窗口之上。",
+                   self.dash.tooltip).pack(side="left", padx=(6, 0))
         tray = tk.BooleanVar(value=bool(
-            self.app.config.get("tray_enabled", True)))
+            app.config.get("tray_enabled", True)))
         ttk.Checkbutton(wrow, text="托盘图标", variable=tray,
-                        command=lambda: self.app.set_tray_enabled(
-                            tray.get())).pack(side="left", padx=10)
-        HelpDot(wrow, "系统托盘图标：左键显示桌宠（幂等恢复，不会隐藏），"
-                      "右键完整菜单。隐藏桌宠后托盘是唯一恢复入口，"
-                      "建议保持开启。").pack(side="left")
-        ttk.Button(win.body, text="隐藏全部桌宠",
-                   command=self.app.hide_pet).pack(anchor="w")
-        HelpDot(win.body, "暂时隐藏所有桌宠（托盘图标保留，左键即可恢复；"
-                          "监听不受影响）。").pack(anchor="w")
-
-        save_card = Card(page)
-        save_card.pack(fill="x")
-        svrow = tk.Frame(save_card.body, bg=LIGHT.surface)
-        svrow.pack(fill="x")
-        tk.Label(svrow, text="配置保存状态", bg=LIGHT.surface,
-                 fg=LIGHT.text, font=pick_font(self, 11, True)).pack(
-            side="left")
-        HelpDot(svrow, "所有设置写入 config.json（原子写入：临时文件+替换，"
-                       "失败绝不静默——会在此处标红并给出重试按钮）。").pack(
+                        command=lambda: app.set_tray_enabled(
+                            tray.get())).pack(side="left", padx=(16, 0))
+        InfoButton(wrow, "左键显示桌宠（幂等恢复），右键完整菜单；隐藏"
+                   "桌宠后托盘是唯一恢复入口。", self.dash.tooltip).pack(
             side="left", padx=(6, 0))
-        self.save_state = tk.Label(save_card.body, text="", bg=LIGHT.surface,
+        hrow = tk.Frame(win.body, bg=LIGHT.surface)
+        hrow.pack(fill="x", pady=2)
+        ttk.Button(hrow, text="隐藏全部桌宠",
+                   command=app.hide_pet).pack(side="left")
+        InfoButton(hrow, "暂时隐藏所有桌宠（托盘保留，左键恢复；监听不受"
+                   "影响）。", self.dash.tooltip).pack(side="left",
+                                                       padx=(6, 0))
+        savep = SurfacePanel(body)
+        savep.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(savep.body, "配置保存状态")
+        self.save_state = tk.Label(savep.body, text="", bg=LIGHT.surface,
                                    fg=LIGHT.text,
-                                   font=pick_font(self, 10))
-        self.save_state.pack(anchor="w", pady=(4, 0))
-        self._save_error_frame = tk.Frame(save_card.body,
-                                          bg=LIGHT.surface)
-        self._save_retry_btn = ttk.Button(
-            self._save_error_frame, text="重试保存",
-            command=self._retry_save)
-        HelpDot(save_card.body, "上次写入失败时点这里重试（保留全部待写入"
-                                "设置）。").pack(anchor="w")
-        tk.Label(save_card.body,
+                                   font=pick_font(savep, 10))
+        self.save_state.pack(anchor="w")
+        srow = tk.Frame(savep.body, bg=LIGHT.surface)
+        srow.pack(fill="x", pady=(6, 0))
+        self._retry_btn = ttk.Button(srow, text="重试保存",
+                                     command=self._retry_save)
+        InfoButton(srow, "所有设置经 650ms debounce 原子写入 config.json"
+                   "（临时文件+替换）；失败绝不静默——此处标红并可重试。",
+                   self.dash.tooltip).pack(side="left", padx=(6, 0))
+        tk.Label(savep.body,
                  text=f"配置文件位置（只读展示）：{CONFIG_PATH}",
                  bg=LIGHT.surface, fg=LIGHT.text_secondary,
-                 font=pick_font(self, 9)).pack(anchor="w", pady=(6, 0))
+                 font=pick_font(savep, 9)).pack(anchor="w", pady=(6, 0))
+        abt = SurfacePanel(body)
+        abt.pack(fill="x")
+        _section_title(abt.body, "关于")
+        tk.Label(abt.body, text=APP_VERSION, bg=LIGHT.surface,
+                 fg=LIGHT.text, font=pick_font(abt, 10)).pack(anchor="w")
 
     def _toggle_autostart(self):
         result = autostart.toggle()
-        self.app.toast("开机自启动已" + ("开启" if result.enabled else "关闭")
-                       + ("" if result.ok else f"（{result.reason}）"), 4)
-        self._refresh_settings()
+        self.dash.app.toast(
+            "开机自启动已" + ("开启" if result.enabled else "关闭")
+            + ("" if result.ok else f"（{result.reason}）"), 4)
+        self.refresh(UiDirty.NONE)
 
-    def _repair_autostart(self):
+    def _repair(self):
         result = autostart.repair()
         if result.ok:
-            self.app.toast("开机自启动已修复", 3)
+            self.dash.app.toast("开机自启动已修复", 3)
         else:
-            self.app.toast("修复失败：" + result.reason, 5)
-        self._refresh_settings()
+            self.dash.app.toast("修复失败：" + result.reason, 5)
+        self.refresh(UiDirty.NONE)
 
     def _retry_save(self):
-        result = self.app.config.commit()
+        result = self.dash.app.config.commit()
         if result.ok:
-            self.app.toast("设置已写入磁盘", 3)
-        self._refresh_settings()
+            self.dash.app.toast("设置已写入磁盘", 3)
+        self.refresh(UiDirty.NONE)
 
-    def _refresh_settings(self):
+    def on_show(self):
+        self.refresh(UiDirty.NONE)
+
+    def refresh(self, reason: UiDirty):
         from .autostart import AutostartState
         st = autostart.status()
         if st.state == AutostartState.HEALTHY:
@@ -1190,51 +1412,225 @@ class Dashboard(tk.Toplevel):
             self.autostart_detail.configure(text="")
             self.autostart_repair_btn.pack_forget()
         elif st.state == AutostartState.STALE:
-            self.autostart_state.configure(text="需要修复", fg=LIGHT.waiting)
+            self.autostart_state.configure(text="需要修复",
+                                           fg=LIGHT.waiting)
             self.autostart_detail.configure(
                 text=f"注册路径与当前 DeskPet 路径不一致：\n"
                      f"{st.registered_command}")
-            self.autostart_repair_btn.pack(side="left", padx=6)
+            self.autostart_repair_btn.pack(in_=self._autostart_row,
+                                           side="left", padx=6)
         else:
             self.autostart_state.configure(text="不可用",
                                            fg=LIGHT.text_secondary)
             self.autostart_repair_btn.pack_forget()
         self.autostart_btn.configure(
             text="关闭" if st.state == AutostartState.HEALTHY else "开启")
-
-        result = self.app.config.last_save_result
-        if result is None or result.ok:
-            self.save_state.configure(text="全部设置已保存", fg=LIGHT.done)
-            self._save_error_frame.pack_forget()
+        saver = self.dash.app.config_saver
+        last = saver.last_result or getattr(
+            self.dash.app.config, "last_save_result", None)
+        if saver.pending():
+            self.save_state.configure(text="正在保存…", fg=LIGHT.waiting)
+        elif last is not None and getattr(last, "ok", True) is False:
+            self.save_state.configure(
+                text=f"上次保存失败：{getattr(last, 'error', '')}",
+                fg=LIGHT.error)
+            self._retry_btn.pack(side="left")
         else:
-            self.save_state.configure(text="⚠ 最近一次设置没有写入磁盘",
-                                      fg=LIGHT.error)
-            for child in self._save_error_frame.winfo_children():
-                if child is not self._save_retry_btn:
-                    child.destroy()
-            tk.Label(self._save_error_frame, text=result.error[:120],
-                     bg=LIGHT.surface, fg=LIGHT.text_secondary,
-                     font=pick_font(self, 9)).pack(side="left")
-            self._save_retry_btn.pack(side="left", padx=6)
-            self._save_error_frame.pack(anchor="w")
+            self.save_state.configure(text="已保存", fg=LIGHT.done)
+            self._retry_btn.pack_forget()
 
-    # ================================================== 刷新（§19 生命周期）
-    def refresh(self):
-        """单次立即刷新（清空诊断等显式调用用）。"""
+    def reflow(self, width: int): ...
+
+
+class _PageHeader:
+    """页面头（§10.2 高 64）：左标题 + 右动作区。"""
+
+    def __init__(self, parent, title: str, metrics: DashboardMetrics):
+        self.frame = tk.Frame(parent, bg=LIGHT.page)
+        self.frame.pack(fill="x", pady=(0, 8))
+        tk.Frame(self.frame, bg=LIGHT.page,
+                 height=metrics.px(PAGE_HEADER_HEIGHT)).pack(
+            side="left", fill="y")
+        self._title = tk.Label(self.frame, text=title, bg=LIGHT.page,
+                               fg=LIGHT.text,
+                               font=pick_font(parent, 15, True))
+        self._title.pack(side="left", padx=(metrics.px(PAGE_PAD_X), 0))
+        self._actions = tk.Frame(self.frame, bg=LIGHT.page)
+        self._actions.pack(side="right",
+                           padx=(0, metrics.px(PAGE_PAD_X)))
+
+    def add_action(self, text: str, command, primary: bool = False):
+        return ttk.Button(self._actions, text=text, width=14 if primary
+                          else 10, command=command).pack(side="left",
+                                                         padx=4)
+
+
+class Dashboard(tk.Toplevel):
+    """v4.3 仪表盘 shell：固定 7 页导航 + lazy/retained 页面。"""
+
+    def __init__(self, app):
+        self.app = app
+        super().__init__(app.root)
+        self.title("DeskPet · 仪表盘")
+        self.metrics = DashboardMetrics.for_window(self)
+        self._apply_window_geometry()
+        self.configure(bg=LIGHT.page)
+        self.protocol("WM_DELETE_WINDOW", self.hide_dashboard)
+        self.selected_key = ""
+        self._page = PAGE_OVERVIEW
+        self._closing = False
+        # 诊断页 ≥1s 节流时间戳（bridge 规则 5 读取，monotonic）
+        self.last_diag_refresh = 0.0
+        # 失焦自动收起（v4.3 用户反馈）
+        self._had_focus = False
+        self._native_dialog_open = False
+        self.bind("<FocusIn>", lambda _e: setattr(self, "_had_focus", True))
+        self.bind("<FocusOut>", self._on_focus_lost)
+
+        # ---- shell：左导航 + 右内容
+        self._build_shell()
+        self._pages: dict[str, DashboardPage] = {}
+        self._current: DashboardPage | None = None
+        self._register_pages()
+        # 滚轮只在页面 canvas 内滚动（§11.5）
+        self.bind("<MouseWheel>", self._on_wheel)
+        # DPI/宽度 breakpoint 重排：50ms debounce（§10.3）
+        self._reflow_after = None
+        self._last_reflow_width = -1
+        self._last_reflow_dpi = self.metrics.dpi
+        self.bind("<Configure>", self._on_configure)
+        # Overview 立即构建（默认页）
+        self._show_page(PAGE_OVERVIEW)
+
+    # ================================================== shell
+    def _apply_window_geometry(self):
+        try:
+            from actions import winkeys
+            _name, area = winkeys.monitor_work_area(
+                self.winfo_screenwidth() // 2,
+                self.winfo_screenheight() // 2)
+        except Exception:
+            area = None
+        s = self.metrics.scale
+        w, h = int(DEFAULT_WINDOW_W * s), int(DEFAULT_WINDOW_H * s)
+        if area:
+            work_w = area[2] - area[0]
+            work_h = area[3] - area[1]
+            w = min(w, max(int(work_w * s) - int(64 * s),
+                           int(300 * s)))
+            h = min(h, max(int(work_h * s) - int(64 * s),
+                           int(240 * s)))
+        self.geometry(f"{w}x{h}")
+        self.minsize(int(860 * s), int(560 * s))
+
+    def _build_shell(self):
+        m = self.metrics
+        nav = tk.Frame(self, bg=LIGHT.page, width=m.px(NAV_WIDTH))
+        nav.pack(side="left", fill="y")
+        nav.pack_propagate(False)
+        brand = tk.Label(nav, text="DeskPet 仪表盘", bg=LIGHT.page,
+                         fg=LIGHT.text, anchor="w", padx=16,
+                         font=pick_font(self, 13, True))
+        brand.pack(fill="x",
+                   ipady=(m.px(BRAND_HEIGHT) - brand.winfo_reqheight()) // 2)
+        tk.Frame(nav, bg=LIGHT.border, height=1).pack(fill="x")
+        self._nav_buttons: dict[str, NavButton] = {}
+        for page in (PAGE_OVERVIEW, PAGE_AGENTS, PAGE_PETS, PAGE_LOOK,
+                     PAGE_MONITOR, PAGE_DIAG):
+            self._add_nav_item(nav, page)
+        tk.Frame(nav, bg=LIGHT.page).pack(fill="both", expand=True)
+        self._add_nav_item(nav, PAGE_SETTINGS)   # 固定底部
+        # 右内容：页面区（滚动容器）
+        self.content = self._make_scroller()
+        self.content.pack(side="left", fill="both", expand=True)
+        self.tooltip = TooltipController(self)
+
+    def _make_scroller(self):
+        from .widgets import ScrollableFrame
+        scroller = ScrollableFrame(self)
+        # 页面居中容器：最大 960 逻辑像素
+        self._center = tk.Frame(scroller.inner, bg=LIGHT.page)
+        self._center.pack(fill="both", expand=True)
+        scroller.inner.bind(
+            "<Configure>",
+            lambda e: self._center.configure(
+                width=max(120, min(int(PAGE_CONTENT_MAX_WIDTH
+                                        * self.metrics.scale),
+                                   e.width))))
+        self._center.pack_propagate(False)
+        return scroller
+
+    def _add_nav_item(self, nav, page: str):
+        btn = NavButton(nav, page, command=lambda p=page: self._show_page(p))
+        btn.configure(height=self.metrics.px(NAV_ITEM_HEIGHT))
+        btn.pack(fill="x")
+        btn._label.configure(pady=max(2, self.metrics.px(
+            NAV_ITEM_HEIGHT - 30) // 2))
+        self._nav_buttons[page] = btn
+
+    def _register_pages(self):
+        for page_cls in (OverviewPage, AgentsPage, PetsPage,
+                         AppearancePage, MonitorPage, DiagnosticsPage,
+                         SettingsPage):
+            page = page_cls(self)
+            self._pages[page.name] = page
+
+    # ================================================== 页面生命周期（§15）
+    def page_header(self, parent, title: str) -> _PageHeader:
+        return _PageHeader(parent, title, self.metrics)
+
+    def page_body(self, parent) -> tk.Frame:
+        body = tk.Frame(parent, bg=LIGHT.page,
+                        padx=self.metrics.px(PAGE_PAD_X),
+                        pady=self.metrics.px(PAGE_PAD_Y))
+        body.pack(fill="both", expand=True)
+        return body
+
+    def _show_page(self, page: str):
+        if self._closing:
+            return
+        target = self._pages.get(page)
+        if target is None:
+            return
+        if self._current is not None and self._current is not target:
+            if self._current.built:
+                self._current.holder.pack_forget()
+                self._current.on_hide()
+        self._page = page
+        for name, btn in self._nav_buttons.items():
+            btn.set_active(name == page)
+        holder = target.ensure_built(self._center)
+        holder.pack(fill="both", expand=True)
+        self._current = target
+        self.tooltip.hide()   # 切页关闭 tooltip（§11.2）
+        target.on_show()
+        width = max(0, self._center.winfo_width())
+        if width > 1:
+            target.reflow(width)
+        self._last_reflow_width = width
+
+    # ================================================== 刷新（§4.4 E 步）
+    def refresh_current_page(self):
         if self._closing or not self.winfo_exists():
             return
         if self.state() == "withdrawn":
             return
+        if self._current is not None:
+            self._current.refresh(UiDirty.NONE)
+
+    def refresh(self):
         self.refresh_current_page()
 
     def is_open(self) -> bool:
-        """Dashboard 逻辑可见（bridge 125ms 档与 flush E 的判据）。"""
         if self._closing or not self.winfo_exists():
             return False
         return self.state() != "withdrawn"
 
+    def on_diagnostics_page(self) -> bool:
+        return self._page == PAGE_DIAG
+
+    # ================================================== 失焦自动收起
     def _on_focus_lost(self, _ev):
-        # FocusOut 在焦点短暂转移时也会触发；idle 时刻复查一次
         if self._closing or self._native_dialog_open:
             return
         try:
@@ -1243,12 +1639,6 @@ class Dashboard(tk.Toplevel):
             pass
 
     def _maybe_auto_collapse(self):
-        """失去焦点（前台窗口不是本仪表盘）时自动收起（v4.3 用户反馈）。
-
-        前台判断用 Win32 GetForegroundWindow——Tk focus_get() 看不见
-        其他进程的焦点。原生文件/消息对话框打开期间不收起（此时前台
-        本来就不在仪表盘）。
-        """
         if self._closing or self._native_dialog_open or not self._had_focus:
             return
         if not self.is_open():
@@ -1264,41 +1654,51 @@ class Dashboard(tk.Toplevel):
         if fg and fg != hwnd:
             self.hide_dashboard()
 
-    def on_diagnostics_page(self) -> bool:
-        return self._page == PAGE_DIAG
+    # ================================================== 滚轮 / reflow
+    def _on_wheel(self, event):
+        if self._current is not None and self._current.built:
+            self.content.wheel_scroll(event.delta, event.x_root, event.y_root)
 
-    def refresh_current_page(self):
-        """v4.3 §4.4 E：只刷新当前页（隐藏页 0 工作，§15）。"""
+    def _on_configure(self, event):
+        if event.widget is not self:
+            return
+        if self._reflow_after is not None:
+            return
+        self._reflow_after = self.after(50, self._reflow_debounced)
+
+    def _reflow_debounced(self):
+        self._reflow_after = None
         if self._closing or not self.winfo_exists():
             return
-        if self.state() == "withdrawn":
-            return
-        targets = self.app.monitor.get_targets()
-        state = self.app._presentation_state
-        try:
-            if self._page == PAGE_OVERVIEW:
-                self._refresh_overview(targets)
-            elif self._page == PAGE_AGENTS:
-                self._refresh_agents(targets)
-            elif self._page == PAGE_LOOK:
-                self._refresh_look_skins()
-                self._refresh_fleet(state)
-            elif self._page == PAGE_DIAG:
-                self._refresh_diag()
-            elif self._page == PAGE_SETTINGS:
-                self._refresh_settings()
-            # PAGE_MONITOR：静态设置行，无周期内容
-        except Exception:
-            pass
+        new_metrics = DashboardMetrics.for_window(self)
+        dpi_changed = new_metrics.dpi != self._last_reflow_dpi
+        if dpi_changed:
+            self.metrics = new_metrics
+            self._last_reflow_dpi = new_metrics.dpi
+        width = max(0, self.content.winfo_width()
+                    - 2 * self.metrics.px(PAGE_PAD_X))
+        crossed = (width >= SettingRow.COMPACT_BREAK) != (
+            self._last_reflow_width >= SettingRow.COMPACT_BREAK)
+        # §10.3：只有 DPI 变化或跨 breakpoint 才重排；像素级拖拽零工作
+        if dpi_changed or crossed or self._last_reflow_width < 0:
+            self._last_reflow_width = width
+            if self._current is not None and self._current.built:
+                self._current.reflow(width)
 
+    # ================================================== 生命周期
     def open(self):
-        """显示（v4.3：无周期 timer；刷新由 UiCoordinator 驱动）。"""
+        """显示（刷新由 UiCoordinator 驱动；无周期 timer）。"""
         self.deiconify()
         self.lift()
+        if self._current is None:
+            self._show_page(PAGE_OVERVIEW)
+        else:
+            self._current.on_show()
         self.refresh_current_page()
 
     def hide_dashboard(self):
         """用户关闭窗口：隐藏（0 周期唤醒；bridge 降回低档）。"""
+        self.tooltip.hide()
         self.withdraw()
         try:
             self.app.ui.kick()
@@ -1306,8 +1706,14 @@ class Dashboard(tk.Toplevel):
             pass
 
     def shutdown(self):
-        """退出 DeskPet 时销毁仪表盘。"""
         self._closing = True
+        self.tooltip.hide()
+        if self._reflow_after is not None:
+            try:
+                self.after_cancel(self._reflow_after)
+            except tk.TclError:
+                pass
+            self._reflow_after = None
         try:
             self.destroy()
         except tk.TclError:
