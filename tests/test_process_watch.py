@@ -28,6 +28,19 @@ def _spawn_sleeper() -> subprocess.Popen:
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
+def terminate_process(proc: subprocess.Popen):
+    """统一 Popen 清理（v4.1.3 §31）：kill 后有界 wait。
+
+    只 kill 不 wait 会让 Popen 对象在进程仍运行时被 GC——CI stderr
+    出现 subprocess ResourceWarning。"""
+    if proc.poll() is None:
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 @unittest.skipIf(sys.platform != "win32", "WindowsExitWatcher 仅 Windows")
 class WindowsExitWatcherTests(unittest.TestCase):
     def setUp(self):
@@ -59,8 +72,7 @@ class WindowsExitWatcherTests(unittest.TestCase):
             time.sleep(0.2)
             self.assertEqual(self.watcher.drain(), [])
         finally:
-            if proc.poll() is None:
-                proc.kill()
+            terminate_process(proc)
 
     def test_register_is_idempotent_and_unregister_closes(self):
         proc = _spawn_sleeper()
@@ -76,8 +88,7 @@ class WindowsExitWatcherTests(unittest.TestCase):
             time.sleep(0.5)
             self.assertEqual(self.watcher.drain(), [])     # 已注销：无事件
         finally:
-            if proc.poll() is None:
-                proc.kill()
+            terminate_process(proc)
 
     def test_register_missing_pid_fails_closed(self):
         # 不存在的 PID：OpenProcess 失败 → False，且绝不产生退出事件
@@ -98,8 +109,7 @@ class WindowsExitWatcherTests(unittest.TestCase):
                 self.assertEqual(watcher.watched_count(), 1)
             finally:
                 for p in (p1, p2):
-                    if p.poll() is None:
-                        p.kill()
+                    terminate_process(p)
         finally:
             watcher.stop()
 
@@ -111,8 +121,7 @@ class WindowsExitWatcherTests(unittest.TestCase):
             self.assertEqual(self.watcher.watched_count(), 0)
             self.assertFalse(self.watcher.started)
         finally:
-            if proc.poll() is None:
-                proc.kill()
+            terminate_process(proc)
 
 
 if __name__ == "__main__":
