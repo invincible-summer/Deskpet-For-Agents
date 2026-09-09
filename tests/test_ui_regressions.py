@@ -310,6 +310,8 @@ class UiContractTests(unittest.TestCase):
         """v4.1.1 §17：启动托盘是纯运行期动作，不写 config。
 
         只有用户显式切换（set_tray_enabled）才持久化 tray_enabled。
+        v4.3 §8.2：持久化机制从 set_and_commit 改为 内存 set（立即
+        生效）+ ConfigSaveCoordinator.request_save()（debounce 落盘）。
         """
         src = self._source("pet", "app.py")
         self.assertIn("def _start_tray_runtime", src)
@@ -322,9 +324,11 @@ class UiContractTests(unittest.TestCase):
         body = method_body("_start_tray_runtime")
         self.assertNotIn("set_and_commit", body)
         self.assertNotIn("config.save", body)
-        # 持久化只发生在 set_tray_enabled
+        self.assertNotIn("request_save", body)
+        # 持久化只发生在 set_tray_enabled（内存 set + debounce 保存器）
         set_body = method_body("set_tray_enabled")
-        self.assertIn("set_and_commit", set_body)
+        self.assertIn('self.config.set("tray_enabled"', set_body)
+        self.assertIn("config_saver.request_save", set_body)
 
     def test_fleet_slot_binding_ui_preserved(self):
         """Fleet slot assignment 是 Presentation 绑定，应保留（§12.2）。"""

@@ -295,11 +295,13 @@ class Config:
         self.data = copy.deepcopy(DEFAULTS)
         self.migration_notice = False
         self._dirty = False
+        self._revision = 0   # v4.3 §8.2：每次内存修改 +1（保存协议用）
         self._last_save: ConfigSaveResult | None = None
         self.load()
 
     # ------------------------------------------------------------ 加载
     def load(self):
+        self._revision = 0   # 全量重载：旧 revision 语义作废
         loaded = self._load_json(self.path)
         notice = False
         if loaded is None:
@@ -333,51 +335,87 @@ class Config:
         """兼容入口：等价 commit()（V3 调用点逐步迁移）。"""
         return self.commit()
 
-    def commit(self, fsync: bool = False) -> ConfigSaveResult:
-        """原子保存：temp → flush →（可选 fsync）→ backup → replace。
+    def _write_data_to_disk(self, data: dict,
+                            fsync: bool = False) -> ConfigSaveResult:
+        """temp → flush →（可选 fsync）→ backup → replace。
 
-        绝不静默吞错（v4plan §9.4）；成功才清 dirty。
+        不获取 Config lock、不触碰实例状态（v4.3 §8.2）：同步 commit()
+        与异步 write_snapshot() 共用；worker 中调用绝不锁住 UI 的
+        config.set()。绝不静默吞错（v4plan §9.4）。
+        """
+        directory = os.path.dirname(self.path) or "."
+        temporary = None
+        try:
+            fd, temporary = tempfile.mkstemp(
+                prefix=".deskpet-config-", dir=directory)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                if fsync:
+                    os.fsync(f.fileno())
+            # 已有有效主文件 → 先备份（last-known-good）
+            if os.path.isfile(self.path):
+                existing = self._load_json(self.path)
+                if existing is not None:
+                    backup_path = (BACKUP_PATH
+                                   if self.path == CONFIG_PATH
+                                   else self.path + ".bak")
+                    try:
+                        if os.path.isfile(backup_path):
+                            os.unlink(backup_path)
+                        os.replace(self.path, backup_path)
+                    except OSError:
+                        pass   # 备份失败不阻塞主保存
+            os.replace(temporary, self.path)
+            temporary = None
+            return ConfigSaveResult(ok=True, path=self.path)
+        except OSError as exc:
+            return ConfigSaveResult(ok=False, path=self.path,
+                                    error=str(exc))
+        finally:
+            if temporary and os.path.exists(temporary):
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
+    def commit(self, fsync: bool = False) -> ConfigSaveResult:
+        """同步原子保存（Tk 线程只允许在退出 flush 兜底时使用；
+        运行期保存走 ConfigSaveCoordinator）。成功才清 dirty。
         """
         with self._lock:
-            directory = os.path.dirname(self.path) or "."
-            temporary = None
-            try:
-                fd, temporary = tempfile.mkstemp(
-                    prefix=".deskpet-config-", dir=directory)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(self.data, f, ensure_ascii=False, indent=2)
-                    f.flush()
-                    if fsync:
-                        os.fsync(f.fileno())
-                # 已有有效主文件 → 先备份（last-known-good）
-                if os.path.isfile(self.path):
-                    existing = self._load_json(self.path)
-                    if existing is not None:
-                        backup_path = (BACKUP_PATH
-                                       if self.path == CONFIG_PATH
-                                       else self.path + ".bak")
-                        try:
-                            if os.path.isfile(backup_path):
-                                os.unlink(backup_path)
-                            os.replace(self.path, backup_path)
-                        except OSError:
-                            pass   # 备份失败不阻塞主保存
-                os.replace(temporary, self.path)
-                temporary = None
+            result = self._write_data_to_disk(self.data, fsync)
+            self._last_save = result
+            if result.ok:
                 self._dirty = False
-                self._last_save = ConfigSaveResult(ok=True, path=self.path)
-                return self._last_save
-            except OSError as exc:
-                result = ConfigSaveResult(ok=False, path=self.path,
-                                          error=str(exc))
-                self._last_save = result
-                return result
-            finally:
-                if temporary and os.path.exists(temporary):
-                    try:
-                        os.unlink(temporary)
-                    except OSError:
-                        pass
+            return result
+
+    # ------------------------------------------------------------ 异步保存协议（v4.3 §8.2）
+    @property
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
+
+    def snapshot_for_save(self) -> tuple[int, dict]:
+        """lock 内只 deepcopy，马上返回（UI 短临界区）。"""
+        with self._lock:
+            return self._revision, copy.deepcopy(self.data)
+
+    def write_snapshot(self, revision: int,
+                       data: dict) -> ConfigSaveResult:
+        """worker 中执行磁盘写入（temp/backup/replace），不持 Config
+        lock、不改实例状态；新鲜度由 acknowledge_save 裁决。"""
+        return self._write_data_to_disk(data)
+
+    def acknowledge_save(self, revision: int,
+                         result: ConfigSaveResult) -> None:
+        """UI 线程收割 worker 结果：revision 仍是最新 → 清 dirty；
+        写期间又有新修改（revision 更大）→ 保持 dirty（下一次
+        debounce 会保存更新快照）。"""
+        with self._lock:
+            self._last_save = result
+            if result.ok and revision >= self._revision:
+                self._dirty = False
 
     def set_and_commit(self, path, value) -> ConfigSaveResult:
         self.set(path, value)
@@ -418,6 +456,7 @@ class Config:
                 node = child
             node[parts[-1]] = copy.deepcopy(value)
             self._dirty = True
+            self._revision += 1
 
     def ensure_fleet_slots(self, count: int) -> bool:
         """保证 pet-1...pet-count 均有持久化 slot（v4.3 §7.2）。
@@ -451,4 +490,5 @@ class Config:
             if changed:
                 concurrent["slots"] = slots
                 self._dirty = True
+                self._revision += 1
             return changed

@@ -54,6 +54,18 @@ class PetApp:
                                           self.presentation)
         # v4.3 §7.4：外观唯一运行期修改接口（save 策略由注入回调决定）
         from .appearance import AppearanceController
+        # v4.3 §8.2：非阻塞配置保存（650ms debounce + 单 transient
+        # worker；bridge 按 pending() 收割）
+        from .config_save import ConfigSaveCoordinator
+
+        def _on_config_saved(result):
+            # 绝不静默吞保存失败（v4plan §9.4）
+            if result is not None and getattr(result, "ok", True) is False:
+                self.toast(f"配置保存失败：{getattr(result, 'error', '')}",
+                           5)
+
+        self.config_saver = ConfigSaveCoordinator(
+            self.root, config, on_result=_on_config_saved)
 
         def _appearance_render(paths: set[str]):
             # force_state/bubble.* 影响 reconcile 决策或模型可见性，
@@ -67,7 +79,9 @@ class PetApp:
                    else UiDirty.NONE))
 
         self.appearance = AppearanceController(
-            config, self.pet_manager, request_render=_appearance_render)
+            config, self.pet_manager,
+            request_save=self.config_saver.request_save,
+            request_render=_appearance_render)
         self.pet_manager.set_hooks(
             on_activate=self.activate_agent,
             on_menu=self._build_menu,
@@ -92,6 +106,11 @@ class PetApp:
             apply_toasts=self._apply_toasts,
             tray_enabled=lambda: bool(self.config.get("tray_enabled", True)),
         )
+        self.ui.config_saver = self.config_saver
+        # v4.3 §9：异步皮肤导入结果经 build lane → poll_results 收割
+        self._import_switch_name = ""
+        self.pet_manager.build_manager.on_import_result = \
+            self._on_skin_import_result
         self.pet_manager.set_render_requester(self.ui.request_view)
 
         self._janitor_after = None
@@ -383,10 +402,11 @@ class PetApp:
                 if isinstance(slot, dict) and slot.get("id") == view.view_id:
                     slot["placement"] = placement
                     break
-            self.config.save()
+            self.config.set("presentation.concurrent.slots", slots)
         else:
             self.config.set("pet_pos", [view.anchor[0], view.anchor[1]])
-            self.config.save()
+        # v4.3 §8.2：拖动结束一次 debounce 保存（不再 Tk 线程写盘）
+        self.config_saver.request_save()
         view.invalidate_dpi()
         # v4.3：无周期 tick 兜底，拖动结束/DPI 变化后显式标 dirty
         view.mark_dirty(layout=True)
@@ -418,8 +438,9 @@ class PetApp:
         self.toast("锁定动画：" + (v if v else "自动"), 3)
 
     def _toggle_terminal_observer(self, flag: bool):
+        # 隐私开关：内存立即生效，磁盘经 debounce 保存器（§8.2）
         self.config.set("monitor.terminal_observer", bool(flag))
-        self.config.save()
+        self.config_saver.request_save()
         if flag:
             self.toast("终端观察将在重启 DeskPet 后启用", 5)
         else:
@@ -431,6 +452,26 @@ class PetApp:
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
         self._reload_skins()
+
+    # ================= 皮肤导入（v4.3 §9 异步） =================
+    def begin_skin_import(self, src_dir: str, name: str) -> None:
+        """异步导入入口：Tk 线程只排队 job + 立即非模态反馈。"""
+        self._import_switch_name = name
+        self.toast(f"正在导入皮肤 {name}…", 8)
+        self.pet_manager.build_manager.submit_import(src_dir, name)
+        self.ui.kick()   # worker 活跃 → bridge 升 125ms 档收割结果
+
+    def _on_skin_import_result(self, ok: bool, name: str,
+                               error: str) -> None:
+        """导入结果（bridge 的 poll_results 内回调，UI 线程）。"""
+        if ok:
+            self.toast(f"皮肤 {name} 导入完成，正在构建…", 5)
+            if self._import_switch_name == name:
+                self._import_switch_name = ""
+                self._switch_skin(name)
+        else:
+            self.toast(f"皮肤导入失败：{error or name}", 6)
+        self.ui.request(UiDirty.SKIN)   # 仪表盘外观页刷新皮肤列表
 
     # ================= 显示/隐藏/托盘/自启 =================
     def hide_pet(self):
@@ -502,7 +543,8 @@ class PetApp:
             self._start_tray_runtime()
         else:
             self._stop_tray_runtime()
-        self.config.set_and_commit("tray_enabled", enabled)
+        self.config.set("tray_enabled", enabled)
+        self.config_saver.request_save()
         self.ui.kick()   # bridge 档位可能变化（200↔500ms）
 
     def toggle_autostart(self) -> bool:
@@ -706,7 +748,7 @@ class PetApp:
 
     def _set_topmost(self, flag: bool):
         self.config.set("topmost", bool(flag))
-        self.config.save()
+        self.config_saver.request_save()
         for view in self.pet_manager.views.values():
             view.window.set_topmost(flag)
 
@@ -802,7 +844,9 @@ class PetApp:
                     self.dashboard.shutdown()
                 except tk.TclError:
                     pass
-            self.config.save()
+            # v4.3 §8.2：退出时有界 flush（1.5s 等 worker + dirty 兜底
+            # 同步 commit），不再无条件在 Tk 线程写盘
+            self.config_saver.flush_for_shutdown()
         finally:
             self._dismiss_active_menu()   # v4.2.3 §9：幂等，不 double-destroy
             self._destroy_agent_picker()  # v4.3：不留死弹窗

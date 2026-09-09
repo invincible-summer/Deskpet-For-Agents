@@ -617,9 +617,13 @@ class Dashboard(tk.Toplevel):
             side="left", padx=(6, 0))
         self.skin_var = tk.StringVar(
             value=str(cfg.get("skin", skins.BUILTIN_SKIN)))
-        ttk.Combobox(srow, textvariable=self.skin_var,
-                     values=sorted(skins.list_skins()),
-                     state="readonly", width=22).pack(side="right")
+        self._skin_combo = ttk.Combobox(
+            srow, textvariable=self.skin_var,
+            values=sorted(skins.list_skins()),
+            state="readonly", width=22)
+        self._skin_combo.pack(side="right")
+        # v4.3 §9：catalog revision 变化（导入完成）→ 刷新 values
+        self._skin_catalog_revision = skins.catalog_revision()
         srow2 = tk.Frame(skin_card.body, bg=LIGHT.surface)
         srow2.pack(fill="x", pady=(6, 0))
         ttk.Button(srow2, text="应用皮肤",
@@ -661,9 +665,7 @@ class Dashboard(tk.Toplevel):
                 "presentation.concurrent.slots") or [])
             if len(slots) < 2:
                 self.app.config.ensure_fleet_slots(3)
-                self.app.config.set_and_commit(
-                    "presentation.concurrent.slots",
-                    self.app.config.get("presentation.concurrent.slots"))
+                self.app.config_saver.request_save()
         self.app.presentation.set_concurrent_mode(mode)
         # v4.3：显式触发呈现 flush（即时切换，不等 bridge 收割 revision）
         self.app.ui.request(UiDirty.PRESENTATION)
@@ -675,17 +677,27 @@ class Dashboard(tk.Toplevel):
             return
         # v4.3 §7.2：先确保 pet-1..pet-N 均有持久化 slot，再更新上限
         self.app.config.ensure_fleet_slots(value)
-        self.app.config.set_and_commit(
-            "presentation.concurrent.max_targets", value)
+        self.app.config.set("presentation.concurrent.max_targets", value)
+        self.app.config_saver.request_save()
         # max_targets 影响 reconcile 的 slot_keys 计算：无周期 tick 兜底，
         # 必须显式触发
         self.app.ui.request(UiDirty.PRESENTATION)
 
     def _save_eligible(self, kind: str):
-        self.app.config.set_and_commit(
+        # 隐私/发现开关：内存立即生效；磁盘经 debounce 保存器
+        self.app.config.set(
             f"presentation.concurrent.eligible_kinds.{kind}",
             bool(self.eligible_vars[kind].get()))
+        self.app.config_saver.request_save()
         self.app.ui.request(UiDirty.PRESENTATION)
+
+    def _refresh_look_skins(self):
+        """v4.3 §9：SkinCatalog revision 变化 → 只 configure values。"""
+        revision = skins.catalog_revision()
+        if revision == self._skin_catalog_revision:
+            return
+        self._skin_catalog_revision = revision
+        self._skin_combo.configure(values=sorted(skins.list_skins()))
 
     def _refresh_fleet(self, state):
         if state is None or state.mode is not PresentationMode.FLEET:
@@ -762,7 +774,7 @@ class Dashboard(tk.Toplevel):
         cfg.set("animated", self.anim_var.get())
         cfg.set("force_state",
                 "" if self.lock_var.get() == "auto" else self.lock_var.get())
-        cfg.commit()
+        self.app.config_saver.request_save()
         for view in self.app.pet_manager.views.values():
             view.set_animated(self.anim_var.get())
             view.set_speed(values.get("speed", 1.0))
@@ -780,7 +792,9 @@ class Dashboard(tk.Toplevel):
         self.app._switch_skin(self.skin_var.get())
 
     def _import_skin(self):
-        # 原生对话框打开期间禁止失焦自动收起（前台本来就不在仪表盘）
+        # 选择目录是用户主动的系统 file dialog（保留同步）；
+        # 校验/copy2/manifest/catalog 刷新全部转入单 background lane
+        # （v4.3 §9），UI 立即非模态反馈"正在导入…"，失败走 toast
         self._native_dialog_open = True
         try:
             src = filedialog.askdirectory(
@@ -792,17 +806,7 @@ class Dashboard(tk.Toplevel):
         import re
         default = re.split(r"[\\/]+", src.rstrip("/\\"))[-1] or "myskin"
         name = default.strip() or "myskin"
-        try:
-            skins.prepare_import(src, name)
-        except Exception as e:
-            self._native_dialog_open = True
-            try:
-                messagebox.showerror("导入失败", str(e), parent=self)
-            finally:
-                self._native_dialog_open = False
-            return
-        self.app.toast(f"正在构建皮肤 {name}（数十秒）…", 60)
-        self.app._switch_skin(name)
+        self.app.begin_skin_import(src, name)
         self.skin_var.set(name)
 
     # ================================================== 监听与隐私
@@ -930,7 +934,9 @@ class Dashboard(tk.Toplevel):
                  font=pick_font(self, 9)).pack(anchor="w", pady=8)
 
     def _save(self, path, value):
-        self.app.config.set_and_commit(path, value)
+        # Monitor/privacy 开关：内存立即生效；磁盘经 debounce 保存器
+        self.app.config.set(path, value)
+        self.app.config_saver.request_save()
 
     # ================================================== 诊断
     def _build_diag(self):
@@ -1275,6 +1281,7 @@ class Dashboard(tk.Toplevel):
             elif self._page == PAGE_AGENTS:
                 self._refresh_agents(targets)
             elif self._page == PAGE_LOOK:
+                self._refresh_look_skins()
                 self._refresh_fleet(state)
             elif self._page == PAGE_DIAG:
                 self._refresh_diag()
