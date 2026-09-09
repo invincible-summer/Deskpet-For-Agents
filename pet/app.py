@@ -51,6 +51,9 @@ class PetApp:
         self.presentation = PresentationController(config)
         self.pet_manager = PetViewManager(self.root, config,
                                           self.presentation)
+        # v4.3 §7.4：外观唯一运行期修改接口（save 策略由注入回调决定）
+        from .appearance import AppearanceController
+        self.appearance = AppearanceController(config, self.pet_manager)
         self.pet_manager.set_hooks(
             on_activate=self.activate_agent,
             on_menu=self._build_menu,
@@ -295,14 +298,9 @@ class PetApp:
         view.invalidate_dpi()
 
     def set_scale(self, scale: float):
-        self.config.set("scale", round(max(.5, min(2., scale)), 2))
-        self.config.save()
-        for view in self.pet_manager.views.values():
-            view.bubble.invalidate()
-            view._win_size = None
-        if self._skin_after:
-            self.root.after_cancel(self._skin_after)
-        self._skin_after = self.root.after(300, self._reload_skins)
+        # v4.3 §7.4：经 AppearanceController（clamp + 定向 apply +
+        # 350ms 最终尺寸 build debounce + 保存策略回调）
+        self.appearance.set_global("scale", scale)
 
     def _reload_skins(self):
         self._skin_after = None
@@ -310,29 +308,19 @@ class PetApp:
             view.load_skin(self.pet_manager.build_manager)
 
     def _switch_skin(self, name: str):
-        self.config.set("skin", name)
-        self.config.save()
-        self._reload_skins()
+        self.appearance.set_global("skin", name)
 
     def _set_animated(self, flag: bool):
-        self.config.set("animated", bool(flag))
-        self.config.save()
-        for view in self.pet_manager.views.values():
-            view.set_animated(flag)
+        self.appearance.set_global("animated", bool(flag))
 
     def _set_speed(self, v: float):
-        self.config.set("speed", v)
-        self.config.save()
-        for view in self.pet_manager.views.values():
-            view.set_speed(v)
+        self.appearance.set_global("speed", v)
 
     def _toggle_bubble(self, flag: bool):
-        self.config.set("bubble.enabled", bool(flag))
-        self.config.save()
+        self.appearance.set_global("bubble.enabled", bool(flag))
 
     def _set_force_state(self, v: str):
-        self.config.set("force_state", v)
-        self.config.save()
+        self.appearance.set_global("force_state", v)
         self.toast("锁定动画：" + (v if v else "自动"), 3)
 
     def _toggle_terminal_observer(self, flag: bool):

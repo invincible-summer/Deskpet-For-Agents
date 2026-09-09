@@ -4,11 +4,12 @@
   * 每只宠物 = 一个 PetView（Toplevel + 独立 cursor + 独立 bubble）；
   * SharedAnimationCache / AnimationScheduler / SkinBuildManager 全进程
     一份，由 manager 统一持有——Pet 数量增加不复制缓存/定时器；
-  * 每 slot 的外观经 ResolvedViewConfig 以 slot override 覆盖全局
-    （null = 继承全局，v4plan §9.3）。
+  * 每 slot 的外观经 ResolvedViewConfig 以 slot appearance 覆盖全局
+    （skin=null = 继承全局，v4.3 §7.1；override 只在 FLEET 生效 §7.6）。
 """
 from __future__ import annotations
 
+import copy
 import time
 
 from actions import winkeys
@@ -31,22 +32,31 @@ STACK_GAP = 6   # 叠层卡片间隔（逻辑像素，随 scale/DPI 缩放）
 
 
 class ResolvedViewConfig:
-    """slot appearance override：null/缺失 = 继承全局（v4plan §9.3）。
+    """slot appearance override 解析（v4.3 §7.3）。
 
-    保持 `config.get(path)` 风格，现有组件无需感知 slot 存在。
+    只缓存一个小的 appearance deepcopy（避免创建时的 stale slot
+    snapshot）；运行期更新一律经 PetViewManager.refresh_slot_config()
+    显式刷新。slot=None 表示该 view 当前不应用 slot override
+    （SINGLE/AGGREGATE 的 pet-1 使用全局 skin，§7.6）。
     """
 
-    _ROOT_KEYS = {"skin", "scale", "speed", "animated", "topmost",
-                  "pet_pos"}
-
-    def __init__(self, global_config, slot: dict | None):
+    def __init__(self, global_config, slot_id: str, slot: dict | None = None):
         self.global_config = global_config
-        self.slot = dict(slot or {})
+        self.slot_id = str(slot_id)
+        self._appearance = self._extract_appearance(slot)
+
+    @staticmethod
+    def _extract_appearance(slot: dict | None) -> dict:
+        appearance = (slot or {}).get("appearance")
+        return copy.deepcopy(appearance) if isinstance(appearance, dict) else {}
+
+    def refresh_slot(self, slot: dict | None) -> None:
+        """运行期刷新 slot appearance（deepcopy 小对象）。"""
+        self._appearance = self._extract_appearance(slot)
 
     def _slot_override(self, path: str):
-        appearance = self.slot.get("appearance") or {}
         parts = path.split(".")
-        node = appearance
+        node = self._appearance
         for part in parts[:-1]:
             if not isinstance(node, dict) or part not in node:
                 return None
@@ -55,6 +65,10 @@ class ResolvedViewConfig:
         if isinstance(node, dict) and leaf in node and node[leaf] is not None:
             return node[leaf]
         return None
+
+    def overrides(self, path: str) -> bool:
+        """该 path 当前是否有 slot override 生效。"""
+        return self._slot_override(path) is not None
 
     def get(self, path, default=None):
         override = self._slot_override(path)
@@ -109,6 +123,11 @@ class PetView:
         self._skin_paths: dict[str, str] = {}
         self._build_key = None
         self._state = "sleep"
+        # v4.3 §17 皮肤运行态（仅内存，不进 config）
+        self.skin_requested_name = ""
+        self.skin_runtime_name = ""
+        self.skin_build_state = "ready"   # ready|queued|building|error|fallback
+        self.skin_build_error = ""
 
     # ------------------------------------------------------------ 皮肤
     def dpi(self) -> int:
@@ -136,24 +155,55 @@ class PetView:
         return (str(skin), self.gif_height(), fps)
 
     def load_skin(self, build_manager):
-        """请求皮肤（去重 build）；有缓存立即就绪。"""
+        """请求皮肤（去重 build）；有缓存立即就绪。
+
+        v4.3 §6.5：请求携带 view_id（waiter set）；换皮时撤销对旧
+        build key 的等待。§7.7：config 指定的皮肤缺失时 runtime 回退
+        builtin-cat（config 字符串原样保留，UI 明示），绝不无图/异常。
+        """
         key = self.desired_build_key()
+        skin, height, fps = key
+        self.skin_requested_name = skin
+        if skin not in skins.list_skins():
+            # missing skin fail-safe：runtime fallback builtin-cat
+            if self.skin_runtime_name != skins.BUILTIN_SKIN:
+                self.skin_runtime_name = skins.BUILTIN_SKIN
+                self.skin_build_state = "fallback"
+                self.skin_build_error = f"皮肤缺失：{skin}"
+            skin = skins.BUILTIN_SKIN
+            key = (skin, height, fps)
+        else:
+            self.skin_runtime_name = skin
+            self.skin_build_error = ""
+        if self._build_key is not None and self._build_key != key:
+            build_manager.forget(self.view_id, self._build_key)
         self._build_key = key
-        skin, height, _fps = key
         paths = skins.built_gifs(skin, height)
         if paths:
             self._skin_ready(paths)
+            if self.skin_build_state != "fallback":
+                self.skin_build_state = "ready"
             return
         alt = skins.built_gifs_any(skin)
         if alt:
             self._skin_ready(alt)
-        build_manager.request(*key)
+        if self.skin_build_state != "fallback":
+            self.skin_build_state = "queued"
+        build_manager.request(self.view_id, skin, height, fps)
 
     def build_result(self, key, kind, payload, build_manager):
         if key != self._build_key:
             return
         if kind == "ok":
+            if self.skin_build_state != "fallback":
+                self.skin_build_state = "ready"
+                self.skin_build_error = ""
             self._skin_ready(payload)
+        elif kind == "err":
+            # v4.3 §17：构建失败保留旧画面，继续运行
+            if self.skin_build_state != "fallback":
+                self.skin_build_state = "error"
+                self.skin_build_error = str(payload)[:200]
 
     def _skin_ready(self, paths: dict[str, str]):
         self._skin_paths = dict(paths)
@@ -321,6 +371,8 @@ class PetView:
 
     def close(self, build_manager=None):
         self.release_images()
+        if build_manager is not None and self._build_key is not None:
+            build_manager.forget(self.view_id, self._build_key)
         self.scheduler.unregister(self.view_id)
         if build_manager is not None and self._build_key is not None:
             build_manager.forget(self._build_key)
@@ -419,6 +471,11 @@ class PetViewManager:
             __import__("pet.skins", fromlist=["SkinBuildManager"]).SkinBuildManager())
         self.views: dict[str, PetView] = {}
         self._hooks = None   # app 提供 activate/menu/interact/moved 回调
+        self._last_sync_mode = None
+        # v4.3 §7.5/§13.3：scale 快速跨 step 只为最终稳定值 build
+        # （350ms debounce；SkinBuildManager 同 key 去重兜底）
+        self._build_debounce_after = None
+        self._build_debounce_views: set[str] = set()
         # v4.3 §18.2：用户显式"隐藏全部桌宠"的运行期 override。
         # 不持久化；进程重启固定 False（下次启动至少一宠重新可见）。
         self.user_hidden = False
@@ -429,25 +486,26 @@ class PetViewManager:
                        on_double_vacant)
 
     # ------------------------------------------------------------ slot 配置
-    def _slot_config(self, slot_id: str, state: PresentationState):
+    def _find_slot(self, slot_id: str) -> dict | None:
         slots = self.config.get("presentation.concurrent.slots", []) or []
-        slot = None
         for item in slots:
             if isinstance(item, dict) and item.get("id") == slot_id:
-                slot = item
-                break
-        if slot is None:
-            # 单目标/未配置 slot：隐式 slot 继承全局（pet_pos 等根键）
-            slot = {"id": slot_id,
-                    "appearance": None,
-                    "placement": {"manual": False}}
-        return ResolvedViewConfig(self.config, slot)
+                return item
+        return None
+
+    def _slot_config(self, slot_id: str):
+        # v4.3 §7.6：slot appearance override 只在 FLEET 生效；
+        # SINGLE/AGGREGATE 的 pet-1 使用全局外观（未配置 slot 时同样
+        # 隐式继承全局 pet_pos 等根键）。
+        fleet_active = (self.presentation is not None
+                        and self.presentation.mode is PresentationMode.FLEET)
+        slot = self._find_slot(slot_id) if fleet_active else None
+        return ResolvedViewConfig(self.config, slot_id, slot)
 
     def ensure_view(self, slot_id: str):
         if slot_id in self.views:
             return self.views[slot_id]
-        state = PresentationMode.SINGLE   # 仅用于默认隐式 slot
-        view_config = self._slot_config(slot_id, None)
+        view_config = self._slot_config(slot_id)
         on_activate, on_menu, on_interact, on_moved, on_double_vacant = \
             self._hooks or (lambda k: None, lambda m: None, lambda: None,
                             lambda v: None, None)
@@ -471,6 +529,110 @@ class PetViewManager:
         if view is not None:
             view.close(self.build_manager)
 
+    # ------------------------------------------------------------ 外观定向更新
+    def refresh_slot_config(self, slot_id: str) -> None:
+        """运行期刷新某个 view 的 slot appearance 解析（v4.3 §7.3）。
+
+        mode 切换（Fleet↔Aggregate）后必须调用：SINGLE/AGGREGATE 的
+        pet-1 不应用 slot override，FLEET 恢复。
+        """
+        view = self.views.get(slot_id)
+        if view is None:
+            return
+        if self.presentation.mode is PresentationMode.FLEET:
+            view.view_config.refresh_slot(self._find_slot(slot_id))
+        else:
+            view.view_config.refresh_slot(None)
+
+    def refresh_all_slot_configs(self) -> None:
+        for slot_id in list(self.views):
+            self.refresh_slot_config(slot_id)
+
+    def slot_skin_overridden(self, slot_id: str) -> bool:
+        view = self.views.get(slot_id)
+        return bool(view and view.view_config.overrides("skin"))
+
+    def apply_appearance_change(self, *, scope: str,
+                                changed_paths: set[str]) -> set[str]:
+        """定向应用一次外观修改（v4.3 §7.5 行为矩阵）。
+
+        scope="global" 或 slot_id；返回需要 redraw 的 view id 集合。
+        skin：旧画面保持，按 build dedup 请求新 build；scale：layout
+        立即变 + 新尺寸 build；speed/animated：cursor 立即变；
+        bubble.*：invalidate + redraw；force_state：重新计算动画决策。
+        """
+        affected: set[str] = set()
+        # 先刷新 resolved config（global 修改影响所有继承者）
+        if scope == "global":
+            self.refresh_all_slot_configs()
+        else:
+            self.refresh_slot_config(scope)
+
+        views = dict(self.views)
+        if scope != "global":
+            view = views.get(scope)
+            views = {scope: view} if view is not None else {}
+
+        if "skin" in changed_paths:
+            for slot_id, view in views.items():
+                if scope == "global" and self.slot_skin_overridden(slot_id):
+                    continue   # slot override 不跟随全局（§7.6）
+                view.load_skin(self.build_manager)
+                affected.add(slot_id)
+        if "scale" in changed_paths:
+            for slot_id, view in views.items():
+                view.invalidate_dpi()
+                view.bubble.invalidate()
+                view._win_size = None
+                affected.add(slot_id)
+            # 布局立即变；最终尺寸 build 走 350ms debounce，
+            # 快速滑过多 step 不排队构建中间尺寸。
+            self._request_deferred_build(set(affected))
+        if "speed" in changed_paths:
+            for slot_id, view in views.items():
+                view.set_speed(float(view.view_config.get("speed", 1.0) or 1.0))
+                affected.add(slot_id)
+        if "animated" in changed_paths:
+            for slot_id, view in views.items():
+                view.set_animated(bool(view.view_config.get("animated", True)))
+                affected.add(slot_id)
+        if any(p == "force_state" or p.startswith("bubble.") for p in
+               changed_paths):
+            for slot_id, view in views.items():
+                view.bubble.invalidate()
+                affected.add(slot_id)
+        return affected
+
+    # ------------------------------------------------------------ build debounce
+    def _request_deferred_build(self, view_ids: set[str],
+                                delay_ms: int = 350) -> None:
+        """合并短时间内的最终尺寸 build 请求（v4.3 §13.3）。"""
+        self._build_debounce_views |= set(view_ids)
+        if self._build_debounce_after is not None:
+            try:
+                self.root.after_cancel(self._build_debounce_after)
+            except Exception:
+                pass
+        self._build_debounce_after = self.root.after(
+            delay_ms, self._flush_deferred_build)
+
+    def _flush_deferred_build(self) -> None:
+        self._build_debounce_after = None
+        view_ids, self._build_debounce_views = self._build_debounce_views, set()
+        for slot_id in sorted(view_ids):
+            view = self.views.get(slot_id)
+            if view is not None:
+                view.load_skin(self.build_manager)
+
+    def cancel_deferred_build(self) -> None:
+        if self._build_debounce_after is not None:
+            try:
+                self.root.after_cancel(self._build_debounce_after)
+            except Exception:
+                pass
+            self._build_debounce_after = None
+        self._build_debounce_views = set()
+
     # ------------------------------------------------------------ 每轮同步
     def sync(self, state: PresentationState,
              targets: dict, now: float, force_state: str = ""):
@@ -489,6 +651,10 @@ class PetViewManager:
             desired = set(state.slot_keys) or {"pet-1"}   # zero-agent fallback
         else:
             desired = {"pet-1"}
+        # v4.3 §7.6：mode 切换后刷新所有 view 的 slot override 解析
+        if state.mode is not self._last_sync_mode:
+            self._last_sync_mode = state.mode
+            self.refresh_all_slot_configs()
         for slot_id in sorted(desired):
             if slot_id not in self.views:
                 self.ensure_view(slot_id)
@@ -600,6 +766,7 @@ class PetViewManager:
 
     def stop(self):
         self.scheduler.stop()
+        self.cancel_deferred_build()
         # 先于 root.destroy() 在主线程释放全部 PhotoImage（防异线程 GC
         # 触碰 Tcl；v4.2.1 CI 崩溃修复），再清缓存帧
         for view in self.views.values():

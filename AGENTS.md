@@ -273,3 +273,7 @@ Work is done only when all of the following are true:
 - remaining limitations are explicitly recorded rather than hidden by heuristics.
 
 When uncertain, choose the solution that is simpler, more conservative, more measurable, and cheaper while preserving the approved semantics.
+
+## Attention
+
+If the test runs overtime continuously, **please check the test logic to see if there is a waiting person trigger or an infinite loop vulnerability**.

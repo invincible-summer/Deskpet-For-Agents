@@ -82,7 +82,11 @@ def built_gifs(skin: str, height: int) -> dict[str, str] | None:
 
 def build_skin(skin: str, height: int, fps: int, log=None) -> dict[str, str]:
     """构建（或复用缓存）皮肤 GIF。耗时操作，勿在 UI 线程调用。
-    优先用子进程跑转换（numpy/scipy 内存随子进程退出释放）。"""
+
+    v4.3 §6.6：转换只走独立子进程（numpy/scipy 内存随子进程退出
+    释放）；子进程失败就是该 build 失败——绝不在 DeskPet 主进程
+    重新 import 转换器（那会把 numpy/scipy 载入常驻 UI 进程）。
+    """
     cached = built_gifs(skin, height)
     if cached:
         return cached
@@ -92,20 +96,12 @@ def build_skin(skin: str, height: int, fps: int, log=None) -> dict[str, str]:
         # 单帧 GIF + meta JSON；产物只在 assets/cache/。
         return _build_builtin_skin(height, log)
     src = os.path.join(PETS_DIR, skin)
-    manifest = {}
-    mf = os.path.join(src, "manifest.json")
-    if os.path.isfile(mf):
-        try:
-            with open(mf, encoding="utf-8") as f:
-                manifest = json.load(f)
-        except ValueError:
-            pass
     out_dir = cache_dir(skin, height)
     if log:
         log(f"正在构建皮肤 {skin}（{height}px）…")
     if not _convert_in_subprocess(src, out_dir, height, fps, log):
-        from tools.convert import convert_skin  # 兜底：进程内转换（重导入）
-        convert_skin(src, out_dir, height=height, fps=fps, manifest=manifest, log=log)
+        raise RuntimeError(
+            f"皮肤 {skin} 构建失败：converter 子进程失败（继续使用原皮肤）")
     built = built_gifs(skin, height)
     if not built:
         raise RuntimeError(f"皮肤 {skin} 构建失败")
@@ -142,7 +138,11 @@ def _build_builtin_skin(height: int, log=None) -> dict[str, str]:
 
 def _convert_in_subprocess(src: str, out_dir: str, height: int, fps: int,
                            log=None) -> bool:
-    """python -m tools.convert 子进程转换。成功返回 True。"""
+    """python -m tools.convert 子进程转换。成功返回 True。
+
+    v4.3 §6.6：失败不再回退进程内转换——直接报告 build error，
+    主进程保持不加载 numpy/scipy。
+    """
     import subprocess
     import sys
     exe = sys.executable
@@ -158,13 +158,13 @@ def _convert_in_subprocess(src: str, out_dir: str, height: int, fps: int,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as e:
         if log:
-            log(f"子进程转换异常，改用进程内转换: {e!r}")
+            log(f"子进程转换异常: {e!r}")
         return False
     if r.returncode == 0:
         return True
     if log:
         err = r.stderr.decode("utf-8", errors="replace")[-400:]
-        log(f"子进程转换失败(code={r.returncode})，改用进程内转换: {err}")
+        log(f"子进程转换失败(code={r.returncode}): {err}")
     return False
 
 
@@ -201,34 +201,55 @@ BuildKey = tuple[str, int, int]   # (skin, height, fps)
 
 
 class SkinBuildManager:
-    """skin build 去重（v4plan §11.4）：同一 (skin,height,fps) 只 build
-    一次；全局最多一个 converter 同时运行。
+    """skin build 去重（v4plan §11.4；v4.3 §6.5 waiter view set）：
+    同一 (skin,height,fps) 只 pending 一次、只启动一个 converter；
+    完成结果 fan-out 给所有等待中的 view；某个 view 中途换皮时
+    通过 forget() 从 waiter set 撤销，不影响仍等待旧 key 的其他 view。
 
-    request() 记录等待者；poll_results() 由 UI tick 调用，返回
-    [(key, "ok"/"err", payload)]，驱动所有等待中的 PetView。
+    全局最多一个 converter 子进程；不同 skin 不并发转换。
     """
 
     def __init__(self):
-        self._waiters: dict[BuildKey, int] = {}    # key → 等待 view 数
+        # v4.3 §6.5：key → 等待中的 view id 集合（≤8 views）
+        self._waiters: dict[BuildKey, set[str]] = {}
         self._queue: "queue.Queue | None" = None   # 当前唯一转换
         self._current: BuildKey | None = None
         self._pending: list[BuildKey] = []
         self._results: list[tuple[BuildKey, str, object]] = []
         self._last_paths: dict[BuildKey, dict] = {}   # 成功结果缓存
 
-    def request(self, skin: str, height: int, fps: int) -> BuildKey:
-        """请求一个 build（幂等）；返回 build key。"""
+    def request(self, view_id: str, skin: str, height: int,
+                fps: int) -> BuildKey:
+        """请求一个 build（幂等）；返回 build key。
+
+        同一 key 被 N 个 view 请求只进入 pending 一次；结果 fan-out。
+        """
         key = (str(skin), int(height), int(fps))
         if key in self._last_paths:
             self._results.append((key, "ok", self._last_paths[key]))
             return key
-        if key in self._waiters:
-            self._waiters[key] += 1
-            return key
-        self._waiters[key] = 1
-        self._pending.append(key)
-        self._maybe_start()
+        waiters = self._waiters.get(key)
+        if waiters is None:
+            self._waiters[key] = {view_id}
+            self._pending.append(key)
+            self._maybe_start()
+        else:
+            waiters.add(view_id)
         return key
+
+    def forget(self, view_id: str, key: BuildKey):
+        """view 不再等待某 build（换皮/关闭时撤销等待）。"""
+        waiters = self._waiters.get(key)
+        if waiters is None:
+            return
+        waiters.discard(view_id)
+        if not waiters:
+            self._waiters.pop(key, None)
+            if key in self._pending:
+                self._pending.remove(key)
+
+    def waiting_views(self, key: BuildKey) -> set[str]:
+        return set(self._waiters.get(key, ()))
 
     def _maybe_start(self):
         if self._queue is not None or not self._pending:
@@ -256,15 +277,6 @@ class SkinBuildManager:
                 self._maybe_start()
         results, self._results = self._results, []
         return results
-
-    def forget(self, key: BuildKey):
-        """slot 不再需要某 build（view 关闭时减引用）。"""
-        if key in self._waiters:
-            self._waiters[key] -= 1
-            if self._waiters[key] <= 0:
-                self._waiters.pop(key, None)
-                if key in self._pending:
-                    self._pending.remove(key)
 
     def building(self) -> bool:
         return self._queue is not None or bool(self._pending)
