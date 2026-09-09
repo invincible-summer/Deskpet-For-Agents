@@ -46,6 +46,7 @@ class PiFile(FileState):
         self.input_summary = ""
         self.error_text = ""
         self.error_ts = 0.0
+        self.done_ts = 0.0
         self.last_assistant_ts = 0.0
         self.last_tool_ts = 0.0
         self.last_activity_kind = ""
@@ -118,6 +119,7 @@ class PiFile(FileState):
         content = msg.get("content")
         blocks = content if isinstance(content, list) else (
             [{"type": "text", "text": content}] if isinstance(content, str) else [])
+        had_assistant_text = False
         for block in blocks:
             if not isinstance(block, dict):
                 continue
@@ -131,6 +133,7 @@ class PiFile(FileState):
                     self.phase = Phase.ANSWERING
                     self.turn_active = True
                     self.turn_known_over = False
+                    had_assistant_text = True
             elif role == "user" and btype in {"text", "input_text"}:
                 value = _text(block.get("text") or block.get("content"))
                 if value.strip():
@@ -160,6 +163,80 @@ class PiFile(FileState):
                     self.last_assistant_ts = ts
                     self.last_activity_kind = "assistant"
 
+        # v4.2.3 §8.1：pi v3 assistant.stopReason 决定 turn 生命周期；
+        # 独立 role=toolResult message 只是活动证据。
+        if role == "assistant":
+            self._apply_stop_reason(msg, ts, had_assistant_text)
+        elif role == "toolResult":
+            self._apply_tool_result_message(msg, ts)
+
+    def _apply_stop_reason(self, msg: dict, ts: float,
+                           had_assistant_text: bool = False):
+        """pi v3 stopReason: stop|length|toolUse|error|aborted（§8.1）。
+
+        unknown/empty → 保持保守 activity evidence，不凭空宣布完成。
+        """
+        reason = str(msg.get("stopReason") or "").strip().lower()
+        if reason == "tooluse":
+            self.turn_active = True
+            self.turn_known_over = False
+            if self.phase in (Phase.NONE, Phase.ANSWERING, Phase.THINKING):
+                self.phase = Phase.EXECUTING
+            return
+        if reason == "stop":
+            self.turn_active = False
+            self.turn_known_over = True
+            self.done_ts = ts
+            return
+        if reason == "length":
+            # 同 stop；可标记长度限制，但不是 ERROR
+            self.turn_active = False
+            self.turn_known_over = True
+            self.done_ts = ts
+            if not had_assistant_text:
+                self.last_text = "输出达到长度限制"
+                self.last_activity_kind = "assistant"
+                self.last_assistant_ts = ts
+            return
+        if reason == "error":
+            self._set_error({"message": msg.get("errorMessage")
+                             or msg.get("error") or msg.get("message")}, ts)
+            return
+        if reason == "aborted":
+            # 不伪造成功庆祝：无 DONE 窗口，直接回 IDLE
+            self.turn_active = False
+            self.turn_known_over = True
+            self.done_ts = 0.0
+            self.phase = Phase.NONE
+            return
+        # unknown/empty：维持 block 处理后的保守状态
+
+    def _apply_tool_result_message(self, msg: dict, ts: float):
+        """独立 role=toolResult message（pi v3，§8.1）。
+
+        isError=True 只表示工具结果失败，不能把整个 Agent 置 ERROR——
+        pi 可能继续推理并恢复；最终 turn 状态由后续 assistant stopReason
+        决定。
+        """
+        name = str(msg.get("toolName") or msg.get("tool")
+                   or msg.get("toolCallId") or "?")
+        content = msg.get("content")
+        if isinstance(content, list):
+            value = " ".join(
+                _text(item) if isinstance(item, dict) else str(item)
+                for item in content)
+        else:
+            value = _text(content)
+        value = value.strip()
+        self.last_tool = shorten(f"{name}: {value}" if value else name,
+                                 SUMMARY_MAX)
+        self.last_tool_ts = ts
+        self.last_activity_kind = "tool"
+        if value:
+            self.last_text = shorten(value, SUMMARY_MAX)
+        phase = classify_phase(name, value)
+        self.phase = phase if phase is not Phase.NONE else Phase.EXECUTING
+
     def _summary_text(self) -> str:
         if self.last_activity_kind == "assistant" and self.last_text:
             return self.last_text
@@ -183,6 +260,13 @@ class PiFile(FileState):
             obs.phase = Phase.USER_INPUT
             obs.confidence = Confidence.EXACT
             obs.summary = shorten(self.input_summary or "等待输入", SUMMARY_MAX)
+            return obs
+        if self.done_ts and 0 <= now - self.done_ts < 8:
+            # assistant stopReason=stop/length → 短 DONE 展示窗口，之后 IDLE
+            obs.status = Status.DONE
+            obs.phase = Phase.NONE
+            obs.confidence = Confidence.EXACT
+            obs.summary = shorten(self._summary_text() or "回合完成", SUMMARY_MAX)
             return obs
         if self.turn_active:
             obs.status = Status.WORKING

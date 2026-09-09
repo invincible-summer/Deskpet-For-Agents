@@ -20,6 +20,7 @@ from . import autostart, skins
 from .labels import mode_text, phase_text, status_text
 from .presentation import PresentationMode
 from .theme import LIGHT, STATUS_COLOR, pick_font
+from .version import APP_LABEL as APP_VERSION
 from .widgets import (
     Card,
     Expander,
@@ -40,7 +41,7 @@ PAGE_MONITOR = "监听与隐私"
 PAGE_DIAG = "诊断"
 PAGE_SETTINGS = "设置"
 
-APP_VERSION = "DeskPet V4.2.2"
+# APP_VERSION 由 pet.version.APP_LABEL 提供（v4.2.3 §10.1 统一版本源）
 
 _BINDING_LABELS = {
     WindowBindingConfidence.CONFIRMED: "已确认",
@@ -602,7 +603,7 @@ class Dashboard(tk.Toplevel):
                       "皮肤\"后按当前尺寸构建（几十秒）。").pack(
             side="left", padx=(6, 0))
         self.skin_var = tk.StringVar(
-            value=str(cfg.get("skin", "amiya")))
+            value=str(cfg.get("skin", skins.BUILTIN_SKIN)))
         ttk.Combobox(srow, textvariable=self.skin_var,
                      values=sorted(skins.list_skins()),
                      state="readonly", width=22).pack(side="right")
@@ -1005,13 +1006,16 @@ class Dashboard(tk.Toplevel):
                 f" · metadata={stats.get('metadata_pid_count', 0)}"
                 f" · uia事件={stats.get('events', 0)}"
                 f" · 可见读取={stats.get('visible_reads', 0)}"
+                f"（pending {stats.get('pending_visible_reads', 0)}"
+                f" · retry {stats.get('subscription_retry_count', 0)}）"
                 f" · uia队列丢弃={stats.get('uia_queue_dropped', 0)}\n"
                 f"pet_views={stats.get('pet_views', 0)}"
                 f" · cache {stats.get('cache_bytes', 0) // 1024}KB"
                 f"/{stats.get('cache_budget', 0) // 1024}KB"
                 f"（{stats.get('cache_frames', 0)} 帧）"
                 f" · skin_build_pending={stats.get('skin_build_pending', 0)}"
-                f" · exit_watched={stats.get('exit_watched', 0)}")
+                f" · exit_watched={stats.get('exit_watched', 0)}"
+                f" · detached过滤={stats.get('detached_filtered_count', 0)}")
         self.diag_perf.configure(text=perf)
 
         logs = "\n".join(monitor.recent_logs())

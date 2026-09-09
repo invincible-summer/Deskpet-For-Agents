@@ -13,11 +13,15 @@ import unittest
 from agents.models import Confidence, EvidenceSource, Status
 from agents.terminal_uia import (
     APPROVAL_TTL,
+    CONTROL_VISIBLE_READ_MIN_INTERVAL,
     DELTA_MAX,
     EVENT_QUEUE_MAX,
     GLOBAL_VISIBLE_READ_LIMIT,
+    MAX_CONTROLS,
+    MAX_VISIBLE_READS_PER_POLL,
     RING_MAX,
     SCREEN_DIGEST_PER_POLL,
+    SUBSCRIPTION_RETRY_SEC,
     UIA_CALL_QUEUE_MAX,
     WT_WINDOW_CLASS,
     CodexTerminalRecognizer,
@@ -30,6 +34,7 @@ from agents.terminal_uia import (
     TerminalLayout,
     TerminalObserver,
     UiaBackend,
+    VisibleReadReason,
     WEAK_TRIGGER_RE,
 )
 from agents.terminal_resolver import TerminalObservationResolver
@@ -353,8 +358,9 @@ class TextChangedFallbackTests(unittest.TestCase):
         observer.poll(NOW + 0.2)
         # 8 个 dirty control，全局预算 6/s：最多读 6 次
         self.assertLessEqual(len(backend.reads), GLOBAL_VISIBLE_READ_LIMIT)
-        # 预算耗尽的 control 被推迟，下一轮（1s 窗口滑过后）再读
-        self.assertTrue(observer._dirty_controls or len(backend.reads) == 8)
+        # 预算耗尽的请求保留 pending（v4.2.3 broker），下一轮再服务
+        self.assertTrue(observer._pending_reads or len(backend.reads) == 8)
+        self.assertLessEqual(len(observer._pending_reads), MAX_CONTROLS)
 
     def test_waiting_recheck_not_debounced(self):
         observer, backend = self._observer_with_control(
@@ -627,6 +633,177 @@ class ObservationResolverTests(unittest.TestCase):
         out = resolver.resolve([inst], controls, {}, NOW)
         self.assertEqual(out[inst.key].confidence,
                          ObservationBindingConfidence.HIGH)
+
+
+class VisibleReadBrokerTests(unittest.TestCase):
+    """v4.2.3 §5.1 统一可见读取 broker：全路径单一生产入口 + 预算。"""
+
+    def _observer(self, n=1):
+        observer, backend = make_observer()
+        for i in range(n):
+            cid = (11, (i,))
+            backend.controls[cid] = control(11, (i,), f"p{i}")
+            backend.visible[cid] = CODEX_APPROVAL_VISIBLE
+        observer.refresh_controls(force=True)
+        return observer, backend
+
+    def test_backend_read_visible_only_called_from_broker(self):
+        # AC-UIA-01：生产代码中 backend.read_visible 只能从
+        # _read_visible_once 调用（源码静态检查，测试 Fake 除外）
+        import pathlib
+        src = pathlib.Path("agents", "terminal_uia.py")
+        if not src.exists():
+            src = pathlib.Path(__file__).resolve().parents[1] / "agents" / "terminal_uia.py"
+        text = src.read_text(encoding="utf-8")
+        import re as _re
+        hits = [line.strip() for line in text.splitlines()
+                if "read_visible(" in line and "def read_visible" not in line]
+        producers = [h for h in hits
+                     if "self.backend.read_visible" in h]
+        self.assertEqual(len(producers), 1)
+        self.assertIn("self.backend.read_visible(control_id)", producers[0])
+
+    def test_single_control_interval_enforced(self):
+        # AC-UIA-02：单 control ≥0.5s 间隔
+        observer, backend = self._observer(1)
+        cid = (11, (0,))
+        backend.emit(cid, "notification",
+                     "Would you like to run the following command?", ts=NOW)
+        observer.poll(NOW)
+        self.assertEqual(len(backend.reads), 1)
+        # 再触发一个弱触发（不同事件流）：同 control 间隔内不读
+        backend.emit(cid, "notification",
+                     "Would you like to proceed? yes/no", ts=NOW + 0.2)
+        observer.poll(NOW + 0.2)
+        self.assertEqual(len(backend.reads), 1)
+        observer.poll(NOW + 0.6)
+        self.assertLessEqual(len(backend.reads), 2)
+
+    def test_per_poll_max_three_real_reads(self):
+        # AC-UIA-03 + §5.1：一次 poll 最多 3 次真实 read
+        observer, backend = self._observer(8)
+        for i in range(8):
+            backend.emit((11, (i,)), "notification",
+                         "Would you like to run the following command?",
+                         ts=NOW)
+        observer.poll(NOW)
+        self.assertEqual(len(backend.reads), MAX_VISIBLE_READS_PER_POLL)
+        # 剩余请求 pending（每 control 最多 1 个 → ≤MAX_CONTROLS）
+        self.assertLessEqual(len(observer._pending_reads), MAX_CONTROLS)
+
+    def test_priority_upgrade_and_pending_bounded(self):
+        # 弱触发风暴不能扩大 pending；高优先级升级同 control 旧请求
+        observer, backend = self._observer(16)
+        for i in range(16):
+            backend.emit((11, (i,)), "activity", "", ts=NOW)
+        observer.poll(NOW + 0.2)   # 16 个 TEXT_FALLBACK 到期
+        self.assertLessEqual(len(observer._pending_reads), MAX_CONTROLS)
+        stats = observer.stats
+        self.assertLessEqual(stats["pending_visible_reads"], MAX_CONTROLS)
+        by_reason = stats["visible_reads_by_reason"]
+        self.assertEqual(
+            sum(by_reason.values()), stats["visible_reads"])
+
+    def test_read_failure_not_counted_and_no_fake_waiting(self):
+        # 读取失败：不消耗预算 token、不伪造 WAITING
+        observer, backend = self._observer(1)
+        cid = (11, (0,))
+
+        def boom(_control_id):
+            raise RuntimeError("uia broken")
+        backend.read_visible = boom
+        backend.emit(cid, "notification",
+                     "Would you like to run the following command?", ts=NOW)
+        observer.poll(NOW)
+        self.assertEqual(observer.observations, {})
+        self.assertEqual(len(observer._visible_read_times), 0)
+        self.assertEqual(observer.stats["visible_reads"], 0)
+
+    def test_screen_digest_shares_budget_with_approval(self):
+        # 全部通道共用同一预算：任意 1s 窗口 ≤6
+        observer, backend = self._observer(6)
+        prev = 0
+        reads_per_step = []
+        for step in range(10):
+            now = NOW + step * 0.25
+            for i in range(6):
+                backend.emit((11, (i,)), "activity", "", ts=now)
+            observer.poll(now)
+            total = len(backend.reads)
+            reads_per_step.append(total - prev)
+            prev = total
+        # 任意 1s（4 个 step）窗口内的读取总数 ≤6（允许 +1 边界噪声）
+        for start in range(len(reads_per_step) - 3):
+            window = sum(reads_per_step[start + k] for k in range(4))
+            self.assertLessEqual(window, GLOBAL_VISIBLE_READ_LIMIT + 1,
+                                 f"1s window at step {start}: {window}")
+
+
+class SubscriptionRetryTests(unittest.TestCase):
+    """v4.2.3 §5.2：订阅瞬时失败在 topology 不变时自动重试。"""
+
+    class FlakyBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.failing = False
+            self.sync_calls = 0
+
+        def sync_control_subscriptions(self, controls):
+            self.sync_calls += 1
+            super().sync_control_subscriptions(controls)
+
+        def subscription_retry_needed(self):
+            return self.failing
+
+    def _observer(self):
+        backend = self.FlakyBackend()
+        observer = TerminalObserver(backend,
+                                    cfg={"terminal_observer": True})
+        observer._started = True
+        observer._last_discover = time.time()
+        control_id = (11, (1,))
+        backend.controls[control_id] = control(11, (1,), "x")
+        observer.refresh_controls(force=True)
+        return observer, backend, control_id
+
+    def test_retry_when_flag_set_and_interval_elapsed(self):
+        observer, backend, cid = self._observer()
+        base = backend.sync_calls
+        backend.failing = True
+        observer.poll(NOW)
+        self.assertEqual(backend.sync_calls, base + 1)
+        self.assertEqual(observer.stats["subscription_retry_count"], 1)
+        # 2s 内不重复重试（无空 UIA command 风暴）
+        observer.poll(NOW + 1.0)
+        self.assertEqual(backend.sync_calls, base + 1)
+        observer.poll(NOW + SUBSCRIPTION_RETRY_SEC + 0.1)
+        self.assertEqual(backend.sync_calls, base + 2)
+
+    def test_healthy_backend_never_retries(self):
+        # AC-UIA-04：healthy 时 retry counter 保持 0
+        observer, backend, cid = self._observer()
+        base = backend.sync_calls
+        for step in range(5):
+            observer.poll(NOW + step * 0.5)
+        self.assertEqual(backend.sync_calls, base)
+        self.assertEqual(observer.stats["subscription_retry_count"], 0)
+
+    def test_uia_backend_flag_requires_full_coverage(self):
+        # UiaBackend 覆盖判定：desired control/window 全部有活跃订阅才清除
+        backend = UiaBackend()
+        a = ObservedTerminalControl(control_id=(1, (1,)), hwnd=1,
+                                    window_pid=5, title="a")
+        backend._control_subscriptions[(1, (1,))] = object()
+        backend._window_subscriptions[1] = object()
+        self.assertTrue(backend._subscriptions_covered([a]))
+        b_missing = ObservedTerminalControl(control_id=(1, (2,)), hwnd=1,
+                                            window_pid=5, title="b")
+        self.assertFalse(backend._subscriptions_covered([a, b_missing]))
+        w_missing = ObservedTerminalControl(control_id=(1, (1,)), hwnd=9,
+                                            window_pid=5, title="a")
+        self.assertFalse(backend._subscriptions_covered([w_missing]))
+        # 空列表 = 全部覆盖（没有期望订阅）
+        self.assertTrue(backend._subscriptions_covered([]))
 
 
 if __name__ == "__main__":

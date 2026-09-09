@@ -204,7 +204,16 @@ class PetWindow:
         try:
             menu.tk_popup(ev.x_root, ev.y_root)
         finally:
-            menu.grab_release()
+            # v4.2.3 §9：finally 显式销毁，不依赖 Python GC 决定
+            # Tk menu widget 生命周期。
+            try:
+                menu.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                menu.destroy()
+            except tk.TclError:
+                pass
 
     def hit_button(self, x: int, y: int):
         if self._hit_cb:

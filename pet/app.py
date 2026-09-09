@@ -28,6 +28,7 @@ from .dashboard import Dashboard
 from .labels import status_text
 from .petview import PetView, PetViewManager
 from .presentation import PresentationController, PresentationMode, PresentationState
+from .version import APP_LABEL
 
 INTERACT_LINES = [
     "摸摸头～今天也要加油哦",
@@ -78,7 +79,7 @@ class PetApp:
         self._closing = False
 
         if getattr(config, "migration_notice", False):
-            self.toast("DeskPet V4.2.2：被动监听 · 终端窗口唤起 · 并发需手动开启", 8)
+            self.toast(f"{APP_LABEL}：被动监听 · 终端窗口唤起 · 并发需手动开启", 8)
         if bool(self.config.get("tray_enabled", True)):
             self._start_tray_runtime()
 
@@ -344,7 +345,7 @@ class PetApp:
 
     def _rebuild_skin(self):
         from .config import CACHE_DIR
-        d = skins.cache_dir(self.config.get("skin", "amiya"), 240)
+        d = skins.cache_dir(self.config.get("skin", skins.BUILTIN_SKIN), 240)
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
         self._reload_skins()
@@ -442,7 +443,35 @@ class PetApp:
         except queue.Empty:
             pass
 
+    # ================= ephemeral 菜单生命周期（v4.2.3 §9） =================
+    def _destroy_menu(self, menu):
+        """幂等销毁一个 popup menu；任何阶段失败都不抛 TclError。"""
+        if menu is None:
+            return
+        try:
+            menu.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            menu.unpost()
+        except tk.TclError:
+            pass
+        try:
+            menu.destroy()
+        except tk.TclError:
+            pass
+
+    def _dismiss_active_menu(self):
+        """销毁当前 tray popup（进程内最多一个）；幂等。"""
+        menu = self._active_menu
+        self._active_menu = None
+        self._destroy_menu(menu)
+
     def _tray_menu(self):
+        # v4.2.3 §9：先确定性销毁旧 popup（最多一个 tray menu），
+        # tk_popup + finally 销毁，不长期持有 _active_menu，不加
+        # click-away polling/focus watcher。
+        self._dismiss_active_menu()
         menu = tk.Menu(self.root, tearoff=0)
         self._active_menu = menu
         menu.add_command(
@@ -457,13 +486,15 @@ class PetApp:
             import ctypes
             pt = ctypes.wintypes.POINT()
             ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-            menu.post(pt.x, pt.y)
+            menu.tk_popup(pt.x, pt.y)
         except (OSError, tk.TclError):
-            try:
-                menu.destroy()
-            except tk.TclError:
-                pass
-            self._active_menu = None
+            pass
+        finally:
+            # quit() 等 command 可能已销毁并清空 _active_menu（幂等）；
+            # 只有仍为当前对象时才清属性，销毁本身无条件执行。
+            if self._active_menu is menu:
+                self._active_menu = None
+            self._destroy_menu(menu)
 
     def _agents_submenu(self, menu):
         """Agents 子菜单：每项捕获 exact key（§8.4/§8.5）。
@@ -679,13 +710,7 @@ class PetApp:
                     pass
             self.config.save()
         finally:
-            if self._active_menu is not None:
-                try:
-                    self._active_menu.unpost()
-                    self._active_menu.destroy()
-                except tk.TclError:
-                    pass
-                self._active_menu = None
+            self._dismiss_active_menu()   # v4.2.3 §9：幂等，不 double-destroy
             for attr in ("_poll_build_after", "_poll_monitor_after",
                          "_ui_after", "_janitor_after", "_skin_after",
                          "_reassert_after"):

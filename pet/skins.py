@@ -10,12 +10,32 @@ import threading
 
 STATES = ["walk", "attack", "die", "special", "sleep"]
 
-from .config import CACHE_DIR, PETS_DIR
+# 程序化原创 fallback 皮肤（v4.2.3 §10.4）：公开源码包无用户版权素材
+# 时仍首启可见。唯一常量，fresh config 与 desired_build_key 的最终
+# fallback 都引用它，不再出现隐藏的 amiya 默认值。
+# 必须定义在 `from .config import ...` 之前：pet.config 反向引用本常量
+# 构造 DEFAULTS，导入顺序保证两个方向都无循环失败。
+BUILTIN_SKIN = "builtin-cat"
+
+# builtin-cat 每 state 的循环语义（与导入 manifest 一致）
+_BUILTIN_LOOP = {"walk": True, "sleep": True, "attack": False,
+                 "die": False, "special": False}
+
+from .config import CACHE_DIR, PETS_DIR  # noqa: E402
 
 
 def list_skins() -> dict[str, dict]:
-    """{皮肤名: manifest}。有 manifest.json 或五个素材齐全的目录都算。"""
-    out: dict[str, dict] = {}
+    """{皮肤名: manifest}。有 manifest.json 或五个素材齐全的目录都算。
+
+    注入虚拟 builtin-cat（程序化 fallback，不占 assets/pets 磁盘目录）。
+    """
+    out: dict[str, dict] = {
+        BUILTIN_SKIN: {
+            "name": BUILTIN_SKIN,
+            "title": "DeskPet 原创小猫（内置）",
+            "builtin": True,
+        },
+    }
     try:
         entries = sorted(os.listdir(PETS_DIR))
     except OSError:
@@ -66,6 +86,11 @@ def build_skin(skin: str, height: int, fps: int, log=None) -> dict[str, str]:
     cached = built_gifs(skin, height)
     if cached:
         return cached
+    if skin == BUILTIN_SKIN:
+        # v4.2.3 §10.4：程序化 fallback 皮肤不进 ffmpeg/numpy/scipy
+        # 子进程，直接用 pet.icon.draw_cat 经 Pillow 生成五个轻量
+        # 单帧 GIF + meta JSON；产物只在 assets/cache/。
+        return _build_builtin_skin(height, log)
     src = os.path.join(PETS_DIR, skin)
     manifest = {}
     mf = os.path.join(src, "manifest.json")
@@ -87,6 +112,32 @@ def build_skin(skin: str, height: int, fps: int, log=None) -> dict[str, str]:
     if log:
         log(f"皮肤 {skin} 构建完成")
     return built
+
+
+def _build_builtin_skin(height: int, log=None) -> dict[str, str]:
+    """builtin-cat：draw_cat + Pillow 生成单帧 GIF 与 meta（§10.4）。"""
+    from .icon import draw_cat
+
+    height = max(96, min(960, int(height)))
+    out_dir = cache_dir(BUILTIN_SKIN, height)
+    os.makedirs(out_dir, exist_ok=True)
+    paths = {}
+    for state in STATES:
+        out_gif = os.path.join(out_dir, state + ".gif")
+        if not (os.path.isfile(out_gif)
+                and os.path.isfile(out_gif + ".json")):
+            img = draw_cat(height).convert("P")
+            img.save(out_gif, save_all=True, append_images=[],
+                     duration=1000, loop=0)
+            with open(out_gif + ".json", "w", encoding="utf-8") as f:
+                json.dump({
+                    "frames": 1, "width": img.width, "height": img.height,
+                    "delay_ms": 1000, "loop": _BUILTIN_LOOP.get(state, True),
+                }, f, ensure_ascii=False)
+        paths[state] = out_gif
+    if log:
+        log(f"内置皮肤 {BUILTIN_SKIN}（{height}px）已生成")
+    return paths
 
 
 def _convert_in_subprocess(src: str, out_dir: str, height: int, fps: int,

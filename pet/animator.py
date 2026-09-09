@@ -223,20 +223,15 @@ class AnimationScheduler:
         self._callbacks: dict[str, object] = {}
         self._after_id = None
         self._due_target = 0.0
-        self._active_paths: set[str] = set()   # 供缓存 keep 判定
 
     def register(self, cursor: AnimationCursor, on_frame) -> None:
         self._cursors[cursor.view_id] = cursor
         self._callbacks[cursor.view_id] = on_frame
-        if cursor.path:
-            self._active_paths.add(cursor.path)
         self._schedule()
 
     def unregister(self, view_id: str) -> None:
-        cursor = self._cursors.pop(view_id, None)
+        self._cursors.pop(view_id, None)
         self._callbacks.pop(view_id, None)
-        if cursor is not None:
-            self._active_paths.discard(cursor.path)
         if not self._cursors:
             self._cancel()
 
@@ -246,12 +241,19 @@ class AnimationScheduler:
     def cursors(self) -> dict[str, AnimationCursor]:
         return dict(self._cursors)
 
+    def active_paths(self) -> set[str]:
+        """cache keep set 从 cursors 派生（v4.2.3 §11）。
+
+        替代只增不减的 mutable `_active_paths`：walk→attack→die 状态
+        切换后旧 path 不再进入 keep 集，历史动画可被预算正常逐出。
+        Fleet ≤8 个 view，O(≤8) 可忽略。
+        """
+        return {c.path for c in self._cursors.values() if c.path}
+
     def frame_image(self, cursor: AnimationCursor):
-        if cursor.path and cursor.path not in self._active_paths:
-            self._active_paths.add(cursor.path)   # play() 换动画后同步 keep 集
         return self.cache.frame(cursor.path,
                                 min(cursor.frame_index, cursor.frames - 1),
-                                keep_paths=self._active_paths,
+                                keep_paths=self.active_paths(),
                                 master=self.root)
 
     def frame_size(self, cursor: AnimationCursor) -> tuple[int, int]:

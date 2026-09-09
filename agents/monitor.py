@@ -24,6 +24,7 @@
 import queue
 import threading
 import time
+from dataclasses import dataclass
 
 from .base import BaseWatcher
 from .claude import ClaudeWatcher
@@ -57,6 +58,18 @@ WATCHERS = {
 }
 
 LOG_MAX = 300
+
+
+@dataclass
+class NativeTerminalLease:
+    """Windows native Agent 的 terminal-detach 观察租约（v4.2.3 §2.4）。
+
+    runtime-only：上限天然等于 live native Agent 数，不持久化。
+    只有曾获得 windows-ancestor CONFIRMED 强绑定的 Agent 才会被 arm。
+    """
+    armed_window_pid: int = 0
+    last_probe_generation: int = 0
+    broken_generations: int = 0
 
 
 def _num(value, default=0.0) -> float:
@@ -245,6 +258,8 @@ class Monitor:
         self._last_resolve = 0.0
         self._instance_sig: tuple = ()
         self._last_logs_trim = 0.0
+        # Windows native 保守 orphan 识别租约（v4.2.3 §2.4，runtime-only）
+        self._native_terminal_leases: dict[str, NativeTerminalLease] = {}
 
     # ------------------------------------------------------------ 生命周期
     def start(self):
@@ -381,8 +396,10 @@ class Monitor:
             "wsl_scan_ms": round(getattr(wsl, "scan_ms", 0.0), 1),
             "windows_scan_ms": round(self._probe.windows_scan_ms, 1),
             "metadata_pid_count": getattr(wsl, "metadata_pid_count", 0),
+            "detached_filtered_count": getattr(wsl, "detached_filtered_count", 0),
             "exit_watched": (self._exit_watcher.watched_count()
                              if self._exit_watcher is not None else 0),
+            "native_terminal_leases": len(self._native_terminal_leases),
         }
         out.update(self._terminal_service.stats())
         return out
@@ -473,14 +490,17 @@ class Monitor:
                 source_disabled = (
                     (inst.source == "windows" and not windows_enabled)
                     or (inst.source.startswith("wsl:") and not wsl_enabled))
+                kind_disabled = inst.kind not in enabled
                 if source_disabled:
                     # 用户关闭该 source：按 authoritative empty 处理，不留 ghost
                     exits.append((key, "source-disabled"))
+                elif kind_disabled:
+                    # 用户显式关闭 kind 必须立即生效（v4.2.3 §4）：
+                    # 用户配置意图高于 probe health，即使该 source 本轮
+                    # authoritative=False 也必须退出。
+                    exits.append((key, "kind-disabled"))
                 elif inst.source in authoritative:
-                    if inst.kind not in enabled:
-                        exits.append((key, "kind-disabled"))
-                    else:
-                        exits.append((key, "authoritative-absence"))
+                    exits.append((key, "authoritative-absence"))
                 else:
                     # 该来源本轮不 authoritative（扫描失败）：保留缓存实例，不判死
                     merged[key] = inst
@@ -532,6 +552,65 @@ class Monitor:
                         or str(inst.process_token) != ev.process_token):
                     continue
                 self._commit_exit(ev.key, "process-exit-event", now)
+
+    def _prune_detached_native(self, instances: dict[str, AgentInstance],
+                               probe_snap: dict[str, SourceProbeSnapshot],
+                               now: float) -> list[str]:
+        """Windows native 保守 orphan 识别（v4.2.3 §2.4）。
+
+        有条件的防御性补强，不声称检测所有 native ConPTY orphan：
+          * 只有曾获得 windows-ancestor CONFIRMED 强绑定的 Agent 才
+            arm lease（从未强绑定的进程不能因没有窗口证据被删除）；
+          * 外部父进程连续 2 个 authoritative generation 不存在且强
+            绑定没有恢复才 commit exit（默认约 6 秒，吸收 parent()
+            短暂读取失败/launcher 替换）；
+          * source 非 authoritative / parent_alive 为 None/True / 只缺
+            一轮 → 不递增、不判死。
+        返回本轮 commit exit 的 key（调用方需同步从局部 instances/
+        session_obs 删除，确保同一 tick 不再构建 snapshot）。
+        """
+        windows_snap = probe_snap.get("windows")
+        if windows_snap is None or not windows_snap.authoritative:
+            return []
+        generation = windows_snap.generation
+        commit_keys: list[str] = []
+        with self.lock:
+            for key, inst in instances.items():
+                if inst.source != "windows":
+                    continue
+                binding = self.window_bindings.get(key)
+                strong = (binding is not None
+                          and binding.native_strong_binding)
+                lease = self._native_terminal_leases.get(key)
+                if strong:
+                    if lease is None:
+                        lease = NativeTerminalLease()
+                        self._native_terminal_leases[key] = lease
+                    lease.broken_generations = 0
+                    lease.armed_window_pid = binding.window.pid
+                    lease.last_probe_generation = generation
+                    continue
+                if lease is None or lease.armed_window_pid == 0:
+                    # 从未被强绑定：保留 UNKNOWN，不判死
+                    continue
+                if lease.last_probe_generation == generation:
+                    # 本 authoritative generation 已计数（同 generation
+                    # 的多个 monitor tick 不得重复递增）
+                    continue
+                lease.last_probe_generation = generation
+                if inst.external_parent_alive is False:
+                    lease.broken_generations += 1
+                    if lease.broken_generations >= 2:
+                        commit_keys.append(key)
+                # external_parent_alive 为 None/True：不递增，不判死
+            for key in commit_keys:
+                self._native_terminal_leases.pop(key, None)
+                self._commit_exit(key, "terminal-detached-native", now)
+            # 租约生命周期与实例一致：实例已消失（其他 exit 路径）即清理
+            for key in list(self._native_terminal_leases):
+                if key not in self.instances:
+                    self._native_terminal_leases.pop(key, None)
+        return commit_keys
 
     def _tick(self):
         cfg_m = dict(self.config.get("monitor") or {})
@@ -585,6 +664,13 @@ class Monitor:
             except Exception:
                 self.window_bindings = {}
                 self.terminal_observation_bindings = {}
+
+        # 3.5) Windows native 保守 orphan 识别（v4.2.3 §2.4）：resolve
+        # 之后、状态融合之前；本轮 commit exit 的 key 同 tick 不再
+        # 构建 snapshot/session 观察。
+        for key in self._prune_detached_native(instances, probe_snap, now):
+            instances.pop(key, None)
+            session_obs.pop(key, None)
 
         # 4) 状态融合
         grace = _num(cfg_m.get("activity_grace_sec", 10.0), 10.0)

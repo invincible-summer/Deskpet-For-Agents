@@ -14,9 +14,10 @@
 import json
 import os
 import time
+from dataclasses import dataclass
 
 from . import paths
-from .base import BaseWatcher, FileState, classify_phase, parse_ts
+from .base import BaseWatcher, FileState, _as_text, classify_phase, parse_ts
 from .models import (
     AgentKind,
     Confidence,
@@ -31,9 +32,16 @@ from .summarize import fmt_command, shorten
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
-# PID registry 指向旧 JSONL 后，同 cwd 新 JSONL 需要连续 N 个扫描周期
-# 确认增长才自动切换（plan §12）。
+# PID registry 指向旧 JSONL 后，绑定文件需连续 N 个扫描周期不增长、
+# 且同 cwd 候选发生 N 次独立增长才自动脱离（v4.2.3 §6）。
 _STALE_CONFIRM_CYCLES = 2
+# 持续增长候选的 matcher 加分（< registry hint 4000，> cwd 1000）：
+# 只在脱离 stale 绑定后参与评分，让 mutual-unique 确定性选择增长文件，
+# 不做"直接强绑第一个增长候选"的 greedy。
+_GROWTH_BONUS = 2000
+_GROWTH_FRESH_SEC = 600.0
+# stale hint 集合上限（运行期防御；实际大小 ≈ /clear 事件数）
+_STALE_HINT_MAX = 32
 
 # conversation JSONL 顶层记录类型（2026-09 查证）
 _RECORD_TYPES = frozenset({
@@ -283,13 +291,33 @@ class ClaudeFile(FileState):
         return None
 
 
+@dataclass
+class FileGrowthState:
+    """单文件 (size, mtime_ns) 增长采样状态（v4.2.3 §6）。
+
+    固定大小状态而非 history list：JSONL 增长优先依赖 size（避免
+    mtime 分辨率差异）；stable_cycles 统计绑定文件的静默周期；
+    change_count 统计自采样基线后的独立增长次数。
+    """
+    size: int = -1
+    mtime_ns: int = -1
+    stable_cycles: int = 0
+    change_count: int = 0
+    last_change_at: float = 0.0
+    last_sample_at: float = 0.0
+
+
 class ClaudeWatcher(BaseWatcher):
     kind = AgentKind.CLAUDE
 
     def __init__(self, monitor_cfg: dict):
         super().__init__(monitor_cfg)
         self._pid_hint_cache: dict[int, tuple[float, dict]] = {}
-        self._growth: dict[str, list[tuple[float, float]]] = {}  # path → [(ts, mtime)]
+        # path → FileGrowthState；上限 = MAX_TRACKED_FILES（files 清理时同步 prune）
+        self._growth: dict[str, FileGrowthState] = {}
+        # 已被 growth 证据证伪的 PID registry sessionId（runtime-only）：
+        # 防止 stale registry hint 把实例反复拉回冻结旧 transcript
+        self._stale_hint_sids: set[str] = set()
 
     def make_state(self, path: str) -> FileState:
         return ClaudeFile(path)
@@ -313,52 +341,138 @@ class ClaudeWatcher(BaseWatcher):
                 icwd = str(getattr(inst, "cwd", "") or "")
                 if rcwd and icwd and rcwd.rstrip("/") != icwd.rstrip("/"):
                     hint = {}
+                # growth 证据已证伪的 sessionId 不再作为 hint（第二层：
+                # /clear 后 registry 长期指旧 transcript，issue #53037）。
+                if hint and sid in self._stale_hint_sids:
+                    hint = {}
                 self._pid_hint_cache[pid] = (now, hint)
                 return hint
         self._pid_hint_cache[pid] = (now, {})
         return {}
 
-    # ---- /clear 后的 transcript 切换（plan §12） ----
+    def _candidate_score(self, inst, st: FileState) -> int:
+        score = super()._candidate_score(inst, st)
+        growth = self._growth.get(st.path)
+        if growth is not None and growth.change_count >= _STALE_CONFIRM_CYCLES:
+            now = time.time()
+            if growth.last_change_at and now - growth.last_change_at < _GROWTH_FRESH_SEC:
+                score += _GROWTH_BONUS
+        return score
+
+    # ---- /clear 后的 transcript 切换（v4.2.3 §6） ----
     def revalidate_bindings(self, instances: list, now: float):
         if not self._instance_files:
             return
-        for key, path in list(self._instance_files.items()):
+        # 1) 对当前 bound file 以及同 source、same normalized cwd 的
+        #    所有已跟踪候选各做一次 stat，更新 (size, mtime_ns) 增长状态。
+        bound_paths = {p for p in self._instance_files.values()
+                       if p in self.files}
+        sample_paths = set(bound_paths)
+        for path in bound_paths:
             st = self.files.get(path)
             if st is None:
                 continue
-            history = self._growth.setdefault(path, [])
-            try:
-                mtime = os.stat(path).st_mtime
-            except OSError:
+            cwd = (st.cwd or "").rstrip("/")
+            source = st.source or ""
+            if not cwd:
                 continue
-            if history and history[-1][1] != mtime:
-                history.append((now, mtime))
-            elif not history:
-                history.append((now, mtime))
-            del history[:-6]
-            if len(history) < _STALE_CONFIRM_CYCLES + 1:
+            for other_path, other in self.files.items():
+                if other_path in sample_paths:
+                    continue
+                ocwd = (other.cwd or "").rstrip("/")
+                if not ocwd or ocwd != cwd:
+                    continue
+                if source and other.source and other.source != source:
+                    continue
+                sample_paths.add(other_path)
+        for path in sample_paths:
+            self._sample_growth(path, now)
+        # 2) 绑定 A 静默 ≥2 周期，且存在满足全部切换条件的增长候选 B
+        #    → 只 pop 绑定与旧 growth 引用，不直接强绑 B；下一轮由
+        #    mutual-unique matcher（growth bonus 让 B 确定性胜出）决定。
+        inst_by_key = {_as_text(getattr(i, "key", "")): i for i in instances}
+        for key, path in list(self._instance_files.items()):
+            if path not in self.files:
                 continue
-            # 绑定文件连续 N 个扫描周期未增长，而同 cwd 的其他候选持续增长
-            # → registry 指向旧 JSONL，自动切换（plan §12）。
-            growing = self._growing_same_cwd_candidates(st, now)
-            if growing:
+            growth = self._growth.get(path)
+            if growth is None or growth.stable_cycles < _STALE_CONFIRM_CYCLES:
+                continue
+            if self._growing_same_cwd_candidate(path, growth, now):
+                st = self.files.get(path)
                 self._instance_files.pop(key, None)
                 self._growth.pop(path, None)
+                # stale registry hint 失效 + 清掉从 A 回填的 session_id，
+                # 否则 +4000/+5000 会把实例立刻拉回冻结的 A。
+                if st is not None:
+                    for sid in {st.session_id, st.file_id}:
+                        if sid:
+                            self._stale_hint_sids.add(sid)
+                    inst = inst_by_key.get(key)
+                    if inst is not None and getattr(inst, "session_id", ""):
+                        if inst.session_id in {st.session_id, st.file_id}:
+                            try:
+                                inst.session_id = ""
+                            except Exception:
+                                pass
+                while len(self._stale_hint_sids) > _STALE_HINT_MAX:
+                    self._stale_hint_sids.pop()
 
-    def _growing_same_cwd_candidates(self, st: FileState, now: float) -> bool:
+    def _sample_growth(self, path: str, now: float) -> None:
+        """一次 stat 采样：用 (st_size, st_mtime_ns) 判定增长。"""
+        try:
+            s = os.stat(path)
+            size, mtime_ns = int(s.st_size), int(s.st_mtime_ns)
+        except OSError:
+            return
+        g = self._growth.get(path)
+        if g is None:
+            self._growth[path] = FileGrowthState(
+                size=size, mtime_ns=mtime_ns, last_sample_at=now)
+            return
+        g.last_sample_at = now
+        if size != g.size or mtime_ns != g.mtime_ns:
+            if size > g.size:
+                # JSONL append 增长优先看 size 增大
+                g.change_count += 1
+                g.last_change_at = now
+                g.stable_cycles = 0
+            g.size, g.mtime_ns = size, mtime_ns
+        else:
+            g.stable_cycles += 1
+
+    def _growing_same_cwd_candidate(self, bound_path: str,
+                                    bound_growth: FileGrowthState,
+                                    now: float) -> bool:
+        """切换条件（v4.2.3 §6）：B 与 A source/cwd 一致、≥2 次独立
+        增长、比 A 更新、仍存在于 self.files。"""
+        st = self.files.get(bound_path)
+        if st is None:
+            return False
         cwd = (st.cwd or "").rstrip("/")
+        source = st.source or ""
         if not cwd:
             return False
-        source = st.source or ""
         for other_path, other in self.files.items():
-            if other_path == st.path:
-                continue
-            if source and other.source and other.source != source:
+            if other_path == bound_path:
                 continue
             ocwd = (other.cwd or "").rstrip("/")
             if not ocwd or ocwd != cwd:
                 continue
-            history = self._growth.get(other_path) or []
-            if len(history) >= _STALE_CONFIRM_CYCLES and history[-1][1] != history[0][1]:
+            if source and other.source and other.source != source:
+                continue
+            growth = self._growth.get(other_path)
+            if growth is None:
+                continue
+            if (growth.change_count >= _STALE_CONFIRM_CYCLES
+                    and growth.last_change_at > bound_growth.last_change_at):
                 return True
         return False
+
+    def prune_growth(self):
+        """files 清理后同步 prune _growth（状态上限 = MAX_TRACKED_FILES）。"""
+        for path in list(self._growth):
+            if path not in self.files:
+                self._growth.pop(path, None)
+
+    def _after_files_pruned(self):
+        self.prune_growth()

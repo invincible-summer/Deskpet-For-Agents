@@ -27,6 +27,22 @@ class AgentKind(str, Enum):
         }[self.value]
 
 
+class TerminalAttachment(str, Enum):
+    """interactive-terminal liveness（v4.2.3 §2.2，runtime-only）。
+
+    "process exists" 不等价于"用户还有一个打开的终端 Agent"：
+      * ATTACHED —— 有直接、可核验的 terminal attachment 证据
+        （WSL：有效 controlling TTY + 正 tpgid）；
+      * DETACHED —— 有直接、可核验的 terminal-detached 证据
+        （WSL：TTY 被 revoke 且无 foreground process group）；
+      * UNKNOWN —— 证据矛盾/不可读；必须 fail-open 保留实例。
+    该字段只存在内存，不进 selector fingerprint、不持久化、不参与 key。
+    """
+    ATTACHED = "attached"
+    DETACHED = "detached"
+    UNKNOWN = "unknown"
+
+
 class Status(str, Enum):
     IDLE = "idle"          # 进程存活 + 明确知道没有 active turn
     WORKING = "working"    # 正在工作（active turn 或近期活动证据）
@@ -211,11 +227,21 @@ class AgentInstance:
     codex_home: str = ""
     claude_config_dir: str = ""
     kimi_code_home: str = ""
+    # PI_CODING_AGENT_SESSION_DIR（allowlist env；runtime-only）
+    pi_session_dir: str = ""
 
     # 附加 hint（TMUX/STY/TERM_PROGRAM 归并显示，不持久化）
     terminal_hint: str = ""
 
     session_id: str = ""        # 会话解析成功后由 watcher 回填
+
+    # interactive-terminal liveness（v4.2.3 §2.2，runtime-only，不持久化）
+    terminal_attachment: TerminalAttachment = TerminalAttachment.UNKNOWN
+    # canonical group 的外部父进程（跳过 same-kind launcher 后的最高
+    # launcher 的 parent）；0 表示没有可计算的外部父进程
+    external_parent_pid: int = 0
+    # True/False = 本轮 census 明确看到存在/不存在；None = 无法判断
+    external_parent_alive: bool | None = None
 
     def __post_init__(self):
         if not self.key:
@@ -345,6 +371,16 @@ class TerminalWindowBinding:
     def wakeable(self) -> bool:
         """是否允许用户显式唤起（v4.1.3：window 存在即 wakeable）。"""
         return self.window is not None and self.window.hwnd > 0
+
+    @property
+    def native_strong_binding(self) -> bool:
+        """v4.2.3 §2.4 native lease arm 条件：DeskPet 曾直接证明
+        "这个 native Agent 属于这个 WT window"（CONFIRMED +
+        windows-ancestor + 窗口存在）。封装在此避免上层散读
+        confidence 字段。"""
+        return (self.confidence is WindowBindingConfidence.CONFIRMED
+                and self.reason == "windows-ancestor"
+                and self.window is not None)
 
 
 class ObservationBindingConfidence(str, Enum):

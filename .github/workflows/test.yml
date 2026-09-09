@@ -17,19 +17,27 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -c constraints-v4.2.3.txt
       - name: Byte-compile
         run: python -m compileall agents pet actions tools
       - name: Unit tests
         run: python -m unittest discover tests -p "test_*.py"
       - name: Monitor benchmark
         run: python tests/benchmark_monitor.py --ticks 5000 --report benchmark-report.json
+      - name: Presentation benchmark
+        run: python tests/benchmark_presentation.py --report presentation-benchmark.json
       - name: Upload benchmark report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: monitor-benchmark
           path: benchmark-report.json
+      - name: Upload presentation benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: presentation-benchmark
+          path: presentation-benchmark.json
       # 单测已覆盖：terminal window activation 逻辑、并发激活矩阵、
       # source-disabled 停扫、config 运行时 clamp。
       # 真实 Windows Terminal foreground policy / UIA 事件接受度属于

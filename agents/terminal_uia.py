@@ -38,6 +38,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Callable
 
 from .matching import best_effort_scores, mutual_unique_matches
@@ -66,9 +67,15 @@ REDISCOVER_SEC = 20.0     # control 重新发现周期（safety refresh；正常
 TEXT_CHANGED_DEBOUNCE = 0.15        # TextChanged → 可见读取的 debounce
 CONTROL_VISIBLE_READ_MIN_INTERVAL = 0.5   # 单 control 可见读取最小间隔
 GLOBAL_VISIBLE_READ_LIMIT = 6         # 全局可见读取预算（次/秒）
+# 可见读取 broker（v4.2.3 §5.1）：所有生产读取经统一入口调度；
+# 每次 poll 最多 3 次真实 read，避免一次 poll 被同步 UIA 调用拖长。
+MAX_VISIBLE_READS_PER_POLL = 3
+# 订阅瞬时失败重试（v4.2.3 §5.2）：topology 不变时对当前 controls
+# 重试一次 sync；健康状态下零额外 UIA command。
+SUBSCRIPTION_RETRY_SEC = 2.0
 # 屏幕摘要通道（v4.1.4）：窗口候选评分用的每 control 最近一次可见读取。
-# 只存内存、绝不持久化/展示/写日志；事件驱动的 _inspect_visible 顺带
-# 更新，缺失/过期才补读，且与审批通道共享同一套读取预算。
+# 只存内存、绝不持久化/展示/写日志；事件驱动的读取顺带更新，
+# 缺失/过期才补读，且与审批通道共享同一套读取预算。
 SCREEN_DIGEST_STALE_SEC = 30.0       # 无事件时的最长可信时间
 SCREEN_DIGEST_MIN_INTERVAL = 2.0     # 单 control 摘要补读最小间隔
 SCREEN_DIGEST_PER_POLL = 2           # 每次 poll 最多补读的 control 数
@@ -191,6 +198,14 @@ class TerminalBackend:
     def sync_control_subscriptions(self, controls: list):
         """默认实现为空；真实后端在唯一 MTA 线程完成 add/remove。"""
 
+    def subscription_retry_needed(self) -> bool:
+        """订阅是否存在瞬时失败、需要 topology 不变时的重试。
+
+        v4.2.3 §5.2：默认 False（健康/不可重试）。真实后端在全部
+        期望订阅覆盖后自动清除。
+        """
+        return False
+
 
 class UiaCall:
     """一次封送到 MTA 线程的 UIA 调用；支持超时取消与异常回传。"""
@@ -236,6 +251,8 @@ class UiaBackend(TerminalBackend):
         self._control_tracker = SubscriptionTracker()
         self._window_tracker = SubscriptionTracker()
         self.event_sink: Callable[[TerminalEvent], None] | None = None
+        # 订阅瞬时失败标记（v4.2.3 §5.2）：全部期望订阅覆盖后自动清除
+        self._subscription_retry = False
         # 诊断计数（不含任何终端文本）
         self.calls = 0
         self.errors = 0
@@ -248,7 +265,16 @@ class UiaBackend(TerminalBackend):
                 "uia_timeouts": self.timeouts,
                 "uia_queue_dropped": self.queue_dropped,
                 "uia_control_subs": len(self._control_subscriptions),
-                "uia_window_subs": len(self._window_subscriptions)}
+                "uia_window_subs": len(self._window_subscriptions),
+                "uia_subscription_retry": int(self.subscription_retry_needed())}
+
+    def subscription_retry_needed(self) -> bool:
+        with self._lock:
+            return self._subscription_retry
+
+    def _mark_subscription_retry(self):
+        with self._lock:
+            self._subscription_retry = True
 
     # ---- MTA 线程 ----
     def _run(self):
@@ -527,7 +553,11 @@ class UiaBackend(TerminalBackend):
 
     # ---- 订阅生命周期（唯一 MTA 线程内完成 add/remove） ----
     def sync_control_subscriptions(self, controls: list):
-        """按当前 control 集合同步订阅：新增订阅、消失退订，绝不积累。"""
+        """按当前 control 集合同步订阅：新增订阅、消失退订，绝不积累。
+
+        全部期望订阅覆盖后清除 retry 标记；任何 control/window 注册
+        失败则置位，由 observer 在 topology 不变时定期重试（§5.2）。
+        """
         def do():
             wanted = {c.control_id for c in controls}
             to_add, to_remove = self._control_tracker.sync(wanted)
@@ -540,7 +570,20 @@ class UiaBackend(TerminalBackend):
                 self._subscribe_control(control_by_id[control_id])
             # 窗口级 StructureChanged：control 开合 → 立即触发重发现
             self._sync_window_subscriptions({c.hwnd for c in controls})
+            # 只有 desired control/window trackers 全部覆盖才清 retry
+            covered = self._subscriptions_covered(controls)
+            with self._lock:
+                self._subscription_retry = not covered
         self._submit(do)
+
+    def _subscriptions_covered(self, controls: list) -> bool:
+        """desired control/window 是否全部有活跃订阅（不含文本）。"""
+        desired_controls = {c.control_id for c in controls}
+        desired_hwnds = {c.hwnd for c in controls}
+        return (all(cid in self._control_subscriptions
+                    for cid in desired_controls)
+                and all(hwnd in self._window_subscriptions
+                        for hwnd in desired_hwnds))
 
     def _subscribe_control(self, control: ObservedTerminalControl):
         try:
@@ -574,12 +617,14 @@ class UiaBackend(TerminalBackend):
                 if sub.notification_registered or sub.text_changed_registered:
                     self._control_subscriptions[control.control_id] = sub
                 else:
-                    # 两类事件都注册失败：不标记为已订阅，下轮可重试
+                    # 两类事件都注册失败：不标记为已订阅，标记重试
                     self._control_tracker.discard(control.control_id)
+                    self._mark_subscription_retry()
                 return
         except Exception:
             self.errors += 1
             self._control_tracker.discard(control.control_id)
+            self._mark_subscription_retry()
 
     def _remove_control_subscription(self, sub: ControlSubscription):
         if sub.text_changed_registered:
@@ -612,12 +657,14 @@ class UiaBackend(TerminalBackend):
                     sub.registered = True
                 except Exception:
                     self.errors += 1
+                    self._mark_subscription_retry()
                 if sub.registered:
                     self._window_subscriptions[hwnd] = sub
                 else:
                     self._window_tracker.discard(hwnd)
             except Exception:
                 self._window_tracker.discard(hwnd)
+                self._mark_subscription_retry()
                 self.errors += 1
 
     def _remove_window_subscription(self, sub: WindowSubscription):
@@ -756,8 +803,35 @@ DEFAULT_RECOGNIZERS = (
 
 # ------------------------------------------------------------- 观察器
 
+class VisibleReadReason(IntEnum):
+    """可见读取的生产原因（v4.2.3 §5.1）；数值越小优先级越高。"""
+    WAITING_RECHECK = 0     # WAITING TTL 复检（最紧急：审批语义）
+    APPROVAL_TRIGGER = 1    # 弱触发 delta（Notification 审批文案）
+    TEXT_FALLBACK = 2       # TextChanged debounce 到期的兜底读取
+    SCREEN_DIGEST = 3       # 屏幕摘要缺失/过期补读
+
+
+@dataclass
+class _VisibleReadRequest:
+    reason: VisibleReadReason
+    delta: str = ""
+    enqueued_at: float = 0.0
+
+
+# _read_visible_once 的"暂时不可读"哨兵：限流/预算推迟（请求保留），
+# 与 None（读取失败，请求丢弃）区分。
+_READ_BUSY = object()
+
+
 class TerminalObserver:
-    """事件驱动的终端观察器（逻辑与 backend 解耦，可注入 FakeBackend）。"""
+    """事件驱动的终端观察器（逻辑与 backend 解耦，可注入 FakeBackend）。
+
+    可见读取统一 broker（v4.2.3 §5.1）：`backend.read_visible` 只有
+    `_read_visible_once` 一个生产调用入口；所有通道（WAITING 复检、
+    弱触发、TextChanged fallback、屏幕摘要）先登记 pending request，
+    由 `_service_visible_reads` 在 poll 末按优先级统一消费，共用
+    单 control ≥0.5s + 全局 ≤6/s 预算，每 poll 最多 3 次真实 read。
+    """
 
     def __init__(self, backend: TerminalBackend,
                  recognizers=DEFAULT_RECOGNIZERS, cfg: dict | None = None):
@@ -778,16 +852,21 @@ class TerminalObserver:
         self._dirty_controls: dict[tuple, float] = {}
         self._last_visible_read: dict[tuple, float] = {}
         self._visible_read_times: deque = deque()   # 全局预算滑动窗口
+        # 统一可见读取 broker：每 control 最多 1 个 pending request
+        self._pending_reads: dict[tuple, _VisibleReadRequest] = {}
         # 屏幕摘要（v4.1.4）：窗口候选评分证据，仅内存
         self._screens: dict[tuple, str] = {}
         self._screen_read_at: dict[tuple, float] = {}
         self._last_discover = 0.0
         self._structure_dirty = False
         self._started = False
+        self._last_subscription_retry = 0.0
         # 诊断计数（不含任何终端文本）
         self.stats = {"events": 0, "dropped": 0, "visible_reads": 0,
                       "rediscoveries": 0, "triggers": 0,
-                      "text_fallback_reads": 0, "screen_reads": 0}
+                      "text_fallback_reads": 0, "screen_reads": 0,
+                      "visible_reads_by_reason": {}, "pending_visible_reads": 0,
+                      "subscription_retry_count": 0}
         backend.event_sink = self._on_event
 
     # ---- UIA callback 线程入口：只入队，绝不阻塞 ----
@@ -852,7 +931,7 @@ class TerminalObserver:
             for table in (self.activity, self._waiting_recheck, self.rings,
                           self._ring_len, self._dirty_controls,
                           self._last_visible_read, self._screens,
-                          self._screen_read_at):
+                          self._screen_read_at, self._pending_reads):
                 for control_id in list(table):
                     if control_id not in new_map:
                         table.pop(control_id, None)
@@ -870,6 +949,7 @@ class TerminalObserver:
         if not self._started:
             return
 
+        # 1) drain events
         with self._event_q_lock:
             events = list(self._events)
             self._events.clear()
@@ -888,7 +968,9 @@ class TerminalObserver:
                 self.activity[control_id] = ev.ts or now
                 if WEAK_TRIGGER_RE.search(ev.text):
                     self.stats["triggers"] += 1
-                    self._inspect_visible(control_id, now, delta=ev.text)
+                    self._request_visible_read(
+                        control_id, now, VisibleReadReason.APPROVAL_TRIGGER,
+                        delta=ev.text)
             elif ev.kind in ("notification", "activity"):
                 self.activity[control_id] = ev.ts or now
                 # TextChanged fallback：Notification 不携带审批文案时，
@@ -899,43 +981,99 @@ class TerminalObserver:
                     self._dirty_controls[control_id] = (min(current, deadline)
                                                         if current else deadline)
 
-        # 事件处理完毕后再判定重发现：structure 事件本轮立即生效
+        # 2) 事件处理完毕后再判定重发现：structure 事件本轮立即生效
         if self._structure_dirty:
             self._structure_dirty = False
             self.refresh_controls(force=True)
         else:
             self.refresh_controls()
 
-        # 等待期间的 TTL 复检（plan §21）
+        # 3) 订阅瞬时失败重试（v4.2.3 §5.2）：topology 不变时只对当前
+        #    controls 重试 sync；健康状态零额外 UIA command。
+        self._maybe_retry_subscriptions(now)
+
+        # 4) 请求 WAITING TTL 复检（审批通道，最高优先级）
         for control_id in list(self._waiting_recheck):
             if control_id not in self.controls:
                 self._waiting_recheck.pop(control_id, None)
                 self.observations.pop(control_id, None)
                 continue
             if now >= self._waiting_recheck[control_id]:
-                self._inspect_visible(control_id, now)
+                self._waiting_recheck.pop(control_id, None)
+                self._request_visible_read(
+                    control_id, now, VisibleReadReason.WAITING_RECHECK)
 
-        self._drain_dirty(now)
-        self.refresh_screen_digests(now)
+        # 5) 请求 TextChanged debounce 到期的兜底读取
+        self._request_due_text_fallbacks(now)
 
-    # ---- 屏幕摘要（窗口候选评分证据，v4.1.4） ----
-    def screen_texts(self) -> dict[tuple, str]:
-        """每 control 最近一次可见屏幕文本的快照（仅内存，绝不外显）。"""
-        return dict(self._screens)
+        # 6) 请求缺失/过期的屏幕摘要补读
+        self._request_stale_screen_digests(now)
 
-    def refresh_screen_digests(self, now: float):
-        """为缺失/过期的 control 补读屏幕摘要。
+        # 7) 统一消费可见读取请求（唯一真实 read 入口）
+        self._service_visible_reads(now)
 
-        与审批通道共用同一预算（全局 ≤6/s、单 control ≥0.5s），
-        每次 poll 最多补读 SCREEN_DIGEST_PER_POLL 个，不新增线程/
-        轮询循环。事件驱动的 _inspect_visible 会顺带更新摘要，
-        正常运行时这里几乎不读。
-        """
-        if not self._started or not self.controls:
+    # ---- 订阅重试（v4.2.3 §5.2） ----
+    def _maybe_retry_subscriptions(self, now: float):
+        retry = getattr(self.backend, "subscription_retry_needed", None)
+        if retry is None or not retry():
             return
-        while (self._visible_read_times
-               and now - self._visible_read_times[0] > 1.0):
-            self._visible_read_times.popleft()
+        if now - self._last_subscription_retry < SUBSCRIPTION_RETRY_SEC:
+            return
+        self._last_subscription_retry = now
+        sync = getattr(self.backend, "sync_control_subscriptions", None)
+        if sync is None or not self.controls:
+            return
+        self.stats["subscription_retry_count"] += 1
+        try:
+            sync(list(self.controls.values()))
+        except Exception:
+            pass
+
+    # ---- 可见读取 broker（v4.2.3 §5.1） ----
+    def _request_visible_read(self, control_id: tuple, now: float,
+                              reason: VisibleReadReason,
+                              delta: str = "") -> None:
+        """登记一个可见读取请求；不直接读 backend。
+
+        每 control 最多保留 1 个 pending request；新的高优先级请求
+        可升级旧请求，同优先级保持最早入队时间（FIFO 公平）。
+        """
+        if control_id not in self.controls:
+            return
+        pending = self._pending_reads.get(control_id)
+        if pending is None:
+            self._pending_reads[control_id] = _VisibleReadRequest(
+                reason=reason, delta=delta, enqueued_at=now)
+            return
+        if reason <= pending.reason:
+            self._pending_reads[control_id] = _VisibleReadRequest(
+                reason=reason,
+                delta=delta or pending.delta,
+                enqueued_at=min(now, pending.enqueued_at))
+
+    def _request_due_text_fallbacks(self, now: float):
+        """TextChanged debounce 到期的 control 转为 TEXT_FALLBACK 请求。"""
+        if not self._dirty_controls:
+            return
+        for control_id in list(self._dirty_controls):
+            if control_id not in self.controls:
+                self._dirty_controls.pop(control_id, None)
+                continue
+            if now < self._dirty_controls[control_id]:
+                continue
+            self._dirty_controls.pop(control_id, None)
+            self._request_visible_read(
+                control_id, now, VisibleReadReason.TEXT_FALLBACK)
+
+    def _request_stale_screen_digests(self, now: float):
+        """为缺失/过期的 control 登记屏幕摘要补读请求。
+
+        与审批通道共用同一预算（全局 ≤6/s、单 control ≥0.5s），每次
+        poll 最多新登记 SCREEN_DIGEST_PER_POLL 个；事件驱动的读取顺带
+        更新摘要，正常运行时这里几乎不请求。
+        """
+        if not self.controls:
+            return
         picked = 0
         for control_id in self.controls:
             read_at = self._screen_read_at.get(control_id, 0.0)
@@ -943,51 +1081,86 @@ class TerminalObserver:
                      and now - read_at < SCREEN_DIGEST_STALE_SEC)
             if fresh or now - read_at < SCREEN_DIGEST_MIN_INTERVAL:
                 continue
-            if self._screen_read(control_id, now):
-                picked += 1
+            self._request_visible_read(
+                control_id, now, VisibleReadReason.SCREEN_DIGEST)
+            picked += 1
             if picked >= SCREEN_DIGEST_PER_POLL:
                 break
 
-    def _screen_read(self, control_id: tuple, now: float) -> bool:
+    def _service_visible_reads(self, now: float) -> None:
+        """poll 末统一消费 pending 请求（v4.2.3 §5.1）。
+
+        按优先级 + FIFO 顺序服务；每 poll 最多 MAX_VISIBLE_READS_PER_POLL
+        次真实 read；限流/预算推迟的请求保留 pending，下一轮继续。
+        """
+        self.stats["pending_visible_reads"] = len(self._pending_reads)
+        if not self._pending_reads:
+            return
+        # 全局滑窗（只记录成功读取；失败不消耗预算 token）
+        while self._visible_read_times and now - self._visible_read_times[0] > 1.0:
+            self._visible_read_times.popleft()
+        order = sorted(self._pending_reads.items(),
+                       key=lambda kv: (int(kv[1].reason), kv[1].enqueued_at))
+        served = 0
+        for control_id, request in order:
+            if served >= MAX_VISIBLE_READS_PER_POLL:
+                break
+            if control_id not in self.controls:
+                self._pending_reads.pop(control_id, None)
+                continue
+            if request.reason is VisibleReadReason.SCREEN_DIGEST:
+                # 同一 control 的更高优先级读取可能已顺带更新摘要
+                read_at = self._screen_read_at.get(control_id, 0.0)
+                if (control_id in self._screens
+                        and now - read_at < SCREEN_DIGEST_STALE_SEC):
+                    self._pending_reads.pop(control_id, None)
+                    continue
+            result = self._read_visible_once(control_id, now)
+            if result is _READ_BUSY:
+                continue   # 限流/预算：保留 pending
+            self._pending_reads.pop(control_id, None)
+            if result is None:
+                # 读取失败：不伪造 WAITING、不消耗 token；请求丢弃，
+                # 由下一轮事件/复检/摘要 stale 重新驱动。
+                continue
+            served += 1
+            reason_key = request.reason.name
+            by_reason = self.stats["visible_reads_by_reason"]
+            by_reason[reason_key] = by_reason.get(reason_key, 0) + 1
+            if request.reason is VisibleReadReason.SCREEN_DIGEST:
+                self.stats["screen_reads"] += 1
+            else:
+                if request.reason is VisibleReadReason.TEXT_FALLBACK:
+                    self.stats["text_fallback_reads"] += 1
+                self._inspect_text(control_id, result, now, request.delta)
+        self.stats["pending_visible_reads"] = len(self._pending_reads)
+
+    def _read_visible_once(self, control_id: tuple, now: float):
+        """唯一调用 backend.read_visible 的生产入口（v4.2.3 §5.1）。
+
+        统一检查：单 control ≥0.5s、全局滑窗 ≤6/s；成功后同时更新
+        屏幕摘要（同一次 I/O 服务两个通道）。返回：
+          str    —— 读取成功（可为空串）；
+          _READ_BUSY —— 限流/预算暂时不可读（调用方保留请求）；
+          None   —— 读取失败（不消耗预算 token，不更新摘要）。
+        """
         if now - self._last_visible_read.get(control_id, 0.0) < \
                 CONTROL_VISIBLE_READ_MIN_INTERVAL:
-            return False
+            return _READ_BUSY
         if len(self._visible_read_times) >= GLOBAL_VISIBLE_READ_LIMIT:
-            return False
+            return _READ_BUSY
         try:
             visible = self.backend.read_visible(control_id)
         except Exception:
-            return False
+            return None
+        text = str(visible or "")[:VISIBLE_MAX]
         self._last_visible_read[control_id] = now
         self._visible_read_times.append(now)
-        self.stats["screen_reads"] += 1
-        self._screens[control_id] = str(visible or "")[:VISIBLE_MAX]
+        self.stats["visible_reads"] += 1
+        # 同一次读取顺带更新屏幕摘要（复用 I/O，不额外读）
+        self._screens[control_id] = text
         self._screen_read_at[control_id] = now
-        return True
-
-    def _drain_dirty(self, now: float):
-        """处理 TextChanged debounce 到期的可见读取（多重限流）。"""
-        if not self._dirty_controls:
-            return
-        while self._visible_read_times and now - self._visible_read_times[0] > 1.0:
-            self._visible_read_times.popleft()
-        for control_id in list(self._dirty_controls):
-            if control_id not in self.controls:
-                self._dirty_controls.pop(control_id, None)
-                continue
-            if now < self._dirty_controls[control_id]:
-                continue
-            if now - self._last_visible_read.get(control_id, 0.0) < CONTROL_VISIBLE_READ_MIN_INTERVAL:
-                # 单 control 限流：推迟 deadline
-                self._dirty_controls[control_id] = now + TEXT_CHANGED_DEBOUNCE
-                continue
-            if len(self._visible_read_times) >= GLOBAL_VISIBLE_READ_LIMIT:
-                # 全局预算耗尽：推迟到下一轮 poll
-                self._dirty_controls[control_id] = now + TEXT_CHANGED_DEBOUNCE
-                continue
-            self._dirty_controls.pop(control_id, None)
-            self.stats["text_fallback_reads"] += 1
-            self._inspect_visible(control_id, now)
+        return text
 
     def _push_delta(self, control_id: tuple, text: str):
         ring = self.rings.setdefault(control_id, deque())
@@ -1003,17 +1176,9 @@ class TerminalObserver:
     def _ring_text(self, control_id: tuple) -> str:
         return "".join(self.rings.get(control_id, deque()))[:RING_MAX]
 
-    def _inspect_visible(self, control_id: tuple, now: float, delta: str = ""):
-        self.stats["visible_reads"] += 1
-        self._last_visible_read[control_id] = now
-        self._visible_read_times.append(now)
-        try:
-            visible = self.backend.read_visible(control_id)
-        except Exception:
-            visible = ""
-        # 顺带更新屏幕摘要（同一次读取服务两个通道，不多花预算）
-        self._screens[control_id] = str(visible or "")[:VISIBLE_MAX]
-        self._screen_read_at[control_id] = now
+    def _inspect_text(self, control_id: tuple, visible: str, now: float,
+                      delta: str = ""):
+        """对一次成功读取的可见文本运行识别器（不访问 backend）。"""
         obs_list: list[Observation] = []
         for recognizer in self.recognizers:
             try:
@@ -1031,6 +1196,11 @@ class TerminalObserver:
             self._waiting_recheck.pop(control_id, None)
             if old is None and visible:
                 self.activity[control_id] = now
+
+    # ---- 屏幕摘要（窗口候选评分证据，v4.1.4） ----
+    def screen_texts(self) -> dict[tuple, str]:
+        """每 control 最近一次可见屏幕文本的快照（仅内存，绝不外显）。"""
+        return dict(self._screens)
 
     def control_activity_observation(self, control_id: tuple, now: float,
                                      grace: float) -> Observation | None:

@@ -1,0 +1,10 @@
+# DeskPet v4.2.3 release constraints (plan1 §10.2)
+# Python 3.12 / Windows — verified by CI. requirements-*.txt keep expressing
+# compatible minimums; this file pins the reproducible public-release set.
+# Upgrade only after the full Windows Python 3.12 CI passes.
+psutil==7.2.2
+Pillow==12.3.0
+comtypes==1.4.16
+imageio-ffmpeg==0.6.0
+numpy==2.5.3
+scipy==1.18.1

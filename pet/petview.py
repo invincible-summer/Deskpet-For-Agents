@@ -129,7 +129,9 @@ class PetView:
         return max(96, min(960, int(round(240 * scale * dpi))))
 
     def desired_build_key(self):
-        skin = self.view_config.get("skin", "amiya")
+        # 最终 fallback 是程序化 builtin-cat（v4.2.3 §10.4），
+        # 不再暗含 amiya。
+        skin = self.view_config.get("skin", skins.BUILTIN_SKIN)
         fps = int(self.view_config.get("convert.fps", 12) or 12)
         return (str(skin), self.gif_height(), fps)
 

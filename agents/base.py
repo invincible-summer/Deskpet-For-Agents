@@ -375,6 +375,7 @@ class BaseWatcher:
                 self.files.pop(path, None)
                 self._file_source.pop(path, None)
                 self._file_cwd_hint.pop(path, None)
+        self._after_files_pruned()
 
         for path, source in wanted.items():
             if path in self.files:
@@ -392,6 +393,9 @@ class BaseWatcher:
             self._file_source[path] = source
 
     # ------------------------------------------------------- 绑定评分
+    def _after_files_pruned(self):
+        """files 清理后的子类钩子（v4.2.3 §6：同步 prune 派生状态）。"""
+
     def _candidate_score(self, inst, st: FileState) -> int:
         source = _as_text(getattr(inst, "source", ""))
         if source and st.source and source != st.source:

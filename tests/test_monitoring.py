@@ -144,6 +144,87 @@ class SummaryAndTailerTests(unittest.TestCase):
         self.assertEqual(parse_ts("2020-01-01T00:00:00Z"), 1577836800.0)
 
 
+class ClaudeClearRebindTests(unittest.TestCase):
+    """v4.2.3 §6：/clear 后 stale PID registry 的 growth 采样切换。
+
+    fixture：同 PID、registry 始终指 A；A 冻结，B same cwd 连续增长，
+    C same cwd 但不增长 → 必须脱离 A 并最终只绑定 B。
+    只有 A 静默而没有增长候选时不得切换。
+    """
+
+    def _watcher_with_files(self, temp, cwd="/home/u/proj"):
+        watcher = ClaudeWatcher({})
+        files = {}
+        for name in ("A", "B", "C"):
+            path = str(Path(temp) / f"{name}.jsonl")
+            Path(path).write_text(
+                json.dumps({"type": "user", "cwd": cwd,
+                            "message": {"content": [{"type": "text",
+                                                     "text": f"goal {name}"}]},
+                            "timestamp": "2026-01-01T00:00:00Z"}) + "\n",
+                encoding="utf-8")
+            st = ClaudeFile(path)
+            st.source = "windows"
+            st.cwd = cwd
+            files[path] = st
+        watcher.files = files
+        return watcher, files
+
+    def test_stale_registry_switches_from_frozen_a_to_growing_b(self):
+        with tempfile.TemporaryDirectory() as temp:
+            watcher, files = self._watcher_with_files(temp)
+            a, b, c = (files[p].path for p in sorted(files))
+            inst = AgentInstance(AgentKind.CLAUDE, 42, "windows",
+                                 process_token="42", cwd="/home/u/proj")
+            watcher._instance_files = {inst.key: a}
+            now = time.time()
+            # cycle 1: 基线采样；B 第一次增长
+            time.sleep(0.01)
+            with open(b, "a", encoding="utf-8") as s:
+                s.write(json.dumps({"type": "assistant"}) + "\n")
+            watcher.revalidate_bindings([inst], now + 1)
+            self.assertIn(inst.key, watcher._instance_files)
+            # cycle 2: A 静默 1；B 第二次增长
+            time.sleep(0.01)
+            with open(b, "a", encoding="utf-8") as s:
+                s.write(json.dumps({"type": "assistant"}) + "\n")
+            watcher.revalidate_bindings([inst], now + 2)
+            self.assertIn(inst.key, watcher._instance_files)  # A stable=1 还不够
+            # cycle 3: B 第三次增长（change_count=2）+ A stable=2 → 脱离 A
+            time.sleep(0.01)
+            with open(b, "a", encoding="utf-8") as s:
+                s.write(json.dumps({"type": "assistant"}) + "\n")
+            watcher.revalidate_bindings([inst], now + 3)
+            self.assertNotIn(inst.key, watcher._instance_files)
+            # 下一轮 mutual-unique matcher：同 cwd 增长的 B 胜出（C 静默）
+            for path in (a, b, c):
+                files[path].poll_lines()
+            watcher._assign_files([inst])
+            self.assertEqual(watcher._instance_files.get(inst.key), b)
+
+    def test_silent_a_without_growing_candidate_never_switches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            watcher, files = self._watcher_with_files(temp)
+            a, _b, _c = (files[p].path for p in sorted(files))
+            inst = AgentInstance(AgentKind.CLAUDE, 42, "windows",
+                                 process_token="42", cwd="/home/u/proj")
+            watcher._instance_files = {inst.key: a}
+            for cycle in range(6):
+                watcher.revalidate_bindings([inst], time.time() + cycle)
+                self.assertEqual(watcher._instance_files.get(inst.key), a)
+
+    def test_growth_state_pruned_with_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            watcher, files = self._watcher_with_files(temp)
+            a, b, _c = (files[p].path for p in sorted(files))
+            watcher._sample_growth(a, time.time())
+            watcher._sample_growth(b, time.time())
+            self.assertEqual(len(watcher._growth), 2)
+            watcher.files.pop(b, None)
+            watcher.prune_growth()
+            self.assertEqual(set(watcher._growth), {a})
+
+
 # ============================================================ Codex fixtures
 
 class CodexWatcherTests(unittest.TestCase):
@@ -345,6 +426,134 @@ class ClaudeWatcherTests(unittest.TestCase):
         self.assertIsNot(obs.status, Status.WAITING)
 
 
+class PiSessionV3Tests(unittest.TestCase):
+    """v4.2.3 §8：pi v3 stopReason / 独立 toolResult / WSL canonical root。"""
+
+    def _state(self):
+        from agents.pi import PiFile
+        return PiFile("pi-session.jsonl")
+
+    def test_user_then_assistant_stop_done_then_idle(self):
+        # AC-PI-01：DONE 8s 后 IDLE，不能永久 WORKING
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message",
+                               "message": {"role": "user",
+                                           "content": "重构解析器"}}))
+        state.feed(json.dumps({"type": "message",
+                               "message": {"role": "assistant",
+                                           "content": [{"type": "text",
+                                                        "text": "完成"}],
+                                           "stopReason": "stop"}}))
+        self.assertEqual(state.observation(base + 1, {}).status, Status.DONE)
+        self.assertEqual(state.observation(base + 9, {}).status, Status.IDLE)
+
+    def test_tooluse_toolresult_stop_lifecycle(self):
+        # AC-PI-01/02：toolUse 保持 EXECUTING；独立 toolResult message
+        # 是活动证据；最终 stop → DONE
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message",
+                               "message": {"role": "user",
+                                           "content": "跑测试"}}))
+        state.feed(json.dumps({"type": "message",
+                               "message": {"role": "assistant",
+                                           "content": [],
+                                           "stopReason": "toolUse"}}))
+        obs = state.observation(base + 0.1, {})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertEqual(obs.phase, Phase.EXECUTING)
+        state.feed(json.dumps({"type": "message", "message": {
+            "role": "toolResult", "toolCallId": "call-1",
+            "toolName": "Bash", "isError": False,
+            "content": [{"type": "text", "text": "3 passed"}]}}))
+        obs = state.observation(base + 0.2, {})
+        self.assertEqual(obs.status, Status.WORKING)
+        state.feed(json.dumps({"type": "message",
+                               "message": {"role": "assistant",
+                                           "content": [{"type": "text",
+                                                        "text": "全部通过"}],
+                                           "stopReason": "stop"}}))
+        self.assertEqual(state.observation(base + 0.3, {}).status, Status.DONE)
+
+    def test_assistant_error_is_error(self):
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message", "message": {
+            "role": "assistant", "content": [],
+            "stopReason": "error", "errorMessage": "rate limited"}}))
+        obs = state.observation(base + 0.1, {})
+        self.assertEqual(obs.status, Status.ERROR)
+        self.assertIn("rate limited", obs.summary)
+
+    def test_assistant_aborted_no_success_done(self):
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message",
+                               "message": {"role": "user",
+                                           "content": "长任务"}}))
+        state.feed(json.dumps({"type": "message", "message": {
+            "role": "assistant", "content": [],
+            "stopReason": "aborted"}}))
+        obs = state.observation(base + 0.2, {})
+        self.assertNotEqual(obs.status, Status.DONE)
+        self.assertEqual(obs.status, Status.IDLE)
+
+    def test_length_stopreason_marks_limit_not_error(self):
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message", "message": {
+            "role": "assistant", "content": [],
+            "stopReason": "length"}}))
+        obs = state.observation(base + 0.1, {})
+        self.assertEqual(obs.status, Status.DONE)
+        self.assertIn("长度限制", obs.summary)
+
+    def test_tool_result_error_does_not_set_agent_error(self):
+        # AC-PI-02：isError=True 只是工具结果失败，不是整个 Agent ERROR
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message", "message": {
+            "role": "toolResult", "toolCallId": "c2", "toolName": "Bash",
+            "isError": True,
+            "content": [{"type": "text", "text": "exit 1"}]}}))
+        obs = state.observation(base + 0.1, {})
+        self.assertNotEqual(obs.status, Status.ERROR)
+
+    def test_unknown_stopreason_stays_conservative(self):
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message", "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "正在处理"}],
+            "stopReason": ""}}))
+        obs = state.observation(base + 0.1, {})
+        self.assertEqual(obs.status, Status.WORKING)   # 不凭空宣布完成
+
+    def test_pi_session_roots_windows_and_wsl(self):
+        # AC-PI-03：Windows/WSL 默认 pi session path 都指向
+        # <home>/.pi/agent/sessions；WSL 不从 ~/.pi 整根递归
+        from agents.paths import instance_roots, session_files, windows_roots
+        win_roots = windows_roots(AgentKind.PI)
+        self.assertEqual(len(win_roots), 1)
+        self.assertIn("agent", win_roots[0])
+        self.assertIn("sessions", win_roots[0])
+        wsl = AgentInstance(AgentKind.PI, 2, "wsl:Ubuntu", process_token="2",
+                            home="/home/u")
+        wsl_roots = instance_roots(wsl)
+        self.assertEqual(
+            wsl_roots, ["\\\\wsl.localhost\\Ubuntu\\home\\u\\.pi\\agent\\sessions"])
+        # env override 优先
+        wsl.pi_session_dir = "/custom/pi-sessions"
+        self.assertEqual(
+            instance_roots(wsl),
+            ["\\\\wsl.localhost\\Ubuntu\\custom\\pi-sessions",
+             "\\\\wsl.localhost\\Ubuntu\\home\\u\\.pi\\agent\\sessions"])
+        # depth=2 仍适用：<sessions>/<encoded-cwd>/<file>.jsonl
+        found = session_files(AgentKind.PI, [win_roots[0]], 180.0)
+        self.assertIsInstance(found, list)
+
+
 # ============================================================ Kimi fixtures
 
 class KimiWatcherTests(unittest.TestCase):
@@ -437,16 +646,127 @@ class KimiWatcherTests(unittest.TestCase):
             wire = session_dir / "agents" / "main" / "wire.jsonl"
             wire.write_text("", encoding="utf-8")
             watcher = KimiWatcher({})
-            inst = AgentInstance(AgentKind.KIMI, 1, "wsl:Ubuntu", cwd="/w",
-                                 home="/home/u", process_token="7")
+            # Windows 实例：session_index root 即临时目录，sessionDir 为
+            # 受控 relative 路径（v4.2.3 §7.3 containment 合法路径）
+            inst = AgentInstance(AgentKind.KIMI, 1, "windows", cwd="/w",
+                                 process_token="7")
             from agents import paths as paths_mod
-            index_text = json.dumps({"sessionId": "s1", "sessionDir": str(session_dir),
-                                     "workDir": "/w"})
-            with patch.object(paths_mod, "read_kimi_index_tail", return_value=[
-                    {"sessionId": "s1", "sessionDir": str(session_dir), "workDir": "/w"}]):
-                candidates = watcher.extra_candidates("wsl:Ubuntu", [inst])
+            with patch.object(paths_mod, "kimi_index_roots",
+                              return_value=[str(temp)]), \
+                 patch.object(paths_mod, "read_kimi_index_tail", return_value=[
+                    {"sessionId": "s1", "sessionDir": "s1", "workDir": "/w"}]):
+                candidates = watcher.extra_candidates("windows", [inst])
             self.assertEqual(len(candidates), 1)
             self.assertTrue(candidates[0][1].endswith("wire.jsonl"))
+            st = watcher.files.get(candidates[0][1])
+            self.assertIsNone(st)   # extra_candidates 只登记 hint，不建 state
+
+    def test_state_json_read_from_session_root_not_agents_dir(self):
+        # AC-KIMI-03：wire=<session>/agents/main/wire.jsonl → state.json
+        # 必须从 <session>/state.json（parents[2]）读取，不是 agents/ 目录
+        with tempfile.TemporaryDirectory() as temp:
+            session_dir = Path(temp) / "s1"
+            (session_dir / "agents" / "main").mkdir(parents=True)
+            (session_dir / "state.json").write_text(json.dumps({
+                "title": "T", "lastPrompt": "P"}), encoding="utf-8")
+            # 旧 off-by-one 会错误地找 <session>/agents/state.json
+            wrong = session_dir / "agents" / "state.json"
+            wrong.write_text(json.dumps({"title": "WRONG"}), encoding="utf-8")
+            watcher = KimiWatcher({})
+            title, prompt = watcher._state_json_hints(str(session_dir))
+            self.assertEqual(title, "T")
+            self.assertEqual(prompt, "P")
+
+    def test_session_dir_traversal_rejected(self):
+        # AC-KIMI-03：恶意 sessionDir 不产生候选
+        from agents.paths import resolve_kimi_session_dir
+        with tempfile.TemporaryDirectory() as temp:
+            root = str(Path(temp) / "kimi")
+            (Path(root)).mkdir(parents=True)
+            self.assertIsNone(resolve_kimi_session_dir(root, "../../other"))
+            self.assertIsNone(resolve_kimi_session_dir(root, "..\\..\\other"))
+            self.assertIsNone(resolve_kimi_session_dir(root, "D:\\evil"))
+            self.assertIsNone(resolve_kimi_session_dir(root, "\\\\wsl.localhost\\Ubuntu\\home"))
+            ok = resolve_kimi_session_dir(root, "sessions/abc")
+            self.assertIsNotNone(ok)
+            self.assertTrue(ok.startswith(os.path.normpath(root)))
+            # WSL：absolute Linux 路径必须位于授权 root 内
+            unc_root = "\\\\wsl.localhost\\Ubuntu\\home\\u\\.kimi-code"
+            self.assertEqual(
+                resolve_kimi_session_dir(unc_root, "/home/u/.kimi-code/sessions/x",
+                                         "Ubuntu"),
+                "\\\\wsl.localhost\\Ubuntu\\home\\u\\.kimi-code\\sessions\\x")
+            self.assertIsNone(
+                resolve_kimi_session_dir(unc_root, "/home/other/sessions/x",
+                                         "Ubuntu"))
+            self.assertIsNone(
+                resolve_kimi_session_dir(unc_root, "/home/u/.kimi-code/../../etc",
+                                         "Ubuntu"))
+            # WSL relative：在对应 root 内规范化
+            self.assertEqual(
+                resolve_kimi_session_dir(unc_root, "sessions/y", "Ubuntu"),
+                "\\\\wsl.localhost\\Ubuntu\\home\\u\\.kimi-code\\sessions\\y")
+            self.assertIsNone(
+                resolve_kimi_session_dir(unc_root, "../../home/other", "Ubuntu"))
+
+    def test_interaction_request_approval_and_resolved(self):
+        # AC-KIMI-01：current durable interaction.request(approval) →
+        # WAITING/EXACT；interaction.resolved 清除
+        state = KimiFile("wire.jsonl")
+        base = time.time()
+        state.feed(json.dumps({
+            "type": "prompt.accepted", "time": int(base * 1000),
+            "content": [{"type": "text", "text": "跑测试"}]}))
+        obs = state.observation(base + 0.1, {})
+        self.assertEqual(obs.status, Status.WORKING)
+        state.feed(json.dumps({
+            "type": "interaction.request", "time": int((base + 1) * 1000),
+            "agentId": "main", "id": "it-1", "kind": "approval",
+            "toolCallId": "tc-9",
+            "request": {"title": "Bash: rm -rf build", "command": "rm -rf build"}}))
+        obs = state.observation(base + 1.1, {})
+        self.assertEqual(obs.status, Status.WAITING)
+        self.assertEqual(obs.confidence, Confidence.EXACT)
+        self.assertEqual(obs.phase, Phase.APPROVAL)
+        state.feed(json.dumps({
+            "type": "interaction.resolved", "time": int((base + 2) * 1000),
+            "agentId": "main", "id": "it-1", "response": {"decision": "approved"}}))
+        obs = state.observation(base + 2.1, {})
+        self.assertEqual(obs.status, Status.WORKING)
+        state.feed(json.dumps({
+            "type": "turn.ended", "time": int((base + 3) * 1000)}))
+        obs = state.observation(base + 3.1, {})
+        self.assertEqual(obs.status, Status.DONE)
+
+    def test_interaction_question_is_input_not_waiting(self):
+        # AC-KIMI-02：question/user_tool → INPUT，不误报 approval
+        state = KimiFile("wire.jsonl")
+        base = time.time()
+        state.feed(json.dumps({
+            "type": "interaction.request", "time": int(base * 1000),
+            "agentId": "main", "id": "it-2", "kind": "question",
+            "request": {"question": "使用哪个数据库？"}}))
+        obs = state.observation(base + 0.1, {})
+        self.assertEqual(obs.status, Status.INPUT)
+        self.assertEqual(obs.confidence, Confidence.EXACT)
+        self.assertIn("数据库", obs.summary)
+        state.feed(json.dumps({
+            "type": "interaction.resolved", "time": int((base + 1) * 1000),
+            "id": "it-2", "response": {"answer": "postgres"}}))
+        obs = state.observation(base + 1.1, {})
+        self.assertIsNotNone(obs)
+        self.assertNotEqual(obs.status, Status.INPUT)
+
+    def test_interaction_user_tool_is_input(self):
+        state = KimiFile("wire.jsonl")
+        base = time.time()
+        state.feed(json.dumps({
+            "type": "interaction.request", "time": int(base * 1000),
+            "id": "it-3", "kind": "user_tool",
+            "request": {"tool": "browser", "prompt": "打开页面并登录"}}))
+        obs = state.observation(base + 0.1, {})
+        self.assertEqual(obs.status, Status.INPUT)
+        self.assertNotEqual(obs.status, Status.WAITING)
 
     def test_approval_request_exact_and_response_clears(self):
         state = KimiFile("wire.jsonl")

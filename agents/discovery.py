@@ -26,7 +26,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .models import AgentKind, AgentInstance, SourceProbeSnapshot
+from .models import AgentKind, AgentInstance, SourceProbeSnapshot, TerminalAttachment
 from .paths import ENV_ALLOWLIST
 
 _SELF_PID = os.getpid()
@@ -52,6 +52,51 @@ class ProcessCandidate:
     ppid: int
     comm: str = ""
     args: str = ""
+
+
+def classify_ps_terminal_attachment(tty: str, tpgid: int) -> TerminalAttachment:
+    """已有 ps 字段 → 三态 terminal attachment（v4.2.3 §2.3）。
+
+    tty/tpgid 是 Linux 内核对 controlling terminal / foreground process
+    group 的事实，不需要任何新 syscall。注意：
+      * 不用 pgid == tpgid 作条件——Agent 可以暂时处于 background
+        process group 但仍拥有有效 controlling TTY；
+      * 不单独用 ppid==1 判 orphan——init/supervisor 场景中 PPID
+        不足以构成 terminal-detached 证据。
+    """
+    tty = str(tty or "").strip()
+    no_tty = tty in {"", "?", "??", "-"}
+    no_fg = int(tpgid or 0) <= 0
+    if not no_tty and not no_fg:
+        return TerminalAttachment.ATTACHED
+    if no_tty and no_fg:
+        return TerminalAttachment.DETACHED
+    return TerminalAttachment.UNKNOWN
+
+
+def canonical_terminal_attachment(
+        canonical_pid: int,
+        launcher_pids: tuple[int, ...],
+        rows_by_pid: dict[int, tuple],
+) -> TerminalAttachment:
+    """按 canonical group（canonical + same-kind launcher）判定附件状态。
+
+    Codex Node wrapper + Rust runtime 等同 kind 多层进程必须整组判断：
+    任一成员 ATTACHED 即保留；全部 DETACHED 才过滤；矛盾/缺失 → UNKNOWN。
+    rows_by_pid 值为 _ps_scan 的行元组（pid,ppid,sid,pgid,tpgid,tty,...）。
+    """
+    states = []
+    for pid in (canonical_pid, *launcher_pids):
+        row = rows_by_pid.get(pid)
+        if row is None:
+            continue
+        # 行布局：pid,ppid,sid,pgid,tpgid,tty,uid,etimes,stat,comm,args
+        states.append(classify_ps_terminal_attachment(row[5], row[4]))
+    if any(s is TerminalAttachment.ATTACHED for s in states):
+        return TerminalAttachment.ATTACHED
+    if states and all(s is TerminalAttachment.DETACHED for s in states):
+        return TerminalAttachment.DETACHED
+    return TerminalAttachment.UNKNOWN
 
 
 def canonicalize_agent_processes(
@@ -179,6 +224,17 @@ def scan_windows() -> list[AgentInstance]:
             ppid=parent_by_pid.get(cand.pid, 0),
             launcher_pids=launchers.get(cand.pid, ()),
         )
+        # canonical group 的外部父进程：跳过 same-kind launcher chain，
+        # 找最高 same-kind launcher 的 ppid（v4.2.3 §2.4）。O(短 parent
+        # chain)，不新增 psutil process iteration。
+        external_parent_pid = parent_by_pid.get(cand.pid, 0) or 0
+        for launcher_pid in launchers.get(cand.pid, ()):
+            external_parent_pid = parent_by_pid.get(launcher_pid, 0) or 0
+        inst.external_parent_pid = external_parent_pid
+        inst.external_parent_alive = (
+            True if external_parent_pid in info_by_pid
+            else False if external_parent_pid > 0
+            else None)
         try:
             cwd = psutil.Process(inst.pid).cwd()
             inst.cwd = cwd or ""
@@ -383,6 +439,8 @@ class WslProcessProbe:
         self.scan_count = 0
         self.scan_ms = 0.0
         self.metadata_pid_count = 0
+        # 因明确 DETACHED 被过滤的 canonical group 累计计数（非敏感统计）
+        self.detached_filtered_count = 0
 
     # ---- 第一层：发行版 ----
     def _list_running_distros(self) -> DistroInventory:
@@ -631,7 +689,23 @@ class WslProcessProbe:
                 pid=r[0], ppid=r[1], comm=r[9], args=r[10]) for r in matched]
             canonical, launchers = canonicalize_agent_processes(
                 candidates, parent_by_pid)
-            canonical_rows = [r for r in matched if r[0] in canonical]
+            # terminal attachment（v4.2.3 §2.3）：canonicalization 之后、
+            # 构造 AgentInstance 之前，按 canonical group 判定；
+            # DETACHED 整组不进入 authoritative snapshot，UNKNOWN 正常
+            # 产生（transient ps 输出不得误删）。
+            rows_by_pid = {row[0]: row for row in rows}
+            canonical_rows: list[tuple] = []
+            attachments: dict[int, TerminalAttachment] = {}
+            for r in matched:
+                if r[0] not in canonical:
+                    continue
+                attachment = canonical_terminal_attachment(
+                    r[0], launchers.get(r[0], ()), rows_by_pid)
+                if attachment is TerminalAttachment.DETACHED:
+                    self.detached_filtered_count += 1
+                    continue
+                attachments[r[0]] = attachment
+                canonical_rows.append(r)
 
             meta = self._metadata(distro, [r[0] for r in canonical_rows])
             self.metadata_pid_count = len(canonical_rows)
@@ -658,12 +732,15 @@ class WslProcessProbe:
                     cwd=info.get("cwd", ""),
                     home=info.get("home", ""),
                     launcher_pids=launchers.get(pid, ()),
+                    terminal_attachment=attachments.get(
+                        pid, TerminalAttachment.UNKNOWN),
                 )
                 inst.wt_session = env.get("WT_SESSION", "")
                 inst.wt_profile_id = env.get("WT_PROFILE_ID", "")
                 inst.codex_home = env.get("CODEX_HOME", "")
                 inst.claude_config_dir = env.get("CLAUDE_CONFIG_DIR", "")
                 inst.kimi_code_home = env.get("KIMI_CODE_HOME", "")
+                inst.pi_session_dir = env.get("PI_CODING_AGENT_SESSION_DIR", "")
                 hints = [n for n in ("TMUX", "STY", "TERM_PROGRAM") if env.get(n)]
                 inst.terminal_hint = "·".join(hints[:1])
                 if info.get("home") and not inst.user:

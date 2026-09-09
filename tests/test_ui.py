@@ -260,6 +260,91 @@ class TkTests(unittest.TestCase):
         scheduler.stop()
 
 
+class MenuEphemeralLifecycleTests(unittest.TestCase):
+    """v4.2.3 §9：tray/pet popup menu 的确定性销毁与 churn 上限。"""
+
+    def _app(self):
+        from pet.app import PetApp
+        from pet.petview import PetView
+        cfg = MemoryConfig()
+        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+             patch.object(PetView, 'load_skin', lambda self, bm: None):
+            return PetApp(cfg)
+
+    def test_dismiss_destroys_and_resets_active_menu(self):
+        app = self._app()
+        try:
+            import tkinter as tkmod
+            menu = tkmod.Menu(app.root, tearoff=0)
+            app._active_menu = menu
+            path = menu._w
+            app._dismiss_active_menu()
+            self.assertIsNone(app._active_menu)
+            self.assertEqual(app.root.tk.call('winfo', 'exists', path), 0)
+            # 幂等：重复 dismiss 不抛
+            app._dismiss_active_menu()
+            app._destroy_menu(None)
+        finally:
+            app.quit()
+
+    def test_tray_menu_uses_tk_popup_and_destroys_in_finally(self):
+        app = self._app()
+        try:
+            destroyed = []
+            popups = []
+            real_popup = __import__('tkinter').Menu.tk_popup
+
+            def spy_popup(self, x, y, entry=""):
+                popups.append(self._w)
+                real_popup(self, x, y, entry)
+            with patch('tkinter.Menu.tk_popup', spy_popup):
+                app._tray_menu()
+            self.assertEqual(len(popups), 1)          # tk_popup 而非 post
+            self.assertIsNone(app._active_menu)       # finally 清空
+            # 菜单 widget 已销毁
+            self.assertEqual(app.root.tk.call('winfo', 'exists', popups[0]), 0)
+        finally:
+            app.quit()
+
+    def test_second_tray_menu_destroys_previous(self):
+        app = self._app()
+        try:
+            seen = []
+            real_popup = __import__('tkinter').Menu.tk_popup
+
+            def spy_popup(self, x, y, entry=""):
+                seen.append(self._w)
+            with patch('tkinter.Menu.tk_popup', spy_popup):
+                app._tray_menu()
+                first = seen[0]
+                self.assertEqual(app.root.tk.call('winfo', 'exists', first), 0)
+                app._tray_menu()
+            # 旧 popup 已确定性销毁：任何时刻 _active_menu 最多 1 个
+            self.assertEqual(app.root.tk.call('winfo', 'exists', first), 0)
+            self.assertIsNone(app._active_menu)
+        finally:
+            app.quit()
+
+    def test_menu_churn_1000_no_widget_growth_or_tclerror(self):
+        app = self._app()
+        try:
+            import tkinter as tkmod
+            paths = []
+            for _ in range(1000):
+                menu = tkmod.Menu(app.root, tearoff=0)
+                app._active_menu = menu
+                paths.append(menu._w)
+                app._dismiss_active_menu()
+            self.assertIsNone(app._active_menu)
+            # 所有历史 menu widget 均已销毁（无线性增长）
+            alive = [p for p in paths
+                     if app.root.tk.call('winfo', 'exists', p)]
+            self.assertEqual(alive, [])
+            # 无新增 after timer（菜单生命周期不靠定时器）
+        finally:
+            app.quit()
+
+
 class AppTests(unittest.TestCase):
     def test_primary_target_and_dashboard_smoke(self):
         from pet.app import PetApp

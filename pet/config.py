@@ -24,10 +24,16 @@ ASSETS_DIR = os.path.join(ROOT, "assets")
 PETS_DIR = os.path.join(ASSETS_DIR, "pets")
 CACHE_DIR = os.path.join(ASSETS_DIR, "cache")
 
+# skins.py 在其顶部（路径 import 之前）先定义 BUILTIN_SKIN，
+# 因此这里反向 import 不会循环失败。
+from .skins import BUILTIN_SKIN  # noqa: E402
+
 CONFIG_VERSION = 4
 
 DEFAULTS = {
-    "skin": "amiya",
+    # fresh install 默认程序化原创 fallback（v4.2.3 §10.4）：公开源码
+    # 包不假定用户本机存在版权素材；已有用户 config 原样保留。
+    "skin": BUILTIN_SKIN,
     "scale": 1.0,                # 宠物+气泡整体缩放（改变后重新生成 GIF 缓存）
     "speed": 1.0,                # 动画播放速度倍率
     "animated": True,            # 动态 / 静态（静态=只播第 0 帧）
@@ -253,8 +259,8 @@ def migrate(loaded: dict) -> tuple[dict, bool]:
         migrated = True
     loaded.setdefault("presentation", {})["concurrent"] = concurrent
     loaded["config_version"] = CONFIG_VERSION
-    if loaded.get("skin") == "default":     # 旧版皮肤名迁移
-        loaded["skin"] = "amiya"
+    if loaded.get("skin") == "default":     # 旧版皮肤名迁移（v4.2.3：
+        loaded["skin"] = BUILTIN_SKIN       # 不再隐含 amiya 默认值）
     return loaded, migrated
 
 

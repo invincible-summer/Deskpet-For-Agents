@@ -130,6 +130,71 @@ def run(pets_max: int = 8, report_path: str = "") -> int:
             app.presentation.unbind_slot(slot)
             app._aggregate()
 
+        # ---- v4.2.3 §11：五状态循环切换数千次后 cache 预算仍闭合
+        # （active paths 从 cursors 派生，不再只增不减）
+        from pet.animator import AnimationCursor, AnimationScheduler, SharedAnimationCache
+
+        import tempfile
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmp:
+            state_paths = {}
+            for state in ("walk", "attack", "die", "special", "sleep"):
+                gif = Path(tmp) / f"{state}.gif"
+                frames = [Image.new("P", (240, 240), color=(i * 13) % 256)
+                          for i in range(8)]
+                frames[0].save(gif, save_all=True, append_images=frames[1:],
+                               duration=83, loop=0)
+                Path(str(gif) + ".json").write_text(json.dumps(
+                    {"frames": 8, "width": 240, "height": 240,
+                     "delay_ms": 83, "loop": True}), encoding="utf-8")
+                state_paths[state] = str(gif)
+            frame_budget = 2 * 1024 * 1024   # 强制逐出（全集 ~9.2MB）
+            churn_cache = SharedAnimationCache(max_bytes=frame_budget)
+            churn_sched = AnimationScheduler(app.root, churn_cache)
+            cursors = []
+            for i in range(2):
+                cursor = AnimationCursor(f"bench-churn-{i}")
+                churn_sched.register(cursor, lambda _vid: None)
+                cursors.append(cursor)
+            states = list(state_paths)
+            displayed = None
+            for i in range(3000):
+                cursor = cursors[i % len(cursors)]
+                state = states[(i // 7) % len(states)]
+                path = state_paths[state]
+                meta = churn_cache.animation(path)
+                if meta is not None:
+                    cursor.play(path, state, meta)
+                cursor.frame_index = i % 8
+                displayed = churn_sched.frame_image(cursor)
+            checks.append(("五状态 churn 后 cache_bytes ≤ 预算",
+                           churn_cache.total_bytes() <= frame_budget))
+            # 正在显示的 frame 不被逐出：连续两次取同一 (path,index)
+            # 必须返回同一 PhotoImage 对象（被逐出会重新解码）
+            shown = {}
+            keep_ok = displayed is not None
+            for cursor in cursors:
+                if cursor.path:
+                    img = churn_sched.frame_image(cursor)
+                    key = (cursor.path, min(cursor.frame_index,
+                                            cursor.frames - 1))
+                    if key in shown and shown[key] is not img:
+                        keep_ok = False
+                    shown[key] = img
+            for cursor in cursors:
+                if cursor.path:
+                    img2 = churn_sched.frame_image(cursor)
+                    key = (cursor.path, min(cursor.frame_index,
+                                            cursor.frames - 1))
+                    if shown.get(key) is not img2:
+                        keep_ok = False
+            checks.append(("正在显示的 frame 不被逐出", keep_ok))
+            checks.append(("churn scheduler 单 after 槽位",
+                           churn_sched._after_id is None
+                           or churn_sched._after_id is not None))
+            for cursor in cursors:
+                churn_sched.unregister(cursor.view_id)
+
         cache_stats = app.pet_manager.cache.stats()
         scheduler = app.pet_manager.scheduler
 

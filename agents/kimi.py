@@ -16,6 +16,7 @@
 import json
 import os
 import time
+from pathlib import Path
 
 from . import paths
 from .base import BaseWatcher, FileState, classify_phase, parse_ts
@@ -33,7 +34,8 @@ from .summarize import fmt_command, shorten
 GOAL_MAX = 120
 SUMMARY_MAX = 160
 
-# 真实 wire 顶层事件 + legacy SDK 命名（2026-09 实机验证）
+# 真实 wire 顶层事件 + current durable interaction + legacy SDK 命名
+# （2026-09 实机验证；v4.2.3 §7.1 增加 interaction.request/resolved）
 _TOP_TYPES = frozenset({
     "metadata", "runtime.set_binding", "profile.bind", "prompt.accepted",
     "plan_mode.enter", "plan_mode.exit", "plan_mode.cancel",
@@ -41,6 +43,7 @@ _TOP_TYPES = frozenset({
     "turn.cancel", "error", "fatal", "approval.request", "approval.response",
     "approval.resolved", "ApprovalRequest", "ApprovalResponse",
     "ApprovalRequestResolved", "context.append_loop_event",
+    "interaction.request", "interaction.resolved",
     "TurnBegin", "TurnEnd", "ToolCall", "ToolCallRequest", "UserPrompt",
     "UserMessage", "PromptSubmitted", "Notification", "StatusUpdate", "?",
 })
@@ -115,6 +118,7 @@ class KimiFile(FileState):
         self.goal = ""
         self.pending = None          # dict payload；仅显式审批请求事件
         self.pending_id = ""
+        self.input_id = ""           # durable interaction 的 question/user_tool id
         self.done_ts = 0.0
         self.input_pending = False
         self.input_summary = ""
@@ -219,6 +223,7 @@ class KimiFile(FileState):
             self.turn_known_over = True
             self.done_ts = ts if str(obj.get("reason") or "") != "cancelled" else 0.0
             self.input_pending = False
+            self.input_id = ""
             self.pending = None
             self.pending_id = ""
             self.phase = Phase.NONE
@@ -226,10 +231,43 @@ class KimiFile(FileState):
             self.turn_active = False
             self.turn_known_over = True
             self.input_pending = False
+            self.input_id = ""
             self.done_ts = 0.0
             self.phase = Phase.NONE
-        elif t in ("error", "fatal"):
+        elif t == "error" or t == "fatal":
             self._set_error(obj, ts)
+        elif t == "interaction.request":
+            # current durable interaction（v4.2.3 §7.1）：
+            # { agentId, id, kind: approval|question|user_tool, toolCallId?, request }
+            iid = str(obj.get("id") or "")
+            kind = str(obj.get("kind") or "")
+            request = obj.get("request")
+            payload = dict(request) if isinstance(request, dict) else dict(obj)
+            if kind == "approval":
+                self.pending = payload
+                self.pending_id = iid
+                self.input_pending = False
+                self.input_id = ""
+                self.phase = Phase.APPROVAL
+            elif kind in {"question", "user_tool"}:
+                self.pending = None
+                self.pending_id = ""
+                self.input_pending = True
+                self.input_id = iid
+                summary = _text(_first_present(
+                    payload, "question", "prompt", "message", "text"))
+                self.input_summary = shorten(summary or "等待输入", GOAL_MAX)
+                self.phase = Phase.USER_INPUT
+        elif t == "interaction.resolved":
+            iid = str(obj.get("id") or "")
+            if iid and iid == self.pending_id:
+                self.pending = None
+                self.pending_id = ""
+            if iid and iid == self.input_id:
+                self.input_pending = False
+                self.input_id = ""
+                if self.phase is Phase.USER_INPUT:
+                    self.phase = Phase.NONE
         elif t in ("approval.request", "ApprovalRequest"):
             payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else obj
             self.pending = dict(payload)
@@ -260,6 +298,7 @@ class KimiFile(FileState):
         self.turn_active = True
         self.turn_known_over = False
         self.input_pending = False
+        self.input_id = ""
         self.done_ts = 0.0
         self.error_text = ""
         self.error_ts = 0.0
@@ -461,7 +500,9 @@ class KimiWatcher(BaseWatcher):
                 if wire not in [p for _m, p in out]:
                     out.append((mtime, wire))
                     self._file_cwd_hint[wire] = str(getattr(inst, "cwd", "") or "")
-                    session_dir = os.path.dirname(os.path.dirname(wire))
+                    # wire = <session>/agents/main/wire.jsonl → canonical
+                    # state.json 位于 <session>/state.json（v4.2.3 §7.2）
+                    session_dir = str(Path(wire).parents[2])
                     title, prompt = self._state_json_hints(session_dir)
                     st = self.files.get(wire)
                     if st is not None:

@@ -86,8 +86,11 @@ def run(ticks: int = 20000, report_path: str = "") -> int:
     queue_high = 0
     budget_high = 0
     dirty_high = 0
+    pending_high = 0
     sim_t0 = 1_000_000.0
     sim_t1 = sim_t0 + ticks * 0.5
+    reads_per_tick = []
+    prev_read_count = 0
     for tick in range(ticks):
         now = sim_t0 + tick * 0.5   # 模拟 30min @ 0.5s ≈ 36000 ticks
         # 每个周期：每 control 发 2 个 TextChanged/notification（普通输出）；
@@ -108,6 +111,9 @@ def run(ticks: int = 20000, report_path: str = "") -> int:
         observer.poll(now)
         budget_high = max(budget_high, len(observer._visible_read_times))
         dirty_high = max(dirty_high, len(observer._dirty_controls))
+        pending_high = max(pending_high, len(observer._pending_reads))
+        reads_per_tick.append(backend.read_count - prev_read_count)
+        prev_read_count = backend.read_count
         # 模拟状态融合（直接构造 observation，测 monitor 数据结构上限）
         for inst in instances:
             obs = Observation(source=EvidenceSource.SESSION, timestamp=now,
@@ -121,6 +127,12 @@ def run(ticks: int = 20000, report_path: str = "") -> int:
     sim_duration = sim_t1 - sim_t0
     # TextChanged fallback 读取速率（预算约束的通道）
     fallback_rate = observer.stats["text_fallback_reads"] / sim_duration
+    # v4.2.3 §5.3：统计全部路径 visible reads（不只 fallback）；
+    # 任意 1s 模拟滑窗（0.5s tick → 3 个连续 tick 的跨度含端点为 1.0s）
+    # 内真实读取 ≤6。
+    window_1s_max = max(
+        (sum(reads_per_tick[i:i + 3]) for i in range(len(reads_per_tick) - 2)),
+        default=0)
 
     # ---- control churn 1000 次：订阅账本不积累
     tracker = SubscriptionTracker()
@@ -193,10 +205,13 @@ def run(ticks: int = 20000, report_path: str = "") -> int:
     checks.append(("control 数有上限", len(observer.controls) <= MAX_CONTROLS))
     ring_ok = all(v <= RING_MAX for v in observer._ring_len.values())
     checks.append(("terminal ring ≤8KB", ring_ok and observer._ring_len))
-    checks.append(("可见读取预算 ≤6/s（fallback 通道）",
+    checks.append(("可见读取预算 ≤6/s（全部通道）",
                    fallback_rate <= GLOBAL_VISIBLE_READ_LIMIT
-                   and budget_high <= GLOBAL_VISIBLE_READ_LIMIT + 2))
+                   and budget_high <= GLOBAL_VISIBLE_READ_LIMIT + 2
+                   and window_1s_max <= GLOBAL_VISIBLE_READ_LIMIT))
     checks.append(("dirty control 有界", dirty_high <= MAX_CONTROLS))
+    checks.append(("pending visible reads ≤MAX_CONTROLS",
+                   pending_high <= MAX_CONTROLS))
     checks.append(("统计计数无异常增长", observer.stats["dropped"] >= 0))
     checks.append(("control churn 不积累订阅",
                    len(tracker.active) == len(final_controls)

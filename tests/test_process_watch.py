@@ -74,7 +74,7 @@ class WindowsExitWatcherTests(unittest.TestCase):
         finally:
             terminate_process(proc)
 
-    def test_register_is_idempotent_and_unregister_closes(self):
+    def test_register_is_idempotent_and_unregister_async_closes(self):
         proc = _spawn_sleeper()
         try:
             inst = _instance(proc.pid)
@@ -83,12 +83,27 @@ class WindowsExitWatcherTests(unittest.TestCase):
             self.assertEqual(self.watcher.watched_count(), 1)
             self.watcher.unregister(inst.key)
             self.assertEqual(self.watcher.watched_count(), 0)
+            # unregister 是异步命令：等 watcher 线程消费 remove（handle
+            # 由 watcher 关闭）后再终止进程，确保不再产生事件。
+            self._wait_removed(inst.key)
             proc.terminate()
             proc.wait(timeout=10)
             time.sleep(0.5)
             self.assertEqual(self.watcher.drain(), [])     # 已注销：无事件
         finally:
             terminate_process(proc)
+
+    def _wait_removed(self, key: str, timeout: float = 5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.watcher._lock:
+                drained = (key not in self.watcher._pending_add
+                           and key not in self.watcher._pending_remove
+                           and key not in self.watcher._logical_keys)
+            if drained and key not in self.watcher._entries:
+                return
+            time.sleep(0.02)
+        self.fail(f"remove command for {key} not drained in time")
 
     def test_register_missing_pid_fails_closed(self):
         # 不存在的 PID：OpenProcess 失败 → False，且绝不产生退出事件
@@ -122,6 +137,54 @@ class WindowsExitWatcherTests(unittest.TestCase):
             self.assertFalse(self.watcher.started)
         finally:
             terminate_process(proc)
+
+    def test_churn_stress_no_crash_duplicate_or_handle_leak(self):
+        """AC-EXIT-03：≥500 次真实 register/unregister/terminate churn。
+
+        不得 access violation、WAIT_FAILED storm、重复 exit event、
+        handle count 线性增长。
+        """
+        import ctypes
+
+        def _own_handle_count() -> int:
+            kernel32 = ctypes.windll.kernel32
+            count = ctypes.c_ulong(0)
+            ok = kernel32.GetProcessHandleCount(
+                kernel32.GetCurrentProcess(), ctypes.byref(count))
+            return count.value if ok else -1
+
+        watcher = WindowsExitWatcher()
+        self.assertTrue(watcher.start())
+        baseline = _own_handle_count()
+        try:
+            for i in range(500):
+                proc = _spawn_sleeper()
+                try:
+                    inst = _instance(proc.pid, token=f"{i}")
+                    if not watcher.register(inst):
+                        continue
+                    if i % 3 == 0:
+                        watcher.unregister(inst.key)
+                        self._wait_removed(inst.key, timeout=2.0)
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                finally:
+                    terminate_process(proc)
+            time.sleep(0.5)
+            drained = watcher.drain()
+            # 重复事件检测：同 key 最多一个事件
+            keys = [e.key for e in drained]
+            self.assertEqual(len(keys), len(set(keys)))
+            watcher.stop()
+            self.assertEqual(watcher.watched_count(), 0)
+        finally:
+            watcher.stop()
+            self.assertFalse(watcher.started)
+        # churn + stop 后句柄数不线性增长（允许小幅噪声）
+        after = _own_handle_count()
+        if baseline >= 0 and after >= 0:
+            self.assertLessEqual(after, baseline + 8,
+                                 f"handle leak: {baseline} -> {after}")
 
 
 if __name__ == "__main__":

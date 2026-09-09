@@ -15,6 +15,7 @@ WSL 用户 HOME 一律通过 PID → uid → getent passwd 解析，不再枚举
 """
 import json
 import os
+import posixpath
 import time
 
 from .models import AgentKind
@@ -27,6 +28,7 @@ ENV_ALLOWLIST = (
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
     "KIMI_CODE_HOME",
+    "PI_CODING_AGENT_SESSION_DIR",
     "TMUX",
     "STY",
     "TERM_PROGRAM",
@@ -101,26 +103,38 @@ def instance_roots(inst, kind: AgentKind | None = None) -> list[str]:
     WSL 实例：优先 env 覆盖根（allowlisted），其次该 uid 的真实 HOME；
     数据根必须由 wsl_unc 转换，绝不遍历 \\home\\*。
     Windows 实例：当前用户 HOME（无法读取其他进程 env，无覆盖根）。
+
+    PI（v4.2.3 §8.2）：canonical session root 是
+    `<home>/.pi/agent/sessions`（或 PI_CODING_AGENT_SESSION_DIR 覆盖），
+    不从 `~/.pi` 整根递归——比放大 depth 更省目录枚举、缩小隐私扫描面。
     """
     kind = kind or inst.kind
     source = getattr(inst, "source", "")
     if source.startswith("wsl:"):
         distro = source.split(":", 1)[1]
         roots = []
-        env_root = inst.data_root(kind)
         home = getattr(inst, "home", "")
         candidates = []
-        if env_root:
-            candidates.append(env_root)
-        if home:
-            default = home.rstrip("/") + "/" + {
-                AgentKind.CLAUDE: ".claude",
-                AgentKind.CODEX: ".codex",
-                AgentKind.KIMI: ".kimi-code",
-                AgentKind.PI: ".pi",
-            }[kind]
-            if default not in candidates:
-                candidates.append(default)
+        if kind is AgentKind.PI:
+            # env override allowlist（PI_CODING_AGENT_SESSION_DIR）
+            env_root = str(getattr(inst, "pi_session_dir", "") or "")
+            if env_root:
+                candidates.append(env_root)
+            if home:
+                candidates.append(home.rstrip("/") + "/.pi/agent/sessions")
+        else:
+            env_root = inst.data_root(kind)
+            if env_root:
+                candidates.append(env_root)
+            if home:
+                default = home.rstrip("/") + "/" + {
+                    AgentKind.CLAUDE: ".claude",
+                    AgentKind.CODEX: ".codex",
+                    AgentKind.KIMI: ".kimi-code",
+                    AgentKind.PI: ".pi",
+                }[kind]
+                if default not in candidates:
+                    candidates.append(default)
         for cand in candidates:
             try:
                 roots.append(wsl_unc(distro, cand))
@@ -210,6 +224,77 @@ def parse_kimi_index(text: str) -> list[dict]:
     return entries
 
 
+def _linux_contains(root_linux: str, candidate: str) -> bool:
+    root_linux = posixpath.normpath(root_linux).rstrip("/") or "/"
+    if candidate == root_linux:
+        return True
+    return candidate.startswith(root_linux + "/")
+
+
+def resolve_kimi_session_dir(root: str, session_dir: str,
+                             distro: str = "") -> str | None:
+    """session_index 的 sessionDir → 受控会话目录（v4.2.3 §7.3）。
+
+    所有 sessionDir 在拼接 wire 前必须证明仍位于当前 authorized Kimi
+    root；任何 `..` 越界、跨盘、无效 absolute/relative、commonpath 异常
+    均返回 None。不跟 symlink（保持 follow_symlinks=False 规则）。
+
+      * Windows root + relative sessionDir：normpath(join) 后 commonpath；
+      * WSL root（UNC）+ relative sessionDir：转 Linux 路径规范化 containment；
+      * WSL root + absolute Linux sessionDir：posixpath.normpath 后要求
+        位于该 root 的 Linux 等价路径内，再 wsl_unc；
+      * Windows-absolute/UNC-absolute sessionDir：拒绝。
+    """
+    session_dir = str(session_dir or "").strip().replace("\x00", "")
+    root = str(root or "").strip().rstrip("\\/")
+    if not session_dir or not root:
+        return None
+    is_wsl = bool(distro)
+    if session_dir.startswith("\\\\"):
+        return None
+    if session_dir.startswith("/"):
+        if not is_wsl:
+            return None
+        root_linux = unc_to_linux(root)
+        if not root_linux.startswith("/"):
+            return None
+        try:
+            norm = posixpath.normpath(session_dir)
+        except ValueError:
+            return None
+        if not norm.startswith("/") or not _linux_contains(root_linux, norm):
+            return None
+        try:
+            return wsl_unc(distro, norm)
+        except ValueError:
+            return None
+    if os.path.isabs(session_dir):
+        return None
+    if is_wsl:
+        root_linux = unc_to_linux(root)
+        if not root_linux.startswith("/"):
+            return None
+        try:
+            combined = posixpath.normpath(
+                posixpath.join(root_linux, session_dir.replace("\\", "/")))
+        except ValueError:
+            return None
+        if not combined.startswith("/") or not _linux_contains(root_linux, combined):
+            return None
+        try:
+            return wsl_unc(distro, combined)
+        except ValueError:
+            return None
+    candidate = os.path.normpath(os.path.join(root, session_dir))
+    try:
+        if os.path.commonpath([candidate, os.path.normpath(root)]) != \
+                os.path.normpath(root):
+            return None
+    except ValueError:
+        return None
+    return candidate
+
+
 def read_kimi_index_tail(root: str) -> list[dict]:
     path = os.path.join(root, KIMI_INDEX_NAME)
     try:
@@ -228,7 +313,11 @@ def read_kimi_index_tail(root: str) -> list[dict]:
 
 
 def kimi_wire_candidates(inst) -> list[tuple[float, str]]:
-    """按 cwd 从 session_index 解析 wire.jsonl 候选（无 mtime 时用 0）。"""
+    """按 cwd 从 session_index 解析 wire.jsonl 候选（无 mtime 时用 0）。
+
+    sessionDir 必须经 resolve_kimi_session_dir containment 校验
+    （v4.2.3 §7.3），越界/跨盘/绝对 Windows 路径一律不产生候选。
+    """
     cwd = (getattr(inst, "cwd", "") or "").rstrip("/")
     out: list[tuple[float, str]] = []
     if not cwd:
@@ -240,23 +329,11 @@ def kimi_wire_candidates(inst) -> list[tuple[float, str]]:
             work = str(entry.get("workDir") or "").rstrip("/")
             if work != cwd:
                 continue
-            session_dir = str(entry.get("sessionDir") or "")
+            session_dir = resolve_kimi_session_dir(
+                root, str(entry.get("sessionDir") or ""), distro)
             if not session_dir:
                 continue
-            if distro:
-                if session_dir.startswith("/"):
-                    try:
-                        wire = wsl_unc(distro, session_dir + "/agents/main/wire.jsonl")
-                    except ValueError:
-                        continue
-                else:
-                    wire = os.path.join(root, session_dir.replace("/", os.sep),
-                                        "agents", "main", "wire.jsonl")
-            else:
-                if session_dir.startswith("/"):
-                    continue
-                wire = os.path.join(root, session_dir.replace("/", os.sep),
-                                    "agents", "main", "wire.jsonl")
+            wire = os.path.join(session_dir, "agents", "main", "wire.jsonl")
             mtime = _mtime_of(wire)
             if mtime is not None:
                 out.append((mtime, wire))

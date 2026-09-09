@@ -1,4 +1,4 @@
-# DeskPet V4.2.2 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
+# DeskPet V4.2.3 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
 
 一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
 
@@ -42,7 +42,7 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 
 - **五状态动画**：`walk` 工作中 ｜ `attack` 下达指令 ｜ `die` 等待审批 ｜ `special` 任务完成（×3）｜ `sleep` 空闲
 - **语义化状态气泡**：`Agent · Mode · Phase` + Goal（≤120 字）+ 当前活动摘要（≤160 字，本地规则压缩，不调用 LLM）
-- **等待审批检测**：Kimi 来自 wire `ApprovalRequest`（精确）；Codex/Claude 来自 Windows Terminal UIA 当前可见审批 UI（高置信 + 1.5s TTL 复检）——**静默永远不被推断为等待审批**
+- **等待审批检测**：Kimi 来自 wire durable `interaction.request(kind=approval)`（EXACT；legacy `ApprovalRequest`/`approval.request` 兼容兜底），`question`/`user_tool` 归类为 INPUT 而非 WAITING；Codex/Claude 来自 Windows Terminal UIA 当前可见审批 UI（高置信 + 1.5s TTL 复检）——**静默永远不被推断为等待审批**
 - **多 Agent**：自动跟随（WAITING > INPUT > ERROR > WORKING …，工作中粘性），或并发模式（单宠聚合/多宠分离）
 - **仪表盘 V4.1.4**：左侧导航六页（概览/Agents/桌宠与外观/监听与隐私/诊断/设置），自适应窗口大小；PID 等技术细节在"详情"高级诊断
 - **双击桌宠/气泡/卡片按钮**：唤起该 Agent 所在的 Windows Terminal 窗口（公共 Win32 API 恢复并前置；foreground 被拒时闪烁任务栏；AGGREGATE 下双击桌宠只互动）
@@ -51,20 +51,23 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 
 ## 快速开始
 
-```bat
-:: 1) 创建环境（Miniconda）
-D:\miniconda3\Scripts\conda.exe create -n deskpet python=3.12 -y
-D:\miniconda3\envs\deskpet\python.exe -m pip install -r requirements.txt
+公开源码包使用 repo-local `.venv`（`.gitignore` 已忽略，不污染系统 Python）：
 
-:: 2) 启动
-启动桌宠.bat        （pythonw 隐藏控制台）
-:: 或
-D:\miniconda3\envs\deskpet\python.exe main.py
+```bat
+:: 1) 一次性安装（只寻找已安装的 Python 3.12，不自动联网下载 Python）
+Setup-Desktop.bat
+
+:: 2) 启动（只启动，绝不联网/pip install；环境缺失时明确失败）
+Start-Desktop.bat
 ```
 
-旧配置自动迁移到当前 schema（`config_version` 随版本演进；迁移会删除已废弃键、清空运行期绑定，从不写入 Agent 身份）。
+安装与启动脚本都按"确定性"设计：Setup 用 `constraints-v4.2.3.txt` 锁定 CI 已验证的 Python 3.12 依赖集；Start 只使用 `.venv\Scripts\pythonw.exe`（隐藏控制台），不 fallback 到任意 Conda/System Python——"能双击"不能以"随机使用一个缺依赖环境"为代价。
 
-依赖已拆分：`requirements-core.txt`（psutil/Pillow/comtypes，常驻监控路径）与 `requirements-convert.txt`（imageio-ffmpeg/numpy/scipy，仅皮肤转换期使用，转换在独立子进程完成）；完整安装仍是 `pip install -r requirements.txt`。
+全新安装默认皮肤为程序化原创 fallback `builtin-cat`（`pet/icon.py` 绘制，无版权素材依赖）；导入自己的皮肤后完全走原流程。已有用户 config 中的自定义皮肤原样保留。
+
+旧配置自动迁移到当前 schema（`config_version=4`；迁移会删除已废弃键、清空运行期绑定，从不写入 Agent 身份）。
+
+依赖已拆分：`requirements-core.txt`（psutil/Pillow/comtypes，常驻监控路径）与 `requirements-convert.txt`（imageio-ffmpeg/numpy/scipy，仅皮肤转换期使用，转换在独立子进程完成）；完整安装仍是 `pip install -r requirements.txt`（release 安装由 constraints 锁定版本）。
 
 ## 三路观察（安全、无 hooks）
 
@@ -75,8 +78,8 @@ D:\miniconda3\envs\deskpet\python.exe main.py
 |---|---|---|
 | Codex | `$CODEX_HOME`（默认 `~/.codex`） | `task_started.collaboration_mode_kind` → Plan/Default（EXACT）；user_message → Goal |
 | Claude Code | `$CLAUDE_CONFIG_DIR`（默认 `~/.claude`） | `permission-mode` → 六种模式；`sessions/<pid>.json` 为强 hint（/clear 后自动切换新 transcript） |
-| Kimi | `$KIMI_CODE_HOME`（默认 `~/.kimi-code`，legacy `~/.kimi` 兜底） | `session_index.jsonl` 按 cwd 精确定位；`state.json.lastPrompt` + `prompt.accepted` → Goal；`plan_mode.enter/exit`（EXACT）；wire `ApprovalRequest`（EXACT，兜底 SDK 命名） |
-| pi | `~/.pi` | assistant/toolCall 生命周期 |
+| Kimi | `$KIMI_CODE_HOME`（默认 `~/.kimi-code`，legacy `~/.kimi` 兜底） | `session_index.jsonl` 按 cwd 精确定位（sessionDir 受 containment 校验）；`state.json.lastPrompt` + `prompt.accepted` → Goal；`plan_mode.enter/exit`（EXACT）；wire `interaction.request(kind=approval/question/user_tool)`（EXACT）+ legacy `ApprovalRequest` 兜底 |
+| pi | `~/.pi/agent/sessions`（可用 `PI_CODING_AGENT_SESSION_DIR` 覆盖） | assistant `stopReason`（stop/length/toolUse/error/aborted）驱动 turn 生命周期；独立 `role=toolResult` message 是活动证据（工具失败 ≠ Agent ERROR） |
 
 3. **终端 UIA**（`agents/terminal_uia.py`，观察专用）：独立 MTA 线程（comtypes `CUIAutomation8`/`IUIAutomation5`），订阅 TermControl 的 Notification（2022 起携带新增文本）+ TextChanged（0.15s debounce 的有界审批 fallback）+ 窗口级 StructureChanged（control 开合立即重发现，20s 周期仅为兜底）；弱触发词命中才读 `GetVisibleRanges()` 当前可见区域；审批识别要求**标题模式 + 选项结构同时出现**且识别器种类与绑定 Agent 一致；内存边界：delta≤2048 / ring≤8192 / control≤16 / 事件队列≤256 / UIA 命令队列≤32 / 可见读取全局≤6/s（单 control≥0.5s 间隔）。
 
@@ -103,6 +106,7 @@ Windows Terminal 没有 `WT_SESSION → tab/pane` 公开接口，DeskPet 只做 
   3. **unhealthy** —— WSL 枚举/ps 读取失败：DeskPet 保留上一轮缓存并显示"状态可能延迟"，绝不误判退出（无法读取 ≠ 已经不存在）。
   Running 清单**每轮全新查询，绝不缓存正结果**（V3.1.2 被动性闭环）：`wsl -d <distro> --exec` 本身会启动目标发行版（Microsoft 官方 networking 文档原文），而 probe 间隔 3s 小于 WSL 空闲关机延迟（官方 "8 second rule"），一份过期的 Running 缓存会把用户刚停止的 distro 重新拉起并形成"探测保活"循环——因此只有**本轮刚确认 Running** 的发行版才会被 `wsl -d` 探测；`--list --running` 是宿主侧查询，不会启动任何发行版。停止检测的最坏延迟约为 3s 调度 + 一轮权威缺席确认。
 - **状态语义**：已知 active turn → 无限保持 WORKING；仅活动证据 → 10s 宽限后回 UNKNOWN（不伪造）；DONE 展示 8s；IDLE 只在明确见过 turn 结束后出现；**泛化终端活动（pane 有文本变化）永远不能推翻结构化 Session 的 DONE/IDLE/ERROR/INPUT**
+- **interactive-terminal liveness（V4.2.3）**："进程存在"不等价于"用户还有一个打开的终端 Agent"。Claude/Codex 关闭终端后进程可能 orphan 存活（上游已确认行为）。WSL 用已有 `ps` 的 `tty/tpgid` 直接分类：有效 controlling TTY → attached 继续显示；TTY 被 revoke 且无前台进程组 → detached，下一轮健康 census 即从列表消失；证据矛盾 → UNKNOWN 保留（tmux/screen 内的 Agent 只要 tmux 仍提供 TTY 就保留；nohup/无 TTY 后台进程不再作为"终端 Agent"展示）。Windows native 采用保守判定：只有曾被 `windows-ancestor CONFIRMED` 强绑定、且外部父进程连续两个权威 generation 消失的实例才退出；证据不足一律保留。**DeskPet 只修正自己的观察事实，绝不 kill/terminate/signal 用户的残余 Agent 进程**——orphan 清理是上游 CLI 的生命周期职责。
 - **Status/Phase/Mode 正交**：Mode 是独立维度（Plan/Default/UNKNOWN+原始值），终端 WAITING 成为状态胜者时无权擦除 Session 已解析的 Mode——`WAITING + APPROVAL + PLAN` 是合法且必要的最终状态；优先级为 Session 结构化 Mode → 胜者明确携带的 Mode → NONE
 - **会话解析**：绑定用互相唯一匹配（source/session_id/cwd/started_at 评分，结果与实例遍历顺序无关），同分竞争保持未绑定；late-start 每 15s 无窗 fallback（最近 12 候选）；目录重扫有绑定时降为 15s
 - **兼容性诊断**：会话解析器按已知记录类型集合判定 `OK / PARTIAL / UNKNOWN`，上游格式变化会在仪表盘显示"未知记录"而不是静默失败；Mode 出现未知原始值时显示 `Unknown（原始值：…）`
@@ -161,15 +165,17 @@ tests/                              单元/隐私/UIA/匹配/基准/实机回归
 ## 测试
 
 ```bat
-D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（350+）
-D:\miniconda3\envs\deskpet\python.exe tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json    # 合成基准（队列/预算/churn 上限）
-D:\miniconda3\envs\deskpet\python.exe tools\terminal_window_probe.py --list      # WT 窗口实机 probe（list/validate/activate/resolve）
-D:\miniconda3\envs\deskpet\python.exe tools\terminal_observer_probe.py           # UIA 观察实机 probe（默认不打印终端原文）
-D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\regression.py                # 位置/气泡/缩放/托盘/自启
-D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\replay_real.py               # 真实会话数据回放
+:: 使用 Setup-Desktop.bat 创建的 repo 环境（或任何 Python 3.12 + requirements）
+.venv\Scripts\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（380+）
+.venv\Scripts\python.exe tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json    # 合成基准（队列/预算/churn 上限）
+.venv\Scripts\python.exe tests\benchmark_presentation.py            # Presentation/Fleet/动画缓存基准（blocking）
+.venv\Scripts\python.exe tools\terminal_window_probe.py --list      # WT 窗口实机 probe（list/validate/activate/resolve）
+.venv\Scripts\python.exe tools\terminal_observer_probe.py           # UIA 观察实机 probe（默认不打印终端原文）
+.venv\Scripts\python.exe -X utf8 tests\regression.py                # 位置/气泡/缩放/托盘/自启
+.venv\Scripts\python.exe -X utf8 tests\replay_real.py               # 真实会话数据回放
 ```
 
-CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试（含 window 激活逻辑、并发激活矩阵、source 停扫、config 运行时测试）+ benchmark 5000 ticks（`PYTHONUTF8=1`，benchmark 报告以 artifact 上传）。真实 Windows Terminal foreground policy / UIA 事件接受度属于本机 manual acceptance：CI 只验证纯逻辑、Win32 调用契约 mock、资源边界和 UI dataflow。**Release acceptance requires GitHub Actions green**：workflow conclusion=success 是发布验收的必要条件，CI 红期间不标记版本完成。
+CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试（含 window 激活逻辑、并发激活矩阵、source 停扫、config 运行时测试）+ monitor benchmark 5000 ticks + presentation benchmark（`PYTHONUTF8=1`，benchmark 报告以 artifact 上传）。真实 Windows Terminal foreground policy / UIA 事件接受度属于本机 manual acceptance：CI 只验证纯逻辑、Win32 调用契约 mock、资源边界和 UI dataflow。**Release acceptance requires GitHub Actions green**：workflow conclusion=success 是发布验收的必要条件，CI 红期间不标记版本完成。
 
 ## 已知边界（如实说明）
 
