@@ -43,17 +43,21 @@ class Animation:
     def frame_bytes(self) -> int:
         return len(self._frames) * max(1, self.width * self.height * 4)
 
-    def frame(self, i: int) -> tk.PhotoImage:
+    def frame(self, i: int, master=None) -> tk.PhotoImage:
         img = self._frames.get(i)
         if img is None:
+            # master：显式绑定所属 interpreter（v4.2.1）——不依赖
+            # _default_root，避免多 App/测试生命周期下错绑到别的 root
             try:
-                img = tk.PhotoImage(file=self.path, format=f"gif -index {i}")
+                img = tk.PhotoImage(master=master, file=self.path,
+                                    format=f"gif -index {i}")
             except tk.TclError:
                 # Pillow 保存时会合并相邻相同帧，实际帧数可能比 meta 少
                 self.n = max(1, i)
                 img = self._frames.get(0)
                 if img is None:
-                    img = tk.PhotoImage(file=self.path, format="gif -index 0")
+                    img = tk.PhotoImage(master=master, file=self.path,
+                                        format="gif -index 0")
                     self._frames[0] = img
                 return img
             self._frames[i] = img
@@ -93,12 +97,13 @@ class SharedAnimationCache:
         self._enforce_anims()
         return anim
 
-    def frame(self, path: str, index: int, keep_paths: set[str] = frozenset()):
+    def frame(self, path: str, index: int, keep_paths: set[str] = frozenset(),
+              master=None):
         """取帧并维持全局字节预算。keep_paths 中的动画不做帧逐出。"""
         anim = self.animation(path)
         if anim is None:
             return None
-        img = anim.frame(index)
+        img = anim.frame(index, master=master)
         self._enforce_bytes(keep_paths)
         return img
 
@@ -246,7 +251,8 @@ class AnimationScheduler:
             self._active_paths.add(cursor.path)   # play() 换动画后同步 keep 集
         return self.cache.frame(cursor.path,
                                 min(cursor.frame_index, cursor.frames - 1),
-                                keep_paths=self._active_paths)
+                                keep_paths=self._active_paths,
+                                master=self.root)
 
     def frame_size(self, cursor: AnimationCursor) -> tuple[int, int]:
         return cursor.size

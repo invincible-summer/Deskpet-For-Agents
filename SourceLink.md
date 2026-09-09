@@ -28,6 +28,28 @@
 - **hIcon 生命周期不变**：仍由 `TrayIcon` 线程 `LoadImageW` 加载、
   `stop()` 时 `DestroyIcon`（v4.1.4 模块级 wndproc 修复语义保持）。
 
+### v4.2.1 冻结后 hotfix：Tk 收尾纪律（CI 崩溃修复）
+
+**windows-latest CI 曾中止于 `Tcl_AsyncDelete: async handler deleted
+by the wrong thread`（本地低概率复现）。根因：`app.quit()` 里
+`cache.free_all()` 只清了缓存帧，`PetView._pet_image` 仍持有
+PhotoImage；root.destroy() 后引用环把它们拖到之后由任意触发 GC 的
+工作线程回收，`__del__` 在已销毁 interpreter 上执行 Tcl 调用——
+轻则 "main thread is not in main loop" 噪音，重则 Tcl C 层 panic
+中止进程。**修复：
+
+- **确定性释放**：`PetView.release_images()`；`close()` 与
+  `PetViewManager.stop()` 在 **root.destroy() 之前、主线程**释放全部
+  `_pet_image` 并清缓存帧；`app.quit()` 末尾主线程 `gc.collect()`
+  兜底回收残余引用环——之后任何工作线程触发 GC 都无 Tcl 对象可碰。
+- **显式归属**：`Animation.frame(master=)`/`cache.frame(master=)`/
+  `scheduler.frame_image` 把 PhotoImage 绑定到所属 root，不再依赖
+  `_default_root`（多 App/测试生命周期下防错绑）。
+- **测试纪律**：TkTests 的本地动画缓存必须在 tearDown 里先
+  `free_all()` 再 destroy；回归测试
+  `QuitImageReleaseTests.test_quit_releases_photoimages_before_destroy`
+  断言 quit 后无 PhotoImage 残留 + 工作线程 GC 存活。
+
 ## 0.1 V4.1.4 窗口区分修复（决策依据）
 
 **实机复现（2026-09-09）：两个 WT 窗口各运行一个 WSL Agent，TermControl

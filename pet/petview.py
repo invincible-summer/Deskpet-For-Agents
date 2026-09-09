@@ -307,7 +307,18 @@ class PetView:
         self.scheduler.kick(self.view_id)
         self.window.show()
 
+    def release_images(self):
+        """释放显示中的 PhotoImage 引用（v4.2.1 CI 崩溃修复）。
+
+        必须在所属 interpreter 销毁前、主线程调用：否则引用环会把
+        PhotoImage 拖到之后由任意触发 GC 的工作线程回收，__del__ 异
+        线程触碰 Tcl → "Tcl_AsyncDelete: async handler deleted by
+        the wrong thread" 进程中止（windows-latest CI 曾命中）。
+        """
+        self._pet_image = None
+
     def close(self, build_manager=None):
+        self.release_images()
         self.scheduler.unregister(self.view_id)
         if build_manager is not None and self._build_key is not None:
             build_manager.forget(self._build_key)
@@ -564,4 +575,8 @@ class PetViewManager:
 
     def stop(self):
         self.scheduler.stop()
+        # 先于 root.destroy() 在主线程释放全部 PhotoImage（防异线程 GC
+        # 触碰 Tcl；v4.2.1 CI 崩溃修复），再清缓存帧
+        for view in self.views.values():
+            view.release_images()
         self.cache.free_all()

@@ -11,6 +11,7 @@ V4.1（v4plan §15）：root 是隐藏的 controller Tk root，不是宠物。
 UI 激活 Terminal 只允许 Monitor.activate_target(exact agent_key)。
 Aggregate 模式下桌宠 body 单击/双击只做互动，绝不激活 Terminal。
 """
+import gc
 import glob
 import os
 import queue
@@ -699,3 +700,7 @@ class PetApp:
                 self.root.quit()
             finally:
                 self.root.destroy()
+        # 主线程立即回收残余引用环（v4.2.1）：PhotoImage 已在
+        # pet_manager.stop() 里释放，这里兜底保证之后任何工作线程
+        # 触发 GC 都不会再碰到 Tcl 对象
+        gc.collect()

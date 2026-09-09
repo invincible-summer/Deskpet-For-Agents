@@ -1,8 +1,10 @@
 """Headless model checks and real Tk smoke tests (Windows Python). V3: no approvals."""
 import copy
+import gc
 import os
 from pathlib import Path
 import sys
+import threading
 import unittest
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -167,9 +169,15 @@ class TkTests(unittest.TestCase):
         self.canvas = tk.Canvas(self.root, width=650, height=400)
         self.canvas.pack()
         self.bubble = BubbleRenderer(self.canvas, self.cfg)
+        # 本测试类里临时创建的动画缓存：tearDown 必须先于 root.destroy
+        # 释放其中的 PhotoImage（v4.2.1 CI 崩溃纪律）
+        self._anim_caches = []
 
     def tearDown(self):
+        for cache in self._anim_caches:
+            cache.free_all()          # interpreter 存活时于主线程释放
         self.root.destroy()
+        gc.collect()                  # 主线程收残余引用环（v4.2.1）
 
     def test_fixed_card_cached_items_at_scales(self):
         for scale in (.5, .75, 1, 1.5, 2):
@@ -216,6 +224,7 @@ class TkTests(unittest.TestCase):
         """V4.1：进程级共享缓存预算 + 单调度器多光标（v4plan §11）。"""
         import tkinter as tk
         cache = SharedAnimationCache(max_bytes=800)
+        self._anim_caches.append(cache)
         scheduler = AnimationScheduler(self.root, cache)
         anim = Animation('unused', {'width': 10, 'height': 10, 'frames': 10})
         cache._pool['unused'] = anim
@@ -451,6 +460,53 @@ class TrayDashboardVisibilityTests(unittest.TestCase):
             self.assertIsNone(app.dashboard._refresh_after)
         finally:
             app.quit()
+
+
+class QuitImageReleaseTests(unittest.TestCase):
+    """v4.2.1 CI 崩溃回归（windows-latest 曾中止于
+    "Tcl_AsyncDelete: async handler deleted by the wrong thread"）：
+
+    quit 必须先于 root.destroy() 在主线程释放全部 PhotoImage
+    （PetView._pet_image + 缓存帧）。否则引用环把它们拖到之后，由
+    任意触发 GC 的工作线程回收时，__del__ 在已销毁/异线程 interpreter
+    上执行 Tcl 调用——轻则 "main thread is not in main loop" 噪音，
+    重则 Tcl C 层 panic 直接中止进程。
+    """
+
+    def _app(self):
+        from pet.app import PetApp
+        from pet.petview import PetView
+        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+             patch.object(PetView, 'load_skin', lambda self, bm: None):
+            return PetApp(MemoryConfig())
+
+    def test_quit_releases_photoimages_before_destroy(self):
+        import tkinter as tk
+        app = self._app()
+        try:
+            view = app.pet_manager.views["pet-1"]
+            # 模拟动画拉帧后 view 持有的"当前帧"
+            view._pet_image = tk.PhotoImage(master=app.root, width=8,
+                                            height=8)
+        finally:
+            app.quit()
+        # quit 后：视图不再持有 PhotoImage，缓存帧也已清空
+        self.assertIsNone(view._pet_image)
+        for anim in app.pet_manager.cache._pool.values():
+            self.assertEqual(len(anim._frames), 0)
+        # root 已销毁；此刻由工作线程触发 GC 不得触碰任何 Tcl 对象
+        errors = []
+
+        def _collect():
+            try:
+                gc.collect()
+            except Exception as exc:   # pragma: no cover - 防御性断言
+                errors.append(exc)
+
+        worker = threading.Thread(target=_collect)
+        worker.start()
+        worker.join(timeout=5)
+        self.assertEqual(errors, [])
 
 
 if __name__ == '__main__':
