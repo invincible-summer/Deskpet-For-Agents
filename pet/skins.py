@@ -281,6 +281,10 @@ class SkinBuildManager:
     def building(self) -> bool:
         return self._queue is not None or bool(self._pending)
 
+    def results_pending(self) -> bool:
+        """有未收割结果（如 _last_paths 记忆命中直接入队，building=False）。"""
+        return bool(self._results)
+
     def pending_count(self) -> int:
         return len(self._pending) + (1 if self._queue is not None else 0)
 

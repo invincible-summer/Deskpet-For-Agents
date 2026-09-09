@@ -201,9 +201,21 @@ class PetWindow:
         menu = tk.Menu(self.root, tearoff=0)
         if self.on_menu:
             self.on_menu(menu)
+        # v4.3：桌宠窗口是 no-activate topmost，天然没有前台状态；
+        # 不做前台准备的 TrackPopupMenu 点击菜单外不收起（与托盘
+        # 菜单同一 Win32 缺陷）。
+        hwnd = 0
         try:
+            hwnd = int(self.root.winfo_id())
+        except Exception:
+            pass
+        try:
+            if hwnd:
+                winkeys.prepare_menu_popup(hwnd)
             menu.tk_popup(ev.x_root, ev.y_root)
         finally:
+            if hwnd:
+                winkeys.finish_menu_popup(hwnd)
             # v4.2.3 §9：finally 显式销毁，不依赖 Python GC 决定
             # Tk menu widget 生命周期。
             try:

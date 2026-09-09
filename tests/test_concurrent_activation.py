@@ -282,6 +282,7 @@ class AggregateBubbleRaceTests(unittest.TestCase):
             app.monitor.instances = {a.key: a, b.key: b}
             app.monitor.snapshots = {a.key: snap(a), b.key: snap(b)}
             app._aggregate()      # 绘制：attention（无 focused）= 先启动的 a
+            app.ui._flush_render()   # v4.3：重画经 render flush（§4.4 D）
             view = app.pet_manager.views["pet-1"]
             drawn_key = view.bubble.model.agent_key
             other = b if drawn_key == a.key else a
@@ -574,6 +575,7 @@ class AggregateStackTests(unittest.TestCase):
             }
             app.agent_toast(agents[1].key, "已打开该 Agent 的终端窗口", 5)
             app._apply_toasts()
+            app.ui._flush_render()   # v4.3：卡片绘制经 render flush
             # 三张卡都在，没有任何收起
             self.assertTrue(view.bubble.model.visible)
             self.assertEqual(len(view.stack_bubbles), 2)
@@ -608,6 +610,7 @@ class AggregateStackTests(unittest.TestCase):
             self.assertIn(agents[1].key, app._agent_toasts)
             self.assertNotIn(agents[0].key, app._agent_toasts)
             app._aggregate()
+            app._apply_toasts()   # v4.3：toast 套用在 render flush C 步
             card = view.stack_bubbles[0]
             self.assertEqual(card.model.text, "已打开该 Agent 的终端窗口")
             self.assertEqual(view.bubble.model.text, primary_text)

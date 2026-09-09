@@ -11,7 +11,9 @@
   * 布局自适应窗口大小：文本 wraplength 跟随实际宽度、页面纵向
     铺满、滚动条只在内容超出时出现（非阻塞轻量刷新）。
 """
+import os
 import tkinter as tk
+import time
 from tkinter import filedialog, messagebox, ttk
 
 from agents.models import Status, WindowBindingConfidence
@@ -20,6 +22,7 @@ from . import autostart, skins
 from .labels import mode_text, phase_text, status_text
 from .presentation import PresentationMode
 from .theme import LIGHT, STATUS_COLOR, pick_font
+from .ui_coordinator import UiDirty
 from .version import APP_LABEL as APP_VERSION
 from .widgets import (
     Card,
@@ -67,10 +70,18 @@ class Dashboard(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self.hide_dashboard)
         self.selected_key = ""
         self._page = PAGE_OVERVIEW
-        # refresh 生命周期（v4.1.3 §19）：withdrawn 时 0 timer，
-        # after id 全程保存/取消，杜绝隐藏周期唤醒与 destroy 后回调
-        self._refresh_after = None
+        # v4.3 §4.5：不再有 500ms 全页 refresh timer；当前页刷新由
+        # UiCoordinator 的 render flush 驱动（AC43-UI-02）
         self._closing = False
+        # 失焦自动收起（v4.3 用户反馈）：只有真正拿到过焦点的仪表盘
+        # 才会在焦点离开时 withdraw——CI/测试中从未获得焦点的窗口
+        # 不受影响，避免无焦环境误收起。
+        self._had_focus = False
+        self._native_dialog_open = False
+        self.bind("<FocusIn>", lambda _e: setattr(self, "_had_focus", True))
+        self.bind("<FocusOut>", self._on_focus_lost)
+        # 诊断页 ≥1s 节流的时间戳（bridge 规则 5 读取，monotonic）
+        self.last_diag_refresh = 0.0
 
         # ---- 布局：左导航 + 右内容
         nav = tk.Frame(self, bg=LIGHT.page, width=NAV_WIDTH)
@@ -320,6 +331,7 @@ class Dashboard(tk.Toplevel):
             self.app.presentation.set_instance_included(
                 self.selected_key, True)
             self.app._aggregate()
+            self.app.ui.request(UiDirty.PRESENTATION)
 
     def _exclude_selected(self):
         """运行期移出并发：卡片消失但 Monitor 继续监听。"""
@@ -327,6 +339,7 @@ class Dashboard(tk.Toplevel):
             self.app.presentation.set_instance_included(
                 self.selected_key, False)
             self.app._aggregate()
+            self.app.ui.request(UiDirty.PRESENTATION)
 
     def _detail_text(self, target) -> str:
         inst, snap = target.instance, target.snapshot
@@ -633,6 +646,7 @@ class Dashboard(tk.Toplevel):
         else:
             self.app.toast("并发监听已关闭（回到单目标；仅本次运行有效）", 4)
         self.app._aggregate()
+        self.app.ui.request(UiDirty.PRESENTATION)
         if enabled:
             self.concurrent_detail.pack(fill="x", pady=(8, 0))
         else:
@@ -651,6 +665,8 @@ class Dashboard(tk.Toplevel):
                     "presentation.concurrent.slots",
                     self.app.config.get("presentation.concurrent.slots"))
         self.app.presentation.set_concurrent_mode(mode)
+        # v4.3：显式触发呈现 flush（即时切换，不等 bridge 收割 revision）
+        self.app.ui.request(UiDirty.PRESENTATION)
 
     def _save_max_targets(self):
         try:
@@ -661,11 +677,15 @@ class Dashboard(tk.Toplevel):
         self.app.config.ensure_fleet_slots(value)
         self.app.config.set_and_commit(
             "presentation.concurrent.max_targets", value)
+        # max_targets 影响 reconcile 的 slot_keys 计算：无周期 tick 兜底，
+        # 必须显式触发
+        self.app.ui.request(UiDirty.PRESENTATION)
 
     def _save_eligible(self, kind: str):
         self.app.config.set_and_commit(
             f"presentation.concurrent.eligible_kinds.{kind}",
             bool(self.eligible_vars[kind].get()))
+        self.app.ui.request(UiDirty.PRESENTATION)
 
     def _refresh_fleet(self, state):
         if state is None or state.mode is not PresentationMode.FLEET:
@@ -724,6 +744,7 @@ class Dashboard(tk.Toplevel):
         if key:
             self.app.presentation.set_instance_included(key, False)
         self.app._aggregate()
+        self.app.ui.request(UiDirty.PRESENTATION)
 
     def _apply_look(self):
         cfg = self.app.config
@@ -751,13 +772,21 @@ class Dashboard(tk.Toplevel):
         if new_scale and new_scale != cfg.get("scale"):
             cfg.set("scale", new_scale)
             self.app.set_scale(new_scale)
+        # v4.3：bubble.*/force_state 需要 reconcile 级 flush（无周期
+        # tick 兜底）；外观页自身也要刷新
+        self.app.ui.request(UiDirty.APPEARANCE | UiDirty.PRESENTATION)
 
     def _apply_skin(self):
         self.app._switch_skin(self.skin_var.get())
 
     def _import_skin(self):
-        src = filedialog.askdirectory(
-            title="选择包含 5 个素材文件的文件夹", parent=self)
+        # 原生对话框打开期间禁止失焦自动收起（前台本来就不在仪表盘）
+        self._native_dialog_open = True
+        try:
+            src = filedialog.askdirectory(
+                title="选择包含 5 个素材文件的文件夹", parent=self)
+        finally:
+            self._native_dialog_open = False
         if not src:
             return
         import re
@@ -766,7 +795,11 @@ class Dashboard(tk.Toplevel):
         try:
             skins.prepare_import(src, name)
         except Exception as e:
-            messagebox.showerror("导入失败", str(e), parent=self)
+            self._native_dialog_open = True
+            try:
+                messagebox.showerror("导入失败", str(e), parent=self)
+            finally:
+                self._native_dialog_open = False
             return
         self.app.toast(f"正在构建皮肤 {name}（数十秒）…", 60)
         self.app._switch_skin(name)
@@ -953,6 +986,8 @@ class Dashboard(tk.Toplevel):
         self.refresh()
 
     def _refresh_diag(self):
+        # 诊断页 ≥1s 节流的时间戳（bridge 规则 5 读取）
+        self.last_diag_refresh = time.monotonic()
         monitor = self.app.monitor
         stats = dict(monitor.stats())
         stats.update(self.app.pet_manager.stats())
@@ -1184,58 +1219,88 @@ class Dashboard(tk.Toplevel):
             return
         if self.state() == "withdrawn":
             return
-        self._refresh_once()
+        self.refresh_current_page()
 
-    def open(self):
-        """显示并启动周期刷新（重开时重启 timer）。"""
-        self.deiconify()
-        self.lift()
-        self.start_refresh()
+    def is_open(self) -> bool:
+        """Dashboard 逻辑可见（bridge 125ms 档与 flush E 的判据）。"""
+        if self._closing or not self.winfo_exists():
+            return False
+        return self.state() != "withdrawn"
 
-    def start_refresh(self):
-        if self._refresh_after is None and not self._closing:
-            self._refresh_tick()
+    def _on_focus_lost(self, _ev):
+        # FocusOut 在焦点短暂转移时也会触发；idle 时刻复查一次
+        if self._closing or self._native_dialog_open:
+            return
+        try:
+            self.after_idle(self._maybe_auto_collapse)
+        except tk.TclError:
+            pass
 
-    def _refresh_tick(self):
-        self._refresh_after = None
+    def _maybe_auto_collapse(self):
+        """失去焦点（前台窗口不是本仪表盘）时自动收起（v4.3 用户反馈）。
+
+        前台判断用 Win32 GetForegroundWindow——Tk focus_get() 看不见
+        其他进程的焦点。原生文件/消息对话框打开期间不收起（此时前台
+        本来就不在仪表盘）。
+        """
+        if self._closing or self._native_dialog_open or not self._had_focus:
+            return
+        if not self.is_open():
+            return
+        if os.name != "nt":
+            return
+        try:
+            hwnd = int(self.winfo_id())
+        except Exception:
+            return
+        from actions import winkeys
+        fg = winkeys.foreground_window()
+        if fg and fg != hwnd:
+            self.hide_dashboard()
+
+    def on_diagnostics_page(self) -> bool:
+        return self._page == PAGE_DIAG
+
+    def refresh_current_page(self):
+        """v4.3 §4.4 E：只刷新当前页（隐藏页 0 工作，§15）。"""
         if self._closing or not self.winfo_exists():
             return
         if self.state() == "withdrawn":
-            return   # 隐藏时完全停止；重开由 open() 重启
-
-        self._refresh_once()
-        self._refresh_after = self.after(500, self._refresh_tick)
-
-    def _refresh_once(self):
+            return
         targets = self.app.monitor.get_targets()
         state = self.app._presentation_state
         try:
-            self._refresh_overview(targets)
-            self._refresh_agents(targets)
-            self._refresh_fleet(state)
-            self._refresh_diag()
-            self._refresh_settings()
+            if self._page == PAGE_OVERVIEW:
+                self._refresh_overview(targets)
+            elif self._page == PAGE_AGENTS:
+                self._refresh_agents(targets)
+            elif self._page == PAGE_LOOK:
+                self._refresh_fleet(state)
+            elif self._page == PAGE_DIAG:
+                self._refresh_diag()
+            elif self._page == PAGE_SETTINGS:
+                self._refresh_settings()
+            # PAGE_MONITOR：静态设置行，无周期内容
         except Exception:
             pass
 
-    def hide_dashboard(self):
-        """用户关闭窗口：隐藏 + 停止 refresh timer（0 周期唤醒）。"""
-        self.stop_refresh()
-        self.withdraw()
+    def open(self):
+        """显示（v4.3：无周期 timer；刷新由 UiCoordinator 驱动）。"""
+        self.deiconify()
+        self.lift()
+        self.refresh_current_page()
 
-    def stop_refresh(self):
-        callback = self._refresh_after
-        self._refresh_after = None
-        if callback is not None:
-            try:
-                self.after_cancel(callback)
-            except tk.TclError:
-                pass
+    def hide_dashboard(self):
+        """用户关闭窗口：隐藏（0 周期唤醒；bridge 降回低档）。"""
+        self.withdraw()
+        try:
+            self.app.ui.kick()
+        except Exception:
+            pass
 
     def shutdown(self):
-        """退出 DeskPet 时销毁仪表盘（先停 timer，杜绝 destroy 后回调）。"""
+        """退出 DeskPet 时销毁仪表盘。"""
         self._closing = True
-        self.stop_refresh()
         try:
             self.destroy()
         except tk.TclError:

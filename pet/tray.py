@@ -87,6 +87,11 @@ class TrayIcon:
         self._hicon = None
 
     # ---- 生命周期 ----
+    @property
+    def menu_hwnd(self):
+        """托盘隐藏窗口 HWND（app 弹托盘菜单前的前台准备用，v4.3）。"""
+        return self._hwnd
+
     def start(self):
         if self._thread and self._thread.is_alive():
             return

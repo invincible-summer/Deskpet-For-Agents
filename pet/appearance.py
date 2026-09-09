@@ -63,10 +63,14 @@ class AppearanceController:
     """UI 不直接操作 PetView 私有字段；所有外观修改走这里。"""
 
     def __init__(self, config, pet_manager: PetViewManager,
-                 request_save=None):
+                 request_save=None, request_render=None):
         self.config = config
         self.pet_manager = pet_manager
         self._request_save = request_save or self._default_save
+        # v4.3 §13.3 live apply：apply 完成后通知 UI 安排 render flush
+        # （APPEARANCE；含 force_state/bubble.* 时还需 PRESENTATION 级
+        # reconcile——没有周期 tick 兜底，模型重填必须显式触发）
+        self._request_render = request_render
 
     # ------------------------------------------------------------ 内部
     def _default_save(self):
@@ -77,6 +81,13 @@ class AppearanceController:
 
     def _save(self):
         self._request_save()
+
+    def _notify_render(self, changed_paths: set[str]):
+        if self._request_render is not None:
+            try:
+                self._request_render(changed_paths)
+            except Exception:
+                pass
 
     def _normalize(self, path: str, value):
         """验证/normalize；非法值返回 None（调用方丢弃，不抛异常）。"""
@@ -111,6 +122,7 @@ class AppearanceController:
         self.config.set(path, value)
         self.pet_manager.apply_appearance_change(
             scope="global", changed_paths={path})
+        self._notify_render({path})
         self._save()
 
     # ------------------------------------------------------------ slot skin
@@ -131,6 +143,7 @@ class AppearanceController:
         self.config.set("presentation.concurrent.slots", slots)
         self.pet_manager.apply_appearance_change(
             scope=slot_id, changed_paths={"skin"})
+        self._notify_render({"skin"})
         self._save()
 
     # ------------------------------------------------------------ reset
@@ -159,6 +172,7 @@ class AppearanceController:
         self.pet_manager.refresh_all_slot_configs()
         self.pet_manager.apply_appearance_change(
             scope="global", changed_paths=set(RESET_FIELDS))
+        self._notify_render(set(RESET_FIELDS))
         self._save()
 
     def reset_slot(self, slot_id: str) -> None:

@@ -122,6 +122,11 @@ class PetView:
         # v4.3 §6.3：当前显示帧的 FrameKey（与 _pet_image 对应）；
         # 与 cursor 请求 key 相同 → 沿用当前图，不再次向 cache 请求
         self._pet_frame_key = None
+        # v4.3 §5.1 dirty-view：visual_dirty=需要重画；layout_dirty=
+        # 结构变化（叠层数量/动画尺寸/皮肤就绪），redraw_dirty 两者一并清
+        self.visual_dirty = True
+        self.layout_dirty = True
+        self._request_render = None   # manager 注入的 request 回调
         self._dpi = 0
         self._skin_paths: dict[str, str] = {}
         self._build_key = None
@@ -227,7 +232,9 @@ class PetView:
             return
         self.cursor.play(meta.path, state, meta, repeat=repeat, force=force)
         self.scheduler.kick(self.view_id)
-        self.redraw()   # 与 V3 对齐：切换动画立即显示第 0 帧
+        # 与 V3 对齐：切换动画立即显示第 0 帧——经 render flush（同
+        # event-loop 的 after_idle）合并执行（v4.3 §5.1，不再直接 redraw）
+        self.mark_dirty(layout=True)
 
     def set_speed(self, speed: float):
         self.cursor.speed = max(0.1, float(speed))
@@ -238,7 +245,7 @@ class PetView:
         if self.cursor.static:
             self.cursor.frame_index = 0   # 静态模式显示第 0 帧（V3 行为）
         self.scheduler.kick(self.view_id)
-        self.redraw()
+        self.mark_dirty()
 
     def apply_animation(self, state: str, repeat: int = 0):
         if state != self._state or self.cursor.repeat_left == 0:
@@ -251,7 +258,22 @@ class PetView:
 
     # ------------------------------------------------------------ 绘制
     def _on_frame(self, _view_id):
-        self.redraw()
+        # v4.3 §4.5：scheduler due 只标记 due view dirty，不做全局重绘
+        self.mark_dirty()
+
+    def mark_dirty(self, *, layout: bool = False):
+        """标记本 view 需要重画（v4.3 §5.1）。
+
+        只设置 bool 并把 view_id 送入 coordinator 的 bounded set；
+        多次调用天然 coalesce（coordinator 只保留一个 render
+        after_idle）。绝不在此调用 redraw()/update()/update_idletasks()。
+        """
+        self.visual_dirty = True
+        if layout:
+            self.layout_dirty = True
+        cb = self._request_render
+        if cb is not None:
+            cb(self.view_id)
 
     def _hit(self, x, y):
         tag = self.bubble.hit_button(x, y)
@@ -285,42 +307,56 @@ class PetView:
     def set_body_activation(self, allowed: bool):
         self.body_activates = bool(allowed)
 
-    def set_single_model(self, target):
-        """填充单卡气泡模型（并发模式与单个监听完全一致的气泡）。"""
-        self._fill_model(self.bubble.model, target)
+    def set_single_model(self, target) -> bool:
+        """填充单卡气泡模型；返回显示内容是否变化（v4.3 §5 dirty 检测）。"""
+        return self._fill_model(self.bubble.model, target)
 
-    def set_stacked_models(self, primary, stack):
+    def set_stacked_models(self, primary, stack) -> bool:
         """聚合叠层：主卡（最下，带尾巴）+ 上方无尾巴叠卡（v4.1.4）。
 
         primary = cards[0]（focused/attention 优先），stack = 其余卡，
         顺序 = 距主卡由近到远。卡片数量收缩时销毁多余渲染器条目。
         """
-        self._fill_model(self.bubble.model, primary)
+        changed = self._fill_model(self.bubble.model, primary)
+        if len(self.stack_bubbles) != len(stack):
+            changed = True   # 叠层数量变化 → 结构（layout）变化
         while len(self.stack_bubbles) < len(stack):
             self.stack_bubbles.append(SingleAgentBubbleRenderer(
                 self.window.canvas, self.view_config))
         for renderer, target in zip(self.stack_bubbles, stack):
-            self._fill_model(renderer.model, target)
+            if self._fill_model(renderer.model, target):
+                changed = True
         for renderer in self.stack_bubbles[len(stack):]:
             renderer.model.visible = False
             renderer.destroy_items()
         del self.stack_bubbles[len(stack):]
+        return changed
 
     def clear_stack(self):
         """离开聚合多卡状态：收回叠层（canvas 条目一并删除）。"""
+        if not self.stack_bubbles:
+            return
         for renderer in self.stack_bubbles:
             renderer.destroy_items()
         self.stack_bubbles = []
+        self.mark_dirty(layout=True)
 
-    def _fill_model(self, m, target):
+    def _fill_model(self, m, target) -> bool:
         if target is None:
+            changed = m.visible or m.agent_key != ""
             m.visible = False
             m.agent_key = ""
-            return
+            return changed
+        before = (m.visible, m.agent_key, m.status, m.text, m.footer,
+                  m.accent)
+        # 全量重写正文 = 恢复 canonical 内容 → 清除 toast 覆盖标记
+        m.toast_applied = False
+        m.pre_toast_text = None
         m.agent_key = target.key
         if not bool(self.view_config.get("bubble.enabled", True)):
             m.visible = False
-            return
+            return (m.visible, m.agent_key, m.status, m.text, m.footer,
+                    m.accent) != before
         m.visible = True
         snap = target.snapshot
         head = snap.kind.label
@@ -349,6 +385,8 @@ class PetView:
                 "#a06060" if snap.status == Status.ERROR else "#487f73")
         if snap.stale:
             m.footer += " · 状态可能延迟"
+        return (m.visible, m.agent_key, m.status, m.text, m.footer,
+                m.accent) != before
 
     def hide(self):
         self.hidden = True
@@ -361,6 +399,7 @@ class PetView:
         self.cursor.paused = False
         self.scheduler.kick(self.view_id)
         self.window.show()
+        self.mark_dirty()
 
     def release_images(self):
         """释放显示中的 PhotoImage 引用（v4.2.1 CI 崩溃修复）。
@@ -488,6 +527,9 @@ class PetViewManager:
             __import__("pet.skins", fromlist=["SkinBuildManager"]).SkinBuildManager())
         self.views: dict[str, PetView] = {}
         self._hooks = None   # app 提供 activate/menu/interact/moved 回调
+        # v4.3 §5.1：PetView.mark_dirty → UiCoordinator.request_view 的
+        # 注入点（None 时 mark_dirty 只设置 bool，供测试直接 redraw）
+        self._render_request = None
         self._last_sync_mode = None
         # v4.3 §7.5/§13.3：scale 快速跨 step 只为最终稳定值 build
         # （350ms debounce；SkinBuildManager 同 key 去重兜底）
@@ -501,6 +543,15 @@ class PetViewManager:
                   on_double_vacant=None):
         self._hooks = (on_activate, on_menu, on_interact, on_moved,
                        on_double_vacant)
+
+    def set_render_requester(self, cb) -> None:
+        """注入 mark_dirty → coordinator.request_view 通路（v4.3 §5.1）。
+
+        App 在 UiCoordinator 就绪后调用一次；已存在的 view 一并接上。
+        """
+        self._render_request = cb
+        for view in self.views.values():
+            view._request_render = cb
 
     # ------------------------------------------------------------ slot 配置
     def _find_slot(self, slot_id: str) -> dict | None:
@@ -529,6 +580,8 @@ class PetViewManager:
         view = PetView(slot_id, self.root, view_config, self.scheduler,
                        on_activate, on_menu, on_interact, on_moved,
                        on_double_vacant)
+        if self._render_request is not None:
+            view._request_render = self._render_request
         if view.anchor is None:
             sw = self.root.winfo_screenwidth()
             sh = self.root.winfo_screenheight()
@@ -618,6 +671,12 @@ class PetViewManager:
             for slot_id, view in views.items():
                 view.bubble.invalidate()
                 affected.add(slot_id)
+        # 外观定向更新后统一 mark dirty（v4.3 §4.4 B：APPEARANCE/SKIN
+        # 已定向应用，这里只负责把受影响 view 送入 render 队列）
+        for slot_id in affected:
+            view = self.views.get(slot_id)
+            if view is not None:
+                view.mark_dirty(layout=True)
         return affected
 
     # ------------------------------------------------------------ build debounce
@@ -686,7 +745,9 @@ class PetViewManager:
                     continue
                 view.set_agent(key)
                 view.set_body_activation(True)   # fleet：双击 = 激活绑定 Agent
-                view.set_single_model(targets.get(key))
+                # v4.3 §5：只 dirty 显示内容真正变化的 view
+                if view.set_single_model(targets.get(key)):
+                    view.mark_dirty()
             if not state.slot_keys:
                 # 0-bound fallback：idle 形态、无气泡、不激活终端
                 view = self.views.get("pet-1")
@@ -694,7 +755,8 @@ class PetViewManager:
                     view.set_agent("")
                     view.set_body_activation(False)
                     view.clear_stack()
-                    view.set_single_model(None)
+                    if view.set_single_model(None):
+                        view.mark_dirty()
         else:
             view = self.views["pet-1"]
             view.set_body_activation(
@@ -703,14 +765,18 @@ class PetViewManager:
                     and len(state.cards) > 1):
                 keys = [c.agent_key for c in state.cards]
                 view.set_agent(keys[0])
-                view.set_stacked_models(
-                    targets.get(keys[0]),
-                    [targets.get(k) for k in keys[1:]])
+                # 任一 displayed card 变化 → dirty pet-1（AC43-UI-06）
+                if view.set_stacked_models(
+                        targets.get(keys[0]),
+                        [targets.get(k) for k in keys[1:]]):
+                    view.mark_dirty(layout=True)
             else:
                 view.clear_stack()
                 key = state.focused_key
                 view.set_agent(key)
-                view.set_single_model(targets.get(key) if key else None)
+                if view.set_single_model(
+                        targets.get(key) if key else None):
+                    view.mark_dirty()
 
     def apply_animation(self, state: PresentationState,
                         targets: dict, now: float, force_state: str = ""):
@@ -735,9 +801,27 @@ class PetViewManager:
             for view in self.views.values():
                 view.apply_animation(name, repeat)
 
+    def redraw_dirty(self, view_ids: set[str] | None = None):
+        """只重画 dirty 的 view（v4.3 §5.2）。
+
+        view_ids=None → 所有 visual_dirty 的 view。集合天然 ≤8。
+        redraw_all() 只保留为测试/显式全局 reset 工具。
+        """
+        if view_ids is None:
+            view_ids = {vid for vid, v in self.views.items()
+                        if v.visual_dirty}
+        for view_id in sorted(view_ids):   # stable order
+            view = self.views.get(view_id)
+            if view is not None:
+                view.redraw()
+                view.visual_dirty = False
+                view.layout_dirty = False
+
     def redraw_all(self):
         for view in self.views.values():
             view.redraw()
+            view.visual_dirty = False
+            view.layout_dirty = False
 
     def hide_all(self):
         # v4.3 §18.2：用户显式隐藏是运行期 override（不持久化）

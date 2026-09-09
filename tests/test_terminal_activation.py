@@ -225,11 +225,27 @@ class ForbiddenApiRegressionTests(unittest.TestCase):
                              f"terminal_uia.py 不应包含 {banned}")
 
     def test_winkeys_has_no_key_injection(self):
+        """v4plan §5.7：winkeys 绝不提供输入注入面。
+
+        v4.3 修订：PostMessage 的字面量禁令收窄为"只允许
+        finish_menu_popup 的 WM_NULL 收尾"——那是 Microsoft 文档化的
+        托盘菜单配套（发给自家窗口的空消息，不携带任何输入）；
+        键盘/鼠标注入 API 与输入消息常量仍然全禁。
+        """
         src = self._source("actions/winkeys.py")
-        for banned in ("SendInput", "keybd_event", "PostMessage",
-                       "SendKeys"):
+        for banned in ("SendInput", "keybd_event", "SendKeys",
+                       "mouse_event", "WM_KEYDOWN", "WM_CHAR",
+                       "WM_LBUTTONDOWN", "WM_MOUSEMOVE"):
             self.assertNotIn(banned, src,
                              f"winkeys.py 不应包含 {banned}")
+        # PostMessageW 只允许出现在 finish_menu_popup 内（WM_NULL）
+        import re
+        for m in re.finditer(r"PostMessage", src):
+            after = src[m.start():m.start() + 400]
+            self.assertIn("finish_menu_popup", src[max(0, m.start() - 400):m.start()]
+                          or after,
+                          "PostMessage 只允许作为 finish_menu_popup 的 WM_NULL 收尾")
+            self.assertIn("WM_NULL", after)
 
     def test_monitor_has_no_manual_binding_api(self):
         src = self._source("agents/monitor.py")

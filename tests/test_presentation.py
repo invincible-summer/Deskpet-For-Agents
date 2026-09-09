@@ -420,6 +420,10 @@ class AggregateUiSmokeTests(unittest.TestCase):
             view._on_activate = lambda key: activated.append(key)
             view._on_body_double()
             self.assertEqual(activated, [])
+            # 互动 toast 会临时覆盖主卡（DeskPet 卡无激活区）；
+            # 过期后恢复 agent 卡内容（v4.3 过期恢复路径）
+            app._toast = None
+            app._apply_toasts()
 
             # 气泡与单个监听一致：单卡（显示 attention=WAITING 的 b），
             # 底行命中 → exact key 激活

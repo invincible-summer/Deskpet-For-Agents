@@ -260,6 +260,9 @@ class Monitor:
         self._last_logs_trim = 0.0
         # Windows native 保守 orphan 识别租约（v4.2.3 §2.4，runtime-only）
         self._native_terminal_leases: dict[str, NativeTerminalLease] = {}
+        # v4.3 §4.2 UI 语义 revision：signature 不含只影响新鲜度的时间戳
+        self._ui_revision = 0
+        self._ui_signature: tuple = ()
 
     # ------------------------------------------------------------ 生命周期
     def start(self):
@@ -337,6 +340,58 @@ class Monitor:
         if not key:
             return None
         return self.get_targets().get(key)
+
+    # ------------------------------------------------------------ UI revision
+    def _ui_signature_value(self, snap: Snapshot, inst: AgentInstance,
+                            binding) -> tuple:
+        """UI 展示相关的稳定值（v4.3 §4.2）。
+
+        不含 snapshot.ts / binding.last_seen / validated_at 等不断变化
+        但不影响 UI 的时间戳；terminal_attachment 只在高级诊断需要时
+        纳入（当前 Dashboard 不展示，不进 signature）。
+        """
+        return (
+            snap.key,
+            snap.kind.value, snap.source,
+            inst.project, inst.cwd,
+            snap.status.value, snap.phase.value,
+            snap.mode.value, snap.mode_raw,
+            snap.policy,
+            snap.goal, snap.summary, snap.waiting_detail,
+            bool(snap.stale), snap.parser_health, snap.parser_detail,
+            bool(binding.wakeable) if binding is not None else False,
+            binding.confidence.value if binding is not None else "",
+            binding.reason if binding is not None else "",
+            binding.title if binding is not None else "",
+        )
+
+    def _refresh_ui_revision(self):
+        """每轮最终 snapshots/window_bindings 更新后调用（monitor 线程）。"""
+        items = []
+        for key in sorted(self.snapshots):
+            snap = self.snapshots.get(key)
+            inst = self.instances.get(key)
+            if snap is None or inst is None:
+                continue
+            items.append(self._ui_signature_value(
+                snap, inst, self.window_bindings.get(key)))
+        sig = tuple(items)
+        if sig != self._ui_signature:
+            with self.lock:
+                self._ui_signature = sig
+                self._ui_revision += 1
+
+    def get_targets_if_changed(
+            self, last_revision: int) -> tuple[int, dict[str, AgentTarget] | None]:
+        """revision 未变返回 (revision, None)；变化时一次锁内复制 targets。
+
+        不是新的事件系统：只为避免 UI 桥每 tick 重复复制/重建相同数据。
+        """
+        with self.lock:
+            revision = self._ui_revision
+        if revision == last_revision:
+            return revision, None
+        return revision, self.get_targets()
 
     def is_live_key(self, key: str) -> bool:
         """exact key 是否仍存活（activate 前的二次复核入口）。"""
@@ -698,6 +753,9 @@ class Monitor:
                 if snap.status in (Status.WAITING, Status.INPUT):
                     extra = f" -> {snap.waiting_detail or snap.summary}"
                 self._log(f"{snap.kind.label} [{snap.status.value}]{extra}")
+        # 最终 snapshots/window_bindings 已更新：计算本轮 UI 语义
+        # revision（v4.3 §4.2，monitor 线程内，读取自身刚写入的数据）
+        self._refresh_ui_revision()
         self._trim_logs(now)
 
     def _terminal_observation(self, inst: AgentInstance, now: float,

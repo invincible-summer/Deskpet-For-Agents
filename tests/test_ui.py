@@ -294,14 +294,19 @@ class MenuEphemeralLifecycleTests(unittest.TestCase):
         try:
             destroyed = []
             popups = []
-            real_popup = __import__('tkinter').Menu.tk_popup
+            # v4.3 修复：spy 只记录调用，绝不递归真实 tk_popup——
+            # 测试进程无前台状态，真弹的菜单点击外部不收起，会在
+            # 屏幕上留下悬浮幽灵菜单（用户实测卡屏）。
+            popup_args = []
 
             def spy_popup(self, x, y, entry=""):
                 popups.append(self._w)
-                real_popup(self, x, y, entry)
+                popup_args.append((x, y))
             with patch('tkinter.Menu.tk_popup', spy_popup):
                 app._tray_menu()
             self.assertEqual(len(popups), 1)          # tk_popup 而非 post
+            self.assertEqual(len(popup_args), 1)      # 恰一次、带坐标
+            self.assertTrue(popup_args[0][0] > 0 and popup_args[0][1] > 0)
             self.assertIsNone(app._active_menu)       # finally 清空
             # 菜单 widget 已销毁
             self.assertEqual(app.root.tk.call('winfo', 'exists', popups[0]), 0)
@@ -312,7 +317,6 @@ class MenuEphemeralLifecycleTests(unittest.TestCase):
         app = self._app()
         try:
             seen = []
-            real_popup = __import__('tkinter').Menu.tk_popup
 
             def spy_popup(self, x, y, entry=""):
                 seen.append(self._w)
@@ -343,6 +347,170 @@ class MenuEphemeralLifecycleTests(unittest.TestCase):
                      if app.root.tk.call('winfo', 'exists', p)]
             self.assertEqual(alive, [])
             # 无新增 after timer（菜单生命周期不靠定时器）
+        finally:
+            app.quit()
+
+
+class MenuForegroundPrepTests(unittest.TestCase):
+    """v4.3：tk_popup 前的 Win32 前台准备。
+
+    无前台状态的 TrackPopupMenu（Tk 菜单 grab）点击菜单外不收起——
+    菜单滞留且抓住全部 Tk 输入，必须点菜单本身才能消掉（用户实测
+    卡死）。prepare 必须在 popup 前、finish 在 finally 中。
+    """
+
+    def _app(self):
+        from pet.app import PetApp
+        from pet.petview import PetView
+        cfg = MemoryConfig()
+        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+             patch.object(PetView, 'load_skin', lambda self, bm: None):
+            return PetApp(cfg)
+
+    def test_tray_menu_prepares_foreground_before_popup(self):
+        from actions import winkeys as wk
+        app = self._app()
+        try:
+            calls = []
+
+            def spy_popup(self, x, y, entry=""):
+                calls.append("popup")
+
+            class _FakeTray:
+                menu_hwnd = 4321
+
+            app.tray = _FakeTray()
+            with patch.object(wk, 'prepare_menu_popup',
+                              lambda h: calls.append(("prepare", h))
+                              or True), \
+                 patch.object(wk, 'finish_menu_popup',
+                              lambda h: calls.append(("finish", h))), \
+                 patch('tkinter.Menu.tk_popup', spy_popup):
+                app._tray_menu()
+            self.assertEqual(calls[0], ("prepare", 4321))
+            self.assertEqual(calls[1], "popup")
+            self.assertEqual(calls[-1], ("finish", 4321))
+            self.assertIsNone(app._active_menu)   # finally 仍确定性销毁
+        finally:
+            app.tray = None
+            app.quit()
+
+    def test_tray_menu_without_tray_skips_dance(self):
+        from actions import winkeys as wk
+        app = self._app()
+        try:
+            calls = []
+            with patch.object(wk, 'prepare_menu_popup',
+                              lambda h: calls.append(h)), \
+                 patch.object(wk, 'finish_menu_popup',
+                              lambda h: calls.append(h)), \
+                 patch('tkinter.Menu.tk_popup',
+                       lambda self, x, y, entry="": None):
+                app._tray_menu()
+            self.assertEqual(calls, [])   # 无托盘句柄 → 不做前台操作
+        finally:
+            app.quit()
+
+    def test_pet_menu_prepares_foreground_before_popup(self):
+        from actions import winkeys as wk
+        app = self._app()
+        try:
+            view = app.pet_manager.views["pet-1"]
+            view.window.on_menu = lambda menu: None
+            calls = []
+
+            class _Ev:
+                x_root, y_root = 10, 20
+
+            with patch.object(wk, 'prepare_menu_popup',
+                              lambda h: calls.append(("prepare", h))
+                              or True), \
+                 patch.object(wk, 'finish_menu_popup',
+                              lambda h: calls.append(("finish", h))), \
+                 patch('tkinter.Menu.tk_popup',
+                       lambda self, x, y, entry="":
+                       calls.append("popup")):
+                view.window._on_menu(_Ev())
+            kinds = [c if isinstance(c, str) else c[0]
+                     for c in calls]
+            self.assertEqual(kinds, ["prepare", "popup", "finish"])
+        finally:
+            app.quit()
+
+
+class DashboardAutoCollapseTests(unittest.TestCase):
+    """v4.3 用户反馈：仪表盘失去焦点时自动收起（_maybe_auto_collapse）。
+
+    只有真正拿到过焦点（_had_focus）且前台已离开本窗口才收起；
+    原生对话框期间与从未获焦的窗口（CI/测试）不收起。
+    """
+
+    def _app(self):
+        from pet.app import PetApp
+        from pet.petview import PetView
+        cfg = MemoryConfig()
+        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+             patch.object(PetView, 'load_skin', lambda self, bm: None):
+            return PetApp(cfg)
+
+    def test_collapses_when_foreground_left_after_focus(self):
+        from actions import winkeys as wk
+        app = self._app()
+        try:
+            app.open_dashboard()
+            dash = app.dashboard
+            dash._had_focus = True
+            own = int(dash.winfo_id())
+            with patch.object(wk, 'foreground_window',
+                              lambda: own + 404):
+                dash._maybe_auto_collapse()
+            self.assertFalse(dash.is_open())
+        finally:
+            app.quit()
+
+    def test_stays_open_when_foreground_is_self(self):
+        from actions import winkeys as wk
+        app = self._app()
+        try:
+            app.open_dashboard()
+            dash = app.dashboard
+            dash._had_focus = True
+            own = int(dash.winfo_id())
+            with patch.object(wk, 'foreground_window', lambda: own):
+                dash._maybe_auto_collapse()
+            self.assertTrue(dash.is_open())
+        finally:
+            app.quit()
+
+    def test_never_focused_dashboard_stays_open(self):
+        """CI/测试环境窗口从未获得焦点 → 绝不误收起。"""
+        from actions import winkeys as wk
+        app = self._app()
+        try:
+            app.open_dashboard()
+            dash = app.dashboard
+            dash._had_focus = False
+            own = int(dash.winfo_id())
+            with patch.object(wk, 'foreground_window',
+                              lambda: own + 404):
+                dash._maybe_auto_collapse()
+            self.assertTrue(dash.is_open())
+        finally:
+            app.quit()
+
+    def test_native_dialog_blocks_collapse(self):
+        from actions import winkeys as wk
+        app = self._app()
+        try:
+            app.open_dashboard()
+            dash = app.dashboard
+            dash._had_focus = True
+            dash._native_dialog_open = True
+            own = int(dash.winfo_id())
+            with patch.object(wk, 'foreground_window',
+                              lambda: own + 404):
+                dash._maybe_auto_collapse()
+            self.assertTrue(dash.is_open())
         finally:
             app.quit()
 
@@ -515,19 +683,26 @@ class TrayDashboardVisibilityTests(unittest.TestCase):
         finally:
             app.quit()
 
-    def test_dashboard_withdraw_stops_refresh_timer_and_reopen_restarts(self):
+    def test_dashboard_withdraw_no_periodic_refresh_and_reopen_visible(self):
+        """v4.3 §4.5（AC43-UI-02）：Dashboard 无 500ms 全页 refresh timer。
+
+        隐藏 = is_open() False（flush E 不再刷新）；重开 = 立即刷新
+        当前页一次。周期刷新只存在于 UiCoordinator 的 render flush。
+        """
         app = self._app()
         try:
             app.open_dashboard()
             app.root.update()
-            self.assertIsNotNone(app.dashboard._refresh_after)
-            app.dashboard.hide_dashboard()
-            self.assertIsNone(app.dashboard._refresh_after)
-            app.root.update()                        # 隐藏后绝不自启
-            self.assertIsNone(app.dashboard._refresh_after)
-            app.dashboard.open()
-            app.root.update()
-            self.assertIsNotNone(app.dashboard._refresh_after)  # 重开重启
+            dash = app.dashboard
+            self.assertFalse(hasattr(dash, "_refresh_after"))
+            self.assertTrue(dash.is_open())
+            dash.hide_dashboard()
+            self.assertFalse(dash.is_open())
+            app.root.update()                        # 隐藏后不再有任何刷新
+            self.assertFalse(dash.is_open())
+            # 隐藏状态下 flush E 不触碰页面内容
+            dash.open()
+            self.assertTrue(dash.is_open())
         finally:
             app.quit()
 
@@ -541,13 +716,11 @@ class TrayDashboardVisibilityTests(unittest.TestCase):
             with redirect_stderr(err):
                 app.open_dashboard()
                 app.root.update()
-                self.assertIsNotNone(app.dashboard._refresh_after)
                 app.dashboard.shutdown()
                 for _ in range(3):
                     app.root.update()                # pending after 若未取消会触发
             self.assertEqual(err.getvalue(), "")
             self.assertTrue(app.dashboard._closing)
-            self.assertIsNone(app.dashboard._refresh_after)
         finally:
             app.quit()
 

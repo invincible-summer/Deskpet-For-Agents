@@ -28,6 +28,7 @@ from .dashboard import Dashboard
 from .labels import status_text
 from .petview import PetView, PetViewManager
 from .presentation import PresentationController, PresentationMode, PresentationState
+from .ui_coordinator import UiDirty
 from .version import APP_LABEL
 
 INTERACT_LINES = [
@@ -53,7 +54,20 @@ class PetApp:
                                           self.presentation)
         # v4.3 §7.4：外观唯一运行期修改接口（save 策略由注入回调决定）
         from .appearance import AppearanceController
-        self.appearance = AppearanceController(config, self.pet_manager)
+
+        def _appearance_render(paths: set[str]):
+            # force_state/bubble.* 影响 reconcile 决策或模型可见性，
+            # 定向 apply 之外还需一次 PRESENTATION 级 flush
+            needs_reconcile = any(
+                p == "force_state" or p.startswith("bubble.")
+                for p in paths)
+            self.ui.request(
+                UiDirty.APPEARANCE
+                | (UiDirty.PRESENTATION if needs_reconcile
+                   else UiDirty.NONE))
+
+        self.appearance = AppearanceController(
+            config, self.pet_manager, request_render=_appearance_render)
         self.pet_manager.set_hooks(
             on_activate=self.activate_agent,
             on_menu=self._build_menu,
@@ -64,12 +78,30 @@ class PetApp:
         # 隐式 pet-1 立即创建（single/aggregate 模式也用它）
         self.pet_manager.ensure_view("pet-1")
 
-        self._poll_monitor_after = None
-        self._poll_build_after = None
-        self._ui_after = None
+        # v4.3 §4.3：唯一 bridge timer + render-idle slot（替代
+        # _poll_monitor/_ui_tick/_poll_build 三个周期 timer）
+        from .ui_coordinator import UiCoordinator
+        self.ui = UiCoordinator(
+            self.root,
+            monitor=self.monitor,
+            presentation=self.presentation,
+            pet_manager=self.pet_manager,
+            dashboard_provider=lambda: self.dashboard,
+            tray_drain=self._poll_tray_events,
+            apply_batch=self._aggregate,
+            apply_toasts=self._apply_toasts,
+            tray_enabled=lambda: bool(self.config.get("tray_enabled", True)),
+        )
+        self.pet_manager.set_render_requester(self.ui.request_view)
+
         self._janitor_after = None
         self._skin_after = None
         self._reassert_after = None
+        # v4.3 §4.5：toast 过期用"最近 expiry 的单次 deadline"
+        self._toast_after = None
+        self._toast_deadline = None
+        # v4.3：进程内最多一个 agent picker（死弹窗防护）
+        self._agent_picker = None
         self.dashboard: Dashboard | None = None
         self.tray = None
         self._active_menu = None
@@ -79,6 +111,8 @@ class PetApp:
         # Agent 级反馈（key -> (text, expire)）：只改对应 Agent 自己的
         # 那张卡，其他卡片不收起、不变化（v4.1.4）
         self._agent_toasts: dict[str, tuple[str, float]] = {}
+        # 全局 toast 曾覆盖过主卡模型（过期时需要用 targets 重建一次）
+        self._toast_applied = False
         self._closing = False
 
         if getattr(config, "migration_notice", False):
@@ -130,13 +164,21 @@ class PetApp:
         self._open_agent_picker(view.view_id)
 
     def _open_agent_picker(self, slot_id: str):
+        """空 slot 双击/菜单 → Agent picker（fleet 绑定入口，v4plan §8.2）。
+
+        v4.3：进程内最多一个 picker（重复打开先销毁旧的，杜绝死弹窗
+        残留）；Escape/取消/选择后确定性销毁；quit() 一并销毁。
+        """
         targets = self.monitor.get_targets()
         if not targets:
             self.toast("当前没有发现任何 Agent", 4)
             return
+        self._destroy_agent_picker()
         picker = tk.Toplevel(self.root)
         picker.title("选择要绑定的 Agent")
         picker.geometry("420x300")
+        picker.transient(self.root)
+        self._agent_picker = picker
         tk.Label(picker, text=f"绑定到 {slot_id}（只影响本次运行期）",
                  font=("Microsoft YaHei UI", 10)).pack(anchor="w", padx=12,
                                                        pady=(10, 4))
@@ -151,6 +193,9 @@ class PetApp:
             listbox.insert("end", items[-1][1])
         taken = {v.agent_key for v in self.pet_manager.views.values()}
 
+        def _close(_evt=None):
+            self._destroy_agent_picker()
+
         def _bind(_evt=None):
             sel = listbox.curselection()
             if not sel:
@@ -161,16 +206,36 @@ class PetApp:
                 return
             if self.presentation.bind_slot(slot_id, key):
                 self.toast("已绑定（本次运行期有效）", 3)
-                picker.destroy()
+                self.ui.request(UiDirty.PRESENTATION)
+                _close()
             else:
                 self.toast("绑定失败：该 Agent 已被占用", 4)
 
-        tk.Button(picker, text="绑定", command=_bind).pack(pady=(0, 10))
+        tk.Button(picker, text="绑定", command=_bind).pack(
+            side="left", expand=True, fill="x", padx=(12, 0), pady=(0, 10))
+        tk.Button(picker, text="取消", command=_close).pack(
+            side="left", expand=True, fill="x", padx=(0, 12), pady=(0, 10))
         listbox.bind("<Double-Button-1>", _bind)
+        listbox.bind("<Return>", _bind)
+        picker.bind("<Escape>", _close)
+        picker.protocol("WM_DELETE_WINDOW", _close)
+        listbox.focus_set()
+
+    def _destroy_agent_picker(self):
+        """确定性关闭 agent picker（幂等；quit 与重复打开时调用）。"""
+        picker = self._agent_picker
+        self._agent_picker = None
+        if picker is not None:
+            try:
+                picker.destroy()
+            except tk.TclError:
+                pass
 
     def toast(self, text: str, sec: float = 3.0):
         """应用级提示：只占主卡；叠层卡片保持显示（v4.1.4 不折叠叠层）。"""
         self._toast = (text, time.time() + sec)
+        self._schedule_toast_deadline()
+        self.ui.request(UiDirty.TOAST)
 
     def agent_toast(self, key: str, text: str, sec: float = 3.0):
         """Agent 级反馈：只改该 Agent 自己那张卡的正文（agent_key/status/
@@ -179,6 +244,8 @@ class PetApp:
             self.toast(text, sec)
             return
         self._agent_toasts[key] = (text, time.time() + sec)
+        self._schedule_toast_deadline()
+        self.ui.request(UiDirty.TOAST)
 
     def _toast_text(self) -> str:
         if self._toast and time.time() < self._toast[1]:
@@ -192,41 +259,33 @@ class PetApp:
                     if now >= expire]:
             del self._agent_toasts[key]
 
-    # ================= 主循环 =================
-    def _poll_monitor(self):
-        self._poll_monitor_after = None
-        if self._closing:
-            return
-        try:
-            self._aggregate()
-        except Exception:
-            pass
-        try:
-            self._poll_tray_events()
-        except Exception:
-            pass
-        self._poll_monitor_after = self.root.after(400, self._poll_monitor)
+    # ================= 主循环（v4.3 §4：UiCoordinator 驱动） =================
+    def _aggregate(self, targets: dict | None = None):
+        """MONITOR/PRESENTATION dirty 时的呈现批次（v4plan §6）。
 
-    def _aggregate(self):
-        """每 UI tick：reconcile 呈现事实 + 同步 views + 推进动画（v4plan §6）。"""
+        reconcile 呈现事实 + 同步 views + 推进动画；重画由 render
+        flush 的 redraw_dirty 完成（§4.4 A→D），此处不做任何 redraw。
+        """
         now = time.time()
-        targets = self.monitor.get_targets()
+        if targets is None:
+            targets = self.monitor.get_targets()
         state = self.presentation.reconcile(targets, now)
         self._presentation_state = state
         self.pet_manager.sync(state, targets, now)
         force_state = str(self.config.get("force_state") or "")
         self.pet_manager.apply_animation(state, targets, now, force_state)
-        self._apply_toasts()
-        self.pet_manager.redraw_all()
 
     def _apply_toasts(self):
-        """提示绘制规则（v4.1.4）：
+        """提示绘制规则（v4.1.4，v4.3 §4.4 C 步）：
 
         - Agent 级反馈只覆盖对应 Agent 自己那张卡的正文（身份与可双击
-          性不变），其他卡片不收起、不变化；
+          性不变），其他卡片不收起、不变化；过期恢复原正文；
         - 应用级提示只占主卡，叠层卡片保持显示（不折叠为一摞）；
         - Agent 级反馈找不到对应卡片（该 Agent 刚退出等）：最新一条
           升级为主卡提示，反馈不会静默丢失。
+
+        只改模型 + mark dirty；重画由同批 render flush 的 redraw_dirty
+        完成。无变化不 mark（idle 零工作）。
         """
         self._prune_agent_toasts()
         shown: set[str] = set()
@@ -238,7 +297,18 @@ class PetApp:
                 shown.add(m.agent_key)
                 entry = self._agent_toasts.get(m.agent_key)
                 if entry:
-                    m.text = entry[0]
+                    if not getattr(m, "toast_applied", False):
+                        m.pre_toast_text = m.text   # 首次覆盖前保存原正文
+                        m.toast_applied = True
+                        view.mark_dirty()
+                    if m.text != entry[0]:
+                        m.text = entry[0]
+                        view.mark_dirty()
+                elif getattr(m, "toast_applied", False):
+                    m.toast_applied = False
+                    m.text = getattr(m, "pre_toast_text", m.text)
+                    m.pre_toast_text = None
+                    view.mark_dirty()
         text = self._toast_text()
         if not text:
             orphans = [k for k in self._agent_toasts if k not in shown]
@@ -247,36 +317,58 @@ class PetApp:
                              key=lambda k: self._agent_toasts[k][1])
                 text = self._agent_toasts[latest][0]
         if not text:
+            if self._toast_applied:
+                # 全局 toast 刚过期：主卡曾被覆盖 → 用当前 targets 重建
+                # 一次模型（sync 内的 change 检测会 mark dirty 需要重画
+                # 的 view），再补套尚存的 agent 级 overlay
+                self._toast_applied = False
+                self._aggregate()
+                self._apply_toasts()
             return
+        self._toast_applied = True
         for view in self.pet_manager.views.values():
-            view.bubble.model.visible = True
-            view.bubble.model.status = "DeskPet"
-            view.bubble.model.text = text
-            view.bubble.model.footer = ""
-            view.bubble.model.agent_key = ""
-            view.bubble.model.accent = "#487f73"
+            m = view.bubble.model
+            if not (m.visible and m.status == "DeskPet"
+                    and m.text == text):
+                view.mark_dirty()
+            m.visible = True
+            m.status = "DeskPet"
+            m.text = text
+            m.footer = ""
+            m.agent_key = ""
+            m.accent = "#487f73"
 
-    def _poll_build(self):
-        self._poll_build_after = None
+    def _toast_expired(self):
+        self._toast_after = None
+        self._toast_deadline = None
         if self._closing:
             return
-        try:
-            self.pet_manager.poll_skin_builds()
-        except Exception:
-            pass
-        self._poll_build_after = self.root.after(300, self._poll_build)
+        self.ui.request(UiDirty.TOAST)
+        self._schedule_toast_deadline()   # 可能还有更晚的 agent toast
 
-    def _ui_tick(self):
-        """UI 心跳：皮肤未就绪/静态模式下也要能刷新气泡与提示。"""
-        self._ui_after = None
+    def _schedule_toast_deadline(self):
+        """v4.3 §4.5：toast 过期用最近 expiry 的单次 deadline（非周期）。"""
         if self._closing:
             return
-        try:
-            self.pet_manager.redraw_all()
-        except Exception:
-            import traceback
-            traceback.print_exc()
-        self._ui_after = self.root.after(250, self._ui_tick)
+        expiries = []
+        if self._toast:
+            expiries.append(self._toast[1])
+        expiries.extend(e for _, e in self._agent_toasts.values())
+        if not expiries:
+            return
+        deadline = min(expiries)
+        if (self._toast_after is not None
+                and self._toast_deadline is not None
+                and self._toast_deadline <= deadline + 0.05):
+            return   # 已有相同/更早的 deadline
+        if self._toast_after is not None:
+            try:
+                self.root.after_cancel(self._toast_after)
+            except Exception:
+                pass
+        self._toast_deadline = deadline
+        delay_ms = max(16, int((deadline - time.time()) * 1000) + 16)
+        self._toast_after = self.root.after(delay_ms, self._toast_expired)
 
     # ================= 几何/外观 =================
     def _on_pet_moved(self, view: PetView):
@@ -296,6 +388,8 @@ class PetApp:
             self.config.set("pet_pos", [view.anchor[0], view.anchor[1]])
             self.config.save()
         view.invalidate_dpi()
+        # v4.3：无周期 tick 兜底，拖动结束/DPI 变化后显式标 dirty
+        view.mark_dirty(layout=True)
 
     def set_scale(self, scale: float):
         # v4.3 §7.4：经 AppearanceController（clamp + 定向 apply +
@@ -343,7 +437,6 @@ class PetApp:
         self.pet_manager.hide_all()
         self._start_tray_runtime()   # 隐藏后必须留托盘入口恢复（不写配置）
         self.toast("桌宠已隐藏，点击托盘图标恢复", 4)
-        self._apply_toasts()
 
     def show_pet(self):
         self.pet_manager.show_all()
@@ -410,6 +503,7 @@ class PetApp:
         else:
             self._stop_tray_runtime()
         self.config.set_and_commit("tray_enabled", enabled)
+        self.ui.kick()   # bridge 档位可能变化（200↔500ms）
 
     def toggle_autostart(self) -> bool:
         result = autostart.toggle()
@@ -459,6 +553,9 @@ class PetApp:
         # v4.2.3 §9：先确定性销毁旧 popup（最多一个 tray menu），
         # tk_popup + finally 销毁，不长期持有 _active_menu，不加
         # click-away polling/focus watcher。
+        # v4.3：弹出前对托盘隐藏窗口做 Win32 前台准备——没有前台状态
+        # 的 TrackPopupMenu 点击菜单外不收起、模态循环不退出（经典
+        # tray-menu 缺陷，用户实测卡死需手动点击）。
         self._dismiss_active_menu()
         menu = tk.Menu(self.root, tearoff=0)
         self._active_menu = menu
@@ -470,14 +567,20 @@ class PetApp:
         menu.add_command(label="重新扫描", command=self.monitor.rescan)
         menu.add_separator()
         menu.add_command(label="退出", command=self.quit)
+        from actions import winkeys
+        hwnd = self.tray.menu_hwnd if self.tray is not None else None
         try:
             import ctypes
             pt = ctypes.wintypes.POINT()
             ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            if hwnd:
+                winkeys.prepare_menu_popup(hwnd)
             menu.tk_popup(pt.x, pt.y)
         except (OSError, tk.TclError):
             pass
         finally:
+            if hwnd:
+                winkeys.finish_menu_popup(hwnd)
             # quit() 等 command 可能已销毁并清空 _active_menu（幂等）；
             # 只有仍为当前对象时才清属性，销毁本身无条件执行。
             if self._active_menu is menu:
@@ -633,18 +736,20 @@ class PetApp:
     # ================= 仪表盘 =================
     def open_dashboard(self):
         """打开仪表盘：不改桌宠逻辑 hidden 状态，只对原本可见的桌宠做
-        一次 no-activate Z-order 重声明（v4.1.3 §18）。"""
+       一次 no-activate Z-order 重声明（v4.1.3 §18）。"""
         if self.dashboard is None or not tk.Toplevel.winfo_exists(self.dashboard):
             self.dashboard = Dashboard(self)
         self.dashboard.open()
+        self.ui.kick()   # Dashboard 可见 → bridge 立即升到 125ms 档
+        self.ui.request(UiDirty.DASHBOARD)
         self._schedule_reassert()
 
     # ================= 生命周期 =================
     def run(self):
         self.monitor.start()
-        self._poll_monitor()
-        self._poll_build()
-        self._ui_after = self.root.after(250, self._ui_tick)
+        # v4.3 §4.5：唯一 bridge timer（125/200/500ms 三档）+ 按需
+        # render after_idle；不再有 _poll_monitor/_ui_tick/_poll_build
+        self.ui.start()
         self._janitor_after = self.root.after(600_000, self._janitor)
         self.root.mainloop()
 
@@ -687,6 +792,7 @@ class PetApp:
     def quit(self):
         self._closing = True
         try:
+            self.ui.stop()
             self.monitor.stop()
             self.pet_manager.stop()
             if self.tray:
@@ -699,9 +805,9 @@ class PetApp:
             self.config.save()
         finally:
             self._dismiss_active_menu()   # v4.2.3 §9：幂等，不 double-destroy
-            for attr in ("_poll_build_after", "_poll_monitor_after",
-                         "_ui_after", "_janitor_after", "_skin_after",
-                         "_reassert_after"):
+            self._destroy_agent_picker()  # v4.3：不留死弹窗
+            for attr in ("_janitor_after", "_skin_after", "_reassert_after",
+                         "_toast_after"):
                 callback = getattr(self, attr, None)
                 if callback is not None:
                     try:

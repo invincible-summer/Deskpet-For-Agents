@@ -172,6 +172,40 @@ def try_set_foreground(hwnd: int) -> bool:
     return int(user32.GetForegroundWindow()) == int(hwnd)
 
 
+# ------------------------------------------------------------ popup menu 前台准备
+
+WM_NULL = 0x0000
+
+
+def prepare_menu_popup(hwnd: int) -> bool:
+    """弹出上下文菜单前的前台准备（经典 tray-menu 修复）。
+
+    没有前台状态的窗口调用 TrackPopupMenu（Tk 的 tk_popup）时，
+    点击菜单外不会收起菜单、原生模态循环也不退出——用户必须点菜单
+    本身（Microsoft Learn：任务栏/托盘菜单必须在 TrackPopupMenu 前
+    SetForegroundWindow）。桌宠窗口是 no-activate topmost、托盘窗口
+    是隐藏窗口，两者天然没有前台状态，必须走此准备。
+    """
+    if not user32 or not user32.IsWindow(int(hwnd)):
+        return False
+    user32.SetForegroundWindow(int(hwnd))
+    return True
+
+
+def finish_menu_popup(hwnd: int) -> None:
+    """菜单关闭后的收尾（与 prepare_menu_popup 配套的 WM_NULL）。"""
+    if not user32 or not user32.IsWindow(int(hwnd)):
+        return
+    user32.PostMessageW(int(hwnd), WM_NULL, 0, 0)
+
+
+def foreground_window() -> int:
+    """当前前台窗口 HWND（0 = 无/不可用）；仅诊断与焦点判断用。"""
+    if not user32:
+        return 0
+    return int(user32.GetForegroundWindow())
+
+
 class FLASHWINFO(ctypes.Structure):
     _fields_ = [('cbSize', wt.UINT), ('hwnd', wt.HWND), ('dwFlags', wt.DWORD),
                 ('dwCount', wt.UINT), ('dwTimeout', wt.DWORD)]
