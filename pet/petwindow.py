@@ -130,7 +130,34 @@ class PetWindow:
             pass
 
     def set_topmost(self, flag: bool):
-        self._apply_topmost()
+        """直接应用本次设置（v4.1.3 §17：参数必须生效）。"""
+        try:
+            self.root.attributes("-topmost", bool(flag))
+        except tk.TclError:
+            pass
+
+    def reassert_z_order(self) -> bool:
+        """无激活的 Z-order 重声明（v4.1.3 §17）。
+
+        只用于 DeskPet 自身 Pet Toplevel（Dashboard 打开/托盘恢复后
+        拉回预期层级）；绝不用于 Terminal 前台唤起。非 Windows 测试
+        环境 fallback 到 root.lift()。
+        """
+        if not self.root.winfo_exists():
+            return False
+        try:
+            self.root.update_idletasks()
+            hwnd = int(self.root.winfo_id())
+        except tk.TclError:
+            return False
+        ok = winkeys.reassert_window_z_order(
+            hwnd, topmost=bool(self.config.get("topmost", True)))
+        if not ok:
+            try:
+                self.root.lift()   # 无 Win32 桌面的测试环境 fallback
+            except tk.TclError:
+                return False
+        return True
 
     # ---- 交互（v4.1.3 §11：气泡/body 都是双击激活；单击不激活） ----
     def _on_press(self, ev):

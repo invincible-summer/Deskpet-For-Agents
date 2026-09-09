@@ -14,7 +14,7 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from agents.models import ActivationCode, Status, WindowBindingConfidence
+from agents.models import Status, WindowBindingConfidence
 
 from . import autostart, skins
 from .labels import mode_text, phase_text, status_text
@@ -40,7 +40,7 @@ PAGE_MONITOR = "监听与隐私"
 PAGE_DIAG = "诊断"
 PAGE_SETTINGS = "设置"
 
-APP_VERSION = "DeskPet V4.1.2"
+APP_VERSION = "DeskPet V4.1.3"
 
 _BINDING_LABELS = {
     WindowBindingConfidence.CONFIRMED: "已确认",
@@ -63,10 +63,13 @@ class Dashboard(tk.Toplevel):
         self.geometry("1000x680")
         self.minsize(820, 560)
         self.configure(bg=LIGHT.page)
-        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+        self.protocol("WM_DELETE_WINDOW", self.hide_dashboard)
         self.selected_key = ""
         self._page = PAGE_OVERVIEW
-        self._refreshing = False
+        # refresh 生命周期（v4.1.3 §19）：withdrawn 时 0 timer，
+        # after id 全程保存/取消，杜绝隐藏周期唤醒与 destroy 后回调
+        self._refresh_after = None
+        self._closing = False
 
         # ---- 布局：左导航 + 右内容
         nav = tk.Frame(self, bg=LIGHT.page, width=NAV_WIDTH)
@@ -164,7 +167,7 @@ class Dashboard(tk.Toplevel):
             text=f"{len(targets)} Agents · {waiting} 等待 · {uia}")
         self.ov_stats.configure(text=(
             f"Live {len(targets)}     Waiting {waiting}     "
-            f"Working {working}     Ambiguous {ambiguous}"))
+            f"Working {working}     候选窗口 {ambiguous}"))
 
         entries = []
         for key, t in sorted(targets.items()):
@@ -353,24 +356,20 @@ class Dashboard(tk.Toplevel):
                 line += f"（{snap.parser_detail}）"
             lines.append(line)
         if binding is not None:
-            conf = _BINDING_LABELS.get(binding.confidence,
-                                       _binding_conf_value(binding))
             lines.append("")
             lines.append("Terminal")
-            lines.append(f"Window　{conf}"
-                         + (f" · {binding.title[:30]}" if binding.title else ""))
-            if binding.confidence is WindowBindingConfidence.AMBIGUOUS:
-                lines.append("· 候选窗口（可唤起）：证据不足以直接授予"
-                             "终端审批观察归属")
-            if (binding.confidence is WindowBindingConfidence.NONE
-                    and binding.window is not None):
-                lines.append("· 唯一 Terminal 窗口兜底（可唤起）：不作为"
-                             "审批归属依据")
-            if binding.reason:
-                detail = f"依据：{binding.reason}"
-                if binding.score:
-                    detail += f" · score {binding.score}"
-                lines.append(detail)
+            if binding.window is not None:
+                lines.append("Window　可打开"
+                             + (f" · {binding.title[:30]}"
+                                if binding.title else ""))
+                if binding.confidence is WindowBindingConfidence.AMBIGUOUS:
+                    lines.append("· 候选窗口（可唤起）：证据不足以直接授予"
+                                 "终端审批观察归属")
+                if binding.confidence is WindowBindingConfidence.NONE:
+                    lines.append("· 唯一 Terminal 窗口兜底（可唤起）：不作为"
+                                 "审批归属依据")
+            else:
+                lines.append("Window　未定位")
         if not self.app.monitor.terminal_available():
             err = self.app.monitor.terminal_startup_error()
             lines.append("终端观察不可用（UIA）"
@@ -405,6 +404,16 @@ class Dashboard(tk.Toplevel):
         if snap.session_file:
             bound = "已绑定" if snap.session_bound else "未解析"
             lines.append(f"会话文件（{bound}）：{snap.session_file}")
+        if binding is not None:
+            # confidence 只在高级诊断展示（§22：普通详情只说可打开/未定位）
+            conf = _BINDING_LABELS.get(binding.confidence,
+                                       _binding_conf_value(binding))
+            line = f"Window 绑定：{conf}"
+            if binding.reason:
+                line += f" · {binding.reason}"
+            if binding.score:
+                line += f" · score {binding.score}/{binding.runner_up_score}"
+            lines.append(line)
         if binding is not None and binding.window is not None:
             lines.append(f"HWND {binding.window.hwnd} · window_pid "
                          f"{binding.window.pid} · created "
@@ -413,20 +422,10 @@ class Dashboard(tk.Toplevel):
         return "\n".join(lines)
 
     def _open_terminal(self, key: str):
-        """exact key 激活（v4.1.1 §6.3）：UI 不直接碰 winkeys。"""
-        if not key:
-            return
-        result = self.app.monitor.activate_target(key)
-        if result.code == ActivationCode.OK:
-            return
-        if result.code == ActivationCode.FOREGROUND_DENIED:
-            self.app.toast("Windows 未允许将终端置于前台，已闪烁任务栏提醒", 4)
-        elif result.code == ActivationCode.AGENT_GONE:
-            self.app.toast("该 Agent 已退出", 4)
-        elif result.code == ActivationCode.NO_BINDING:
-            self.app.toast("无法唯一确定该 Agent 所在的终端窗口", 4)
-        elif result.code == ActivationCode.STALE_WINDOW:
-            self.app.toast("原终端窗口已失效，重新识别后仍无法安全打开", 4)
+        """§20：所有 UI 激活统一走 PetApp.activate_agent（exact key），
+        本页不再复制 toast/激活逻辑。"""
+        if key:
+            self.app.activate_agent(key)
 
     # ================================================== 桌宠与外观
     def _build_look(self):
@@ -982,10 +981,17 @@ class Dashboard(tk.Toplevel):
         lines.append("Terminal")
         lines.append(f"  UIA            "
                      f"{'OK' if monitor.terminal_available() else '不可用'}")
+
+        def _sole_window_count() -> int:
+            return sum(1 for t in targets.values()
+                       if t.terminal_window
+                       and _binding_conf_value(t.terminal_window) == "none"
+                       and t.terminal_window.window is not None)
+
         lines.append(f"  Bindings       confirmed {_count('confirmed')}"
                      f" / high {_count('high')}"
-                     f" / fallback {_count('fallback')}"
-                     f" / ambiguous {_count('ambiguous')}")
+                     f" / 候选(ambiguous) {_count('ambiguous')}"
+                     f" / 唯一窗口兜底 {_sole_window_count()}")
         text = "\n".join(lines)
         if text != self._health_signature:
             self._health_signature = text
@@ -1073,9 +1079,9 @@ class Dashboard(tk.Toplevel):
         ttk.Checkbutton(wrow, text="托盘图标", variable=tray,
                         command=lambda: self.app.set_tray_enabled(
                             tray.get())).pack(side="left", padx=10)
-        HelpDot(wrow, "系统托盘图标：左键显示/隐藏桌宠，右键完整菜单。"
-                      "隐藏桌宠后托盘是唯一恢复入口，建议保持开启。").pack(
-            side="left")
+        HelpDot(wrow, "系统托盘图标：左键显示桌宠（幂等恢复，不会隐藏），"
+                      "右键完整菜单。隐藏桌宠后托盘是唯一恢复入口，"
+                      "建议保持开启。").pack(side="left")
         ttk.Button(win.body, text="隐藏全部桌宠",
                    command=self.app.hide_pet).pack(anchor="w")
         HelpDot(win.body, "暂时隐藏所有桌宠（托盘图标保留，左键即可恢复；"
@@ -1168,19 +1174,36 @@ class Dashboard(tk.Toplevel):
             self._save_retry_btn.pack(side="left", padx=6)
             self._save_error_frame.pack(anchor="w")
 
-    # ================================================== 刷新
+    # ================================================== 刷新（§19 生命周期）
     def refresh(self):
-        if self._refreshing:
-            return
-        self._refreshing = True
-        self._refresh_once()
-
-    def _refresh_once(self):
-        if not self.winfo_exists():
+        """单次立即刷新（清空诊断等显式调用用）。"""
+        if self._closing or not self.winfo_exists():
             return
         if self.state() == "withdrawn":
-            self.after(1000, self._refresh_once)
             return
+        self._refresh_once()
+
+    def open(self):
+        """显示并启动周期刷新（重开时重启 timer）。"""
+        self.deiconify()
+        self.lift()
+        self.start_refresh()
+
+    def start_refresh(self):
+        if self._refresh_after is None and not self._closing:
+            self._refresh_tick()
+
+    def _refresh_tick(self):
+        self._refresh_after = None
+        if self._closing or not self.winfo_exists():
+            return
+        if self.state() == "withdrawn":
+            return   # 隐藏时完全停止；重开由 open() 重启
+
+        self._refresh_once()
+        self._refresh_after = self.after(500, self._refresh_tick)
+
+    def _refresh_once(self):
         targets = self.app.monitor.get_targets()
         state = self.app._presentation_state
         try:
@@ -1191,4 +1214,26 @@ class Dashboard(tk.Toplevel):
             self._refresh_settings()
         except Exception:
             pass
-        self.after(500, self._refresh_once)
+
+    def hide_dashboard(self):
+        """用户关闭窗口：隐藏 + 停止 refresh timer（0 周期唤醒）。"""
+        self.stop_refresh()
+        self.withdraw()
+
+    def stop_refresh(self):
+        callback = self._refresh_after
+        self._refresh_after = None
+        if callback is not None:
+            try:
+                self.after_cancel(callback)
+            except tk.TclError:
+                pass
+
+    def shutdown(self):
+        """退出 DeskPet 时销毁仪表盘（先停 timer，杜绝 destroy 后回调）。"""
+        self._closing = True
+        self.stop_refresh()
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass

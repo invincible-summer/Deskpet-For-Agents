@@ -461,6 +461,18 @@ class PetViewManager:
         for view in self.views.values():
             view.show()
 
+    def reassert_visible_windows(self):
+        """对逻辑可见（hidden=False）的桌宠做一次 no-activate Z-order
+        重声明（v4.1.3 §16）。必须用 view.hidden 表示用户逻辑意图，
+        不用 winfo_viewable() 决定是否重新显示。"""
+        for view in self.views.values():
+            if view.hidden:
+                continue
+            try:
+                view.window.reassert_z_order()
+            except Exception:
+                pass
+
     def any_visible(self) -> bool:
         return any(not v.hidden for v in self.views.values())
 

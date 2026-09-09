@@ -300,5 +300,136 @@ class AppTests(unittest.TestCase):
             app.quit()
 
 
+class TrayDashboardVisibilityTests(unittest.TestCase):
+    """Tray 左键 / Dashboard 打开不再意外隐藏桌宠（v4.1.3 §15/§18/§30）。"""
+
+    def _app(self, slots=None):
+        from pet.app import PetApp
+        from pet.petview import PetView
+        if slots is not None:
+            from tests.test_concurrent_activation import ConcurrentConfig
+            cfg = ConcurrentConfig(slots)
+        else:
+            cfg = MemoryConfig()
+        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+             patch.object(PetView, 'load_skin', lambda self, bm: None):
+            return PetApp(cfg)
+
+    def test_tray_left_never_hides_visible_pet(self):
+        app = self._app()
+        try:
+            view = app.pet_manager.views["pet-1"]
+            self.assertFalse(view.hidden)
+            reasserts = []
+            app.pet_manager.reassert_visible_windows = \
+                lambda: reasserts.append(1)
+            app.restore_pet_from_tray()
+            self.assertFalse(view.hidden)          # 仍可见（绝不隐藏）
+            self.assertEqual(reasserts, [1])        # 只做 Z-order 重声明
+            self.assertEqual(str(view.window.root.state()), "normal")
+        finally:
+            app.quit()
+
+    def test_tray_left_restores_all_hidden(self):
+        app = self._app()
+        try:
+            app.hide_pet()
+            view = app.pet_manager.views["pet-1"]
+            self.assertTrue(view.hidden)
+            app.restore_pet_from_tray()
+            self.assertFalse(view.hidden)           # show_all 恢复
+        finally:
+            app.quit()
+
+    def test_explicit_menu_hide_still_works(self):
+        """右键菜单的显式隐藏不受 tray 左键修复影响。"""
+        app = self._app()
+        try:
+            app.hide_pet()
+            self.assertTrue(all(v.hidden
+                                for v in app.pet_manager.views.values()))
+        finally:
+            app.quit()
+
+    def test_open_dashboard_keeps_logical_visibility(self):
+        app = self._app()
+        try:
+            view = app.pet_manager.views["pet-1"]
+            reasserts = []
+            app.pet_manager.reassert_visible_windows = \
+                lambda: reasserts.append(1)
+            app.open_dashboard()
+            app.root.update()                        # 处理 after_idle reassert
+            self.assertTrue(app.dashboard.winfo_exists())
+            self.assertFalse(view.hidden)           # 逻辑 hidden 不变
+            self.assertEqual(reasserts, [1])
+        finally:
+            app.quit()
+
+    def test_fleet_hidden_pet_not_restored_by_dashboard(self):
+        """Fleet：pet-1 可见 / pet-2 已隐藏 → 打开仪表盘只 reassert pet-1，
+        不复活 pet-2。"""
+        from tests.test_concurrent_activation import _slot, inst, snap
+        from agents.models import AgentKind
+        app = self._app(slots=[_slot("pet-1"), _slot("pet-2")])
+        try:
+            a = inst(AgentKind.CODEX, 1)
+            b = inst(AgentKind.CLAUDE, 2, cwd="/w/q")
+            app.monitor.instances = {a.key: a, b.key: b}
+            app.monitor.snapshots = {a.key: snap(a), b.key: snap(b)}
+            app._aggregate()
+            views = app.pet_manager.views
+            self.assertEqual(len(views), 2)
+            v1 = views["pet-1"]
+            v2 = views["pet-2"]
+            v2.hide()
+            calls = []
+            v1.window.reassert_z_order = lambda: calls.append("v1") or True
+            v2.window.reassert_z_order = lambda: calls.append("v2") or True
+            app.open_dashboard()
+            app.root.update()
+            self.assertFalse(v1.hidden)
+            self.assertTrue(v2.hidden)              # 不复活
+            self.assertEqual(calls, ["v1"])          # 只 reassert 可见者
+        finally:
+            app.quit()
+
+    def test_dashboard_withdraw_stops_refresh_timer_and_reopen_restarts(self):
+        app = self._app()
+        try:
+            app.open_dashboard()
+            app.root.update()
+            self.assertIsNotNone(app.dashboard._refresh_after)
+            app.dashboard.hide_dashboard()
+            self.assertIsNone(app.dashboard._refresh_after)
+            app.root.update()                        # 隐藏后绝不自启
+            self.assertIsNone(app.dashboard._refresh_after)
+            app.dashboard.open()
+            app.root.update()
+            self.assertIsNotNone(app.dashboard._refresh_after)  # 重开重启
+        finally:
+            app.quit()
+
+    def test_dashboard_shutdown_no_callback_after_destroy(self):
+        """shutdown 后 pump 事件循环：不得出现 invalid command 回调。"""
+        import io
+        from contextlib import redirect_stderr
+        app = self._app()
+        try:
+            err = io.StringIO()
+            with redirect_stderr(err):
+                app.open_dashboard()
+                app.root.update()
+                self.assertIsNotNone(app.dashboard._refresh_after)
+                app.dashboard.shutdown()
+                for _ in range(3):
+                    app.root.update()                # pending after 若未取消会触发
+            self.assertEqual(err.getvalue(), "")
+            self.assertTrue(app.dashboard._closing)
+            self.assertIsNone(app.dashboard._refresh_after)
+        finally:
+            app.quit()
+
+
 if __name__ == '__main__':
     unittest.main()

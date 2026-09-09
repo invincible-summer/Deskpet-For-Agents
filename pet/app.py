@@ -64,6 +64,7 @@ class PetApp:
         self._ui_after = None
         self._janitor_after = None
         self._skin_after = None
+        self._reassert_after = None
         self.dashboard: Dashboard | None = None
         self.tray = None
         self._active_menu = None
@@ -73,7 +74,7 @@ class PetApp:
         self._closing = False
 
         if getattr(config, "migration_notice", False):
-            self.toast("DeskPet V4.1.2：被动监听 · 终端窗口唤起 · 并发需手动开启", 8)
+            self.toast("DeskPet V4.1.3：被动监听 · 终端窗口唤起 · 并发需手动开启", 8)
         if bool(self.config.get("tray_enabled", True)):
             self._start_tray_runtime()
 
@@ -85,21 +86,22 @@ class PetApp:
         self.interact()
 
     def activate_agent(self, key: str):
-        """唯一激活入口：UI 只携带 exact agent_key（v4.1.1 §6.3）。
+        """唯一激活入口：UI 只携带 exact agent_key（v4.1.3 §20/§21）。
 
-        只恢复并前置该 Agent 所在的 Windows Terminal 顶层窗口；
+        只恢复并前置该 Agent 所在的 Windows Terminal 顶层窗口（候选
+        由 v3-compatible resolver 给出，confidence 不拦用户显式唤起）；
         DeskPet 不切换 Terminal 标签页、不发送键盘输入。
         """
         result = self.monitor.activate_target(key)
         if result.code == ActivationCode.OK:
-            self.toast("已打开该 Agent 所在的终端窗口"
+            self.toast("已打开该 Agent 的终端窗口"
                        + ("（已自动重新识别）" if result.repaired else ""), 2)
         elif result.code == ActivationCode.FOREGROUND_DENIED:
             self.toast("Windows 未允许将终端置于前台，已闪烁任务栏提醒", 4)
         elif result.code == ActivationCode.AGENT_GONE:
             self.toast("该 Agent 已退出", 4)
         elif result.code == ActivationCode.NO_BINDING:
-            self.toast("无法唯一确定该 Agent 所在的终端窗口", 4)
+            self.toast("未能定位该 Agent 的终端窗口", 4)
         elif result.code == ActivationCode.STALE_WINDOW:
             self.toast("原终端窗口已失效，重新识别后仍无法安全打开", 4)
         else:
@@ -322,13 +324,42 @@ class PetApp:
         else:
             self.show_pet()
 
+    def restore_pet_from_tray(self):
+        """托盘左键：幂等显示/恢复（v4.1.3 §15）。
+
+        绝不隐藏已经可见的桌宠——可见时只重新声明 Z-order；全部隐藏
+        时才 show_all。显式隐藏仍走右键菜单的 toggle_visible。
+        """
+        if self.pet_manager.any_visible():
+            self.pet_manager.reassert_visible_windows()
+        else:
+            self.pet_manager.show_all()
+            self._schedule_reassert()
+
+    def _schedule_reassert(self):
+        """idle 时刻做一次 Z-order 重声明；after id 全程可取消。"""
+        if self._closing:
+            return
+        if self._reassert_after is not None:
+            try:
+                self.root.after_cancel(self._reassert_after)
+            except tk.TclError:
+                pass
+        self._reassert_after = self.root.after_idle(self._reassert_now)
+
+    def _reassert_now(self):
+        self._reassert_after = None
+        if self._closing:
+            return
+        self.pet_manager.reassert_visible_windows()
+
     def _start_tray_runtime(self):
         """启动/显示托盘图标（纯运行期，不写配置——v4.1.1 §17）。"""
         if os.name != "nt":
             return
         from .tray import TrayIcon
         if self.tray is None:
-            self.tray = TrayIcon("DeskPet - 左键显示/隐藏，右键菜单")
+            self.tray = TrayIcon("DeskPet - 左键显示桌宠，右键菜单")
             self.tray.start()
         else:
             self.tray.show_icon()
@@ -357,7 +388,8 @@ class PetApp:
             while True:
                 ev = self.tray.events.get_nowait()
                 if ev == "left":
-                    self.toggle_visible()
+                    # 左键只显示/恢复，绝不隐藏可见桌宠（§15）
+                    self.restore_pet_from_tray()
                 elif ev == "right":
                     self._tray_menu()
                 elif ev == "error":
@@ -536,11 +568,12 @@ class PetApp:
 
     # ================= 仪表盘 =================
     def open_dashboard(self):
+        """打开仪表盘：不改桌宠逻辑 hidden 状态，只对原本可见的桌宠做
+        一次 no-activate Z-order 重声明（v4.1.3 §18）。"""
         if self.dashboard is None or not tk.Toplevel.winfo_exists(self.dashboard):
             self.dashboard = Dashboard(self)
-        self.dashboard.deiconify()
-        self.dashboard.lift()
-        self.dashboard.refresh()
+        self.dashboard.open()
+        self._schedule_reassert()
 
     # ================= 生命周期 =================
     def run(self):
@@ -594,6 +627,11 @@ class PetApp:
             self.pet_manager.stop()
             if self.tray:
                 self.tray.stop()
+            if self.dashboard is not None:
+                try:
+                    self.dashboard.shutdown()
+                except tk.TclError:
+                    pass
             self.config.save()
         finally:
             if self._active_menu is not None:
@@ -604,7 +642,8 @@ class PetApp:
                     pass
                 self._active_menu = None
             for attr in ("_poll_build_after", "_poll_monitor_after",
-                         "_ui_after", "_janitor_after", "_skin_after"):
+                         "_ui_after", "_janitor_after", "_skin_after",
+                         "_reassert_after"):
                 callback = getattr(self, attr, None)
                 if callback is not None:
                     try:
