@@ -71,6 +71,9 @@ class PetApp:
         self._presentation_state: PresentationState | None = None
 
         self._toast: tuple[str, float] | None = None
+        # Agent 级反馈（key -> (text, expire)）：只改对应 Agent 自己的
+        # 那张卡，其他卡片不收起、不变化（v4.1.4）
+        self._agent_toasts: dict[str, tuple[str, float]] = {}
         self._closing = False
 
         if getattr(config, "migration_notice", False):
@@ -94,18 +97,19 @@ class PetApp:
         """
         result = self.monitor.activate_target(key)
         if result.code == ActivationCode.OK:
-            self.toast("已打开该 Agent 的终端窗口"
-                       + ("（已自动重新识别）" if result.repaired else ""), 2)
+            self.agent_toast(key, "已打开该 Agent 的终端窗口"
+                             + ("（已自动重新识别）" if result.repaired else ""), 2)
         elif result.code == ActivationCode.FOREGROUND_DENIED:
-            self.toast("Windows 未允许将终端置于前台，已闪烁任务栏提醒", 4)
+            self.agent_toast(key, "Windows 未允许将终端置于前台，已闪烁任务栏提醒", 4)
         elif result.code == ActivationCode.AGENT_GONE:
+            # 该 Agent 的卡片会随本轮 reconcile 消失，无卡可挂 → 主卡提示
             self.toast("该 Agent 已退出", 4)
         elif result.code == ActivationCode.NO_BINDING:
-            self.toast("未能定位该 Agent 的终端窗口", 4)
+            self.agent_toast(key, "未能定位该 Agent 的终端窗口", 4)
         elif result.code == ActivationCode.STALE_WINDOW:
-            self.toast("原终端窗口已失效，重新识别后仍无法安全打开", 4)
+            self.agent_toast(key, "原终端窗口已失效，重新识别后仍无法安全打开", 4)
         else:
-            self.toast("无法打开该 Agent 的终端窗口", 4)
+            self.agent_toast(key, "无法打开该 Agent 的终端窗口", 4)
 
     def _focus_and_activate(self, key: str):
         """Dashboard"查看并设为当前"类操作：设焦点 + 激活（§8.5）。
@@ -160,13 +164,28 @@ class PetApp:
         listbox.bind("<Double-Button-1>", _bind)
 
     def toast(self, text: str, sec: float = 3.0):
+        """应用级提示：只占主卡；叠层卡片保持显示（v4.1.4 不折叠叠层）。"""
         self._toast = (text, time.time() + sec)
+
+    def agent_toast(self, key: str, text: str, sec: float = 3.0):
+        """Agent 级反馈：只改该 Agent 自己那张卡的正文（agent_key/status/
+        配色不变，卡片仍可双击），其他卡片不收起、不变化（v4.1.4）。"""
+        if not key:
+            self.toast(text, sec)
+            return
+        self._agent_toasts[key] = (text, time.time() + sec)
 
     def _toast_text(self) -> str:
         if self._toast and time.time() < self._toast[1]:
             return self._toast[0]
         self._toast = None
         return ""
+
+    def _prune_agent_toasts(self):
+        now = time.time()
+        for key in [k for k, (_, expire) in self._agent_toasts.items()
+                    if now >= expire]:
+            del self._agent_toasts[key]
 
     # ================= 主循环 =================
     def _poll_monitor(self):
@@ -196,13 +215,35 @@ class PetApp:
         self.pet_manager.redraw_all()
 
     def _apply_toasts(self):
+        """提示绘制规则（v4.1.4）：
+
+        - Agent 级反馈只覆盖对应 Agent 自己那张卡的正文（身份与可双击
+          性不变），其他卡片不收起、不变化；
+        - 应用级提示只占主卡，叠层卡片保持显示（不折叠为一摞）；
+        - Agent 级反馈找不到对应卡片（该 Agent 刚退出等）：最新一条
+          升级为主卡提示，反馈不会静默丢失。
+        """
+        self._prune_agent_toasts()
+        shown: set[str] = set()
+        for view in self.pet_manager.views.values():
+            for renderer in [view.bubble, *view.stack_bubbles]:
+                m = renderer.model
+                if not (m.visible and m.agent_key):
+                    continue
+                shown.add(m.agent_key)
+                entry = self._agent_toasts.get(m.agent_key)
+                if entry:
+                    m.text = entry[0]
         text = self._toast_text()
+        if not text:
+            orphans = [k for k in self._agent_toasts if k not in shown]
+            if orphans:
+                latest = max(orphans,
+                             key=lambda k: self._agent_toasts[k][1])
+                text = self._agent_toasts[latest][0]
         if not text:
             return
         for view in self.pet_manager.views.values():
-            # toast 期间只显示主卡提示，叠层卡片暂隐（下一轮 sync 恢复）
-            for renderer in view.stack_bubbles:
-                renderer.model.visible = False
             view.bubble.model.visible = True
             view.bubble.model.status = "DeskPet"
             view.bubble.model.text = text

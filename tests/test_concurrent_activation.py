@@ -19,6 +19,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agents.models import (
+    ActivationCode,
+    ActivationResult,
     AgentInstance,
     AgentKind,
     Snapshot,
@@ -434,7 +436,8 @@ class AggregateStackTests(unittest.TestCase):
     * 主卡（focused/attention 优先）最下、带指向桌宠的尾巴；
      上方卡片无尾巴、小间隔、不粘连；
     * 每张卡携带自己的 agent_key——双击对应气泡唤起对应终端窗口；
-    * 单卡/SINGLE/FLEET 无叠层；toast 期间叠层暂隐；
+    * 单卡/SINGLE/FLEET 无叠层；终端唤起反馈只改对应 Agent 自己那张
+      卡（其他卡不变、叠层不收起）；应用级提示只占主卡、叠层保持显示；
     * Agent 退出后叠层收缩，不留残留渲染器。
     """
 
@@ -544,19 +547,90 @@ class AggregateStackTests(unittest.TestCase):
         finally:
             app.quit()
 
-    def test_toast_hides_stack_until_next_sync(self):
+    def test_agent_feedback_only_changes_that_card(self):
+        """v4.1.4：终端唤起反馈只改对应 Agent 自己那张卡——其他卡内容
+        不变、叠层不收起、被反馈卡身份/可双击性不变。"""
+        app, agents = self._app(3)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            before = {
+                agents[0].key: view.bubble.model.text,
+                agents[1].key: view.stack_bubbles[0].model.text,
+                agents[2].key: view.stack_bubbles[1].model.text,
+            }
+            app.agent_toast(agents[1].key, "已打开该 Agent 的终端窗口", 5)
+            app._apply_toasts()
+            # 三张卡都在，没有任何收起
+            self.assertTrue(view.bubble.model.visible)
+            self.assertEqual(len(view.stack_bubbles), 2)
+            self.assertTrue(all(b.model.visible for b in view.stack_bubbles))
+            # 主卡与最上卡内容不变
+            self.assertEqual(view.bubble.model.text, before[agents[0].key])
+            self.assertEqual(view.stack_bubbles[1].model.text,
+                             before[agents[2].key])
+            # 只有被反馈的卡正文换成反馈文案，agent_key 原样（仍可双击）
+            card = view.stack_bubbles[0]
+            self.assertEqual(card.model.text, "已打开该 Agent 的终端窗口")
+            self.assertEqual(card.model.agent_key, agents[1].key)
+            box = card._hit_boxes[0][0]
+            cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+            self.assertEqual(view._hit(cx, cy), ("activate", agents[1].key))
+            # 反馈过期后下一轮 aggregate 恢复正常内容
+            app._agent_toasts.clear()
+            app._aggregate()
+            self.assertEqual(card.model.text, before[agents[1].key])
+        finally:
+            app.quit()
+
+    def test_activate_agent_feedback_scoped_to_its_card(self):
+        """activate_agent 的结果反馈走 Agent 级通道（端到端）。"""
+        app, agents = self._app(3)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            primary_text = view.bubble.model.text
+            app.monitor.activate_target = lambda key: ActivationResult(
+                ActivationCode.OK)
+            app.activate_agent(agents[1].key)
+            self.assertIn(agents[1].key, app._agent_toasts)
+            self.assertNotIn(agents[0].key, app._agent_toasts)
+            app._aggregate()
+            card = view.stack_bubbles[0]
+            self.assertEqual(card.model.text, "已打开该 Agent 的终端窗口")
+            self.assertEqual(view.bubble.model.text, primary_text)
+            self.assertEqual(len(view.stack_bubbles), 2)
+            self.assertTrue(all(b.model.visible for b in view.stack_bubbles))
+        finally:
+            app.quit()
+
+    def test_global_toast_keeps_stack_visible(self):
+        """应用级提示只占主卡；叠层卡片保持显示、内容不被改写。"""
         app, agents = self._app(3)
         try:
             view = app.pet_manager.views["pet-1"]
             app.toast("测试提示", 5)
             app._apply_toasts()
             for renderer in view.stack_bubbles:
-                self.assertFalse(renderer.model.visible)
+                self.assertTrue(renderer.model.visible)
+                self.assertNotEqual(renderer.model.text, "测试提示")
             self.assertEqual(view.bubble.model.text, "测试提示")
-            # toast 过期后下一轮 aggregate 恢复叠层
+            # 提示过期后下一轮 aggregate 恢复主卡内容
             app._toast = None
             app._aggregate()
-            self.assertTrue(view.stack_bubbles[0].model.visible)
+            self.assertNotEqual(view.bubble.model.text, "测试提示")
+        finally:
+            app.quit()
+
+    def test_feedback_without_card_falls_back_to_primary(self):
+        """Agent 级反馈找不到卡片（Agent 刚退出）：升级为主卡提示，
+        双击绝无静默失败；叠层同样不收起。"""
+        app, agents = self._app(3)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            app.agent_toast("gone-key", "该 Agent 已退出", 5)
+            app._apply_toasts()
+            self.assertEqual(view.bubble.model.text, "该 Agent 已退出")
+            self.assertEqual(len(view.stack_bubbles), 2)
+            self.assertTrue(all(b.model.visible for b in view.stack_bubbles))
         finally:
             app.quit()
 

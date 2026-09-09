@@ -37,7 +37,12 @@
   桌宠的倒三角尾巴，上方卡片 `draw_tail=False`、卡片间只留小间隔
   （STACK_GAP=6 逻辑像素，随 scale/DPI 缩放）；每张卡携带自己的
   agent_key，双击对应气泡 = 唤起该 Agent 的终端窗口（visual identity
-  == click identity）；toast 期间叠层暂隐。
+  == click identity）。
+- **反馈不折叠叠层（`pet/app.py`）**：终端唤起反馈走 Agent 级
+  `agent_toast(key)`——只把该 Agent 自己那张卡的正文换成反馈文案
+  （agent_key/status/配色不变、仍可双击），其他卡不收起不变化；
+  应用级提示只占主卡，叠层保持显示。反馈找不到卡片（Agent 刚退出）
+  时最新一条升级为主卡提示，双击绝无静默失败。
 - **托盘崩溃修复（`pet/tray.py`）**：窗口类 "DeskPetTrayWnd" 进程内只
   注册一次，注册进类的 WNDPROC 必须与类同生命周期——挂实例上的回调
   在实例 GC 后 trampoline 释放，类仍指向该地址，后续实例
