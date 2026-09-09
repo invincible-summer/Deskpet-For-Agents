@@ -40,7 +40,7 @@ PAGE_MONITOR = "监听与隐私"
 PAGE_DIAG = "诊断"
 PAGE_SETTINGS = "设置"
 
-APP_VERSION = "DeskPet V4.1.5"
+APP_VERSION = "DeskPet V4.2.2"
 
 _BINDING_LABELS = {
     WindowBindingConfidence.CONFIRMED: "已确认",

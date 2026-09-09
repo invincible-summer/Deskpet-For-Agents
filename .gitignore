@@ -21,3 +21,5 @@ __pycache__/
 .zcode/
 # 本地 benchmark 运行产物（CI 在 runner 上生成并以 artifact 上传）
 benchmark-report.json
+# 本地计划文档（v4.2.2 起不再入库）
+plan.md

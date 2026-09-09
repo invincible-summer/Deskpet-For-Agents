@@ -1,4 +1,4 @@
-# DeskPet V4.1.5 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
+# DeskPet V4.2.2 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
 
 一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
 

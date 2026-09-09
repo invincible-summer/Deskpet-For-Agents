@@ -1,4 +1,4 @@
-# DeskPet V4.1.5 — SourceLink / Evidence Map
+# DeskPet V4.2.2 — SourceLink / Evidence Map
 
 > 审计日期：2026-09-08（V4.1）；V4.1.2 window-only 收敛更新：2026-09-09；
 > V4.1.3 v3 wake 语义恢复更新：2026-09-09；V4.1.4 窗口区分修复：2026-09-09；V4.1.5 托盘小猫图标：2026-09-09  

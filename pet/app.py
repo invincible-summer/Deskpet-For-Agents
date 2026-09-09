@@ -78,7 +78,7 @@ class PetApp:
         self._closing = False
 
         if getattr(config, "migration_notice", False):
-            self.toast("DeskPet V4.1.5：被动监听 · 终端窗口唤起 · 并发需手动开启", 8)
+            self.toast("DeskPet V4.2.2：被动监听 · 终端窗口唤起 · 并发需手动开启", 8)
         if bool(self.config.get("tray_enabled", True)):
             self._start_tray_runtime()
 
