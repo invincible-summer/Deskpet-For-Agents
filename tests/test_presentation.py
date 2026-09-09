@@ -78,8 +78,19 @@ def targets(*pairs):
 
 
 class ModeTests(unittest.TestCase):
+    def test_startup_runtime_policy_ignores_old_config(self):
+        # AC43-PRES-01：任意旧 config（enabled=false / mode=fleet）
+        # 启动后 runtime 必为 True + AGGREGATE
+        pc = PresentationController(concurrent_cfg(
+            enabled=False, mode="fleet"))
+        self.assertTrue(pc.concurrent_enabled)
+        self.assertIs(pc.concurrent_mode, PresentationMode.AGGREGATE)
+        self.assertIs(pc.mode, PresentationMode.AGGREGATE)
+        self.assertEqual(pc.revision, 0)   # 启动初始化不产生虚假 revision
+
     def test_concurrency_disabled_is_single(self):
         pc = PresentationController(concurrent_cfg(enabled=False))
+        pc.set_concurrent_enabled(False)   # 本次运行用户关闭
         self.assertIs(pc.mode, PresentationMode.SINGLE)
         state = pc.reconcile(targets((inst(AgentKind.CODEX, 1),
                                       snap(inst(AgentKind.CODEX, 1)))), NOW)
@@ -102,12 +113,58 @@ class ModeTests(unittest.TestCase):
             enabled=True, mode="fleet",
             slots=[{"id": "pet-1", "selector": None},
                    {"id": "pet-2", "selector": None}]))
+        pc.set_concurrent_mode(PresentationMode.FLEET)
         a = inst(AgentKind.CODEX, 1)
         state = pc.reconcile(targets((a, snap(a))), NOW)
         self.assertIs(state.mode, PresentationMode.FLEET)
         # selector=None 也自动分配（V4.1.1：尽量自动绑定现有 Agent）
         self.assertEqual(state.slot_keys, {"pet-1": a.key})
         self.assertTrue(pc.is_auto_bound("pet-1"))
+
+
+class RevisionTests(unittest.TestCase):
+    """v4.3 §18.3：revision 只在真正 runtime state 改变时递增。"""
+
+    def test_runtime_switches_bump_revision(self):
+        pc = PresentationController(concurrent_cfg())
+        base = pc.revision
+        pc.set_concurrent_mode(PresentationMode.FLEET)
+        self.assertEqual(pc.revision, base + 1)
+        pc.set_concurrent_mode(PresentationMode.FLEET)   # 无变化不递增
+        self.assertEqual(pc.revision, base + 1)
+        pc.set_concurrent_enabled(False)
+        self.assertEqual(pc.revision, base + 2)
+        pc.set_focus("k1")
+        self.assertEqual(pc.revision, base + 3)
+        pc.set_focus("k1")
+        self.assertEqual(pc.revision, base + 3)
+
+    def test_slot_binding_changes_bump_revision(self):
+        pc = PresentationController(concurrent_cfg(
+            slots=[{"id": "pet-1"}, {"id": "pet-2"}]))
+        pc.set_concurrent_mode(PresentationMode.FLEET)
+        a = inst(AgentKind.CODEX, 1)
+        b = inst(AgentKind.CLAUDE, 2)
+        t = targets((a, snap(a)), (b, snap(b)))
+        pc.reconcile(t, NOW)
+        after_auto = pc.revision
+        # 同输入 reconcile：auto-bind 无变化 → revision 不变
+        pc.reconcile(t, NOW)
+        self.assertEqual(pc.revision, after_auto)
+        # Agent 退出释放绑定 → 实际变化 → 递增
+        pc.reconcile({b.key: t[b.key]}, NOW + 1)
+        self.assertGreater(pc.revision, after_auto)
+
+    def test_no_config_write_on_runtime_switch(self):
+        # AC43-PRES-02：运行期切换不写 config（含启动 reset）
+        cfg = concurrent_cfg(enabled=False, mode="fleet")
+        pc = PresentationController(cfg)
+        pc.set_concurrent_mode(PresentationMode.FLEET)
+        pc.set_concurrent_enabled(False)
+        self.assertEqual(cfg.data["presentation"]["concurrent"].get("enabled"),
+                         False)   # 旧值原样，未被 reset 改写
+        self.assertEqual(cfg.data["presentation"]["concurrent"].get("mode"),
+                         "fleet")
 
 
 class SelectionTests(unittest.TestCase):
@@ -225,8 +282,10 @@ class AttentionTests(unittest.TestCase):
 
 class FleetTests(unittest.TestCase):
     def _fleet_pc(self, slots):
-        return PresentationController(concurrent_cfg(
+        pc = PresentationController(concurrent_cfg(
             enabled=True, mode="fleet", slots=slots))
+        pc.set_concurrent_mode(PresentationMode.FLEET)
+        return pc
 
     def test_bind_unbind_and_duplicate_reject(self):
         pc = self._fleet_pc([{"id": "pet-1"}, {"id": "pet-2"}])
@@ -284,16 +343,21 @@ class FleetTests(unittest.TestCase):
 
 class ModeSwitchTests(unittest.TestCase):
     def test_mode_switch_keeps_monitor_state(self):
-        """并发模式切换只是 presentation 状态：Monitor/UIA 无关（§18.3-10）。"""
+        """并发模式切换只是 presentation runtime 状态：Monitor/UIA 无关。
+
+        v4.3：切换走 controller runtime API（session state），
+        不再写/读 config 的 enabled/mode。
+        """
         pc = PresentationController(concurrent_cfg(enabled=False))
         a = inst(AgentKind.CODEX, 1)
         t = targets((a, snap(a)))
+        pc.set_concurrent_enabled(False)
         self.assertIs(pc.reconcile(t, NOW).mode, PresentationMode.SINGLE)
-        pc.config.set("presentation.concurrent.enabled", True)
+        pc.set_concurrent_enabled(True)
         self.assertIs(pc.reconcile(t, NOW).mode, PresentationMode.AGGREGATE)
-        pc.config.set("presentation.concurrent.mode", "fleet")
         pc.config.set("presentation.concurrent.slots",
                       [{"id": "pet-1", "selector": None}])
+        pc.set_concurrent_mode(PresentationMode.FLEET)
         self.assertIs(pc.reconcile(t, NOW).mode, PresentationMode.FLEET)
 
 

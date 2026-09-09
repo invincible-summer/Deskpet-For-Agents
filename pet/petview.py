@@ -419,6 +419,9 @@ class PetViewManager:
             __import__("pet.skins", fromlist=["SkinBuildManager"]).SkinBuildManager())
         self.views: dict[str, PetView] = {}
         self._hooks = None   # app 提供 activate/menu/interact/moved 回调
+        # v4.3 §18.2：用户显式"隐藏全部桌宠"的运行期 override。
+        # 不持久化；进程重启固定 False（下次启动至少一宠重新可见）。
+        self.user_hidden = False
 
     def set_hooks(self, on_activate, on_menu, on_interact, on_moved,
                   on_double_vacant=None):
@@ -458,6 +461,9 @@ class PetViewManager:
                            sh - 240)
         self.views[slot_id] = view
         view.load_skin(self.build_manager)
+        if self.user_hidden:
+            # v4.3 §18.2：显式隐藏期间新 view 也保持隐藏
+            view.hide()
         return view
 
     def remove_view(self, slot_id: str):
@@ -468,31 +474,45 @@ class PetViewManager:
     # ------------------------------------------------------------ 每轮同步
     def sync(self, state: PresentationState,
              targets: dict, now: float, force_state: str = ""):
-        """按呈现事实创建/回收/更新 views。
+        """按呈现事实创建/回收/更新 views（v4.3 §18.2 至少一宠）。
 
-        Fleet：只有绑定了 Agent 的 slot 才有桌宠（没有绑定不显示，
-        桌宠数量跟随绑定数而不是 slot 配置数）；每只桌宠的气泡与
-        单个监听完全一致（单卡，无 "N Agents" 栈卡）。
-        Aggregate：单宠 "pet-1"，多张候选卡叠成一摞（v4.1.4）——
-        主卡（focused/attention 优先，带尾巴）最下，其余卡小间隔叠上，
-        每张卡携带自己的 agent_key，双击该气泡唤起该 Agent 的终端。
+        * SINGLE/AGGREGATE：恒为 pet-1 一个 view（0 Agent 也保留，
+          idle/sleep 形态、气泡隐藏）；
+        * FLEET：只有绑定了 Agent 的 slot 才有桌宠；0 bound 时保留
+          pet-1 idle fallback（不代表 fake Agent：agent_key 空、不占
+          Monitor target、不进 Agent 计数）；fallback 在第一个 bound
+          slot 出现后被复用或原子替换；
+        * create desired 先于 remove obsolete，任何 reconcile 中可见
+          view 数不降为 0（用户显式隐藏除外）。
         """
         if state.mode is PresentationMode.FLEET:
-            live = set(state.slot_keys)
-            for slot_id in list(self.views):
-                if slot_id not in live:
-                    self.remove_view(slot_id)
-            for slot_id, key in state.slot_keys.items():
-                view = self.ensure_view(slot_id)
+            desired = set(state.slot_keys) or {"pet-1"}   # zero-agent fallback
+        else:
+            desired = {"pet-1"}
+        for slot_id in sorted(desired):
+            if slot_id not in self.views:
+                self.ensure_view(slot_id)
+        for slot_id in list(self.views):
+            if slot_id not in desired:
+                self.remove_view(slot_id)
+
+        if state.mode is PresentationMode.FLEET:
+            for slot_id, key in sorted(state.slot_keys.items()):
+                view = self.views.get(slot_id)
+                if view is None:
+                    continue
                 view.set_agent(key)
                 view.set_body_activation(True)   # fleet：双击 = 激活绑定 Agent
                 view.set_single_model(targets.get(key))
+            if not state.slot_keys:
+                # 0-bound fallback：idle 形态、无气泡、不激活终端
+                view = self.views.get("pet-1")
+                if view is not None:
+                    view.set_agent("")
+                    view.set_body_activation(False)
+                    view.clear_stack()
+                    view.set_single_model(None)
         else:
-            if "pet-1" not in self.views:
-                self.ensure_view("pet-1")
-            for slot_id in list(self.views):
-                if slot_id != "pet-1":
-                    self.remove_view(slot_id)
             view = self.views["pet-1"]
             view.set_body_activation(
                 state.mode is not PresentationMode.AGGREGATE)
@@ -537,10 +557,13 @@ class PetViewManager:
             view.redraw()
 
     def hide_all(self):
+        # v4.3 §18.2：用户显式隐藏是运行期 override（不持久化）
+        self.user_hidden = True
         for view in self.views.values():
             view.hide()
 
     def show_all(self):
+        self.user_hidden = False
         for view in self.views.values():
             view.show()
 

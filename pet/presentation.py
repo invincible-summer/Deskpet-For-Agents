@@ -117,6 +117,11 @@ class PresentationController:
 
     不持有 Monitor；不持久化任何 runtime key（include/exclude/slot
     绑定都是运行期状态，重启后靠语义 selector 重新认领）。
+
+    v4.3 §2/§18.1：`concurrent_enabled` / `concurrent_mode` 是进程
+    运行期 session state——每次启动固定初始化为 True + AGGREGATE，
+    不读取（也不恢复）旧 config 的 enabled/mode；用户本次运行切换
+    只对本次有效，且不触发配置保存。
     """
 
     def __init__(self, config=None):
@@ -132,6 +137,10 @@ class PresentationController:
         self._special_until = 0.0
         self._done_seen: dict[str, float] = {}
         self._last_signature: tuple = ()
+        # v4.3 §18.1：启动固定 runtime policy（不产生虚假 revision）
+        self._concurrent_enabled = True
+        self._concurrent_mode = PresentationMode.AGGREGATE
+        self._revision = 0
 
     # ------------------------------------------------------------ 配置读取
     def _cfg(self, path, default):
@@ -140,18 +149,53 @@ class PresentationController:
         except Exception:
             return default
 
+    # ------------------------------------------------------------ runtime policy
     @property
     def concurrent_enabled(self) -> bool:
-        return bool(self._cfg("presentation.concurrent.enabled", False))
+        """运行期并发开关（session state，不持久化）。"""
+        return self._concurrent_enabled
+
+    @property
+    def concurrent_mode(self) -> PresentationMode:
+        """运行期展示方式（session state，不持久化）。"""
+        return self._concurrent_mode
+
+    def set_concurrent_enabled(self, enabled: bool) -> None:
+        """本次运行内切换并发开关；不触发 ConfigSaveCoordinator。"""
+        enabled = bool(enabled)
+        if enabled != self._concurrent_enabled:
+            self._concurrent_enabled = enabled
+            self._revision += 1
+
+    def set_concurrent_mode(self, mode: PresentationMode) -> None:
+        """本次运行内切换 aggregate/fleet；不触发 ConfigSaveCoordinator。"""
+        if isinstance(mode, str):
+            mode = PresentationMode(mode)
+        if mode is not self._concurrent_mode and mode in (
+                PresentationMode.AGGREGATE, PresentationMode.FLEET):
+            self._concurrent_mode = mode
+            self._revision += 1
+
+    @property
+    def revision(self) -> int:
+        """presentation runtime state 修订号：只在真正变化时递增。"""
+        return self._revision
+
+    def _bump_revision_if_changed(self, before: tuple) -> None:
+        if before != self._runtime_signature():
+            self._revision += 1
+
+    def _runtime_signature(self) -> tuple:
+        return (self._focused_key, tuple(sorted(self._included_keys)),
+                tuple(sorted(self._excluded_keys)),
+                tuple(sorted(self._slot_bindings.items())),
+                tuple(sorted(self._slot_auto)))
 
     @property
     def mode(self) -> PresentationMode:
-        if not self.concurrent_enabled:
+        if not self._concurrent_enabled:
             return PresentationMode.SINGLE
-        raw = str(self._cfg("presentation.concurrent.mode", "aggregate"))
-        if raw == "fleet":
-            return PresentationMode.FLEET
-        return PresentationMode.AGGREGATE
+        return self._concurrent_mode
 
     def max_targets(self) -> int:
         try:
@@ -207,17 +251,25 @@ class PresentationController:
 
     def set_focus(self, agent_key: str | None) -> None:
         """用户明确选择；None/空 = 清除。不持久化。"""
-        self._focused_key = str(agent_key or "")
+        key = str(agent_key or "")
+        if key != self._focused_key:
+            self._focused_key = key
+            self._revision += 1
 
     # ------------------------------------------------------------ include
     def set_instance_included(self, agent_key: str, included: bool) -> None:
         """运行期手动加入/移出并发展示（runtime state，不写配置）。"""
+        before_in = agent_key in self._included_keys
+        before_ex = agent_key in self._excluded_keys
         if included:
             self._included_keys.add(agent_key)
             self._excluded_keys.discard(agent_key)
         else:
             self._excluded_keys.add(agent_key)
             self._included_keys.discard(agent_key)
+        if (before_in != (agent_key in self._included_keys)
+                or before_ex != (agent_key in self._excluded_keys)):
+            self._revision += 1
 
     def instance_included(self, agent_key: str) -> bool | None:
         if agent_key in self._included_keys:
@@ -247,14 +299,18 @@ class PresentationController:
         for other, key in self._slot_bindings.items():
             if key == agent_key and other != slot_id:
                 return False
-        self._slot_bindings[slot_id] = agent_key
-        self._slot_auto.discard(slot_id)
-        self._slot_vacant_reason.pop(slot_id, None)
+        if self._slot_bindings.get(slot_id) != agent_key:
+            self._slot_bindings[slot_id] = agent_key
+            self._slot_auto.discard(slot_id)
+            self._slot_vacant_reason.pop(slot_id, None)
+            self._revision += 1
         return True
 
     def unbind_slot(self, slot_id: str) -> None:
-        self._slot_bindings.pop(slot_id, None)
-        self._slot_auto.discard(slot_id)
+        if slot_id in self._slot_bindings or slot_id in self._slot_auto:
+            self._slot_bindings.pop(slot_id, None)
+            self._slot_auto.discard(slot_id)
+            self._revision += 1
 
     def slot_binding(self, slot_id: str) -> str:
         return self._slot_bindings.get(slot_id, "")
@@ -354,6 +410,7 @@ class PresentationController:
     def reconcile(self, targets: dict[str, AgentTarget],
                   now: float) -> PresentationState:
         """每轮 UI tick 调用：产出呈现事实（不做任何 I/O）。"""
+        runtime_before = self._runtime_signature()
         self._prune_runtime_keys(set(targets))
         state = PresentationState(mode=self.mode)
         state.focused_key = self._focused_key
@@ -389,6 +446,9 @@ class PresentationController:
                 elif self._slot_vacant_reason.get(slot_id):
                     state.slot_vacant_reason[slot_id] = \
                         self._slot_vacant_reason[slot_id]
+        # v4.3 §18.3：prune/reclaim/auto-bind 实际改变 runtime state
+        # （focused/slot 绑定）时递增 revision。
+        self._bump_revision_if_changed(runtime_before)
         self._last_signature = state.signature()
         return state
 

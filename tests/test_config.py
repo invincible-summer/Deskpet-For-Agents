@@ -61,19 +61,78 @@ class MigrationTests(unittest.TestCase):
         self.assertTrue(cfg.get("privacy.wsl_root_metadata_fallback"))
         self.assertEqual(cfg.get("animation_cache_mb"), 64)
         self.assertEqual(cfg.get("force_state"), "walk")
-        # V4.1 新增：并发默认关闭（不改变 V3 视觉习惯）
-        self.assertEqual(cfg.get("config_version"), 4)
-        self.assertFalse(cfg.get("presentation.concurrent.enabled"))
-        self.assertEqual(cfg.get("presentation.concurrent.mode"),
-                         "aggregate")
+        # V4.3：enabled/mode 不再持久化（session runtime state），
+        # 旧值无论是什么都不作为下次启动依据，也不在启动时写盘清除。
+        self.assertEqual(cfg.get("config_version"), 5)
+        self.assertIsNone(cfg.get("presentation.concurrent.enabled"))
+        self.assertIsNone(cfg.get("presentation.concurrent.mode"))
         # eligible 默认继承 discovery 开关
         self.assertFalse(cfg.get(
             "presentation.concurrent.eligible_kinds.claude"))
         self.assertEqual(cfg.get("presentation.concurrent.slots")[0]["id"],
                          "pet-1")
+        # v5：slot appearance 规范为 {"skin": None}
+        self.assertEqual(
+            cfg.get("presentation.concurrent.slots")[0]["appearance"],
+            {"skin": None})
         # pinned / gone_grace 被清除
         self.assertIsNone(cfg.get("monitor.pinned"))
         self.assertIsNone(cfg.get("monitor.gone_grace_sec"))
+
+    def test_v5_drops_persisted_enabled_mode_regardless_of_value(self):
+        # AC43-PRES-01/AC43-CFG-01：旧 enabled=false / mode=fleet 迁移后
+        # 不存在这两个键；slot appearance 规范化且保留未知 future key
+        v4 = {
+            "config_version": 4,
+            "presentation": {"concurrent": {
+                "enabled": False, "mode": "fleet", "max_targets": 5,
+                "slots": [
+                    {"id": "pet-1", "selector": None, "appearance": None,
+                     "placement": {"monitor": "", "u": None, "v": None,
+                                   "anchor": None, "manual": True}},
+                    {"id": "pet-2", "selector": {"kind": "codex"},
+                     "appearance": {"skin": "custom-x", "future_key": 7},
+                     "placement": {"monitor": "", "u": None, "v": None,
+                                   "anchor": None, "manual": False}},
+                ]}},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "config.json")
+            cfg = self._load(v4, path)
+        self.assertEqual(cfg.get("config_version"), 5)
+        self.assertIsNone(cfg.get("presentation.concurrent.enabled"))
+        self.assertIsNone(cfg.get("presentation.concurrent.mode"))
+        self.assertEqual(cfg.get("presentation.concurrent.max_targets"), 5)
+        slots = cfg.get("presentation.concurrent.slots")
+        self.assertEqual(slots[0]["appearance"], {"skin": None})
+        # appearance dict 只 normalize skin，未知 future key 保留
+        self.assertEqual(slots[1]["appearance"]["skin"], "custom-x")
+        self.assertEqual(slots[1]["appearance"]["future_key"], 7)
+        # selector/placement 不被修改
+        self.assertEqual(slots[1]["selector"], {"kind": "codex"})
+        self.assertTrue(slots[0]["placement"]["manual"])
+
+    def test_ensure_fleet_slots_extends_never_shrinks(self):
+        # AC43-SKIN-05：lowering max_targets 不删除 dormant slot
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "config.json")
+            cfg = self._load({"config_version": 5}, path)
+            changed = cfg.ensure_fleet_slots(4)
+            self.assertTrue(changed)
+            ids = [s["id"] for s in cfg.get("presentation.concurrent.slots")]
+            self.assertEqual(ids, ["pet-1", "pet-2", "pet-3", "pet-4"])
+            # 已存在时不重复、不删除
+            self.assertFalse(cfg.ensure_fleet_slots(2))
+            ids = [s["id"] for s in cfg.get("presentation.concurrent.slots")]
+            self.assertEqual(ids, ["pet-1", "pet-2", "pet-3", "pet-4"])
+            # 提高后恢复
+            cfg.ensure_fleet_slots(6)
+            ids = [s["id"] for s in cfg.get("presentation.concurrent.slots")]
+            self.assertEqual(ids, ["pet-1", "pet-2", "pet-3", "pet-4",
+                                   "pet-5", "pet-6"])
+            # count clamp 1..8
+            cfg.ensure_fleet_slots(99)
+            self.assertEqual(len(cfg.get("presentation.concurrent.slots")), 8)
 
     def test_corrupt_primary_falls_back_to_backup(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -91,7 +150,7 @@ class MigrationTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as f:
                 f.write("not json")
             cfg = Config(path)
-            self.assertEqual(cfg.get("config_version"), 4)
+            self.assertEqual(cfg.get("config_version"), 5)
             self.assertTrue(cfg.get("bubble.enabled"))
 
 
@@ -102,7 +161,7 @@ class NormalizeTests(unittest.TestCase):
             "bubble": {"font_size": 3, "width": 10, "height": 9999,
                        "relative_width": 9},
             "presentation": {"concurrent": {
-                "mode": "bogus", "max_targets": 99,
+                "enabled": True, "mode": "bogus", "max_targets": 99,
                 "eligible_kinds": "junk",
                 "slots": [{"id": ""}, {"id": "a"}, {"id": "a"}, "junk"]}},
         })
@@ -114,7 +173,9 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(data["bubble"]["height"], 220)
         self.assertEqual(data["bubble"]["relative_width"], 1.6)
         conc = data["presentation"]["concurrent"]
-        self.assertEqual(conc["mode"], "aggregate")
+        # v4.3：enabled/mode 不是持久化字段，normalize 直接移除
+        self.assertNotIn("enabled", conc)
+        self.assertNotIn("mode", conc)
         self.assertEqual(conc["max_targets"], 8)
         # slot id 唯一非空；非法项丢弃后至少保一个默认
         slot_ids = [s["id"] for s in conc["slots"]]

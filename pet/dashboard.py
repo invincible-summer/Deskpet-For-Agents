@@ -439,12 +439,12 @@ class Dashboard(tk.Toplevel):
         row.pack(fill="x")
         tk.Label(row, text="并发监听显示", bg=LIGHT.surface, fg=LIGHT.text,
                  font=pick_font(self, 11, True)).pack(side="left")
-        HelpDot(row, "默认关闭（单目标模式）。开启后同时展示多个 Agent："
-                     "开启后仍由 Monitor 统一监听，不产生额外进程。").pack(
+        HelpDot(row, "每次启动固定开启（默认单宠聚合）。开关仅对本次运行"
+                     "有效，下次启动恢复；不增加每 Agent 线程。").pack(
             side="left", padx=(6, 0))
         self.concurrent_var = tk.BooleanVar(
-            value=bool(cfg.get("presentation.concurrent.enabled", False)))
-        ttk.Checkbutton(row, text="（OFF / ON，手动开启）",
+            value=self.app.presentation.concurrent_enabled)
+        ttk.Checkbutton(row, text="（OFF / ON，仅本次运行）",
                         variable=self.concurrent_var,
                         command=self._toggle_concurrent).pack(side="right")
 
@@ -624,13 +624,14 @@ class Dashboard(tk.Toplevel):
                  font=pick_font(self, 9)).pack(anchor="w", pady=(4, 0))
 
     def _toggle_concurrent(self):
+        # v4.3 §18.1：并发开关是运行期 session state，不写 config；
+        # 每次进程启动固定恢复"并行监听 + 单宠聚合"。
         enabled = self.concurrent_var.get()
-        self.app.config.set_and_commit("presentation.concurrent.enabled",
-                                       enabled)
+        self.app.presentation.set_concurrent_enabled(enabled)
         if enabled:
-            self.app.toast("并发监听已开启（默认单宠聚合）", 4)
+            self.app.toast("并发监听已开启（默认单宠聚合；仅本次运行有效）", 4)
         else:
-            self.app.toast("并发监听已关闭（回到单目标）", 4)
+            self.app.toast("并发监听已关闭（回到单目标；仅本次运行有效）", 4)
         self.app._aggregate()
         if enabled:
             self.concurrent_detail.pack(fill="x", pady=(8, 0))
@@ -638,28 +639,26 @@ class Dashboard(tk.Toplevel):
             self.concurrent_detail.pack_forget()
 
     def _on_mode_segment(self, index: int):
-        mode = "fleet" if index == 1 else "aggregate"
-        slots = list(self.app.config.get(
-            "presentation.concurrent.slots") or [])
-        if mode == "fleet" and len(slots) < 2:
-            import copy as _copy
-            for i in range(2, 4):
-                slot = _copy.deepcopy(slots[0] if slots else {
-                    "id": "", "selector": None, "appearance": None,
-                    "placement": {"monitor": "", "u": None, "v": None,
-                                  "anchor": None, "manual": False}})
-                slot["id"] = f"pet-{i}"
-                slot["placement"] = {"monitor": "", "u": None, "v": None,
-                                     "anchor": None, "manual": False}
-                slots.append(slot)
-            self.app.config.set("presentation.concurrent.slots", slots)
-        self.app.config.set_and_commit("presentation.concurrent.mode", mode)
+        # v4.3 §18.1：展示方式同样是运行期 session state，不写 config。
+        mode = PresentationMode.FLEET if index == 1 else PresentationMode.AGGREGATE
+        if mode is PresentationMode.FLEET:
+            # 保证持久化 slot 存在（appearance/placement 可跨模式保留）
+            slots = list(self.app.config.get(
+                "presentation.concurrent.slots") or [])
+            if len(slots) < 2:
+                self.app.config.ensure_fleet_slots(3)
+                self.app.config.set_and_commit(
+                    "presentation.concurrent.slots",
+                    self.app.config.get("presentation.concurrent.slots"))
+        self.app.presentation.set_concurrent_mode(mode)
 
     def _save_max_targets(self):
         try:
             value = max(1, min(8, int(self.max_var.get())))
         except (ValueError, tk.TclError):
             return
+        # v4.3 §7.2：先确保 pet-1..pet-N 均有持久化 slot，再更新上限
+        self.app.config.ensure_fleet_slots(value)
         self.app.config.set_and_commit(
             "presentation.concurrent.max_targets", value)
 

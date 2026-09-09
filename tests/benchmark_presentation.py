@@ -89,6 +89,9 @@ def run(pets_max: int = 8, report_path: str = "") -> int:
         app = PetApp(BenchConfig(slots))
     from agents.terminal_service import WindowsTerminalService
     app.monitor._terminal_service = WindowsTerminalService(None)
+    # v4.3：mode 是运行期 session state（config 旧 fleet 被启动策略忽略）
+    from pet.presentation import PresentationMode
+    app.presentation.set_concurrent_mode(PresentationMode.FLEET)
 
     checks = []
     try:

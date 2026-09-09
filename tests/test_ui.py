@@ -143,14 +143,16 @@ class GeometryTests(unittest.TestCase):
                     json.dump(old, f)
                 cfg = Config()
                 self.assertTrue(cfg.migration_notice)
-                self.assertEqual(cfg.data["config_version"], 4)
+                self.assertEqual(cfg.data["config_version"], 5)
                 for banned in ("connection_mode", "managed", "keys",
                                "auto_approve", "approve_restore_focus",
                                "window_instances"):
                     self.assertNotIn(banned, cfg.data)
                 self.assertNotIn("pinned", cfg.data["monitor"])
                 self.assertNotIn("gone_grace_sec", cfg.data["monitor"])
-                self.assertFalse(cfg.data["presentation"]["concurrent"]["enabled"])
+                # v4.3：enabled/mode 不再持久化（session runtime state）
+                self.assertNotIn("enabled", cfg.data["presentation"]["concurrent"])
+                self.assertNotIn("mode", cfg.data["presentation"]["concurrent"])
                 self.assertEqual(cfg.data["presentation"]["concurrent"]["slots"][0]["id"], "pet-1")
                 self.assertNotIn("session_bindings", cfg.data["monitor"])
                 self.assertNotIn("waiting_quiet_sec", cfg.data["monitor"])
@@ -487,8 +489,11 @@ class TrayDashboardVisibilityTests(unittest.TestCase):
         不复活 pet-2。"""
         from tests.test_concurrent_activation import _slot, inst, snap
         from agents.models import AgentKind
+        from pet.presentation import PresentationMode
         app = self._app(slots=[_slot("pet-1"), _slot("pet-2")])
         try:
+            # v4.3：fleet 是运行期 session state
+            app.presentation.set_concurrent_mode(PresentationMode.FLEET)
             a = inst(AgentKind.CODEX, 1)
             b = inst(AgentKind.CLAUDE, 2, cwd="/w/q")
             app.monitor.instances = {a.key: a, b.key: b}

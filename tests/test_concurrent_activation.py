@@ -92,10 +92,14 @@ def snap(i, status=Status.WORKING):
 def make_app(slots):
     from pet.app import PetApp
     from pet.petview import PetView
+    from pet.presentation import PresentationMode
     cfg = ConcurrentConfig(slots)
     with patch.object(PetApp, "_reload_skins", lambda self: None), \
          patch.object(PetView, "load_skin", lambda self, bm: None):
         app = PetApp(cfg)
+    # v4.3：mode 是运行期 session state（config 旧 mode=fleet 被启动
+    # 策略忽略），本测试矩阵显式切到 fleet
+    app.presentation.set_concurrent_mode(PresentationMode.FLEET)
     return app
 
 
@@ -269,9 +273,10 @@ class AggregateBubbleRaceTests(unittest.TestCase):
     def test_click_uses_drawn_key_not_new_attention(self):
         app = make_app([_slot("pet-1")])
         try:
-            # aggregate 模式
-            app.config.data["presentation"]["concurrent"]["mode"] = "aggregate"
-            app.config.data["presentation"]["concurrent"]["enabled"] = True
+            # aggregate 模式（v4.3：运行期切换）
+            from pet.presentation import PresentationMode
+            app.presentation.set_concurrent_enabled(True)
+            app.presentation.set_concurrent_mode(PresentationMode.AGGREGATE)
             a = inst(AgentKind.CODEX, 1)
             b = inst(AgentKind.CLAUDE, 2, cwd="/w/q")
             app.monitor.instances = {a.key: a, b.key: b}
@@ -313,9 +318,14 @@ class InteractionModeMatrixTests(unittest.TestCase):
     """
 
     def _make(self, enabled, mode, slots=None, n_agents=1):
+        from pet.presentation import PresentationMode
         app = make_app(slots or [_slot("pet-1")])
-        app.config.data["presentation"]["concurrent"]["enabled"] = enabled
-        app.config.data["presentation"]["concurrent"]["mode"] = mode
+        # v4.3：enabled/mode 是运行期 session state
+        app.presentation.set_concurrent_enabled(bool(enabled))
+        if enabled:
+            app.presentation.set_concurrent_mode(
+                PresentationMode.FLEET if mode == "fleet"
+                else PresentationMode.AGGREGATE)
         agents = [inst(AgentKind.CODEX, i + 1, cwd=f"/w/p{i}")
                   for i in range(n_agents)]
         app.monitor.instances = {a.key: a for a in agents}
@@ -442,9 +452,13 @@ class AggregateStackTests(unittest.TestCase):
     """
 
     def _app(self, n=3, mode="aggregate"):
+        from pet.presentation import PresentationMode
         app = make_app([_slot("pet-1")])
-        app.config.data["presentation"]["concurrent"]["enabled"] = True
-        app.config.data["presentation"]["concurrent"]["mode"] = mode
+        # v4.3：运行期 session state 切换
+        app.presentation.set_concurrent_enabled(True)
+        app.presentation.set_concurrent_mode(
+            PresentationMode.FLEET if mode == "fleet"
+            else PresentationMode.AGGREGATE)
         agents = [inst(AgentKind.CODEX, i + 1, cwd=f"/w/p{i}")
                   for i in range(n)]
         app.monitor.instances = {a.key: a for a in agents}

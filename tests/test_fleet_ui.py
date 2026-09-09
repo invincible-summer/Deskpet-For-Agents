@@ -86,6 +86,10 @@ class FleetUiTests(unittest.TestCase):
             app = PetApp(cfg)
         from agents.terminal_service import WindowsTerminalService
         app.monitor._terminal_service = WindowsTerminalService(None)
+        # v4.3：mode 是运行期 session state；config 旧 mode=fleet 被
+        # 启动策略忽略，fleet 测试显式切换
+        from pet.presentation import PresentationMode
+        app.presentation.set_concurrent_mode(PresentationMode.FLEET)
         return app
 
     def _put(self, app, *agents_with_snap):
@@ -109,13 +113,76 @@ class FleetUiTests(unittest.TestCase):
         finally:
             app.quit()
 
-    def test_no_agents_no_pets(self):
-        """没有 Agent → 没有桌宠（不因并发设置创建空桌宠）。"""
+    def test_no_agents_keeps_idle_fallback_pet(self):
+        """v4.3 §18.2：Fleet 0 bound → pet-1 idle fallback（AC43-PRES-05）。
+
+        fallback 不代表 fake Agent：agent_key 空、不占 Monitor target。
+        """
         app = self._app([_slot("pet-1"), _slot("pet-2")])
         try:
             self._put(app)
             app._aggregate()
-            self.assertEqual(len(app.pet_manager.views), 0)
+            self.assertEqual(list(app.pet_manager.views), ["pet-1"])
+            view = app.pet_manager.views["pet-1"]
+            self.assertEqual(view.agent_key, "")
+            self.assertFalse(app.pet_manager.user_hidden)
+        finally:
+            app.quit()
+
+    def test_fallback_replaced_when_first_bound_slot_appears(self):
+        # AC43-PRES-05：fallback 被复用/替换，可见数不降为 0、无第 9 只
+        app = self._app([_slot("pet-1"), _slot("pet-2")])
+        try:
+            self._put(app)
+            app._aggregate()
+            self.assertEqual(list(app.pet_manager.views), ["pet-1"])
+            a = inst(AgentKind.CODEX, 1)
+            self._put(app, (a, snap(a)))
+            app._aggregate()
+            # pet-1 被 Agent 复用（同一 view 对象，不 destroy/recreate）
+            self.assertEqual(app.pet_manager.views["pet-1"].agent_key, a.key)
+            b = inst(AgentKind.CLAUDE, 2)
+            self._put(app, (a, snap(a)), (b, snap(b)))
+            app._aggregate()
+            self.assertEqual(len(app.pet_manager.views), 2)   # 无 fallback 第 3 只
+        finally:
+            app.quit()
+
+    def test_aggregate_zero_target_keeps_pet1_sleep(self):
+        # AC43-PRES-03/04：SINGLE/AGGREGATE 0 target 仍有 pet-1，sleep
+        app = self._app([_slot("pet-1")])
+        try:
+            from pet.presentation import PresentationMode
+            app.presentation.set_concurrent_mode(PresentationMode.AGGREGATE)
+            self._put(app)
+            app._aggregate()
+            self.assertEqual(list(app.pet_manager.views), ["pet-1"])
+            view = app.pet_manager.views["pet-1"]
+            self.assertEqual(view.agent_key, "")
+            state = app._presentation_state
+            name, _repeat = app.presentation.animation_state_for([], {}, NOW)
+            self.assertEqual(name, "sleep")
+            app.presentation.set_concurrent_enabled(False)   # SINGLE
+            app._aggregate()
+            self.assertEqual(list(app.pet_manager.views), ["pet-1"])
+        finally:
+            app.quit()
+
+    def test_user_hidden_not_persisted_and_reset_on_new_manager(self):
+        # AC43-PRES-08：hide_all 置 user_hidden；恢复后 False
+        app = self._app([_slot("pet-1")])
+        try:
+            self._put(app, (inst(AgentKind.CODEX, 1),
+                            snap(inst(AgentKind.CODEX, 1))))
+            app._aggregate()
+            app.hide_pet()
+            self.assertTrue(app.pet_manager.user_hidden)
+            app.restore_pet_from_tray()
+            self.assertFalse(app.pet_manager.user_hidden)
+            # ensure_view 在 user_hidden 期间创建的 view 也隐藏
+            app.pet_manager.user_hidden = True
+            view = app.pet_manager.ensure_view("pet-2")
+            self.assertTrue(view.hidden)
         finally:
             app.quit()
 
@@ -154,7 +221,7 @@ class FleetUiTests(unittest.TestCase):
             app.quit()
 
     def test_agent_exit_removes_pet_and_refills(self):
-        """Agent 退出 → 桌宠消失；slot 由下一个候选自动补位。"""
+        """Agent 退出 → 绑定桌宠释放；0 bound 时 pet-1 idle fallback。"""
         app = self._app([_slot("pet-1")])
         try:
             a = inst(AgentKind.CODEX, 1)
@@ -164,7 +231,9 @@ class FleetUiTests(unittest.TestCase):
             app.monitor.instances = {}
             app.monitor.snapshots = {}
             app._aggregate()
-            self.assertEqual(len(app.pet_manager.views), 0)   # 无绑定不显示
+            # v4.3 §18.2：0 bound → pet-1 fallback（agent_key 空）
+            self.assertEqual(len(app.pet_manager.views), 1)
+            self.assertEqual(app.pet_manager.views["pet-1"].agent_key, "")
             b = inst(AgentKind.CLAUDE, 2)
             self._put(app, (b, snap(b)))
             app._aggregate()

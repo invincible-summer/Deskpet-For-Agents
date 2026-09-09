@@ -28,7 +28,7 @@ CACHE_DIR = os.path.join(ASSETS_DIR, "cache")
 # 因此这里反向 import 不会循环失败。
 from .skins import BUILTIN_SKIN  # noqa: E402
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 DEFAULTS = {
     # fresh install 默认程序化原创 fallback（v4.2.3 §10.4）：公开源码
@@ -72,14 +72,15 @@ DEFAULTS = {
     },
     "presentation": {
         "concurrent": {
-            "enabled": False,         # 并发必须用户手动开启（v4plan §6.1）
-            "mode": "aggregate",      # aggregate | fleet
+            # v4.3 §8.1：enabled/mode 不再持久化——每次进程启动由
+            # PresentationController 固定初始化为 True + aggregate
+            # （session runtime state），不恢复上次退出时的选择。
             "max_targets": 3,        # 展示上限 1..8（不是 Monitor 发现上限）
             "eligible_kinds": {"codex": True, "claude": True,
                                "kimi": True, "pi": True},
             "slots": [
                 {"id": "pet-1", "selector": None,
-                 "appearance": None,
+                 "appearance": {"skin": None},
                  "placement": {"monitor": "", "u": None, "v": None,
                                "anchor": None, "manual": False}},
             ],
@@ -115,7 +116,6 @@ _LEGACY_KEYS = (
 )
 
 _KIND_KEYS = ("claude", "codex", "kimi", "pi")
-_MODES = ("aggregate", "fleet")
 
 
 @dataclass(frozen=True)
@@ -154,6 +154,24 @@ def _clamp(value, lo, hi):
     except (TypeError, ValueError):
         return lo
     return max(lo, min(hi, v))
+
+
+def _normalize_slot_appearance(slot: dict) -> None:
+    """v4.3 §7.1/§8.1：slot appearance 规范化。
+
+    appearance None → {"skin": None}；dict → 只 normalize `skin`
+    （必须为 str 或 None），未知 future keys 原样保留；其他类型重置。
+    """
+    appearance = slot.get("appearance")
+    if appearance is None:
+        slot["appearance"] = {"skin": None}
+    elif isinstance(appearance, dict):
+        skin = appearance.get("skin")
+        appearance["skin"] = (str(skin).strip()
+                              if isinstance(skin, str) and skin.strip()
+                              else None)
+    else:
+        slot["appearance"] = {"skin": None}
 
 
 def normalize(data: dict) -> dict:
@@ -195,9 +213,10 @@ def normalize(data: dict) -> dict:
             monitor.get("active_file_window_sec", 180), 30, 3600)
     concurrent = ((data.get("presentation") or {}).get("concurrent"))
     if isinstance(concurrent, dict):
-        if concurrent.get("mode") not in _MODES:
-            concurrent["mode"] = "aggregate"
-        concurrent["enabled"] = bool(concurrent.get("enabled", False))
+        # v4.3 §8.1：enabled/mode 不再是持久化字段（runtime session
+        # state 由 PresentationController 每次启动固定初始化）。
+        concurrent.pop("enabled", None)
+        concurrent.pop("mode", None)
         concurrent["max_targets"] = int(_clamp(
             concurrent.get("max_targets", 3), 1, 8))
         eligible = concurrent.get("eligible_kinds")
@@ -219,6 +238,7 @@ def normalize(data: dict) -> dict:
             if not slot_id or slot_id in seen:
                 continue   # slot id 必须唯一非空
             seen.add(slot_id)
+            _normalize_slot_appearance(slot)
             clean_slots.append(slot)
         concurrent["slots"] = clean_slots or [copy.deepcopy(
             DEFAULTS["presentation"]["concurrent"]["slots"][0])]
@@ -226,7 +246,7 @@ def normalize(data: dict) -> dict:
 
 
 def migrate(loaded: dict) -> tuple[dict, bool]:
-    """V3 → V4.1 迁移；返回 (data, migrated)。"""
+    """V3 → V4.1 → V4.3 迁移；返回 (data, migrated)。"""
     migrated = False
     version = loaded.get("config_version", 0)
     if not isinstance(version, int) or version < 3:
@@ -240,11 +260,13 @@ def migrate(loaded: dict) -> tuple[dict, bool]:
     if not isinstance(concurrent, dict):
         concurrent = {}
         migrated = True
-    if "enabled" not in concurrent:
-        # V3 → V4.1：默认不开启并发，保持单目标视觉习惯（v4plan §21）
-        concurrent["enabled"] = False
-        migrated = True
-    concurrent.setdefault("mode", "aggregate")
+    # v4.3 §8.1：删除旧 persisted enabled/mode。无论旧值是什么
+    # （false/single/fleet/aggregate），都不作为下次启动初始模式依据；
+    # 只修改内存中的 normalized config，不为清这两个字段在启动时写盘。
+    for stale in ("enabled", "mode"):
+        if stale in concurrent:
+            concurrent.pop(stale, None)
+            migrated = True
     concurrent.setdefault("max_targets", 3)
     if "eligible_kinds" not in concurrent:
         agents = ((loaded.get("monitor") or {}).get("agents")
@@ -396,3 +418,37 @@ class Config:
                 node = child
             node[parts[-1]] = copy.deepcopy(value)
             self._dirty = True
+
+    def ensure_fleet_slots(self, count: int) -> bool:
+        """保证 pet-1...pet-count 均有持久化 slot（v4.3 §7.2）。
+
+        只扩展，不因 count 降低删除已有更高 slot 的
+        selector/appearance/placement（未来重新提高时恢复）；
+        normalize 保证 slot id 唯一。返回是否发生修改（调用方据此
+        决定是否随下一次正常保存落盘）。
+        """
+        count = max(1, min(8, int(count)))
+        with self._lock:
+            concurrent = self.data.setdefault("presentation", {}) \
+                .setdefault("concurrent", {})
+            slots = concurrent.get("slots")
+            if not isinstance(slots, list):
+                slots = []
+            existing = {str(s.get("id") or "") for s in slots
+                        if isinstance(s, dict)}
+            changed = False
+            for i in range(1, count + 1):
+                slot_id = f"pet-{i}"
+                if slot_id in existing:
+                    continue
+                slots.append({
+                    "id": slot_id, "selector": None,
+                    "appearance": {"skin": None},
+                    "placement": {"monitor": "", "u": None, "v": None,
+                                  "anchor": None, "manual": False},
+                })
+                changed = True
+            if changed:
+                concurrent["slots"] = slots
+                self._dirty = True
+            return changed
