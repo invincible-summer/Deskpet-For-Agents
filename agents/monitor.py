@@ -616,11 +616,12 @@ class Monitor:
 
     def _terminal_observation(self, inst: AgentInstance, now: float,
                               grace: float) -> Observation | None:
-        """observation binding 驱动的终端证据归属（v4.1.1 §7.4）。
+        """observation binding 驱动的终端证据归属（v4.1.3 §7/§23）。
 
         只有 CONFIRMED/HIGH 的 observation binding 才允许把 WAITING/
-        activity 证据归给该 Agent；FALLBACK 窗口兜底、AMBIGUOUS 一律
-        没有 binding → 没有终端证据（宁可没有，也不错归）。
+        activity 证据归给该 Agent；低置信 Window 候选（AMBIGUOUS/
+        唯一窗口兜底）不生成 binding → 没有终端证据（宁可没有，
+        也不错归）。
         """
         obs_binding = self.terminal_observation_bindings.get(inst.key)
         if obs_binding is None:

@@ -45,9 +45,8 @@ APP_VERSION = "DeskPet V4.1.2"
 _BINDING_LABELS = {
     WindowBindingConfidence.CONFIRMED: "已确认",
     WindowBindingConfidence.HIGH: "高置信",
-    WindowBindingConfidence.FALLBACK: "唯一窗口兜底",
-    WindowBindingConfidence.AMBIGUOUS: "无法唯一确定",
-    WindowBindingConfidence.NONE: "未绑定",
+    WindowBindingConfidence.AMBIGUOUS: "候选窗口（可唤起）",
+    WindowBindingConfidence.NONE: "未定位",
 }
 
 
@@ -360,17 +359,18 @@ class Dashboard(tk.Toplevel):
             lines.append("Terminal")
             lines.append(f"Window　{conf}"
                          + (f" · {binding.title[:30]}" if binding.title else ""))
-            if binding.confidence is WindowBindingConfidence.FALLBACK:
-                lines.append("· 唯一窗口兜底：可打开窗口，但终端审批观察"
-                             "不会归属到该 Agent")
+            if binding.confidence is WindowBindingConfidence.AMBIGUOUS:
+                lines.append("· 候选窗口（可唤起）：证据不足以直接授予"
+                             "终端审批观察归属")
+            if (binding.confidence is WindowBindingConfidence.NONE
+                    and binding.window is not None):
+                lines.append("· 唯一 Terminal 窗口兜底（可唤起）：不作为"
+                             "审批归属依据")
             if binding.reason:
                 detail = f"依据：{binding.reason}"
                 if binding.score:
                     detail += f" · score {binding.score}"
                 lines.append(detail)
-            if binding.confidence is WindowBindingConfidence.AMBIGUOUS:
-                lines.append("⚠ 无法唯一确定终端窗口：终端审批观察不会"
-                             "归属到该 Agent")
         if not self.app.monitor.terminal_available():
             err = self.app.monitor.terminal_startup_error()
             lines.append("终端观察不可用（UIA）"

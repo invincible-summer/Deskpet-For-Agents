@@ -24,6 +24,7 @@ class _FakeUser32:
         self.iconic = iconic
         self.fg_after = fg_after        # SetForegroundWindow 后的前台窗口
         self.calls: list[str] = []
+        self.swp_calls: list[tuple] = []
 
     def IsWindow(self, hwnd):
         return self.is_window
@@ -60,6 +61,11 @@ class _FakeUser32:
 
     def FlashWindowEx(self, info):
         self.calls.append('flash')
+        return True
+
+    def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+        self.swp_calls.append((int(hwnd), int(insert_after), x, y, cx, cy,
+                               int(flags)))
         return True
 
 
@@ -146,6 +152,13 @@ class ValidateWindowTests(unittest.TestCase):
         with patch.object(winkeys, "user32", fake):
             self.assertFalse(winkeys.validate_window(_identity(cls="")))
 
+    def test_missing_expected_process_created_rejected(self):
+        """§9.1：process_created<=0 的期望身份 fail-closed（0 值不再穿透）。"""
+        fake = _FakeUser32()
+        with patch.object(winkeys, "user32", fake), \
+             patch("psutil.Process", _FakePsutil(1000.0).Process):
+            self.assertFalse(winkeys.validate_window(_identity(created=0.0)))
+
 
 class ForegroundTests(unittest.TestCase):
     def test_foreground_denied_flashes_and_reports_false(self):
@@ -172,6 +185,35 @@ class ForegroundTests(unittest.TestCase):
                        'post_message', 'raise_terminal'):
             self.assertFalse(hasattr(winkeys, banned),
                              f"winkeys.{banned} 不应存在")
+
+
+class ReassertZOrderTests(unittest.TestCase):
+    """§10：DeskPet 自身 Pet Toplevel 的 no-activate Z-order 重声明。"""
+
+    def _flags(self):
+        return (winkeys.SWP_NOSIZE | winkeys.SWP_NOMOVE
+                | winkeys.SWP_NOACTIVATE | winkeys.SWP_SHOWWINDOW)
+
+    def test_topmost_reassert_uses_noactivate(self):
+        fake = _FakeUser32()
+        with patch.object(winkeys, "user32", fake):
+            self.assertTrue(winkeys.reassert_window_z_order(11, topmost=True))
+        hwnd, after, x, y, cx, cy, flags = fake.swp_calls[0]
+        self.assertEqual((hwnd, after, x, y, cx, cy),
+                         (11, winkeys.HWND_TOPMOST, 0, 0, 0, 0))
+        self.assertEqual(flags, self._flags())
+
+    def test_non_topmost_reassert_uses_hwnd_top(self):
+        fake = _FakeUser32()
+        with patch.object(winkeys, "user32", fake):
+            self.assertTrue(winkeys.reassert_window_z_order(11, topmost=False))
+        self.assertEqual(fake.swp_calls[0][1], winkeys.HWND_TOP)
+
+    def test_dead_hwnd_reassert_fails(self):
+        fake = _FakeUser32(is_window=False)
+        with patch.object(winkeys, "user32", fake):
+            self.assertFalse(winkeys.reassert_window_z_order(11, topmost=True))
+        self.assertEqual(fake.swp_calls, [])
 
 
 if __name__ == "__main__":

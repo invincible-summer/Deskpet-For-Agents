@@ -27,10 +27,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agents.models import AgentKind, AgentInstance, Observation, Phase, Status, Confidence, EvidenceSource
+from agents.models import AgentKind, AgentInstance, Observation, Phase, Status, Confidence, EvidenceSource, WindowIdentity
 from agents.terminal_uia import (
     DELTA_MAX, EVENT_QUEUE_MAX, GLOBAL_VISIBLE_READ_LIMIT, MAX_CONTROLS,
-    RING_MAX, UIA_CALL_QUEUE_MAX, VISIBLE_MAX,
+    RING_MAX, UIA_CALL_QUEUE_MAX, VISIBLE_MAX, WT_WINDOW_CLASS,
     ObservedTerminalControl, SubscriptionTracker, TerminalObserver,
     TerminalBackend, TerminalEvent, TerminalLayout,
 )
@@ -146,7 +146,11 @@ def run(ticks: int = 20000, report_path: str = "") -> int:
                                             window_pid=5,
                                             title="claude beta u2@box"),
     }
-    resolver = TerminalWindowResolver(enum_windows=lambda: [])
+    def _ident(hwnd):
+        return WindowIdentity(hwnd=hwnd, pid=5, process_created=1234.5,
+                              window_class=WT_WINDOW_CLASS)
+    resolver = TerminalWindowResolver(enum_windows=lambda: [],
+                                      identity_for_hwnd=_ident)
     obs_resolver = TerminalObservationResolver(enum_windows=lambda: [])
     w1 = resolver.resolve([a, b], controls, 1000.0)
     w2 = resolver.resolve([b, a], controls, 1000.0)

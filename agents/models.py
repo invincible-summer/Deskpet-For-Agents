@@ -295,27 +295,28 @@ class WindowIdentity:
 
 
 class WindowBindingConfidence(str, Enum):
-    """窗口解析的可靠程度（v4.1.1 §4.2）。
+    """窗口解析的可靠程度（v4.1.3 §3.1）。
 
-    与 observation attribution 的置信度彻底分离：
+    confidence 不是 activation gate：能否尝试唤起只由
+    TerminalWindowBinding.window 是否存在决定。confidence 只表达
+    "这个候选窗口是怎么选出来的"，供诊断与 observation 链参考：
       * CONFIRMED —— Windows native PID 祖先链唯一定位；
-      * HIGH —— WSL/标题/cwd/distro 证据互相唯一，先定位 control
-        再映射到其所属 window；
-      * FALLBACK —— 桌面只有一个 WT 顶层窗口：允许唤起窗口，
-        但不赋予 terminal evidence attribution；
-      * AMBIGUOUS —— 多候选窗口，无法安全唯一定位（window=None）；
-      * NONE —— 没有任何可用窗口。
+      * HIGH —— WSL/标题/cwd/distro 证据互相唯一（v3 权重评分）；
+      * AMBIGUOUS —— 证据不够安全用于自动 observation attribution，
+        但仍有 v3 best-positive control 所属 HWND 可供用户显式唤起
+        （window 可不为 None）；
+      * NONE —— 没有 Agent-specific 可靠证据；桌面只有一个 WT 顶层
+        窗口时仍携带该 window（single-window-fallback，可唤起）。
     """
     CONFIRMED = "confirmed"
     HIGH = "high"
-    FALLBACK = "fallback"
     AMBIGUOUS = "ambiguous"
     NONE = "none"
 
 
 @dataclass
 class TerminalWindowBinding:
-    """Agent ↔ Windows Terminal 顶层窗口的关联（window-only，v4.1.1 §4.2）。
+    """Agent ↔ Windows Terminal 顶层窗口的关联（window-only，v4.1.3 §3.2）。
 
     只回答"这个 Agent 大概在哪个 WT 顶层窗口"；不含 Tab/Pane，
     不参与 terminal text attribution（那是 TerminalObservationBinding
@@ -339,6 +340,11 @@ class TerminalWindowBinding:
     @property
     def hwnd(self) -> int:
         return self.window.hwnd if self.window else 0
+
+    @property
+    def wakeable(self) -> bool:
+        """是否允许用户显式唤起（v4.1.3：window 存在即 wakeable）。"""
+        return self.window is not None and self.window.hwnd > 0
 
 
 class ObservationBindingConfidence(str, Enum):

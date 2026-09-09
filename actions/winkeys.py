@@ -113,7 +113,8 @@ def window_identity(hwnd: int) -> WindowIdentity | None:
 def validate_window(identity: WindowIdentity) -> bool:
     """验证目标仍是发现时的那个窗口：IsWindow + 属主 PID + create_time + class。
 
-    期望值缺失即失败（没有期望就无法证明身份）。绝不猜测。
+    期望值缺失即失败（没有期望就无法证明身份），包括
+    process_created<=0——无法防 PID 复用的身份一律拒绝。绝不猜测。
     """
     if not user32:
         return False
@@ -126,6 +127,8 @@ def validate_window(identity: WindowIdentity) -> bool:
     if expected_pid <= 0:
         return False
     expected_created = float(getattr(identity, "process_created", 0.0) or 0.0)
+    if expected_created <= 0:
+        return False   # fail-closed（v4.1.3 §9.1）：0 值不再穿透
     expected_class = str(getattr(identity, "window_class", "") or "")
     if not expected_class:
         return False
@@ -139,7 +142,7 @@ def validate_window(identity: WindowIdentity) -> bool:
         created = float(psutil.Process(int(pid.value)).create_time())
     except Exception:
         return False
-    if expected_created > 0 and abs(created - expected_created) > 0.5:
+    if abs(created - expected_created) > 0.5:
         return False
     buf = ctypes.create_unicode_buffer(128)
     length = user32.GetClassNameW(hwnd, buf, len(buf))
@@ -180,6 +183,37 @@ def flash_window(hwnd: int) -> bool:
         return False
     info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), int(hwnd), 2, 3, 0)
     return bool(user32.FlashWindowEx(ctypes.byref(info)))
+
+
+# ------------------------------------------------------------ Z-order（v4.1.3 §10）
+
+HWND_TOP = 0
+HWND_TOPMOST = -1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+
+if user32:
+    user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                    wt.UINT]
+    user32.SetWindowPos.restype = wt.BOOL
+
+
+def reassert_window_z_order(hwnd: int, *, topmost: bool) -> bool:
+    """DeskPet 自身 Pet Toplevel 的 Z-order 重声明（SWP_NOACTIVATE）。
+
+    SetWindowPos 只改变层级不激活窗口（Microsoft Learn）——用于
+    Dashboard 打开/托盘恢复后把桌宠拉回预期层级；Terminal 的用户
+    显式唤起仍走 try_set_foreground（SetForegroundWindow），两者分开。
+    """
+    if not user32 or not user32.IsWindow(int(hwnd)):
+        return False
+    insert_after = HWND_TOPMOST if topmost else HWND_TOP
+    flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+    return bool(user32.SetWindowPos(int(hwnd), insert_after,
+                                    0, 0, 0, 0, flags))
 
 
 # ------------------------------------------------------------ 多显示器 / DPI（v4plan §12）

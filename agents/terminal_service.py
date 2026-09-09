@@ -1,5 +1,5 @@
 """WindowsTerminalService：观察 + 双解析 + window-only 激活的 facade
-（v4.1.1 plan §14）。
+（v4.1.3 §8）。
 
 内部组合 UiaBackend / TerminalObserver / TerminalWindowResolver /
 TerminalObservationResolver。Monitor 只面对本模块，不再分别管理终端
@@ -83,8 +83,10 @@ class WindowsTerminalService:
         return self.observer.backend if self.observer is not None else None
 
     def available(self) -> bool:
+        """UIA 观察是否就绪（§8.4：startup 失败只作历史诊断，不永久
+        gate 后续 ready 的 backend）。"""
         backend = self.backend
-        return bool(self.observer is not None and not self.failed
+        return bool(self.observer is not None
                     and backend is not None and backend.available)
 
     def startup_error(self) -> str:
@@ -125,8 +127,10 @@ class WindowsTerminalService:
         """
         controls = self.observed_controls()
         try:
+            # Window 目录来自 enum_windows，不依赖 UIA layout（§8.1）；
+            # UIA controls 只是 v3 WSL 标题 hint。
             window_bindings = self.window_resolver.resolve(
-                list(instances), controls, now, layout=self.layout())
+                list(instances), controls, now)
         except Exception:
             window_bindings = {}
         try:
@@ -163,7 +167,12 @@ class WindowsTerminalService:
     # ------------------------------------------------------------ 用户显式 action
     def activate(self, agent_key: str, *,
                  is_agent_live: Callable[[str], bool]) -> ActivationResult:
-        """window-only 激活事务（plan §6.3；refresh 最多一次）。"""
+        """window-only 激活事务（§8.2；refresh 最多一次）。
+
+        不看 confidence：CONFIRMED/HIGH/AMBIGUOUS/NONE 只要
+        binding.window 存在，都走同一条 restore + foreground 链
+        （wakeability 只由 window 决定，v4.1.3 §3.1）。
+        """
         if not is_agent_live(agent_key):
             return ActivationResult(ActivationCode.AGENT_GONE)
 
@@ -174,7 +183,8 @@ class WindowsTerminalService:
                 detail=binding.reason if binding is not None else "")
 
         if not winkeys.validate_window(binding.window):
-            # 4. 只允许一次 refresh + re-resolve
+            # 4. 只允许一次 refresh + re-resolve（不循环，§8.3）
+            self.window_resolver.invalidate_window_cache()
             self.refresh_observed_controls(force=True)
             self._resolve_once()
             if not is_agent_live(agent_key):

@@ -161,12 +161,23 @@ class WindowActivationTests(unittest.TestCase):
         r.assert_not_called()
         fg.assert_not_called()
 
-    # ------------------------------------------------ 辅助语义
-    def test_fallback_binding_activates_window(self):
-        """FALLBACK（唯一窗口兜底）允许唤起窗口（plan §5.3）。"""
+    # ------------------------------------------------ 辅助语义（§26）
+    def test_ambiguous_with_window_activates(self):
+        """AMBIGUOUS + window（v3 best-positive 候选）允许唤起（§26）。"""
         service = self._service()
         self._bind(service, make_binding(make_identity(hwnd=11, pid=100),
-                                         WindowBindingConfidence.FALLBACK))
+                                         WindowBindingConfidence.AMBIGUOUS))
+        with patch.object(winkeys, "validate_window", return_value=True), \
+             patch.object(winkeys, "restore_window", return_value=True), \
+             patch.object(winkeys, "try_set_foreground", return_value=True):
+            result = service.activate(KEY, is_agent_live=ALWAYS_LIVE)
+        self.assertEqual(result.code, ActivationCode.OK)
+
+    def test_none_confidence_with_window_activates(self):
+        """NONE + window（唯一窗口兜底）允许唤起（§26）。"""
+        service = self._service()
+        self._bind(service, make_binding(make_identity(hwnd=11, pid=100),
+                                         WindowBindingConfidence.NONE))
         with patch.object(winkeys, "validate_window", return_value=True), \
              patch.object(winkeys, "restore_window", return_value=True), \
              patch.object(winkeys, "try_set_foreground", return_value=True):
@@ -226,6 +237,20 @@ class ForbiddenApiRegressionTests(unittest.TestCase):
                        "manual_location"):
             self.assertNotIn(banned, src,
                              f"monitor.py 不应包含 {banned}")
+
+    def test_no_confidence_gate_in_activation_path(self):
+        """§26：激活链禁止重新引入 Window confidence gate——wakeability
+        只由 binding.window 决定（observation binding 自己的置信度
+        fail-closed 检查不受此限制）。"""
+        service_src = self._source("agents/terminal_service.py")
+        self.assertNotIn(".confidence", service_src,
+                         "terminal_service.py 不应读取任何 binding.confidence")
+        monitor_src = self._source("agents/monitor.py")
+        for banned in ("terminal_window.confidence",
+                       "window_binding.confidence",
+                       "WindowBindingConfidence"):
+            self.assertNotIn(banned, monitor_src,
+                             f"monitor.py 激活链不应包含 {banned}")
 
 
 if __name__ == "__main__":

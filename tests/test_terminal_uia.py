@@ -1,8 +1,9 @@
-"""UIA 观察器单元测试：FakeBackend，不需要真实 Terminal（v4.1.1 §21）。
+"""UIA 观察器单元测试：FakeBackend，不需要真实 Terminal（v4.1.3）。
 
   * 观察流：Notification/TextChanged debounce/可见读取限流/TTL 复检/
     StructureChanged 重发现/订阅生命周期；
-  * 解析器：window-only 与 observation-only 双链（§5/§7）；
+  * 解析器：observation-only 严格链（§7/§28）——Window 唤起候选语义
+    已分离到 tests/test_terminal_window_resolver.py；
   * 删除所有 selected-tab topology 断言（产品已不承诺 Tab/Pane）。
 """
 from __future__ import annotations
@@ -30,10 +31,7 @@ from agents.terminal_uia import (
     UiaBackend,
     WEAK_TRIGGER_RE,
 )
-from agents.terminal_resolver import (
-    TerminalObservationResolver,
-    TerminalWindowResolver,
-)
+from agents.terminal_resolver import TerminalObservationResolver
 from agents.models import (
     AgentInstance, AgentKind, ObservationBindingConfidence,
     WindowBindingConfidence, WindowIdentity,
@@ -444,204 +442,30 @@ class RecognizerKindTests(unittest.TestCase):
         self.assertIsNone(obs.agent_kind)
 
 
-# ============================================================ window resolver
-
-class WindowResolverTests(unittest.TestCase):
-    def _wsl(self, kind=AgentKind.CODEX, cwd="/w/x", user="", pid=1):
-        return AgentInstance(kind=kind, pid=pid, source="wsl:Ubuntu",
-                             process_token=str(pid), cwd=cwd, user=user)
-
-    def test_windows_native_ancestor_chain_confirmed(self):
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 50, "codex", WT_WINDOW_CLASS)],
-            ancestor_pids=lambda pid: {pid, 50},
-        )
-        inst = AgentInstance(AgentKind.CODEX, 99, "windows", process_token="9")
-        bindings = resolver.resolve([inst], {}, NOW)
-        b = bindings[inst.key]
-        self.assertEqual(b.confidence, WindowBindingConfidence.CONFIRMED)
-        self.assertEqual(b.hwnd, 11)
-        self.assertEqual(b.reason, "windows-ancestor")
-
-    def test_windows_native_multi_control_window_still_confirmed(self):
-        """window-only 语义：窗口唯一即 CONFIRMED，不要求唯一 control
-        （旧"窗口唯一但多 pane = AMBIGUOUS"是 exact-pane 残留，已删除）。"""
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 50, "wt", WT_WINDOW_CLASS)],
-            ancestor_pids=lambda pid: {pid, 50},
-        )
-        inst = AgentInstance(AgentKind.CODEX, 99, "windows", process_token="9")
-        controls = {
-            (11, (1,)): control(11, (1,), "codex"),
-            (11, (2,)): control(11, (2,), "claude"),
-        }
-        bindings = resolver.resolve([inst], controls, NOW)
-        self.assertEqual(bindings[inst.key].confidence,
-                         WindowBindingConfidence.CONFIRMED)
-
-    def test_windows_native_multi_window_ambiguous_no_window(self):
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(1, 10, "wt", WT_WINDOW_CLASS),
-                                  (2, 10, "wt", WT_WINDOW_CLASS)],
-            ancestor_pids=lambda pid: {10},
-        )
-        inst = AgentInstance(AgentKind.CODEX, 99, "windows", process_token="9")
-        bindings = resolver.resolve([inst], {}, NOW)
-        b = bindings[inst.key]
-        self.assertEqual(b.confidence, WindowBindingConfidence.AMBIGUOUS)
-        self.assertIsNone(b.window)
-        self.assertEqual(b.reason, "multi-window-ancestor")
-
-    def test_wsl_title_scoring_high_when_unique(self):
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 5, "u@box:~/DeskPet", WT_WINDOW_CLASS)])
-        inst = self._wsl(cwd="/home/u/DeskPet", user="u")
-        controls = {
-            (11, (1,)): control(11, (1,), "u@box:~/DeskPet"),
-            (11, (2,)): control(11, (2,), "PowerShell"),
-        }
-        bindings = resolver.resolve([inst], controls, NOW)
-        b = bindings[inst.key]
-        self.assertEqual(b.confidence, WindowBindingConfidence.HIGH)
-        self.assertEqual(b.hwnd, 11)
-        self.assertIn("cwd", b.reason)
-
-    def test_wsl_window_title_is_second_evidence_source(self):
-        """TermControl Name 停在 "Ubuntu"，但 WT 顶层窗口标题带路径 → HIGH。"""
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 5, "dev@box: ~/proj/app",
-                                   WT_WINDOW_CLASS)])
-        inst = self._wsl(cwd="/home/dev/proj/app", user="dev")
-        controls = {(11, (1,)): control(11, (1,), "Ubuntu")}
-        bindings = resolver.resolve([inst], controls, NOW)
-        b = bindings[inst.key]
-        self.assertEqual(b.confidence, WindowBindingConfidence.HIGH)
-        self.assertIn("cwd", b.reason)
-
-    def test_wsl_two_similar_controls_ambiguous(self):
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 5, "u@box:~/DeskPet", WT_WINDOW_CLASS),
-                                  (22, 6, "u@box:~/DeskPet",
-                                   WT_WINDOW_CLASS)])
-        inst = self._wsl(cwd="/home/u/DeskPet", user="u")
-        controls = {
-            (11, (1,)): control(11, (1,), "u@box:~/DeskPet"),
-            (22, (2,)): control(22, (2,), "u@box:~/DeskPet"),
-        }
-        bindings = resolver.resolve([inst], controls, NOW)
-        self.assertEqual(bindings[inst.key].confidence,
-                         WindowBindingConfidence.AMBIGUOUS)
-        self.assertIsNone(bindings[inst.key].window)
-
-    def test_wsl_kind_in_title_strong(self):
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 5, "claude", WT_WINDOW_CLASS)])
-        inst = self._wsl(kind=AgentKind.CLAUDE, cwd="/x")
-        controls = {(11, (1,)): control(11, (1,), "claude")}
-        bindings = resolver.resolve([inst], controls, NOW)
-        self.assertEqual(bindings[inst.key].confidence,
-                         WindowBindingConfidence.HIGH)
-
-    def test_single_window_fallback_allows_window_but_not_high(self):
-        """唯一 WT 窗口兜底：FALLBACK 允许唤起窗口（plan §5.3）。"""
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 5, "shell", WT_WINDOW_CLASS)])
-        inst = self._wsl(cwd="/home/dev/proj/app", user="dev")
-        controls = {(11, (1,)): control(11, (1,), "Ubuntu")}
-        bindings = resolver.resolve([inst], controls, NOW)
-        b = bindings[inst.key]
-        self.assertEqual(b.confidence, WindowBindingConfidence.FALLBACK)
-        self.assertEqual(b.hwnd, 11)
-        self.assertEqual(b.reason, "single-window-fallback")
-
-    def test_no_window_no_binding(self):
-        resolver = TerminalWindowResolver(enum_windows=lambda: [])
-        inst = self._wsl()
-        bindings = resolver.resolve([inst], {}, NOW)
-        b = bindings[inst.key]
-        self.assertEqual(b.confidence, WindowBindingConfidence.NONE)
-        self.assertEqual(b.hwnd, 0)
-
-    def test_multiple_windows_no_evidence_ambiguous(self):
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 5, "a", WT_WINDOW_CLASS),
-                                  (22, 6, "b", WT_WINDOW_CLASS)])
-        inst = self._wsl()
-        bindings = resolver.resolve([inst], {}, NOW)
-        b = bindings[inst.key]
-        self.assertEqual(b.confidence, WindowBindingConfidence.AMBIGUOUS)
-        self.assertIsNone(b.window)
-        self.assertEqual(b.reason, "multiple terminal windows")
-
-
-class MutualBindingTests(unittest.TestCase):
-    def test_weak_single_control_not_high(self):
-        """唯一 control + 1 分弱提示（只命中 user@）→ 绝不能 HIGH。"""
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 5, "u@box", WT_WINDOW_CLASS)])
-        inst = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
-                             process_token="9", cwd="/x/y", user="u")
-        controls = {(11, (1,)): control(11, (1,), "u@box")}
-        bindings = resolver.resolve([inst], controls, NOW)
-        b = bindings[inst.key]
-        # 单窗口兜底也不够格（有两个窗口才 AMBIGUOUS；这里唯一窗口）
-        self.assertEqual(b.confidence, WindowBindingConfidence.FALLBACK)
-        self.assertLess(b.score, 3)
-
-    def test_two_agents_two_controls_mutual_unique(self):
-        def enum():
-            return [(11, 5, "wt", WT_WINDOW_CLASS)]
-        codex = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
-                              process_token="9", cwd="/w/alpha", user="u1")
-        claude = AgentInstance(AgentKind.CLAUDE, 2, "wsl:Ubuntu",
-                               process_token="10", cwd="/w/beta", user="u2")
-        controls = {
-            (11, (1,)): control(11, (1,), "codex u1@box:~/alpha"),
-            (11, (2,)): control(11, (2,), "claude u2@box:~/beta"),
-        }
-        r1 = TerminalWindowResolver(enum_windows=enum).resolve(
-            [codex, claude], controls, NOW)
-        r2 = TerminalWindowResolver(enum_windows=enum).resolve(
-            [claude, codex], controls, NOW)   # 顺序无关
-        self.assertEqual(r1[codex.key].confidence, WindowBindingConfidence.HIGH)
-        self.assertEqual(r1[claude.key].confidence, WindowBindingConfidence.HIGH)
-        self.assertEqual(
-            {k: v.hwnd for k, v in r1.items()},
-            {k: v.hwnd for k, v in r2.items()})
-
-    def test_close_competition_with_margin_still_high(self):
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 5, "wt", WT_WINDOW_CLASS)])
-        a = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
-                          process_token="9", cwd="/w/alpha", user="u")
-        b = AgentInstance(AgentKind.CODEX, 2, "wsl:Ubuntu",
-                          process_token="10", cwd="/w/beta", user="u")
-        # 两个 control 都含 "codex"（+3）与 "u@"（+1），各自 cwd 差异化（+2）
-        controls = {
-            (11, (1,)): control(11, (1,), "codex alpha u@box"),
-            (11, (2,)): control(11, (2,), "codex beta u@box"),
-        }
-        bindings = resolver.resolve([a, b], controls, NOW)
-        # A: X=6, Y=4；B: X=4, Y=6 → 双向唯一，margin=2 → 都 HIGH
-        self.assertEqual(bindings[a.key].confidence, WindowBindingConfidence.HIGH)
-        self.assertEqual(bindings[b.key].confidence, WindowBindingConfidence.HIGH)
-
+# ============================================================ observation resolver
 
 class ObservationResolverTests(unittest.TestCase):
+    """观察链保持 v4.1.2 严格语义（v4.1.3 §7/§28）：Window 唤起放宽
+    （AMBIGUOUS/NONE 可携带窗口）绝不意味着 observation attribution
+    放宽——低置信 Window 候选不直接授予任何 Terminal 证据。"""
+
     def _native(self, pid=99, token="9"):
         return AgentInstance(AgentKind.CODEX, pid, "windows",
                              process_token=token)
 
+    def _binding_stub(self, hwnd=11, confidence=WindowBindingConfidence.NONE):
+        return type("B", (), {
+            "window": WindowIdentity(hwnd, hwnd + 100, 1.0, WT_WINDOW_CLASS),
+            "hwnd": hwnd,
+            "confidence": confidence})()
+
     def test_native_sole_control_confirmed(self):
         controls = {(11, (1,)): control(11, (1,), "codex")}
-        windows = {11: WindowIdentity(11, 50, 1.0, WT_WINDOW_CLASS)}
-        bindings = {self._native().key: None}
         inst = self._native()
         resolver = TerminalObservationResolver(enum_windows=lambda: [])
         window_bindings = {
-            inst.key: type("B", (), {
-                "window": windows[11], "hwnd": 11,
-                "confidence": WindowBindingConfidence.CONFIRMED})()}
+            inst.key: self._binding_stub(
+                confidence=WindowBindingConfidence.CONFIRMED)}
         out = resolver.resolve([inst], controls, window_bindings, NOW)
         self.assertIn(inst.key, out)
         self.assertEqual(out[inst.key].confidence,
@@ -656,24 +480,36 @@ class ObservationResolverTests(unittest.TestCase):
             (11, (2,)): control(11, (2,), "y"),
         }
         window_bindings = {
-            inst.key: type("B", (), {
-                "window": WindowIdentity(11, 50, 1.0, WT_WINDOW_CLASS),
-                "hwnd": 11,
-                "confidence": WindowBindingConfidence.CONFIRMED})()}
+            inst.key: self._binding_stub(
+                confidence=WindowBindingConfidence.CONFIRMED)}
         resolver = TerminalObservationResolver(enum_windows=lambda: [])
         out = resolver.resolve([inst], controls, window_bindings, NOW)
         self.assertEqual(out, {})
 
-    def test_fallback_window_binding_never_grants_observation(self):
-        """FALLBACK 窗口兜底允许唤起，但不赋予 terminal evidence（§5.3）。"""
+    def test_ambiguous_window_with_hwnd_never_grants_observation(self):
+        """§28：Window AMBIGUOUS + valid HWND + 多 control 无 strict
+        evidence → 无 TerminalObservationBinding（可唤起 ≠ 可归属）。"""
+        inst = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
+                             process_token="9")
+        controls = {
+            (11, (1,)): control(11, (1,), "x"),
+            (11, (2,)): control(11, (2,), "y"),
+        }
+        window_bindings = {
+            inst.key: self._binding_stub(
+                confidence=WindowBindingConfidence.AMBIGUOUS)}
+        resolver = TerminalObservationResolver(enum_windows=lambda: [])
+        out = resolver.resolve([inst], controls, window_bindings, NOW)
+        self.assertEqual(out, {})
+
+    def test_sole_window_fallback_never_grants_observation(self):
+        """§28：Window NONE + 唯一窗口兜底 HWND + generic profile 标题
+        → 无 TerminalObservationBinding。"""
         inst = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
                              process_token="9")
         controls = {(11, (1,)): control(11, (1,), "Ubuntu")}
         window_bindings = {
-            inst.key: type("B", (), {
-                "window": WindowIdentity(11, 5, 1.0, WT_WINDOW_CLASS),
-                "hwnd": 11,
-                "confidence": WindowBindingConfidence.FALLBACK})()}
+            inst.key: self._binding_stub(confidence=WindowBindingConfidence.NONE)}
         resolver = TerminalObservationResolver(enum_windows=lambda: [])
         out = resolver.resolve([inst], controls, window_bindings, NOW)
         self.assertEqual(out, {})
@@ -691,74 +527,19 @@ class ObservationResolverTests(unittest.TestCase):
                          ObservationBindingConfidence.HIGH)
         self.assertEqual(out[inst.key].control_id, (11, (1,)))
 
-
-class ScoringRegressionTests(unittest.TestCase):
-    """V4.1.1 评分修正（用户反馈：无法扫描关联终端）。
-
-    * 词边界：kind "pi" 不得命中 "pip"；"codex" 命中 "codex · task"；
-    * ~/路径标记：`user@host: ~/a/b` 按 cwd 归一化比对，不再用裸
-      basename（用户名==家目录名时会造成所有同用户 control 假命中）；
-    * WT 顶层窗口标题是第二条证据：TermControl Name 停在 profile 名
-      时仍可通过窗口标题达成 HIGH；
-    * "Ubuntu" 这类无路径标题不产生假 HIGH（fail-closed）。
-    """
-
-    def _inst(self, kind=AgentKind.CODEX, cwd="/w/x", user=""):
-        return AgentInstance(kind=kind, pid=1, source="wsl:Ubuntu",
-                             process_token="9", cwd=cwd, user=user)
-
-    def test_pi_word_boundary_not_pip(self):
-        resolver = TerminalWindowResolver(enum_windows=lambda: [])
-        inst = self._inst(kind=AgentKind.PI)
-        score, reason = resolver._scorer.score(inst, "pip install requests")
-        self.assertEqual(score, 0)
-        self.assertNotIn("kind", reason)
-
-    def test_kind_word_boundary_matches(self):
-        resolver = TerminalWindowResolver(enum_windows=lambda: [])
-        inst = self._inst(kind=AgentKind.CODEX)
-        score, _ = resolver._scorer.score(inst, "codex · 编码中")
-        self.assertGreaterEqual(score, 3)
-
-    def test_tilde_path_marker_scores_cwd(self):
-        resolver = TerminalWindowResolver(enum_windows=lambda: [])
-        inst = self._inst(cwd="/home/dev/proj/app", user="dev")
-        score, reason = resolver._scorer.score(inst, "dev@box: ~/proj/app")
-        self.assertIn("cwd", reason)
-        self.assertIn("user@", reason)
-
-    def test_home_dir_basename_does_not_match_user_host(self):
-        """Agent 在家目录：不得因 basename==用户名 命中所有 user@host 标题。"""
-        resolver = TerminalWindowResolver(enum_windows=lambda: [])
-        inst = self._inst(cwd="/home/dev", user="dev")
-        score, reason = resolver._scorer.score(inst, "dev@box: ~/proj/app")
-        # 只有 user@ 弱证据，绝不能有 cwd
-        self.assertNotIn("cwd", reason)
-        self.assertLess(score, 3)
-
-    def test_generic_profile_title_stays_fallback_or_ambiguous(self):
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 5, "a", WT_WINDOW_CLASS),
-                                  (22, 6, "b", WT_WINDOW_CLASS)])
-        inst = self._inst(cwd="/home/dev/proj/app", user="dev")
+    def test_window_title_second_evidence_high(self):
+        """TermControl Name 停在 "Ubuntu"，但 WT 顶层窗口标题带路径 →
+        观察链仍可 HIGH（窗口标题第二证据只属于观察链，§4.3）。"""
+        inst = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
+                             process_token="9", cwd="/home/dev/proj/app",
+                             user="dev")
         controls = {(11, (1,)): control(11, (1,), "Ubuntu")}
-        bindings = resolver.resolve([inst], controls, NOW)
-        self.assertNotEqual(bindings[inst.key].confidence,
-                            WindowBindingConfidence.HIGH)
-
-    def test_two_distinct_paths_both_high(self):
-        """两个不同项目的 control + 两个对应 Agent → 双向唯一都 HIGH。"""
-        resolver = TerminalWindowResolver(
-            enum_windows=lambda: [(11, 5, "wt", WT_WINDOW_CLASS)])
-        a = self._inst(kind=AgentKind.CODEX, cwd="/home/dev/alpha", user="dev")
-        b = self._inst(kind=AgentKind.CLAUDE, cwd="/home/dev/beta", user="dev")
-        controls = {
-            (11, (1,)): control(11, (1,), "dev@box: ~/alpha"),
-            (11, (2,)): control(11, (2,), "dev@box: ~/beta"),
-        }
-        bindings = resolver.resolve([a, b], controls, NOW)
-        self.assertEqual(bindings[a.key].confidence, WindowBindingConfidence.HIGH)
-        self.assertEqual(bindings[b.key].confidence, WindowBindingConfidence.HIGH)
+        resolver = TerminalObservationResolver(
+            enum_windows=lambda: [(11, 5, "dev@box: ~/proj/app",
+                                   WT_WINDOW_CLASS)])
+        out = resolver.resolve([inst], controls, {}, NOW)
+        self.assertEqual(out[inst.key].confidence,
+                         ObservationBindingConfidence.HIGH)
 
 
 if __name__ == "__main__":
