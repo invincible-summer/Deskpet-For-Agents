@@ -1,6 +1,7 @@
-# DeskPet V4.1.2 — SourceLink / Evidence Map
+# DeskPet V4.1.3 — SourceLink / Evidence Map
 
-> 审计日期：2026-09-08（V4.1）；V4.1.2 window-only 收敛更新：2026-09-09  
+> 审计日期：2026-09-08（V4.1）；V4.1.2 window-only 收敛更新：2026-09-09；
+> V4.1.3 v3 wake 语义恢复更新：2026-09-09  
 > DeskPet 审计基线：`invincible-summer/DeskPet@af8236d15dc3bfecaa89464e1b77d7f84c2b09be`  
 >
 > 本文件是证据链与接口依据。链接分为：
@@ -8,9 +9,46 @@
 > - **实现合同**：Microsoft/Linux 官方 API 文档，可作为代码语义依据；
 > - **上游当前行为**：Windows Terminal 当前源码，说明现行实现，但必须 feature-detect，不能把内部源码细节当永久公开 ABI；
 > - **能力缺口证据**：Windows Terminal 官方仓库 issue，证明截至当前公开接口仍缺某项能力；issue 本身不是 API 合同；
-> - **DeskPet 内部审计证据**：固定到本次审计 commit，便于之后核对 V3→V4.1→V4.1.2 修改。
+> - **DeskPet 内部审计证据**：固定到本次审计 commit，便于之后核对 V3→V4.1→V4.1.2→V4.1.3 修改。
 
-## 0. V4.1.2 Core Convergence（window-only）决策依据
+## 0. V4.1.3 v3 wake 语义恢复（决策依据）
+
+**V4.1.2 把"证据不够唯一"一律折叠成 `AMBIGUOUS + window=None`，导致
+v3 已验证可用的"只要被动 resolver 能给出候选 HWND，用户就可以显式
+唤起"体验退化（`activate()` 在进入 Win32 前就返回 NO_BINDING）。
+V4.1.3 恢复 v3 candidate selection，同时保留 v4.1.2 的强
+`WindowIdentity` 与严格 observation attribution：**
+
+- **候选选择（v3 决策拓扑，`agents/terminal_resolver.py`）**：
+  native PID ancestor → mutual-unique 标题评分（v3 权重 kind+3/
+  cwd+2/user@+1/distro+1）→ 正向证据不唯一仍保留 best control 所属
+  HWND（AMBIGUOUS + window）→ 唯一 WT 窗口兜底（NONE + window）。
+  confidence 不是 activation gate；wakeability 只由
+  `TerminalWindowBinding.window` 决定（`FALLBACK` 枚举已删除）。
+- **身份（v4.1.2 保留）**：所有候选 HWND 经 `winkeys.window_identity()`
+  建立完整 incarnation 身份（测试经 `identity_for_hwnd` 注入非零
+  `process_created`，不再构造 0 值假身份）；身份失败 → window=None +
+  reason 后缀 `·window-identity-failed`；`validate_window` 对
+  `process_created<=0` fail-closed（修复 0 值穿透）。
+- **窗口目录独立于 UIA**：来自 `enum_windows()` + 3s 缓存
+  （`invalidate_window_cache` 供 stale activation 强制重枚举）；UIA
+  controls 只是 WSL 标题 hint。
+- **观察不放宽**：低置信窗口候选（AMBIGUOUS / NONE+窗口）不授予任何
+  Terminal text/approval attribution；observation 链仍只认自己的
+  strict CONFIRMED/HIGH（窗口标题第二证据仅属于 observation scorer）。
+- **交互固定三模式（均双击）**：SINGLE 气泡/body 双击均唤起；
+  AGGREGATE 仅气泡双击唤起（body 双击只互动）；FLEET 各自唤起。
+- **Z-order 分离**：DeskPet 自身 Pet Toplevel 用 `SetWindowPos` +
+  `SWP_NOACTIVATE`（Microsoft Learn：改变 Z-order 不激活窗口），用于
+  Dashboard 打开/托盘恢复后拉回层级；Terminal 用户显式唤起仍走
+  `SetForegroundWindow`（OS 可拒绝，拒绝时 `FlashWindowEx`）。
+- **可见性**：托盘左键幂等显示/恢复（绝不隐藏已可见桌宠）；Dashboard
+  打开不改逻辑 hidden、withdrawn 时 0 refresh timer、after id 全程
+  cancel（无 destroy 后回调）。
+- microsoft/terminal#19783 结论不变：仍只承诺 window 级唤起，
+  不切 Tab/Pane、不发送键盘输入。
+
+## 0.1 V4.1.2 Core Convergence（window-only）决策依据（仍然有效）
 
 **exact Window → Tab → Pane 激活设计（V4.1）已 abandoned**，不再作为当前实现要求：
 
@@ -29,15 +67,15 @@
 
 ## 1. DeskPet 实现基线
 
-### 1.0 V4.1.2 当前实现（2026-09-09 完成，工作树）
+### 1.0 V4.1.3 当前实现（2026-09-09 完成，工作树）
 
-V4.1.2 收敛产物（`plan.md` v4.1.1 的实施；上游依据见后续章节）：
+V4.1.3 产物（v4.1.3 plan.md 的实施；上游依据见后续章节）：
 
 - `agents/models.py`：`WindowBindingConfidence`（CONFIRMED/HIGH/
-  FALLBACK/AMBIGUOUS/NONE）/ `TerminalWindowBinding` /
+  AMBIGUOUS/NONE，v4.1.3 删除 FALLBACK；confidence 不是 activation
+  gate）/ `TerminalWindowBinding`（含 `wakeable`）/
   `ObservationBindingConfidence` / `TerminalObservationBinding` /
-  `ObservedTerminalControl` 数据合同；`ActivationCode` 收敛为 5 值
-  （删除 STALE_TAB/STALE_PANE/UIA_UNAVAILABLE/AMBIGUOUS）；
+  `ObservedTerminalControl` 数据合同；`ActivationCode` 5 值；
   `AgentTarget.terminal_window`；
 - `agents/terminal_uia.py`：观察层删除全部 Tab topology
   （TabItem 枚举、SelectionItem 选择、tab-selected 事件、pane 焦点），

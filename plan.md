@@ -1,228 +1,176 @@
-# DeskPet v4.1.1 Core Convergence 修复计划
+# DeskPet v4.1.3 完整修复实施计划
 
-> 审计与修复基线：`invincible-summer/DeskPet`  
-> 当前审计提交：`1feaf4f7d203725547d1e7519d8bc2a6f95a11c0`（v4.1）  
-> v3 参考提交：`af8236d15dc3bfecaa89464e1b77d7f84c2b09be`  
-> 本计划目标：在保留 v4.1 已经完成的多 Agent、低资源监听、进程生命周期、安全 UIA 观察、Presentation/Fleet 等改进的前提下，彻底撤销失败的 exact Window → Tab → Pane 激活设计及其手工绑定链；终端唤起恢复为 v3 的 Window-level 语义，并用 v4.1 更强的 `WindowIdentity` 做安全校验。
+> **用途**：v4.1.3 代码修改、审查、测试、实机验收的详细执行依据。  
+> **当前实现基线**：`266f5ae5e4695a1ec2cff6936f74a9723bb11b6f`（v4.1.2）  
+> **v3 行为参考**：`af8236d15dc3bfecaa89464e1b77d7f84c2b09be`  
+> **仓库**：`invincible-summer/DeskPet`
 
----
-
-## 1. 修复目标与最终产品语义
-
-本轮不做功能扩展，不重构与问题无关的业务，不重新引入 hooks，不加入键盘注入，不通过 Terminal 快捷键、`SendInput`、`PostMessage`、剪贴板或模拟 Ctrl+Tab 解决精确标签页定位。
-
-修复完成后，DeskPet 的终端相关能力必须被拆成两条互不污染的链：
-
-1. **Terminal Window Navigation**
-   - 只负责“这个 Agent 对应哪个 Windows Terminal 顶层窗口”。
-   - 用户点击桌宠、气泡、Dashboard Agent 卡片、托盘 Agent 项时，只尝试恢复并前置这个窗口。
-   - 不依赖 UIA 是否可用。
-   - 不依赖 Tab、Pane、SelectionItemPattern、UIA focus。
-   - 不能唯一确定窗口时 fail-closed，不猜。
-
-2. **Terminal Observation**
-   - 只负责被动监听 Windows Terminal 当前可观察 `TermControl` 的 Notification / TextChanged / Visible Text。
-   - 内部可以使用 UIA RuntimeId 作为短生命周期的观察句柄。
-   - 这个内部 UIA control identity 不属于用户可见“绑定”，不参与激活，不持久化。
-   - 只有归属置信度足够高时，才允许把 WAITING/approval/activity 证据归到具体 Agent。
-   - 观察无法安全归属时，宁可没有 terminal evidence，也不能错归。
-
-最终用户语义必须是：
-
-> “打开终端” = 打开/前置该 Agent 所在的 Windows Terminal 窗口。  
-> DeskPet 不保证、不尝试切换到某个既有 Tab/Pane。
-
-这与 Windows Terminal 目前没有稳定公开的“按 `WT_SESSION` 激活既有标签页”接口这一现实一致。Windows Terminal 项目在 2026-01-25 的相关 feature request 中也明确讨论了外部进程无法按 session identity 稳定切换既有 Tab 的缺口，因此不再把 UIA Tab selection 当成 DeskPet 的产品级承诺。
+本计划的核心不是继续增强 v4.1/v4.1.2 的 Terminal 绑定算法，而是**恢复 v3 已经验证可用的 Terminal 顶层窗口候选选择语义**，同时保留 v4.1.2 的多 Agent、并发呈现、严格 UIA Observation、强 `WindowIdentity`、低资源生命周期等正确改进。
 
 ---
 
-## 2. 必须保持的核心不变量
+## 1. v4.1.3 最终目标
 
-### 2.1 安全不变量
+本版本只收敛四件事情：
 
-任何用户显式终端唤起都必须遵守：
+1. **Terminal Window Wake 恢复 v3 语义**：Windows native 用 PID ancestor；WSL 使用被动观察到的 `TermControl` 标题按 v3 权重评分；HIGH 匹配失败但存在正向 best control 时仍保留其 HWND；桌面只有一个 Windows Terminal 顶层窗口时仍保留该 HWND。`confidence` 不再决定能不能打开终端，`TerminalWindowBinding.window != None` 才决定 wakeability。
+2. **Terminal Observation 保持 v4.1.2 严格链**：`ObservedTerminalControl`、审批识别、WAITING/activity attribution 不因 Window wake 放宽；低置信 Window 可供用户显式唤起，但不能自动把 Terminal 文本归给 Agent。
+3. **固定三种交互模式**：非并发 SINGLE 双击气泡或桌宠都唤起；并发 AGGREGATE 只有双击气泡唤起，双击桌宠只互动；并发 FLEET 每只气泡或桌宠双击都唤起各自 exact Agent。
+4. **修复 Tray / Dashboard 桌宠消失**：Tray 左键不再 toggle，而是幂等 show/recover；Dashboard 打开不改变 logical hidden state，只对原本 visible Pet 做一次 no-activate Z-order reassert；Dashboard 隐藏时停止 refresh timer。
 
-```text
-agent_key
-  → Agent 仍存活
-  → TerminalWindowBinding 存在
-  → WindowIdentity 验证
-  → restore window
-  → SetForegroundWindow
-  → 验证前台窗口
-  → 若 OS 拒绝：FlashWindowEx
-```
-
-绝不允许：
+明确不做：
 
 ```text
-SendInput
-keybd_event
-PostMessage 模拟快捷键
-Ctrl+Tab / Alt+数字
-剪贴板注入
-根据 tab title 模糊选择后强制 Select
-根据 pane index 猜测
-```
-
-### 2.2 资源不变量
-
-DeskPet 仍然以“常驻、轻量、低 CPU、低内存”为目标：
-
-- 一个 Tk interpreter。
-- 一个 Monitor core thread。
-- 一个 process probe thread。
-- 一个 UIA MTA thread（启用 terminal observer 时）。
-- 一个 Windows process exit wait thread。
-- 不允许 per-Agent polling thread。
-- 不允许 per-Pet monitor thread。
-- UIA event queue、visible read、ring buffer 继续有硬上限。
-- Windows/WSL source 被关闭时，对应扫描必须真正停止。
-- 无 Windows Agent 时 exit watcher 必须真正阻塞，不做 200 ms 周期唤醒。
-
-### 2.3 并发 UI 不变量
-
-所有“表示一个具体 Agent”的交互元素必须携带 **exact runtime `agent_key`**：
-
-```text
-Fleet PetView
-Fleet BubbleModel
-Dashboard Agent Card
-Tray Agent Menu Item
-Agent detail "打开终端"
-未来任何 per-Agent bubble/card
-```
-
-禁止这些入口通过以下隐式状态推导目标：
-
-```text
-primary_key
-attention_key
-当前最新 Agent
-当前 WAITING Agent
-当前选中的 Terminal Tab
-focused terminal element
-当前唯一 Pane
-```
-
-`attention_key` 只用于视觉优先级，不是激活 identity。
-
----
-
-## 3. 当前 v4.1 审计结论
-
-### 3.1 应保留的 v4.1 能力
-
-以下能力不是终端唤起问题的根源，应继续保留：
-
-- `SourceProbeSnapshot` 的 authoritative / unavailable 三态。
-- Windows native Agent 的 process incarnation。
-- WSL process token / source-isolated discovery。
-- `WindowsExitWatcher` 单线程等待模型。
-- Watcher session evidence。
-- `StateReducer` 对 structured session evidence 与 generic terminal activity 的优先级区分。
-- Terminal observer 的 MTA COM 架构。
-- Notification + TextChanged + StructureChanged 事件驱动观察。
-- visible text 限制、TTL、ring / queue / read budget。
-- `WindowIdentity(hwnd, pid, process_created, window_class)`。
-- PresentationController 的 focused / attention 分离。
-- Fleet slot → Agent 的 runtime binding。
-- SharedAnimationCache / single AnimationScheduler。
-- 配置原子保存与 runtime identity 不落盘。
-
-### 3.2 必须清除的 v4.1 设计
-
-整条 exact terminal location 产品链退出：
-
-```text
-TabInfo
+BEST_EFFORT 新等级
+Agent → Tab
+Agent → Pane
 TerminalLocation
-BindingOrigin.MANUAL
-manual_location
-set_manual_location
-focused_location
-bind_focused_location
-TerminalActivator exact transaction
-select_tab
-selected_tab
-focus_pane
-STALE_TAB
-STALE_PANE
-"关联当前 Terminal 位置"
-Tab RuntimeId 用户诊断
-Pane RuntimeId 用户诊断
-exact Window → Tab → Pane 产品文案
+TabInfo
+manual Terminal binding
+focused_location / focused_pane 作为产品绑定
+SelectionItemPattern 激活
+WT_SESSION → existing tab 激活
+Ctrl+Tab / SendInput / keybd_event / PostMessage / 剪贴板注入
 ```
-
-注意：
-
-`TermControl` 仍然是 UIA 读取 Terminal 文本的底层对象，因此不能简单删除所有“pane-like”内部概念。应将其从“Agent terminal binding”中拆出，作为 observation-only 私有对象。
-
-建议重命名：
-
-```python
-PaneInfo
-# →
-ObservedTerminalControl
-```
-
-若为了降低改动风险，本轮也可以暂时保留 `PaneInfo` 类名，但必须在注释和接口上明确：
-
-> 这是 UIA observer 的内部 control descriptor，不是用户可绑定 Terminal Pane，也不参与 window activation。
-
-推荐本轮直接改名，避免下一版本再次混淆。
 
 ---
 
-## 4. 目标数据模型
+## 2. v3 终端唤起真正需要恢复的部分
 
-## 4.1 `WindowIdentity`
+v3 的用户激活链是：
 
-保留 v4.1：
-
-```python
-@dataclass(frozen=True)
-class WindowIdentity:
-    hwnd: int
-    pid: int
-    process_created: float
-    window_class: str
+```text
+Agent
+→ TerminalBinding
+→ binding.hwnd != 0
+→ validate_terminal_window(binding)
+→ IsWindow + owner PID + window class
+→ SW_RESTORE（若最小化）
+→ SetForegroundWindow(hwnd)
+→ GetForegroundWindow()==hwnd ?
+   ├─ yes: success
+   └─ no : FlashWindowEx
 ```
 
-验证合同：
+v3 的关键点是：**用户显式唤起没有要求 `BindingConfidence` 必须为 CONFIRMED/HIGH。** 只要 resolver 给出了候选 HWND，并且 action 层验证通过，就会尝试唤起。
 
-```python
-def validate_window(identity: WindowIdentity) -> bool:
-    """
-    True iff:
-      IsWindow(hwnd)
-      GetWindowThreadProcessId(hwnd) == pid
-      current process create_time ~= process_created
-      GetClassNameW(hwnd) == window_class
-    """
+v3 WSL resolver 的决策顺序：
+
+```text
+A. manual Pane binding                 ← v4.1.3 不恢复
+B. Windows native PID ancestor
+C. Agent ↔ TermControl mutual-unique scoring
+D. mutual-unique 失败但存在 best positive control
+E. 唯一 Windows Terminal window fallback
 ```
 
-`process_created` 用于防 PID incarnation 复用；`window_class` 用于防 HWND 指向其他应用窗口。
+最重要的是 D。v3 在正向证据存在但不够唯一时：
 
-## 4.2 新的 `TerminalWindowBinding`
+```python
+TerminalBinding(
+    hwnd=best_pane.hwnd,
+    confidence=AMBIGUOUS,
+    ...
+)
+```
 
-将当前公共 `TerminalBinding` 收敛成 window-only：
+即：**AMBIGUOUS 仍然携带 HWND。**
+
+v4.1.2 当前却把同类情况改成：
+
+```python
+TerminalWindowBinding(
+    confidence=AMBIGUOUS,
+    window=None,
+)
+```
+
+于是 `WindowsTerminalService.activate()` 在进入 Win32 前就返回 `NO_BINDING`。这是当前“不能像 v3 一样唤起终端”的首要修复点。
+
+### 2.1 不是 bug-for-bug 复制 v3
+
+v3 sole-window fallback 虽然保留 `hwnd`，但没有完整写入 `window_pid`，而 v3 的 `validate_terminal_window()` 又要求 `expected_pid > 0`，这条 fallback 本身存在旧缺陷。
+
+v4.1.3 必须采用：
+
+```text
+v3 决定“选哪个 HWND”
++
+v4.1.2 winkeys.window_identity(hwnd) 建立完整身份
+```
+
+最终所有可唤起候选必须具有：
+
+```text
+HWND
+PID
+process create_time
+window class
+```
+
+因此恢复的是 **v3 的候选选择行为**，不是原样复制旧数据结构。
+
+### 2.2 v3 不恢复项
+
+v3 的 `manual_bind_focused()`、`set_manual_binding()`、`pane_id`、用户“高级关联当前 Pane”全部继续删除。当前决策是 Window-only wake，绝不重新引入 manual Tab/Pane 修复链。
+
+---
+
+## 3. 最终数据模型
+
+### 3.1 `WindowBindingConfidence`
+
+当前 v4.1.2：
+
+```python
+CONFIRMED
+HIGH
+FALLBACK
+AMBIGUOUS
+NONE
+```
+
+v4.1.3 改为：
+
+```python
+class WindowBindingConfidence(str, Enum):
+    CONFIRMED = "confirmed"
+    HIGH = "high"
+    AMBIGUOUS = "ambiguous"
+    NONE = "none"
+```
+
+删除：
+
+```text
+FALLBACK
+BEST_EFFORT（不得新增）
+```
+
+语义：
+
+- `CONFIRMED`：Windows native PID ancestor 唯一定位 WT window。
+- `HIGH`：v3-compatible TermControl 标题评分达到 mutual-unique 高置信。
+- `AMBIGUOUS`：证据不够安全用于自动 observation attribution，但仍可能有一个 v3 best-positive control 所属 HWND 可供用户显式 wake。
+- `NONE`：没有 Agent-specific 可靠证据；如果桌面只有一个 WT window，仍可以带这个 window 作为 single-window fallback。
+
+必须在注释和测试中写明：
+
+> `confidence` 不是 activation gate。是否可以尝试唤起只由 `TerminalWindowBinding.window` 是否存在决定。
+
+### 3.2 `TerminalWindowBinding`
+
+保持当前 window-only 结构：
 
 ```python
 @dataclass
 class TerminalWindowBinding:
     provider: str = "windows-terminal"
-
     window: WindowIdentity | None = None
     title: str = ""
-
-    # 只表达“窗口解析”的可靠程度
     confidence: WindowBindingConfidence = WindowBindingConfidence.NONE
-
     last_seen: float = 0.0
     validated_at: float = 0.0
-
-    # 安全诊断，禁止放 terminal text
     reason: str = ""
     score: int = 0
     runner_up_score: int = 0
@@ -232,1853 +180,1555 @@ class TerminalWindowBinding:
         return self.window.hwnd if self.window else 0
 ```
 
-推荐新增专用 enum，避免再拿 terminal observation attribution 的 confidence 混用：
+建议增加：
 
 ```python
-class WindowBindingConfidence(str, Enum):
-    CONFIRMED = "confirmed"
-    HIGH = "high"
-    FALLBACK = "fallback"
-    AMBIGUOUS = "ambiguous"
-    NONE = "none"
+@property
+def wakeable(self) -> bool:
+    return self.window is not None and self.window.hwnd > 0
 ```
 
-其中：
+禁止重新加入：
 
-- `CONFIRMED`：Windows native PID ancestor 唯一定位。
-- `HIGH`：WSL / title / cwd / distro 等证据唯一定位到一个 control，再映射到一个 window。
-- `FALLBACK`：只有一个 Windows Terminal 顶层窗口，可以唤起窗口，但不代表 terminal text 可归属。
-- `AMBIGUOUS`：有多个候选窗口，无法安全唯一定位。
-- `NONE`：没有可用窗口。
-
-`FALLBACK` **允许用户唤起**，但不赋予 observation attribution 权限。
-
-## 4.3 UIA 私有观察对象
-
-```python
-@dataclass(frozen=True)
-class ObservedTerminalControl:
-    control_id: tuple
-    hwnd: int
-    window_pid: int
-    title: str
-    window_class: str = WT_WINDOW_CLASS
+```text
+pane_id
+tab_id
+RuntimeId
+manual origin
+selected/index
 ```
 
-生命周期：
+### 3.3 `TerminalObservationBinding`
 
-- 仅内存。
-- 仅 UIA thread / observer 使用。
-- UIA RuntimeId 失效后删除。
-- Agent exit 不需要向它写回任何 user binding。
-- 不持久化到 config。
-- Dashboard 普通诊断不展示 control id。
-
-## 4.4 观察归属结果
-
-推荐独立：
+保持当前：
 
 ```python
 @dataclass(frozen=True)
 class TerminalObservationBinding:
     agent_key: str
     control_id: tuple
-    confidence: ObservationBindingConfidence
+    confidence: ObservationBindingConfidence  # 仅 CONFIRMED/HIGH
     reason: str = ""
 ```
 
-只允许：
-
-```python
-CONFIRMED
-HIGH
-```
-
-参与：
-
-```text
-waiting_observation
-activity_observation
-```
-
-`AMBIGUOUS/NONE` 不产生 Agent-specific terminal evidence。
-
-这样彻底消除当前一个 `TerminalBinding` 同时承担“能不能打开窗口”和“能不能安全归属审批”的语义冲突。
+Window wake 与 Observation attribution 完全分离。
 
 ---
 
-## 5. Window Resolver 详细设计
+## 4. `agents/terminal_resolver.py`：恢复 v3 candidate selection
 
-建议从当前 `TerminalResolver` 中拆出：
+这是 v4.1.3 的核心文件。
+
+### 4.1 Window navigation 不再继续增强
+
+从 `TerminalWindowResolver` 中移除/退出以下 v4.1.2 新语义：
+
+```text
+WT 顶层 Window title 作为新的 Window wake 直接评分模型
+control 数量决定 Window title 是否可用于 navigation
+FALLBACK confidence
+AMBIGUOUS 强制 window=None
+“必须唯一确定 Window 才允许 wake”
+```
+
+不新增 Agent↔HWND 新评分矩阵，也不使用 one-to-one HWND 分配。
+
+恢复：
+
+```text
+Agent ↔ ObservedTerminalControl score
+→ control.hwnd
+```
+
+`ObservedTerminalControl` 在 Window resolver 中只是被动 title hint，`control_id` 不进入公开 binding。
+
+### 4.2 v3-compatible scoring
+
+Window wake 使用 v3 权重：
+
+```text
+kind    +3
+cwd     +2
+user@   +1
+distro  +1
+
+HIGH_MIN_SCORE  = 3
+HIGH_MIN_MARGIN = 1
+```
+
+但不复制 v3 的字符串误匹配 bug。允许保留 v4.1.2 已完成的纯安全修正：
+
+```text
+pi 使用词边界，不匹配 pip
+~/path 做归一化
+/home/dev 不因 dev@host 被当成 cwd 命中
+distro 使用词边界
+```
+
+这些修正不改变 v3 的决策拓扑。
+
+### 4.3 Navigation scorer 与 Observation scorer 分开
+
+当前共享 `_EvidenceScorer.titles_for()` 会把 WT 顶层窗口标题作为第二证据。Window navigation 为了严格回到 v3，不应继续使用这条增强；ObservationResolver 则保持现状。
+
+建议拆为：
+
+```python
+class _BaseTerminalTitleScorer:
+    def score_title(self, inst, title) -> tuple[int, str]: ...
+
+class _V3WindowControlScorer(_BaseTerminalTitleScorer):
+    def score_control(self, inst, control) -> int:
+        return self.score_title(inst, control.title)[0]
+
+class _ObservationScorer(_BaseTerminalTitleScorer):
+    # 保持 v4.1.2 当前 titles_for / window-title secondary evidence
+    ...
+```
+
+不要用一个 `navigation=True/False` 参数隐藏两套合同。
+
+---
+
+## 5. Window catalog 与 `WindowIdentity`
+
+### 5.1 Window catalog 独立于 UIA layout
+
+Window resolver 的 Windows Terminal 顶层窗口列表来自：
+
+```python
+winkeys.enum_windows()
+```
+
+身份来自：
+
+```python
+winkeys.window_identity(hwnd)
+```
+
+不要求 UIA `TerminalLayout.windows` 存在。
+
+建议接口：
 
 ```python
 class TerminalWindowResolver:
-    def resolve(
+    def __init__(
         self,
-        instances: list[AgentInstance],
-        controls: Mapping[tuple, ObservedTerminalControl],
-        windows: Mapping[int, WindowIdentity],
-        now: float,
-    ) -> dict[str, TerminalWindowBinding]:
+        enum_windows=None,
+        ancestor_pids=None,
+        identity_for_hwnd=None,
+    ):
         ...
 ```
 
-不再有：
+测试通过 `identity_for_hwnd` 注入真实非零 `process_created`，生产默认使用 `winkeys.window_identity()`。
+
+### 5.2 内部窗口缓存
+
+沿用 v3 的轻量 3 秒 catalog cache：
 
 ```python
-set_manual_location
-manual_location
-_prune_manual
-tab_id
-pane_id
+WINDOW_CACHE_SEC = 3.0
+
+self._last_windows = []
+self._windows_ts = 0.0
 ```
-
-### 5.1 Windows native Agent
-
-规则：
-
-```text
-Agent PID
-→ ancestor PID set
-→ Windows Terminal top-level windows whose owner PID ∈ ancestor set
-```
-
-结果：
-
-```text
-唯一窗口
-  → CONFIRMED
-
-多个窗口
-  → AMBIGUOUS
-
-没有窗口
-  → 继续进入 observation/title fallback
-```
-
-不要求窗口下“只有一个 pane”。
-
-旧逻辑里“窗口唯一但多个 pane = AMBIGUOUS”是 exact-pane 产品语义留下的限制；Window-only 激活后应删除。
-
-### 5.2 WSL Agent
-
-WSL 无法通过 Linux PID 直接证明 Windows HWND，继续使用只读、保守评分：
-
-候选 evidence：
-
-- Agent kind token。
-- normalized cwd / `~/path`。
-- user。
-- distro。
-- Terminal control title。
-- 必要时顶层 Terminal window title。
-
-只要某个 `ObservedTerminalControl` 能通过 mutually-unique / min-score / margin 规则高置信匹配到 Agent：
-
-```text
-Agent
-→ control
-→ control.hwnd
-→ WindowIdentity
-→ HIGH TerminalWindowBinding
-```
-
-这里 control identity 只是“帮助找到 hwnd”的一次性证据，不写进公开 window binding。
-
-### 5.3 唯一 Terminal window fallback
-
-如果：
-
-```text
-无法对 Agent 做高置信匹配
-AND
-当前桌面只有一个 Windows Terminal 顶层窗口
-```
-
-则：
 
 ```python
-TerminalWindowBinding(
-    window=only_window,
-    confidence=FALLBACK,
-    reason="single-window-fallback",
-)
+def _windows(self, force=False):
+    if not force and now - self._windows_ts < WINDOW_CACHE_SEC:
+        return self._last_windows
+    rows = winkeys.enum_windows()
+    rows = [r for r in rows if r.class == WT_WINDOW_CLASS]
+    ...
 ```
 
-允许：
+这样不增加 Monitor 0.5s 主循环成本；stale activation 时只 force 一次。
 
-```text
-打开终端
+### 5.3 候选 HWND 身份失败
+
+若 v3 heuristic 选中了 HWND，但：
+
+```python
+winkeys.window_identity(hwnd) is None
 ```
 
-不允许：
-
-```text
-把这个窗口里的 WAITING 自动归给该 Agent
-```
-
-### 5.4 多窗口无法区分
-
-```text
-多个 Windows Terminal window
-+
-没有可靠 evidence
-```
+不得构造 `process_created=0` 的假身份。
 
 返回：
 
 ```python
-confidence = AMBIGUOUS
-window = None
+TerminalWindowBinding(
+    window=None,
+    confidence=<证据等级>,
+    reason="...·window-identity-failed",
+)
 ```
 
-`activate_target()` 返回 `NO_BINDING` 或专用 `AMBIGUOUS_WINDOW`。
-
-为了简化用户语义，推荐不再保留 `AMBIGUOUS` activation result，统一：
-
-```text
-NO_BINDING
-detail="multiple terminal windows"
-```
-
-普通 UI 只提示：
-
-> 无法唯一确定该 Agent 所在的终端窗口。
-
-高级诊断保留 reason。
+用户 action 不得触碰该 HWND。
 
 ---
 
-## 6. Window-only 激活接口
-
-## 6.1 `actions/winkeys.py`
-
-保留 v4.1 原语：
-
-```python
-window_identity(hwnd)
-validate_window(identity)
-restore_window(hwnd)
-try_set_foreground(hwnd)
-flash_window(hwnd)
-enum_windows()
-```
-
-增加一个薄的 window-level helper 也可以：
-
-```python
-def activate_window(identity: WindowIdentity) -> WindowActivationResult:
-    if not validate_window(identity):
-        return STALE
-    if not restore_window(identity.hwnd):
-        return STALE
-    if try_set_foreground(identity.hwnd):
-        return OK
-    flash_window(identity.hwnd)
-    return FOREGROUND_DENIED
-```
-
-不建议把 resolver 逻辑塞回 `winkeys.py`。
-
-## 6.2 ActivationCode
-
-收敛为：
-
-```python
-class ActivationCode(str, Enum):
-    OK = "ok"
-    AGENT_GONE = "agent_gone"
-    NO_BINDING = "no_binding"
-    STALE_WINDOW = "stale_window"
-    FOREGROUND_DENIED = "foreground_denied"
-```
-
-删除：
-
-```text
-STALE_TAB
-STALE_PANE
-UIA_UNAVAILABLE
-```
-
-原因：
-
-Terminal window activation 不依赖 UIA。
-
-## 6.3 `WindowsTerminalService.activate`
+## 6. `TerminalWindowResolver.resolve()` 确定实现
 
 目标签名：
 
 ```python
-def activate(
+def resolve(
     self,
-    agent_key: str,
-    *,
-    is_agent_live: Callable[[str], bool],
-) -> ActivationResult:
+    instances: list[AgentInstance],
+    controls: dict[tuple, ObservedTerminalControl],
+    now: float,
+) -> dict[str, TerminalWindowBinding]:
     ...
 ```
 
-推荐直接传 `agent_key`，不要传一个可能已经 stale 的 `AgentTarget`。
+Window resolver 删除 `layout=` 参数；ObservationResolver 仍可使用 layout。
 
-事务：
+### 6.1 Windows native
+
+```text
+Agent PID
+→ _ancestor_pids(pid)
+→ 枚举 WT window owner PID
+```
+
+规则：
+
+```text
+命中 1 个 WT HWND
+→ CONFIRMED + 完整 WindowIdentity
+
+命中 >1
+→ AMBIGUOUS + window=None
+
+命中 0
+→ 进入 v3 control scoring fallback
+```
+
+特别注意：**唯一 native WT window 下有多个 TermControl 也仍然 CONFIRMED。** Window-only wake 已不再关心 pane 数量。
+
+### 6.2 WSL / native fallback scoring
 
 ```python
-def activate(agent_key, is_agent_live):
-    if not is_agent_live(agent_key):
-        return AGENT_GONE
+agent_keys = [inst.key for inst in scored_instances]
+control_ids = list(controls)
 
-    binding = current_window_binding(agent_key)
-    if not binding or not binding.window:
-        return NO_BINDING
+def score_fn(agent_key, control_id):
+    return scorer.score_control(
+        inst_by_key[agent_key],
+        controls[control_id],
+    )
 
-    if not validate_window(binding.window):
-        refresh_windows_and_resolve_once()
+decisions = mutual_unique_matches(
+    agent_keys,
+    control_ids,
+    score_fn,
+    min_score=3,
+    min_margin=1,
+)
 
-        if not is_agent_live(agent_key):
-            return AGENT_GONE
-
-        binding = current_window_binding(agent_key)
-        if not binding or not binding.window:
-            return NO_BINDING(repaired=True)
-
-        if not validate_window(binding.window):
-            return STALE_WINDOW(repaired=True)
-
-    restore_window(binding.hwnd)
-
-    if try_set_foreground(binding.hwnd):
-        return OK
-
-    flash_window(binding.hwnd)
-    return FOREGROUND_DENIED
+diagnostics = best_effort_scores(
+    agent_keys,
+    control_ids,
+    score_fn,
+)
 ```
 
-限制：
-
-- refresh 最多一次。
-- 不调用 `observer.backend.select_tab()`。
-- 不调用 `selected_tab()`。
-- 不调用 `focus_pane()`。
-- UIA observer 为 `None` 时仍可正常激活已有有效 window binding。
-- 若 window binding 的生成依赖 UIA title evidence，而当前 UIA 暂不可用，允许使用仍通过 `WindowIdentity` 校验的最近一次 runtime binding；一旦 identity stale，不能继续猜。
-
----
-
-## 7. Terminal Observation 详细设计
-
-### 7.1 保留 UIA MTA
-
-真实 UIA backend 继续：
+### 6.3 v3 决策顺序
 
 ```text
-one MTA thread
-no owned windows
-all UIA calls marshalled to that thread
-event handler add/remove on same MTA thread
-bounded call queue
+1. mutual unique 成功
+   → HIGH
+   → window = selected control.hwnd
+
+2. mutual unique 失败，但 best_control != None 且 best_score > 0
+   → AMBIGUOUS
+   → window = best control.hwnd             ★ v3 关键行为
+
+3. 完全无正向 control evidence，且只有一个 WT HWND
+   → NONE
+   → window = sole WT hwnd                  ★ v3 fallback
+   → reason=single-window-fallback
+
+4. 多个 WT window 且无正向 evidence
+   → NONE
+   → window=None
+   → reason=multiple-terminal-windows-no-evidence
+
+5. 无 WT window
+   → NONE
+   → window=None
+   → reason=no-terminal-window
 ```
 
-不要为了删除 Tab selection 而退回 Tk UI thread 调 UIA。
+### 6.4 `_binding_from_hwnd()`
 
-### 7.2 删除 Tab topology
-
-从 `terminal_uia.py` 删除：
-
-```text
-TabInfo
-TerminalLocation
-TerminalLayout.tabs
-TerminalLayout.selected_tabs
-_find_tab_items
-select_tab
-selected_tab
-focused_location
-focus_pane
-SelectionItemPattern
-tab-selected event
-_tab_dirty
-tab_events stats
-```
-
-目标 observer 只关心：
-
-```text
-Windows Terminal top-level windows
-TermControl descendants
-Notification events
-TextChanged events
-StructureChanged events
-visible text
-```
-
-`StructureChanged` 仍用于 control 开/关、split 改变、active control attach/detach 后的重新发现。
-
-### 7.3 保留有界读取
-
-硬限制继续保留或收紧：
-
-```text
-DELTA_MAX                    2048 chars
-RING_MAX                     8192 chars / control
-VISIBLE_MAX                  4096 chars
-MAX_CONTROLS                 16
-EVENT_QUEUE_MAX              256
-UIA_CALL_QUEUE_MAX           32
-GLOBAL_VISIBLE_READ_LIMIT    <= 6 / sec
-PER_CONTROL_VISIBLE_READ     >= 0.5 sec interval
-approval TTL                 ~1.5 sec
-waiting recheck              ~0.75 sec
-```
-
-只读 `TextPattern.GetVisibleRanges()`，不读取完整 scrollback。
-
-### 7.4 WAITING 归属
-
-`Monitor._terminal_observation()` 改为：
+所有 confidence 共用同一个构造函数：
 
 ```python
-obs_binding = self._terminal_service.observation_binding(inst.key)
-
-if obs_binding is None:
-    return None
-
-if obs_binding.confidence not in (CONFIRMED, HIGH):
-    return None
-
-waiting = service.waiting_observation(obs_binding.control_id)
-
-if waiting and waiting.agent_kind in (None, inst.kind):
-    return waiting
-
-return service.activity_observation(
-    obs_binding.control_id,
+def _binding_from_hwnd(
+    self,
+    hwnd,
+    row,
     now,
-    grace,
-)
-```
-
-不能再通过公共 `TerminalWindowBinding` 中的 `pane_id` 取得 observation。
-
----
-
-## 8. 并发模式与 per-Agent 终端唤起
-
-这是本轮必须单独验收的功能。
-
-当前 v4.1 已经具有正确的基础链：
-
-```text
-PresentationState.slot_keys[slot_id] = exact_agent_key
-        ↓
-PetViewManager.sync()
-        ↓
-view.set_agent(exact_agent_key)
-        ↓
-view.set_single_model(target)
-        ↓
-BubbleModel.agent_key = target.key
-```
-
-必须保留并强化这条链。
-
-### 8.1 Fleet 模式
-
-每个 slot：
-
-```text
-pet-1 → Agent A
-pet-2 → Agent B
-pet-3 → Agent C
-```
-
-必须得到：
-
-```text
-PetView("pet-1").agent_key == A.key
-PetView("pet-2").agent_key == B.key
-PetView("pet-3").agent_key == C.key
-
-pet-1.bubble.model.agent_key == A.key
-pet-2.bubble.model.agent_key == B.key
-pet-3.bubble.model.agent_key == C.key
-```
-
-用户动作：
-
-```text
-双击 pet-1 body
-→ PetView._on_double()
-→ on_activate(A.key)
-→ PetApp.activate_agent(A.key)
-→ Monitor.activate_target(A.key)
-→ TerminalWindowService.activate(A.key)
-→ A 对应 WindowIdentity
-```
-
-`pet-2`、`pet-3` 同理。
-
-任何一个 Pet 都不能通过 `PresentationController.focused_key` 替换自己的 key。
-
-### 8.2 Fleet 气泡
-
-气泡底行 hit target：
-
-```python
-HitTarget(
-    action="activate_agent",
-    agent_key=self.model.agent_key,
-)
-```
-
-因此：
-
-```text
-点击 pet-2 气泡
-→ exact B.key
-→ B 的 Terminal window
-```
-
-必须测试气泡的 `model.agent_key` 与 `view.agent_key` 一致。
-
-建议在 `PetView.set_single_model()` 增加 defensive invariant：
-
-```python
-if target is None:
-    ...
-else:
-    assert not self.agent_key or self.agent_key == target.key
-    m.agent_key = target.key
-```
-
-生产代码可以不用 Python `assert`，也可以检测不一致后清空 hit target，并记录安全诊断：
-
-```python
-if self.agent_key and self.agent_key != target.key:
-    m.agent_key = ""
-    ...
-```
-
-推荐测试保证永不发生即可，不在生产路径增加额外分支。
-
-### 8.3 Aggregate 模式
-
-当前 Aggregate 采用一个 Pet + 一个与单 Agent 一致的单卡气泡：
-
-```text
-focused Agent
-如果无 focused → attention Agent
-```
-
-这里不重新引入旧的多卡叠加 bubble。
-
-气泡显示谁：
-
-```text
-BubbleModel.agent_key 必须就是被显示 Agent 的 exact key
-```
-
-点击这个气泡：
-
-```text
-只激活 bubble.model.agent_key
-```
-
-不能在点击时重新计算 attention key。
-
-原因：
-
-从绘制到点击之间 Agent 状态可能变化；如果 click handler 临时重新取“当前最需要关注 Agent”，用户看到的是 Agent A，点击却可能跳到 Agent B。
-
-所以：
-
-```text
-visual identity == click identity
-```
-
-必须由 `BubbleModel.agent_key` 固化。
-
-### 8.4 Dashboard / Tray
-
-Dashboard Agent card：
-
-```text
-button closure captures key
-→ app.activate_agent(key)
-```
-
-Tray submenu：
-
-```text
-lambda k=key: app.activate_agent(k)
-```
-
-这些也不能走 `focused_key` 推导。
-
-### 8.5 是否修改 focused_key
-
-终端激活动作与 UI focus 是两个概念。
-
-推荐接口：
-
-```python
-def activate_agent(self, key: str) -> None:
-    # 只激活对应 Terminal window
-    ...
-
-def focus_and_activate_agent(self, key: str) -> None:
-    self.presentation.set_focus(key)
-    self.activate_agent(key)
-```
-
-使用规则：
-
-- Fleet pet body/bubble：`activate_agent(key)`，不必改变 global focused key。
-- Dashboard “查看并设为当前”类操作：可用 `focus_and_activate_agent(key)`。
-- Dashboard “打开终端”：仅 `activate_agent(key)`。
-- Tray Agent：仅 `activate_agent(key)`。
-
-这样一个 Fleet Pet 被点击时不会偷偷改变 aggregate/focused presentation 状态。
-
----
-
-## 9. `Monitor` 修复
-
-### 9.1 删除 manual binding API
-
-删除：
-
-```python
-Monitor.bind_focused_location()
-```
-
-删除对应日志：
-
-```text
-终端位置手动关联
-```
-
-### 9.2 新 activation 入口
-
-```python
-def activate_target(self, key: str) -> ActivationResult:
-    if not key:
-        return ActivationResult(NO_BINDING)
-
-    if not self.is_live_key(key):
-        return ActivationResult(AGENT_GONE)
-
-    return self._terminal_service.activate(
-        key,
-        is_agent_live=self.is_live_key,
+    confidence,
+    reason,
+    score=0,
+    runner_up=0,
+):
+    identity = self._identity(hwnd)
+
+    if identity is None:
+        return TerminalWindowBinding(
+            window=None,
+            title=(row.title if row else "")[:80],
+            confidence=confidence,
+            last_seen=now,
+            reason=reason + "·window-identity-failed",
+            score=score,
+            runner_up_score=runner_up,
+        )
+
+    return TerminalWindowBinding(
+        window=identity,
+        title=(row.title if row else "")[:80],
+        confidence=confidence,
+        last_seen=now,
+        validated_at=now,
+        reason=reason,
+        score=score,
+        runner_up_score=runner_up,
     )
 ```
 
-不需要先构造 `AgentTarget` 再交给 activator。
-
-### 9.3 binding 表拆分
-
-当前：
-
-```python
-self.bindings
-```
-
-建议改为两个表：
-
-```python
-self.window_bindings: dict[str, TerminalWindowBinding]
-self.terminal_observation_bindings: dict[str, TerminalObservationBinding]
-```
-
-`AgentTarget.terminal` 若 UI 仍需显示 window 诊断，可继续指 `TerminalWindowBinding`，但应重命名字段：
-
-```python
-AgentTarget.terminal_window
-```
-
-如果改动影响面过大，本轮可暂时保留 `terminal` 字段名，但其类型必须变成 `TerminalWindowBinding`，并删除所有 tab/pane 含义。
-
-推荐本轮直接改名，避免长期技术债。
-
-### 9.4 exit cleanup
-
-`_commit_exit()`：
-
-```python
-self.window_bindings.pop(key, None)
-self.terminal_observation_bindings.pop(key, None)
-self._terminal_service.drop_instance(key)
-```
-
-`drop_instance` 只清 runtime resolver cache，不再有 manual binding。
-
 ---
 
-## 10. Process Probe 与低功耗修复
+## 7. `TerminalObservationResolver` 保持 v4.1.2
 
-## 10.1 `windows_enabled=False` 真正停扫描
-
-当前问题：
-
-UI 关闭 Windows source 后 Monitor 虽然不展示 Windows instance，但 `ProcessProbeWorker` 仍周期调用 `scan_windows()`。
-
-修复：
-
-```python
-windows_enabled = bool(cfg_m.get("windows_enabled", True))
-
-if windows_enabled:
-    if due:
-        ...
-else:
-    with self._lock:
-        self._snapshot.pop("windows", None)
-    self._windows_cache = ()
-    self.windows_scan_ms = 0.0
-    self.windows_probe_error = ""
-```
-
-验收：
-
-```text
-windows_enabled=False
-运行 N 个 probe tick
-scan_windows mock call_count == 0
-```
-
-若运行中从 True → False：
-
-- source snapshot 清掉。
-- Monitor 下一轮按 `source-disabled` commit exit。
-- ExitWatcher unregister 对应 Windows Agent。
-- 不再继续扫描。
-
-从 False → True：
-
-- `_last_windows=0` 或检测 enable transition 后立即 scan。
-- 不需要重启 DeskPet。
-
-## 10.2 `WindowsExitWatcher` 空闲 INFINITE wait
-
-当前只有 control handle 时使用 200ms timeout。
-
-改为：
-
-```python
-WaitForMultipleObjects(1, arr, False, INFINITE)
-```
-
-因为：
-
-```text
-register → SetEvent(control)
-unregister → SetEvent(control)
-stop → SetEvent(control)
-```
-
-均会安全唤醒。
-
-验收：
-
-- 空集合时不调用 `time.sleep()`。
-- 不存在固定 200ms wake。
-- register 后能立即重建 wait set。
-- stop 能在 join timeout 内退出。
-
-## 10.3 exit event 顺序
-
-当前风险：
-
-```text
-copy instances
-→ drain exit event
-→ 后续仍使用旧 copy
-```
-
-改为：
-
-```text
-_merge_instances
-→ snapshot current instances for exit watcher registration
-→ register
-→ drain exit events
-→ 重新 snapshot instances
-→ session poll
-→ terminal observation
-→ state reduce
-```
-
-保证 `_commit_exit()` 后同一 tick 不再为已退出 Agent 重建 snapshot/binding。
-
----
-
-## 11. 动态配置与硬边界
-
-`Monitor._loop()` 不应只在进入循环前读取一次 `file_poll_sec`。
-
-改为：
-
-```python
-while not stop:
-    start = ...
-    _tick()
-    poll_sec = clamp(
-        config.get("monitor.file_poll_sec", 0.5),
-        0.2,
-        5.0,
-    )
-    wait(max(0.15, poll_sec - elapsed))
-```
-
-`Config.normalize()` 增加：
-
-```text
-windows_scan_sec        1.0 .. 60.0
-wsl_scan_sec            1.0 .. 120.0
-file_poll_sec           0.2 .. 5.0
-session_scan_sec        1.0 .. 60.0
-activity_grace_sec      1.0 .. 60.0
-active_file_window_sec  30  .. 3600
-```
-
-配置文件手改异常值也不能制造高频 loop。
-
----
-
-## 12. Presentation 修复
-
-### 12.1 selector reclaim origin bug
-
-当前 `_reclaim_slots()` 唯一匹配时：
-
-```python
-self._slot_bindings[slot_id] = candidates[0].key
-```
-
-但没有：
-
-```python
-self._slot_auto.add(slot_id)
-```
-
-导致 UI 可能把自动 reclaim 显示成“手动绑定”。
-
-修复：
-
-```python
-if len(candidates) == 1:
-    self._slot_bindings[slot_id] = candidates[0].key
-    self._slot_auto.add(slot_id)
-    self._slot_vacant_reason.pop(slot_id, None)
-```
-
-### 12.2 不要误删 Fleet 的“手动 slot 绑定”
-
-本计划删除的是：
-
-> 手动绑定 Agent 到 Terminal Tab/Pane。
-
-不是：
-
-> 用户选择某个 Agent 由哪一只桌宠展示。
-
-`PresentationController.bind_slot(slot_id, agent_key)` 是 UI presentation binding，不是 terminal binding，应保留。
-
-命名和文档应显式区分：
-
-```text
-Fleet slot assignment
-≠
-Terminal manual binding
-```
-
----
-
-## 13. UI 修复
-
-## 13.1 Dashboard
-
-删除：
-
-```text
-关联当前 Terminal 位置
-手工修复说明
-CONFIRMED/HIGH 后禁用修复按钮
-Tab ID
-Pane ID
-Manual origin
-exact Tab/Pane 帮助文案
-```
-
-“打开终端”帮助文字改为：
-
-> 打开该 Agent 所在的 Windows Terminal 窗口。DeskPet 不切换 Terminal 标签页、不发送键盘输入。若 Windows 阻止后台程序抢前台，会闪烁任务栏提醒。
-
-### 13.2 Activation toast
-
-`PetApp.activate_agent()`：
-
-```text
-OK
-→ 已打开该 Agent 所在的终端窗口
-
-FOREGROUND_DENIED
-→ Windows 未允许将终端置于前台，已闪烁任务栏提醒
-
-AGENT_GONE
-→ 该 Agent 已退出
-
-NO_BINDING
-→ 无法唯一确定该 Agent 所在的终端窗口
-
-STALE_WINDOW
-→ 原终端窗口已失效，重新识别后仍无法安全打开
-```
-
-删除：
-
-```text
-请关联当前 Terminal 位置
-已选中 exact tab
-UIA unavailable
-STALE_TAB
-STALE_PANE
-```
-
-### 13.3 普通诊断
+本轮不放宽 Observation。
 
 保留：
 
 ```text
-Agent key
-process PID/token
-source/distro
-session binding health
-Terminal HWND
-Terminal PID
-Terminal process create_time
-Terminal window class
-window resolve confidence/reason
-UIA observer available
-UIA events / dropped / visible reads
-parser health
+Windows native：CONFIRMED window + 该 window 当前只有一个 observed control
+→ Observation CONFIRMED
+
+其他情况：Agent ↔ exact ObservedTerminalControl 严格 mutual unique
+→ Observation HIGH
+
+否则不生成 binding
 ```
 
-不展示：
+重要不变量：
 
 ```text
-Tab RuntimeId
-Pane RuntimeId
-manual terminal location
-selected tab
+Window AMBIGUOUS + valid HWND
+≠ 自动获得 terminal text attribution
+
+Window NONE + sole-window HWND
+≠ 自动获得 terminal text attribution
 ```
+
+但 ObservationResolver 可以依据自己独立的 strict control evidence 得出 HIGH；这是允许的，因为依据不是低置信 Window binding。
 
 ---
 
-## 14. `terminal_service.py` 目标结构
+## 8. `agents/terminal_service.py`
 
-建议改成：
+### 8.1 `resolve()`
+
+改为：
 
 ```python
-class WindowsTerminalService:
-    def __init__(
-        self,
-        observer: TerminalObserver | None,
-        window_resolver: TerminalWindowResolver | None = None,
-        observation_resolver: TerminalObservationResolver | None = None,
-        cfg: dict | None = None,
-    ):
-        ...
+controls = self.observed_controls()
 
-    # lifecycle
-    def start(self) -> bool: ...
-    def stop(self) -> None: ...
-    def available(self) -> bool: ...
-    def startup_error(self) -> str: ...
+window_bindings = self.window_resolver.resolve(
+    list(instances),
+    controls,
+    now,
+)
 
-    # observation
-    def poll(self, now: float) -> None: ...
-    def refresh_observed_controls(self, force=False) -> bool: ...
-    def waiting_observation(self, control_id): ...
-    def activity_observation(self, control_id, now, grace): ...
-
-    # resolver
-    def resolve(
-        self,
-        instances: list[AgentInstance],
-        now: float,
-    ) -> tuple[
-        dict[str, TerminalWindowBinding],
-        dict[str, TerminalObservationBinding],
-    ]:
-        ...
-
-    def current_window_binding(
-        self,
-        agent_key: str,
-    ) -> TerminalWindowBinding | None:
-        ...
-
-    def observation_binding(
-        self,
-        agent_key: str,
-    ) -> TerminalObservationBinding | None:
-        ...
-
-    # user action
-    def activate(
-        self,
-        agent_key: str,
-        *,
-        is_agent_live: Callable[[str], bool],
-    ) -> ActivationResult:
-        ...
-
-    def drop_instance(self, agent_key: str) -> None:
-        ...
+observation_bindings = self.observation_resolver.resolve(
+    list(instances),
+    controls,
+    window_bindings,
+    now,
+    layout=self.layout(),
+)
 ```
 
-不再暴露 UIA backend 的 tab-control methods 给 Monitor/UI。
+结果：Window catalog 不依赖 UIA；UIA controls 只是 v3 WSL title hint。
+
+UIA unavailable：
+
+```text
+Windows native ancestor → 仍能绑定
+sole WT window → 仍能 NONE + window
+multiple WT + WSL + controls={} → 不猜，NONE + no window
+```
+
+### 8.2 `activate()` 不看 confidence
+
+必须只判断：
+
+```python
+binding = self._window_bindings.get(agent_key)
+if binding is None or binding.window is None:
+    return NO_BINDING
+```
+
+以下全部合法进入相同 activation：
+
+```text
+CONFIRMED + window
+HIGH + window
+AMBIGUOUS + window
+NONE + window
+```
+
+禁止任何：
+
+```python
+if binding.confidence not in (...):
+    return NO_BINDING
+```
+
+### 8.3 stale refresh
+
+保留 v4.1.2 的“一次刷新、一次 re-resolve”：
+
+```text
+validate false
+→ window_resolver.invalidate_window_cache()
+→ refresh_observed_controls(force=True)（可选增强，不作为 Window catalog 前提）
+→ resolve once
+→ Agent live check
+→ validate once
+→ success / STALE_WINDOW
+```
+
+不循环。
+
+### 8.4 UIA availability latch
+
+当前 `service.failed` 与 `backend.available` 有语义冲突。改为：
+
+```python
+def available(self):
+    backend = self.backend
+    return bool(
+        self.observer is not None
+        and backend is not None
+        and backend.available
+    )
+```
+
+startup failed 只能作为历史诊断，不能永久 gate 后续 ready 的 backend。
 
 ---
 
-## 15. `terminal_uia.py` 推荐拆分
+## 9. `actions/winkeys.py`
 
-当前文件过大，且观察与 exact navigation 混合。
-
-推荐本轮最小安全拆法：
+Terminal 继续保留 v4.1.2 原语：
 
 ```text
-terminal_uia.py
-  UiaBackend
-  ObservedTerminalControl
-  TerminalEvent
-  TerminalObserver
-  Recognizers
-  SubscriptionTracker
-
-terminal_resolver.py
-  TerminalWindowResolver
-  TerminalObservationResolver
-```
-
-如果为了控制 diff 暂不拆文件，也至少按 class 边界完全分离。
-
-`matching.py` 继续复用 `mutual_unique_matches()`，因为 session binding 也在用，不能因删除 TerminalResolver 直接删掉。
-
----
-
-## 16. `actions/winkeys.py` 计划
-
-不回退文件内容到 v3。
-
-保留 v4.1：
-
-```text
+enum_windows
 window_identity
 validate_window
 restore_window
 try_set_foreground
 flash_window
-monitor_work_area
-dpi_for_window
 ```
 
-删除任何只为 Tab/Pane activation 服务的注释。
+不恢复 v3 的 `raise_terminal(binding)` 业务封装。
 
-可补：
+### 9.1 `process_created` 必须 fail-closed
+
+当前只有 `expected_created > 0` 才比较，和注释“期望缺失即失败”不一致。
+
+改为：
 
 ```python
-@dataclass(frozen=True)
-class WindowActivation:
-    ok: bool
-    foreground_denied: bool = False
+if expected_created <= 0:
+    return False
+
+created = psutil.Process(pid).create_time()
+if abs(created - expected_created) > 0.5:
+    return False
 ```
 
-但不是必要。
-
-原则：
-
-> 行为回到 v3，安全校验保留 v4.1。
-
----
-
-## 17. Tray / 配置启动写盘优化
-
-当前 app 初始化若 `tray_enabled=True` 调 `start_tray()`，而 `start_tray()` 会再次保存 `tray_enabled=True`。
-
-改成：
-
-```python
-def _start_tray_runtime(self):
-    # 不写 config
-    ...
-
-def set_tray_enabled(self, enabled: bool):
-    if enabled:
-        self._start_tray_runtime()
-    else:
-        self._stop_tray_runtime()
-
-    config.set_and_commit("tray_enabled", enabled)
-```
-
-启动：
-
-```python
-if config.get("tray_enabled"):
-    self._start_tray_runtime()
-```
-
-减少无意义常驻启动写盘。
-
----
-
-## 18. Shutdown 生命周期
-
-给 `ProcessProbeWorker`：
-
-```python
-def stop(self):
-    self._stop.set()
-
-def join(self, timeout=2.0):
-    ...
-```
-
-Monitor：
-
-```python
-def stop(self):
-    self._stop.set()
-    self._probe.stop()
-
-    exit_watcher.stop()
-    terminal_service.stop()
-
-    if self._thread:
-        self._thread.join(timeout=...)
-
-    self._probe.join(timeout=...)
-```
-
-注意避免：
+完整验证条件：
 
 ```text
-Monitor thread join 自己
-UIA MTA thread 被 Tk thread 无限等待
-```
-
-所有 join 都必须有界。
-
----
-
-## 19. 测试重构
-
-## 19.1 删除错误产品语义测试
-
-从 `test_terminal_service.py / test_terminal_uia.py / test_ui.py` 删除：
-
-```text
-select exact tab
-selected tab verification
-selection pattern unavailable
-manual focused location
-manual binding lifecycle
-sole-pane rebind
-STALE_TAB
-STALE_PANE
-focus_pane
-```
-
-这些测试当前是在保护已经决定移除的行为。
-
-## 19.2 Window activation 单测
-
-新增 `tests/test_terminal_activation.py`：
-
-### A. Valid window
-
-```text
-live Agent
-+ valid WindowIdentity
-→ restore_window called once
-→ try_set_foreground called with exact hwnd
-→ OK
-```
-
-### B. UIA unavailable
-
-```text
-observer=None
-+ valid TerminalWindowBinding
-→ activation still OK
-```
-
-这是重要回归测试。
-
-### C. stale HWND
-
-```text
-validate_window=False
-→ resolve refresh once
-→ new valid binding
-→ OK(repaired=True)
-```
-
-### D. stale after retry
-
-```text
-first invalid
-refresh
-second invalid
-→ STALE_WINDOW
-```
-
-### E. foreground denied
-
-```text
-try_set_foreground=False
-→ flash_window exact hwnd
-→ FOREGROUND_DENIED
-```
-
-### F. no binding
-
-```text
-→ NO_BINDING
-→ no restore
-→ no foreground
-```
-
-### G. Agent exited
-
-```text
-is_agent_live=False
-→ AGENT_GONE
-→ no window action
-```
-
-### H. forbidden API regression
-
-静态搜索测试或 source inspection：
-
-```text
-terminal_service.py 不含 select_tab
-terminal_service.py 不含 focus_pane
-terminal_service.py 不含 SendInput
+IsWindow(hwnd)
+expected pid > 0
+actual pid == expected pid
+expected process_created > 0
+actual create_time ~= expected
+expected class != ""
+actual class == expected class
 ```
 
 ---
 
-## 20. 并发激活测试矩阵
+## 10. 新增 DeskPet Pet Z-order helper
 
-新增 `tests/test_concurrent_activation.py`。
-
-### 20.1 Fleet body
-
-构造：
-
-```text
-slot pet-1 -> A
-slot pet-2 -> B
-```
-
-触发：
-
-```text
-view1._on_double()
-```
-
-断言：
-
-```text
-on_activate == [A.key]
-```
-
-触发：
-
-```text
-view2._on_double()
-```
-
-断言：
-
-```text
-on_activate == [B.key]
-```
-
-绝不调用 `focused_key`。
-
-### 20.2 Fleet bubble
-
-构造：
-
-```text
-view1.bubble.model.agent_key = A.key
-view2.bubble.model.agent_key = B.key
-```
-
-命中底行：
-
-```text
-view1 bubble → A.key
-view2 bubble → B.key
-```
-
-### 20.3 binding/window independence
-
-构造：
-
-```text
-A.window.hwnd = 101
-B.window.hwnd = 202
-```
-
-点击 pet-1：
-
-```text
-try_set_foreground(101)
-not 202
-```
-
-点击 pet-2：
-
-```text
-try_set_foreground(202)
-not 101
-```
-
-这是本轮最关键的 end-to-end logical test。
-
-### 20.4 same Windows Terminal window
-
-允许：
-
-```text
-A → hwnd 101
-B → hwnd 101
-```
-
-因为用户要求回退到 window-level。
-
-此时点击两个不同 Pet 都会前置同一个 Terminal window，这是正确行为；DeskPet 不承诺自动切到 A/B 各自 Tab。
-
-测试必须明确记录这一语义，防止后续开发又把它当 bug 重引入 exact tab selection。
-
-### 20.5 Aggregate bubble race
-
-绘制时：
-
-```text
-bubble.model.agent_key = A.key
-```
-
-随后 attention 变成 B。
-
-用户点击原气泡：
-
-```text
-仍 activate(A.key)
-```
-
-不能重新按新 attention 选 B。
-
----
-
-## 21. Observation 测试
-
-继续保留：
-
-- Notification event 入队。
-- queue overflow 丢最旧。
-- delta truncation。
-- ring size bound。
-- visible read debounce。
-- global read budget。
-- approval TTL。
-- old visible approval 不无限 WAITING。
-- recognizer kind mismatch 不归属。
-- generic activity 不覆盖 structured session DONE/IDLE。
-- StructureChanged 后 controls refresh。
-- COM handler churn 不增长。
-
-删除所有 selected-tab topology assertions。
-
----
-
-## 22. Process / 生命周期测试
+Terminal foreground 与 DeskPet 自己的 Toplevel Z-order 必须分开。
 
 新增：
 
+```python
+def reassert_window_z_order(hwnd: int, *, topmost: bool) -> bool:
+    ...
+```
+
+Win32：
+
+```python
+HWND_TOP = 0
+HWND_TOPMOST = -1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+
+insert_after = HWND_TOPMOST if topmost else HWND_TOP
+flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)
+```
+
+只用于 DeskPet 自身 Pet Toplevel；Terminal 用户显式 action 仍使用 `SetForegroundWindow()`。
+
+不使用：
+
 ```text
-windows_enabled=False → scan_windows call_count == 0
-False→True → 下一 probe 周期立即 scan
-True→False → windows cache/source 清理
-
-ExitWatcher no entries → INFINITE wait contract
-register → control event wakes thread
-stop → control event wakes thread
-
-exit event in tick
-→ instance removed
-→ same tick watcher/terminal/state 不再处理旧 key
+focus_force
+grab_set
+SetForegroundWindow(Pet)
 ```
 
 ---
 
-## 23. 配置测试
+## 11. `pet/petwindow.py`：气泡改成真正双击
 
-新增 normalize：
+当前 `_on_press()` 命中气泡后立即 `on_click_button(tag)`，所以气泡现在实际是单击激活。
 
-```text
-file_poll_sec=-1 → 0.2
-file_poll_sec=999 → 5.0
-windows_scan_sec=0 → 1.0
-wsl_scan_sec=999 → 120
+### 11.1 callback
+
+建议改名：
+
+```python
+self.on_bubble_double = None
+self.on_body_double = None
 ```
 
-运行中改 `file_poll_sec`：
+### 11.2 `_on_press()`
 
-```text
-下一 loop 使用新值
+```python
+def _on_press(self, ev):
+    tag = self.hit_button(ev.x, ev.y)
+    if tag:
+        self._drag_off = None
+        return "break"
+
+    self._drag_off = (ev.x, ev.y)
 ```
 
-不要求重启。
+即：单击气泡不 activation，也不启动拖动。
+
+### 11.3 `_on_double()`
+
+```python
+def _on_double(self, ev):
+    self._drag_off = None
+
+    tag = self.hit_button(ev.x, ev.y)
+    if tag:
+        if self.on_bubble_double:
+            self.on_bubble_double(tag)
+        return "break"
+
+    if self.on_body_double:
+        self.on_body_double()
+    return "break"
+```
+
+一次 double-click 只能产生一次 activation callback。
 
 ---
 
-## 24. UI 测试
+## 12. `pet/bubble.py`
 
-确保普通界面不再存在字符串：
+`BubbleModel.agent_key` 和 `HitTarget` 保持 exact identity。
 
-```text
-关联当前 Terminal 位置
-STALE_TAB
-STALE_PANE
-精确 Tab
-精确 Pane
+推荐把整个 visible bubble rectangle 作为 double-click target，而不是只有 footer 小区域：
+
+```python
+if self.model.agent_key:
+    self._hit_boxes.append((
+        (ox, oy, x1, y1),
+        HitTarget(
+            action="activate_agent",
+            agent_key=self.model.agent_key,
+        ),
+    ))
 ```
 
-Help 文案必须出现：
+实际 action 仍只由 PetWindow 的 `<Double-Button-1>` handler 执行。
+
+禁止 double handler 现场重新读取 `attention_key/focused_key`。必须使用绘制时固化的 `BubbleModel.agent_key`，保证：
 
 ```text
-打开 Windows Terminal 窗口
-不切换标签页
-不发送键盘输入
+visual identity == click identity
 ```
-
-Fleet slot binding UI 仍保留，因为这是 Presentation 绑定。
 
 ---
 
-## 25. 手工 Windows 验收工具
+## 13. `pet/petview.py` 三模式规则
 
-废弃/重构 `tools/terminal_layout_probe.py`。
+当前 `PetViewManager.sync()` 的 body activation 规则已经符合需求，保留。
 
-新增：
-
-```text
-tools/terminal_window_probe.py
-```
-
-功能：
-
-```bash
-python tools/terminal_window_probe.py --list
-python tools/terminal_window_probe.py --validate <hwnd>
-python tools/terminal_window_probe.py --activate <hwnd>
-```
-
-输出只含：
+### SINGLE（非并发）
 
 ```text
-hwnd
-pid
-process_created
-class
-title
-valid
-foreground result
+bubble double → exact Agent Terminal
+body double   → exact Agent Terminal
 ```
 
-不输出 Terminal 可见文本。
-
-另保留一个 observation-only probe：
-
-```bash
-python tools/terminal_observer_probe.py
-```
-
-只显示：
+### AGGREGATE（并发单宠）
 
 ```text
-control count
-event count
-visible read count
-recognizer type/status
+bubble double → 当前绘制 Agent Terminal
+body double   → interact only
 ```
 
-默认不打印 terminal raw text。
-
-CI 不操作用户真实 Windows Terminal。
-
----
-
-## 26. README / SourceLink / plan 文档更新
-
-README 删除：
+### FLEET（并发多宠）
 
 ```text
-exact Window → Tab → Pane
-精确返回 Agent Tab/Pane
-手动关联 Terminal 位置
-gone_grace_sec 当前配置
-pinned 当前配置
-tests/uia_probe.py
+pet A bubble/body → Agent A
+pet B bubble/body → Agent B
 ```
 
-README 新增明确说明：
-
-> DeskPet 通过公共 Win32 API 恢复并尝试前置 Agent 所在的 Windows Terminal 顶层窗口，不切换既有标签页。Terminal UIA 只用于被动状态观察，不用于用户显式导航。
-
-`SourceLink.md` 更新官方依据。
-
-`v4plan.md` 标记 exact Tab/Pane 方案为 abandoned，不再作为当前实现要求。
-
-推荐本文件 `plan.md` 成为 v4.1.1 的唯一实施验收依据；修复完成后再同步 README/SourceLink。
-
----
-
-## 27. CI
-
-现有 Windows CI 保留：
+建议方法重命名：
 
 ```text
-compileall
-unittest discover
-monitor benchmark
-artifact upload
-```
-
-增加：
-
-```text
-terminal window activation logical tests
-concurrent activation tests
-source-disabled scan tests
-config runtime tests
-```
-
-删除/改正：
-
-```text
-tests/uia_probe.py
-```
-
-因为仓库当前没有这个文件。
-
-CI 注释改为：
-
-> 真实 Windows Terminal foreground policy / UIA event acceptance 为本机 manual acceptance；CI 只验证纯逻辑、Win32 调用契约 mock、资源边界和 UI dataflow。
-
----
-
-## 28. Benchmark 验收
-
-现有 Monitor benchmark 继续要求：
-
-```text
-event queue bounded
-UIA call queue bounded
-controls <= MAX_CONTROLS
-ring <= RING_MAX
-visible reads <= configured global budget
-dropped 在压力范围内
-resolver deterministic
-```
-
-新增 lightweight checks：
-
-```text
-windows disabled:
-  windows scan delta == 0
-
-idle ExitWatcher:
-  no polling timeout path
-
-N Fleet Pets:
-  still one Monitor
-  one UIA thread
-  one AnimationScheduler
-  one SharedAnimationCache
-```
-
-不设“每 Pet 一个线程”。
-
----
-
-## 29. 分阶段实施顺序
-
-### Phase A — Data contract cleanup
-
-修改：
-
-```text
-agents/models.py
-```
-
-完成：
-
-```text
-Window-only binding model
-observation-only binding model
-ActivationCode cleanup
-TabInfo/TerminalLocation removal
-```
-
-完成后全仓库修复类型错误，先不改 UI。
-
-### Phase B — UIA observer cleanup
-
-修改：
-
-```text
-agents/terminal_uia.py
-```
-
-完成：
-
-```text
-删除 Tab topology/control
-保留 TermControl observation
-保留 MTA/event/bounds
-```
-
-若拆文件：
-
-```text
-agents/terminal_resolver.py
-```
-
-### Phase C — Terminal service
-
-重写：
-
-```text
-agents/terminal_service.py
+PetView._on_double
+→ PetView._on_body_double
 ```
 
 实现：
 
-```text
-resolve window
-resolve observation control
-window-only activation
+```python
+def _on_body_double(self):
+    if not self.body_activates:
+        self._on_interact_cb()
+        return
+
+    if self.agent_key:
+        self._on_activate(self.agent_key)
+        return
+
+    if self._on_double_vacant:
+        self._on_double_vacant(self)
 ```
 
-完全删除 manual path。
+Window hook：
 
-### Phase D — Monitor
-
-修改：
-
-```text
-agents/monitor.py
+```python
+self.window.on_bubble_double = self._on_hit_tag
+self.window.on_body_double = self._on_body_double
 ```
 
-完成：
+---
+
+## 14. 并发 exact routing 不改变
+
+保留现有：
 
 ```text
-双 binding 表
-manual API 删除
-activation API
-exit tick 顺序
-windows_enabled gate
-dynamic file_poll
+PresentationState.slot_keys[slot_id]
+→ PetViewManager.sync()
+→ view.set_agent(exact key)
+→ BubbleModel.agent_key = target.key
 ```
 
-### Phase E — UI / concurrency
-
-修改：
+所有 Terminal wake：
 
 ```text
+exact agent_key
+→ PetApp.activate_agent(key)
+→ Monitor.activate_target(key)
+→ WindowsTerminalService.activate(key)
+→ _window_bindings[key]
+→ exact candidate HWND
+```
+
+不能通过 `focused_key` 替代 Fleet Pet 自己的 key。
+
+---
+
+## 15. Tray 左键消失修复
+
+当前：
+
+```python
+if ev == "left":
+    self.toggle_visible()
+```
+
+这会让已经 visible 的 Pet 被主动 hide。
+
+新增：
+
+```python
+def restore_pet_from_tray(self):
+    if self.pet_manager.any_visible():
+        self.pet_manager.reassert_visible_windows()
+    else:
+        self.pet_manager.show_all()
+        self.root.after_idle(self.pet_manager.reassert_visible_windows)
+```
+
+`_poll_tray_events()`：
+
+```python
+if ev == "left":
+    self.restore_pet_from_tray()
+```
+
+右键菜单的显式“显示/隐藏桌宠”仍可以使用 `toggle_visible()`。
+
+Tooltip 改成：
+
+```text
+DeskPet - 左键显示桌宠，右键菜单
+```
+
+---
+
+## 16. `PetViewManager.reassert_visible_windows()`
+
+新增：
+
+```python
+def reassert_visible_windows(self):
+    for view in self.views.values():
+        if view.hidden:
+            continue
+        view.window.reassert_z_order()
+```
+
+必须使用 `view.hidden` 表示用户逻辑 hidden intent，不使用 `winfo_viewable()` 决定是否应该重新显示。
+
+---
+
+## 17. `PetWindow.reassert_z_order()`
+
+新增：
+
+```python
+def reassert_z_order(self):
+    if not self.root.winfo_exists():
+        return False
+
+    self.root.update_idletasks()
+    hwnd = int(self.root.winfo_id())
+
+    return winkeys.reassert_window_z_order(
+        hwnd,
+        topmost=bool(self.config.get("topmost", True)),
+    )
+```
+
+非 Windows 测试环境可 fallback `root.lift()`。
+
+同时修当前：
+
+```python
+def set_topmost(self, flag):
+    self._apply_topmost()
+```
+
+参数未直接生效的问题。改为：
+
+```python
+def set_topmost(self, flag):
+    self.root.attributes("-topmost", bool(flag))
+```
+
+---
+
+## 18. Dashboard 打开不改变 Pet hidden state
+
+当前 `open_dashboard()` 没有显式调用 `hide_pet()`；修复策略不是强制 `show_all()`，而是恢复原本 visible Pet 的 Z-order。
+
+改为：
+
+```python
+def open_dashboard(self):
+    if self.dashboard is None or not self.dashboard.winfo_exists():
+        self.dashboard = Dashboard(self)
+
+    self.dashboard.open()
+    self.root.after_idle(self.pet_manager.reassert_visible_windows)
+```
+
+效果：
+
+```text
+原本 visible Pet → Dashboard 打开后仍 visible，并重新声明 Z-order
+原本 view.hidden=True → 不 show、不 reassert
+```
+
+---
+
+## 19. Dashboard refresh 生命周期
+
+当前 `_refresh_once()` 永久 `after(500)`，withdrawn 后仍 `after(1000)`，且没有保存/cancel ID；这会造成隐藏 Dashboard 周期唤醒和 destroy 后 Tcl callback。
+
+新增：
+
+```python
+self._refresh_after = None
+self._closing = False
+```
+
+### `open()`
+
+```python
+def open(self):
+    self.deiconify()
+    self.lift()
+    self.start_refresh()
+```
+
+### `start_refresh()` / `_refresh_tick()`
+
+```python
+def start_refresh(self):
+    if self._refresh_after is None:
+        self._refresh_tick()
+
+
+def _refresh_tick(self):
+    self._refresh_after = None
+    if self._closing or not self.winfo_exists():
+        return
+    if self.state() == "withdrawn":
+        return  # hidden 时完全停止
+
+    # 当前各页 refresh
+    ...
+
+    self._refresh_after = self.after(500, self._refresh_tick)
+```
+
+### `hide_dashboard()`
+
+```python
+def hide_dashboard(self):
+    self.stop_refresh()
+    self.withdraw()
+```
+
+### `stop_refresh()`
+
+```python
+def stop_refresh(self):
+    callback = self._refresh_after
+    self._refresh_after = None
+    if callback is not None:
+        try:
+            self.after_cancel(callback)
+        except tk.TclError:
+            pass
+```
+
+### `shutdown()`
+
+```python
+def shutdown(self):
+    self._closing = True
+    self.stop_refresh()
+    self.destroy()
+```
+
+`WM_DELETE_WINDOW` 改绑定 `hide_dashboard`。
+
+`PetApp.quit()` 在 root destroy 前调用 `dashboard.shutdown()`。
+
+---
+
+## 20. Dashboard Terminal action 统一
+
+当前 Dashboard `_open_terminal()` 直接调用 `monitor.activate_target()` 并复制 toast。
+
+改成：
+
+```python
+def _open_terminal(self, key):
+    if key:
+        self.app.activate_agent(key)
+```
+
+所有 UI 最终统一：
+
+```text
+Pet body / Bubble / Tray Agent / Dashboard Agent / Fleet menu
+→ PetApp.activate_agent(exact key)
+```
+
+---
+
+## 21. Activation toast
+
+普通用户不需要知道 binding confidence。
+
+建议：
+
+```text
+OK:
+  已打开该 Agent 的终端窗口
+
+FOREGROUND_DENIED:
+  Windows 未允许将终端置于前台，已闪烁任务栏提醒
+
+AGENT_GONE:
+  该 Agent 已退出
+
+NO_BINDING:
+  未能定位该 Agent 的终端窗口
+
+STALE_WINDOW:
+  原终端窗口已失效，重新识别后仍无法安全打开
+```
+
+不再把 AMBIGUOUS 自动翻译为“无法打开”。
+
+---
+
+## 22. Dashboard Terminal 诊断
+
+删除 FALLBACK label。
+
+展示规则：
+
+```text
+CONFIRMED + window
+→ 已确认
+
+HIGH + window
+→ 高置信
+
+AMBIGUOUS + window
+→ 候选窗口（可唤起）
+→ 证据不足以直接授予 Terminal observation attribution
+
+NONE + window + reason=single-window-fallback
+→ 唯一 Terminal 窗口兜底（可唤起）
+→ 不作为审批归属依据
+
+window=None
+→ 未定位
+```
+
+普通 Agents 列表只显示“可打开/未定位”；confidence 放高级诊断。
+
+---
+
+## 23. Monitor 保持简单
+
+`Monitor.activate_target(key)` 不检查 confidence：
+
+```python
+if not key:
+    return NO_BINDING
+if not self.is_live_key(key):
+    return AGENT_GONE
+return self._terminal_service.activate(key, is_agent_live=self.is_live_key)
+```
+
+Terminal Observation 继续只使用 `observation_bindings[key]`，不得重新拿 Window confidence 判断 WAITING。
+
+---
+
+## 24. v4.1.2 已经做对、禁止回退的部分
+
+保持：
+
+```text
+SourceProbeSnapshot authoritative 三态
+Windows process incarnation
+WSL process token
+WindowsExitWatcher
+windows_enabled=False 真停扫
+ExitWatcher idle INFINITE wait
+exit drain 后同 tick 重新 snapshot
+dynamic file_poll_sec
+monitor config hard clamp
+StateReducer structured session priority
+UIA MTA thread
+Notification/TextChanged/StructureChanged
+bounded queues/rings/visible read budget
+approval TTL
+SharedAnimationCache
+single AnimationScheduler
+Fleet exact slot→Agent routing
+Presentation focused/attention 分离
+Tray runtime start 不重复写配置
+```
+
+---
+
+## 25. 测试：Terminal resolver
+
+建议新增 `tests/test_terminal_window_resolver.py`，把 Window candidate 语义从 UIA recognizer tests 中分开。
+
+必须覆盖：
+
+1. Windows native unique ancestor → `CONFIRMED + hwnd`。
+2. native unique window + 多 controls → 仍 `CONFIRMED + hwnd`。
+3. native multi-window ancestor → `AMBIGUOUS + window=None`。
+4. WSL mutual unique → `HIGH + hwnd`。
+5. WSL positive but non-unique → `AMBIGUOUS + hwnd`。**这是 v4.1.3 发布阻断测试。**
+6. 只命中低分 `user@`、存在 best positive control → `AMBIGUOUS + hwnd`，保持 v3 行为。
+7. no evidence + sole WT window → `NONE + hwnd`，`reason=single-window-fallback`。
+8. no evidence + multiple WT windows → `NONE + window=None`。
+9. no WT window → `NONE + window=None`。
+10. resolver 输出顺序与 Agent 输入顺序无关。
+
+测试 identity 必须注入非零 `process_created`，不再构造 `process_created=0` 的假生产 binding。
+
+---
+
+## 26. 测试：Activation 不看 confidence
+
+修改 `tests/test_terminal_activation.py`：
+
+```text
+CONFIRMED + valid window → OK
+HIGH      + valid window → OK
+AMBIGUOUS + valid window → OK
+NONE      + valid window → OK
+```
+
+删除 FALLBACK test。
+
+继续覆盖：
+
+```text
+window=None → NO_BINDING
+Agent dead → AGENT_GONE
+stale → refresh exactly once
+foreground denied → flash exact HWND
+```
+
+增加源检查，防止未来重新写 confidence gate。
+
+---
+
+## 27. 测试：WindowIdentity
+
+新增：
+
+```text
+process_created == 0 → validate False
+wrong pid             → False
+wrong class           → False
+wrong create_time     → False
+invalid hwnd          → False
+all match             → True
+```
+
+---
+
+## 28. 测试：Observation 不被 Window wake 放宽
+
+必须覆盖：
+
+```text
+Window AMBIGUOUS + hwnd
++ 多 control 无 strict evidence
+→ 无 TerminalObservationBinding
+```
+
+```text
+Window NONE + sole-window hwnd
++ generic profile title
+→ 无 TerminalObservationBinding
+```
+
+同时保留 Observation 自己 strict HIGH 的正向测试。
+
+---
+
+## 29. 测试：三种桌宠模式
+
+完整矩阵：
+
+| Mode | Bubble single | Bubble double | Body double |
+|---|---|---|---|
+| SINGLE | no action | exact Agent activate | exact Agent activate |
+| AGGREGATE | no action | drawn exact Agent activate | interact only |
+| FLEET | no action | own exact Agent activate | own exact Agent activate |
+
+额外：
+
+```text
+一次 bubble double-click → activation_count == 1
+Aggregate 绘制 A 后 attention 变 B → 点击仍 activate A
+Fleet pet-1 / pet-2 分别保持 own key
+```
+
+---
+
+## 30. 测试：Tray / Dashboard visibility
+
+必须新增：
+
+```text
+Pet visible + tray left
+→ 仍 visible
+→ reassert called
+
+all Pet hidden + tray left
+→ show_all
+
+explicit tray menu hide
+→ 仍可以隐藏
+
+Pet visible + open_dashboard
+→ logical hidden 仍 False
+→ reassert visible window
+
+Fleet pet1 visible / pet2 hidden + open_dashboard
+→ pet1 reassert
+→ pet2 不 show
+
+Dashboard withdraw
+→ _refresh_after is None
+
+Dashboard reopen
+→ refresh timer restart
+
+Dashboard shutdown/root destroy
+→ 无 invalid command Tcl callback
+```
+
+---
+
+## 31. CI ResourceWarning 清理
+
+测试中 `Popen` cleanup 统一：
+
+```python
+def terminate_process(proc):
+    if proc.poll() is None:
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+```
+
+目标：
+
+```text
+unit tests PASS
+benchmark PASS
+stderr 无 subprocess ResourceWarning
+stderr 无 Tcl invalid command name
+```
+
+---
+
+## 32. 资源预算
+
+v4.1.3 不新增常驻线程，不新增轮询。
+
+保持：
+
+```text
+Tk UI
+Monitor core
+Process probe
+UIA MTA
+Windows ExitWatcher
+Tray Win32 thread（启用时）
+```
+
+Z-order reassert 只发生在：
+
+```text
+Tray left recovery
+Dashboard open
+explicit show
+```
+
+Dashboard withdrawn 时 0 refresh timer。
+
+---
+
+## 33. 文件级修改清单
+
+### 必改
+
+```text
+agents/models.py
+agents/terminal_resolver.py
+agents/terminal_service.py
+actions/winkeys.py
+
+pet/bubble.py
+pet/petwindow.py
+pet/petview.py
 pet/app.py
 pet/dashboard.py
-pet/petview.py
-pet/bubble.py
-pet/presentation.py
-```
 
-确认：
+ tests/test_terminal_activation.py
+ tests/test_terminal_uia.py 或新增 test_terminal_window_resolver.py
+ tests/test_concurrent_activation.py
+ tests/test_ui.py
+ tests/test_ui_regressions.py
+ tests/test_process_watch.py
 
-```text
-Fleet Pet body exact key
-Fleet bubble exact key
-Aggregate bubble visual key
-Dashboard exact key
-Tray exact key
-```
-
-同时修 selector reclaim origin。
-
-### Phase F — resource lifecycle
-
-修改：
-
-```text
-agents/process_watch.py
-pet/config.py
-pet/app.py
-```
-
-完成：
-
-```text
-INFINITE idle wait
-config clamp
-tray startup no redundant save
-thread join
-```
-
-### Phase G — tests/tools/docs
-
-删除旧 exact tests，新增 window-only + concurrency tests。
-
-更新：
-
-```text
 README.md
 SourceLink.md
-v4plan.md
-.github/workflows/test.yml
-tools/*
+plan.md
 ```
 
-### Phase H — final dead-code audit
+### 原则上不改
 
-全仓库搜索必须无产品路径残留：
+```text
+agents/state.py
+agents/discovery.py
+Agent session parsers
+pet/presentation.py（除测试发现真实 bug）
+pet/animator.py
+```
+
+---
+
+## 34. 全仓 dead-code gate
+
+产品代码必须无：
 
 ```text
 TerminalLocation
+TabInfo
+bind_focused_pane
 bind_focused_location
-set_manual_location
 manual_location
+set_manual_location
+set_manual_binding
+focused_location
 select_tab
 selected_tab
 focus_pane
+SelectionItemPattern
 STALE_TAB
 STALE_PANE
-关联当前 Terminal 位置
+BEST_EFFORT
+WindowBindingConfidence.FALLBACK
 ```
 
-允许出现这些词的唯一位置：
+输入注入必须无：
 
 ```text
-历史迁移文档 / changelog / abandoned design 说明
+SendInput
+keybd_event
+SendKeys
+PostMessage 模拟按键
+clipboard injection
+Ctrl+Tab 自动切 tab
 ```
 
-当前产品代码和测试不得依赖。
+---
+
+## 35. 文档同步
+
+README / SourceLink 必须明确：
+
+> DeskPet 的 Terminal window wake 使用 v3-compatible 被动 heuristic：Windows native 优先使用进程祖先关系；WSL 使用当前可观察 TermControl 标题做 kind/cwd/user/distro 评分。高置信匹配失败但仍有一个 v3 best-positive control 时，DeskPet 可以把它所属的顶层 Terminal window 作为用户显式唤起候选；这不会自动授予 Terminal text/approval attribution。DeskPet 不切换 Tab/Pane，也不发送键盘输入。
+
+交互写明：
+
+```text
+非并发 SINGLE：双击桌宠或气泡 → Terminal
+并发 AGGREGATE：双击气泡 → Terminal；双击桌宠 → 互动
+并发 FLEET：双击各自桌宠或气泡 → 各自 Agent Terminal
+```
+
+Tray：
+
+```text
+左键显示/恢复桌宠
+右键菜单
+```
+
+同步清理 README 中旧 `config_version:3`、已删除 `gone_grace_sec` 等陈旧说明。
 
 ---
 
-## 30. 最终 Definition of Done
+## 36. 推荐实施顺序
 
-本轮只有同时满足以下条件才算完成：
-
-1. 用户无法手工绑定 Terminal Tab/Pane。
-2. 产品代码没有 manual terminal location runtime chain。
-3. “打开终端”不依赖 UIA。
-4. “打开终端”不依赖 Tab/Pane。
-5. 有效 WindowIdentity 可通过 v3 风格 restore + foreground 唤起。
-6. OS 拒绝 foreground 时只 Flash，不绕过系统 policy。
-7. stale HWND/PID incarnation fail-closed。
-8. WSL 多窗口无法唯一定位时不猜。
-9. 唯一 Terminal window fallback 可以唤起，但不赋予 terminal evidence attribution。
-10. UIA observer 继续识别 WAITING/approval。
-11. Terminal observation 不安全时不归属具体 Agent。
-12. Fleet 模式每只 Pet 双击都使用自己的 exact `agent_key`。
-13. Fleet 模式每只气泡点击都使用自己的 exact `agent_key`。
-14. 不同 Agent 若映射到不同 HWND，分别打开各自 HWND。
-15. 不同 Agent 若恰好同属一个 Terminal window，则都打开同一 window，且不尝试自动切 Tab。
-16. Aggregate 气泡使用绘制时固化的 exact key，不按点击瞬间 attention 重新选 Agent。
-17. Dashboard / Tray 所有 Agent action 捕获 exact key。
-18. `windows_enabled=False` 真正停止 Windows process scan。
-19. ExitWatcher 无 Agent 时为真正 blocking wait。
-20. `file_poll_sec` 运行时修改实际生效。
-21. monitor 配置有代码级 clamp。
-22. exit event 后同 tick 不再处理 stale instance。
-23. Fleet selector reclaim 正确标记 auto。
-24. 启动 Tray 不无条件重写 config。
-25. shutdown thread 生命周期有界。
-26. README/SourceLink/CI 与新合同一致。
-27. Windows unit tests 全绿。
-28. Monitor benchmark 继续满足原资源预算。
-29. 不新增 hook/config requirement。
-30. 不新增输入注入或审批自动执行能力。
+1. `models.py` 删除 FALLBACK，明确 confidence != wakeability。
+2. `terminal_resolver.py` 恢复 v3 candidate selection。
+3. 所有候选 HWND 统一 `window_identity()`。
+4. 修 `validate_window(process_created<=0)`。
+5. 更新 Terminal resolver/activation tests，先确认 v3 wake 语义。
+6. 确认 Observation tests 不退步。
+7. 改 `PetWindow` single/double event routing。
+8. 固化 SINGLE / AGGREGATE / FLEET matrix。
+9. Tray left 改为 restore/show。
+10. 增加 Pet no-activate Z-order reassert。
+11. Dashboard refresh lifecycle 重构。
+12. Dashboard Terminal action 统一走 `PetApp.activate_agent()`。
+13. 修 UIA availability latch。
+14. 清 subprocess/Tcl CI warnings。
+15. README / SourceLink / plan 同步。
+16. 全仓 forbidden search。
+17. Windows CI + benchmark。
+18. Windows 实机 probe + 三模式交互验收。
 
 ---
 
-## 31. 外部实现依据
+## 37. 推荐提交拆分
 
-### Microsoft Win32
+```text
+Commit 1: v4.1.3 terminal v3 wake semantics
+  models / resolver / service / winkeys / terminal tests
 
-SetForegroundWindow  
+Commit 2: v4.1.3 double-click interaction
+  bubble / petwindow / petview / interaction tests
+
+Commit 3: v4.1.3 tray dashboard visibility
+  SetWindowPos helper / app / dashboard / visibility tests
+
+Commit 4: v4.1.3 lifecycle cleanup
+  UIA availability / subprocess cleanup / Tcl lifecycle
+
+Commit 5: v4.1.3 docs and acceptance
+  README / SourceLink / plan / CI comments
+```
+
+---
+
+## 38. 实机验收
+
+保留 `tools/terminal_window_probe.py`：
+
+```bat
+python tools\terminal_window_probe.py --list
+python tools\terminal_window_probe.py --validate <HWND>
+python tools\terminal_window_probe.py --activate <HWND>
+```
+
+建议增加：
+
+```bat
+python tools\terminal_window_probe.py --resolve
+```
+
+只输出非敏感诊断：
+
+```text
+agent kind/source/project basename
+binding confidence/reason
+hwnd
+window pid/create_time/class
+valid
+```
+
+禁止输出 Terminal raw visible text。
+
+实机判断：
+
+```text
+resolver 有 hwnd + probe activate 成功 + DeskPet 不成功
+→ activation 链问题
+
+resolver 无 hwnd
+→ candidate selection 问题
+
+validate false
+→ WindowIdentity 问题
+
+validate true + FOREGROUND_DENIED
+→ Windows foreground policy，Flash 即正确 fallback
+```
+
+---
+
+## 39. Definition of Done
+
+### Terminal
+
+- [ ] native unique ancestor → CONFIRMED + WindowIdentity
+- [ ] native unique ancestor 不受 control 数量影响
+- [ ] WSL mutual unique → HIGH + WindowIdentity
+- [ ] WSL best-positive non-unique → AMBIGUOUS + WindowIdentity
+- [ ] sole WT / no evidence → NONE + WindowIdentity
+- [ ] multiple WT / no evidence → NONE + window=None
+- [ ] activation 不以 confidence 作为 gate
+- [ ] AMBIGUOUS + valid window 能打开
+- [ ] NONE + valid sole window 能打开
+- [ ] process_created<=0 fail-closed
+- [ ] stale 只 retry 一次
+- [ ] foreground denied 只 Flash
+
+### Observation
+
+- [ ] AMBIGUOUS window 不直接授予 observation
+- [ ] NONE fallback 不直接授予 observation
+- [ ] strict CONFIRMED/HIGH observation 正常
+- [ ] UIA MTA / TTL / read budget 不回归
+
+### UI interaction
+
+- [ ] SINGLE：bubble double ✓ / body double ✓
+- [ ] AGGREGATE：bubble double ✓ / body double=互动
+- [ ] FLEET：每只 bubble/body double → own exact Agent
+- [ ] bubble single 不 activation
+- [ ] 一次 double 只触发一次 activation
+- [ ] Aggregate 使用绘制时 exact key
+
+### Tray / Dashboard
+
+- [ ] Tray left 不隐藏 visible Pet
+- [ ] Tray left 能恢复 all-hidden Pet
+- [ ] 右键菜单仍可显式 hide
+- [ ] Dashboard open 不改变 logical hidden
+- [ ] visible Pet reassert Z-order
+- [ ] hidden Fleet Pet 不被恢复
+- [ ] Dashboard withdrawn 无 refresh timer
+- [ ] 无 callback-after-destroy
+
+### Resources / CI
+
+- [ ] 不新增线程
+- [ ] 不新增轮询
+- [ ] windows source off 真停扫
+- [ ] ExitWatcher idle INFINITE
+- [ ] benchmark 全绿
+- [ ] tests 全绿
+- [ ] 无 subprocess ResourceWarning
+- [ ] 无 Tcl invalid command
+
+### Clean-up
+
+- [ ] 无 FALLBACK
+- [ ] 无 BEST_EFFORT
+- [ ] 无 manual Terminal binding
+- [ ] 无 Tab/Pane activation
+- [ ] 无输入注入
+- [ ] README / SourceLink / plan 与 v4.1.3 一致
+
+---
+
+## 40. 官方实现依据
+
+### Windows foreground
+
+Microsoft `SetForegroundWindow`  
 https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow
 
-核心约束：
+- 用户显式 Terminal activation 使用 HWND。
+- Windows 可以拒绝后台进程抢 foreground。
+- DeskPet 不通过键盘/输入注入绕过；拒绝时 `FlashWindowEx`。
 
-- API 接收顶层 `HWND`。
-- Windows 限制哪些进程能够抢到 foreground。
-- DeskPet 必须接受调用被拒，不能通过输入注入绕过。
+### DeskPet Pet Z-order
 
-WaitForMultipleObjects  
-https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects
+Microsoft `SetWindowPos`  
+https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos
 
-核心约束：
+- `SWP_NOACTIVATE` 可改变 Z-order 而不激活窗口。
+- 用于 Dashboard 打开后恢复 Pet Toplevel 层级。
+- 不用于 Terminal foreground activation。
 
-- 可等待 Event / Process 等 waitable handle。
-- `INFINITE` 可用于直到对象 signal。
-- 当前 ExitWatcher control event 足以安全唤醒 register/unregister/stop。
+### UI Automation threading
 
-### Microsoft UI Automation
-
-Understanding Threading Issues  
+Microsoft `Understanding Threading Issues`  
 https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading
 
-核心约束：
+- desktop-wide UIA 在独立线程。
+- UIA thread 不拥有窗口。
+- COM MTA。
+- event handler add/remove 同一非 UI/MTA thread。
 
-- desktop-wide UIA client 应把 UIA 调用放到独立线程。
-- 线程不应拥有窗口。
-- 建议 COM MTA。
-- add/remove event handler 应在同一个非 UI/MTA thread。
+v4.1.2 当前架构符合，v4.1.3 不改变。
 
-IUIAutomationTextPattern::GetVisibleRanges  
-https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationtextpattern-getvisibleranges
+### Windows Terminal exact tab 限制
 
-核心约束：
-
-- 读取当前可见 text ranges。
-- 继续用于 DeskPet approval fallback，避免扫描完整 scrollback。
-
-### Windows Terminal
-
-Feature Request: Focus/Activate Tab by WT_SESSION (#19783)  
+Windows Terminal issue #19783  
 https://github.com/microsoft/terminal/issues/19783
 
-该 issue 明确描述：
-
-- 外部进程目前没有稳定的按 `WT_SESSION` 激活既有 Terminal Tab 的接口。
-- UI Automation Tab title / SelectionItemPattern 是 fragile workaround。
-- DeskPet 因此不再把 exact existing Tab activation 作为可靠产品合同。
+上游明确没有稳定公开的外部 `WT_SESSION → existing tab focus` API；UIA Tab title + `SelectionItemPattern.Select()` 和 keyboard simulation 都属于 fragile workaround。因此 v4.1.3 继续只承诺顶层 Window wake。
 
 ---
 
-## 32. 最终架构一句话
+## 41. 最终架构合同
 
-修复后的 DeskPet 应当是：
+```text
+Process Discovery
+    ↓
+exact AgentInstance / agent_key
+    ↓
+Session Observation ───────────────┐
+                                   │
+Terminal UIA Observation ──────────┼→ StateReducer → Snapshot
+    │                              │
+    └→ strict control attribution ─┘
 
-> **Process/Session/UIA 被动观察负责“Agent 现在在做什么”，Window Resolver 只负责“Agent 大概在哪个 Windows Terminal 顶层窗口”，Presentation 负责“哪个桌宠/气泡代表哪个 exact Agent”，而用户点击始终沿 exact `agent_key` 唤起那个 Agent 的 Terminal window；三条职责不再通过 Tab/Pane 或手工绑定互相耦合。**
+exact agent_key
+    ↓
+v3-compatible Window candidate selection
+    ↓
+TerminalWindowBinding
+    ↓
+WindowIdentity
+    ↓
+用户双击
+    ↓
+validate
+    ↓
+restore + SetForegroundWindow
+    ↓
+denied → Flash
+```
 
-这就是 v4.1.1 的最终收敛目标。
+UI：
+
+```text
+SINGLE:
+    bubble double → exact Agent → Terminal
+    body double   → exact Agent → Terminal
+
+AGGREGATE:
+    bubble double → drawn exact Agent → Terminal
+    body double   → interact
+
+FLEET:
+    pet A bubble/body → Agent A → Terminal candidate A
+    pet B bubble/body → Agent B → Terminal candidate B
+```
+
+Visibility：
+
+```text
+Tray left
+→ show/recover
+→ never hide an already visible Pet
+
+Dashboard open
+→ dashboard lift
+→ visible Pets SetWindowPos(... SWP_NOACTIVATE)
+→ no logical hidden mutation
+```
+
+---
+
+## 42. 一句话验收标准
+
+> **v4.1.3 必须恢复 v3 的“只要被动 resolver 能给出一个候选 Terminal HWND，用户就可以显式尝试把它唤起”的体验，同时继续使用 v4.1.2 的强 `WindowIdentity` 和严格 Terminal observation attribution；并把交互固定为 SINGLE/FLEET 气泡与 body 均双击唤起、AGGREGATE 仅气泡双击唤起，Tray/Dashboard 不再意外隐藏桌宠。**

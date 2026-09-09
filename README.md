@@ -1,10 +1,10 @@
-# DeskPet V4.1.2 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
+# DeskPet V4.1.3 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
 
 一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
 
 DeskPet 不创建、不托管、不控制任何 Agent：不配置 hooks、不注入进程、不发送键盘事件、不自动审批。
 
-**终端唤起语义（V4.1.2 收敛）**：DeskPet 通过公共 Win32 API 恢复并尝试前置 Agent 所在的 Windows Terminal 顶层窗口，**不切换既有标签页**。Terminal UIA 只用于被动状态观察，不用于用户显式导航——Windows Terminal 目前没有稳定的公开"按 `WT_SESSION` 激活既有标签页"接口（[microsoft/terminal#19783](https://github.com/microsoft/terminal/issues/19783)，closed/not_planned），UIA Tab 选择是 fragile workaround，不再作为产品承诺。
+**终端唤起语义（V4.1.3，v3-compatible 被动 heuristic）**：DeskPet 的 Terminal window wake 使用被动启发式——Windows native 优先使用进程祖先关系；WSL 使用当前可观察 TermControl 标题做 kind/cwd/user/distro 评分。高置信匹配失败但仍有一个 v3 best-positive control 时，DeskPet 可以把它所属的顶层 Terminal window 作为用户显式唤起候选；这不会自动授予 Terminal text/approval attribution。DeskPet 不切换 Tab/Pane，也不发送键盘输入。Windows Terminal 目前没有稳定的公开"按 `WT_SESSION` 激活既有标签页"接口（[microsoft/terminal#19783](https://github.com/microsoft/terminal/issues/19783)，closed/not_planned），因此只承诺 window 级唤起；候选窗口经 `WindowIdentity`（HWND+PID+进程创建时间+窗口类）校验后才动作，OS 拒绝抢前台时闪烁任务栏提醒，绝不绕过。
 
 V4.1 的能力概览：
 
@@ -30,7 +30,13 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 桌宠动画 + 气泡（Codex · Plan · 编码中 / 目标 / 当前活动）
 ```
 
-等待审批时气泡提示"请在终端处理"；双击桌宠（或点击气泡底行/仪表盘卡片/托盘菜单项）唤起该 Agent 所在的 Windows Terminal 窗口（聚合模式下桌宠身体只用于互动，点击气泡底行激活）。
+等待审批时气泡提示"请在终端处理"。**交互（V4.1.3 固定三种模式，均为双击）**：
+
+- 非并发 SINGLE：双击桌宠或气泡 → 唤起该 Agent 的 Terminal 窗口
+- 并发 AGGREGATE（单宠聚合）：双击气泡 → 唤起当前绘制 Agent 的 Terminal；双击桌宠 → 只互动
+- 并发 FLEET（多宠分离）：双击各自的桌宠或气泡 → 唤起各自 Agent 的 Terminal
+
+气泡/桌宠单击不激活。仪表盘卡片"打开终端"按钮与托盘 Agents 子菜单同样按 exact agent_key 唤起。托盘左键 = 显示/恢复桌宠（绝不隐藏已可见的桌宠），右键 = 完整菜单。
 
 ## 功能
 
@@ -38,8 +44,8 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 - **语义化状态气泡**：`Agent · Mode · Phase` + Goal（≤120 字）+ 当前活动摘要（≤160 字，本地规则压缩，不调用 LLM）
 - **等待审批检测**：Kimi 来自 wire `ApprovalRequest`（精确）；Codex/Claude 来自 Windows Terminal UIA 当前可见审批 UI（高置信 + 1.5s TTL 复检）——**静默永远不被推断为等待审批**
 - **多 Agent**：自动跟随（WAITING > INPUT > ERROR > WORKING …，工作中粘性），或并发模式（单宠聚合/多宠分离）
-- **仪表盘 V4.1.2**：左侧导航六页（概览/Agents/桌宠与外观/监听与隐私/诊断/设置），自适应窗口大小；PID 等技术细节在"详情"高级诊断
-- **双击桌宠/气泡底行/卡片按钮**：唤起该 Agent 所在的 Windows Terminal 窗口（公共 Win32 API 恢复并前置；foreground 被拒时闪烁任务栏）
+- **仪表盘 V4.1.3**：左侧导航六页（概览/Agents/桌宠与外观/监听与隐私/诊断/设置），自适应窗口大小；PID 等技术细节在"详情"高级诊断
+- **双击桌宠/气泡/卡片按钮**：唤起该 Agent 所在的 Windows Terminal 窗口（公共 Win32 API 恢复并前置；foreground 被拒时闪烁任务栏；AGGREGATE 下双击桌宠只互动）
 - **系统集成**：托盘图标、开机自启、隐藏、换肤、缩放、锁定动画
 - **隐私**：`/proc/<pid>/environ` 只在 WSL 内部按 allowlist（`WT_SESSION`/`CODEX_HOME` 等 9 项）过滤后才进入 Python；终端文本只在内存、绝不落盘
 
@@ -56,7 +62,7 @@ D:\miniconda3\envs\deskpet\python.exe -m pip install -r requirements.txt
 D:\miniconda3\envs\deskpet\python.exe main.py
 ```
 
-旧 V2 配置自动迁移到 `config_version: 3`（删除连接方式/受控会话/按键/自动审批配置，清空旧绑定）。
+旧配置自动迁移到当前 schema（`config_version` 随版本演进；迁移会删除已废弃键、清空运行期绑定，从不写入 Agent 身份）。
 
 依赖已拆分：`requirements-core.txt`（psutil/Pillow/comtypes，常驻监控路径）与 `requirements-convert.txt`（imageio-ffmpeg/numpy/scipy，仅皮肤转换期使用，转换在独立子进程完成）；完整安装仍是 `pip install -r requirements.txt`。
 
@@ -76,25 +82,26 @@ D:\miniconda3\envs\deskpet\python.exe main.py
 
 ## 终端窗口关联的置信度（诚实原则）
 
-Windows Terminal 没有 `WT_SESSION → tab/pane` 公开接口，DeskPet 只做 window 级关联（两条独立链）：
+Windows Terminal 没有 `WT_SESSION → tab/pane` 公开接口，DeskPet 只做 window 级关联（两条独立链）。**confidence 不是唤起开关**：能否尝试唤起只由"解析器是否给出候选窗口"决定，confidence 只说明候选是怎么选出来的（仪表盘高级诊断可见）。
 
-- **窗口唤起链**（用户点击"打开终端"）：
-  - **Windows 原生 Agent**：PID 祖先链 → 唯一 WT 窗口 → `CONFIRMED`
-  - **WSL Agent**：标题/cwd/distro 评分（kind+3 / cwd+2 / user@+1 / distro+1），**互相唯一匹配** → `HIGH`（TermControl 标题与 WT 顶层窗口标题双证据，后者仅在窗口内唯一 control 时采用）
-  - `FALLBACK`：桌面只有一个 WT 窗口——可以唤起窗口，但**不**把终端审批观察归属给该 Agent
-  - `AMBIGUOUS`：多个候选窗口且无可靠证据 → 拒绝唤起（fail-closed，不猜）
-- **观察归属链**（WAITING/activity 证据归给谁）：只有 `CONFIRMED`（祖先唯一窗口 + 窗口内唯一被观察 control）或 `HIGH`（标题证据互相唯一）才归属；其余宁可没有终端证据也不错归。观察用 UIA RuntimeId 是运行期内部句柄，不持久化、不参与激活、不在普通诊断展示。
-- UIA 不可用时正常降级：Goal/Mode/Phase 来自会话文件，"打开终端"不受影响（窗口激活不依赖 UIA），仅 Codex/Claude 的"等待审批"无法补足
+- **窗口唤起链**（用户双击/按钮"打开终端"，v3-compatible 候选选择）：
+  - **Windows 原生 Agent**：PID 祖先链 → 唯一 WT 窗口 → `CONFIRMED`（窗口内 control 数量不影响）
+  - **WSL Agent**：TermControl 标题评分（kind+3 / cwd+2 / user@+1 / distro+1），**互相唯一匹配** → `HIGH`
+  - 正向证据不够唯一时：保留 best control 所属窗口作唤起候选（`AMBIGUOUS`，v3 行为）——可唤起，但不归属终端证据
+  - 无 Agent 证据但桌面只有一个 WT 窗口：保留该窗口（`NONE` + 唯一窗口兜底）——可唤起，不归属终端证据
+  - 多窗口且无正向证据 / 无 WT 窗口：无候选（fail-closed，不猜）
+- **观察归属链**（WAITING/activity 证据归给谁）：只有 `CONFIRMED`（祖先唯一窗口 + 窗口内唯一被观察 control）或 `HIGH`（标题证据互相唯一，WT 顶层窗口标题仅在窗口内唯一 control 时作第二证据）才归属；其余宁可没有终端证据也不错归。观察用 UIA RuntimeId 是运行期内部句柄，不持久化、不参与激活、不在普通诊断展示。
+- UIA 不可用时正常降级：Goal/Mode/Phase 来自会话文件，"打开终端"不受影响（窗口目录来自 Win32 枚举，不依赖 UIA；仅 WSL 标题评分与"等待审批"观察缺位）
 
 ## 稳定性设计
 
 - **线程架构**：Tk UI ｜ Monitor Core（0.5s）｜ ProcessProbe worker（3s，single-slot）｜ UIA MTA —— WSL 卡顿不卡气泡
-- **进程身份**：key 含启动 token（`wsl:Ubuntu|codex|4812|<ticks>`），PID 复用不继承旧绑定；wrapper/runtime 折叠（npm shim → node 只保留最深 runtime，不跨 kind 折叠）；`/proc` ticks 缺失时用稳定 fallback 代次 token，绝不退化成裸 PID；消失宽限 15s
+- **进程身份**：key 含启动 token（`wsl:Ubuntu|codex|4812|<ticks>`），PID 复用不继承旧绑定；wrapper/runtime 折叠（npm shim → node 只保留最深 runtime，不跨 kind 折叠）；`/proc` ticks 缺失时用稳定 fallback 代次 token，绝不退化成裸 PID
 - **来源隔离与三态生命周期**：探测健康按真实 source（`windows` / `wsl:Ubuntu` / `wsl:Debian`…）判定，一个 distro 扫描失败不污染其他来源的实例与"状态可能延迟"标记。WSL source 有三种内部语义（V3.1.1）：
   1. **healthy + instances** —— 发行版运行且 Agent 被发现；
-  2. **healthy + empty** —— 已权威确认当前发行版没有 Agent，或发行版已停止（`wsl --list --running --quiet` 成功且输出为空即是权威空结果）；旧实例经 `gone_grace_sec`（默认 15s）后清除，同时清掉该 distro 的进程缓存与 fallback 代次 token——重启后 Linux PID 从小整数再来也不会继承旧绑定；
+  2. **healthy + empty** —— 已权威确认当前发行版没有 Agent，或发行版已停止（`wsl --list --running --quiet` 成功且输出为空即是权威空结果）；权威缺席**立即**清除该实例（V4.1 起无消失宽限），同时清掉该 distro 的进程缓存与 fallback 代次 token——重启后 Linux PID 从小整数再来也不会继承旧绑定；
   3. **unhealthy** —— WSL 枚举/ps 读取失败：DeskPet 保留上一轮缓存并显示"状态可能延迟"，绝不误判退出（无法读取 ≠ 已经不存在）。
-  Running 清单**每轮全新查询，绝不缓存正结果**（V3.1.2 被动性闭环）：`wsl -d <distro> --exec` 本身会启动目标发行版（Microsoft 官方 networking 文档原文），而 probe 间隔 3s 小于 WSL 空闲关机延迟（官方 "8 second rule"），一份过期的 Running 缓存会把用户刚停止的 distro 重新拉起并形成"探测保活"循环——因此只有**本轮刚确认 Running** 的发行版才会被 `wsl -d` 探测；`--list --running` 是宿主侧查询，不会启动任何发行版。停止检测的最坏延迟约为 3s 调度 + 15s 消失宽限 ≈ 18s。
+  Running 清单**每轮全新查询，绝不缓存正结果**（V3.1.2 被动性闭环）：`wsl -d <distro> --exec` 本身会启动目标发行版（Microsoft 官方 networking 文档原文），而 probe 间隔 3s 小于 WSL 空闲关机延迟（官方 "8 second rule"），一份过期的 Running 缓存会把用户刚停止的 distro 重新拉起并形成"探测保活"循环——因此只有**本轮刚确认 Running** 的发行版才会被 `wsl -d` 探测；`--list --running` 是宿主侧查询，不会启动任何发行版。停止检测的最坏延迟约为 3s 调度 + 一轮权威缺席确认。
 - **状态语义**：已知 active turn → 无限保持 WORKING；仅活动证据 → 10s 宽限后回 UNKNOWN（不伪造）；DONE 展示 8s；IDLE 只在明确见过 turn 结束后出现；**泛化终端活动（pane 有文本变化）永远不能推翻结构化 Session 的 DONE/IDLE/ERROR/INPUT**
 - **Status/Phase/Mode 正交**：Mode 是独立维度（Plan/Default/UNKNOWN+原始值），终端 WAITING 成为状态胜者时无权擦除 Session 已解析的 Mode——`WAITING + APPROVAL + PLAN` 是合法且必要的最终状态；优先级为 Session 结构化 Mode → 胜者明确携带的 Mode → NONE
 - **会话解析**：绑定用互相唯一匹配（source/session_id/cwd/started_at 评分，结果与实例遍历顺序无关），同分竞争保持未绑定；late-start 每 15s 无窗 fallback（最近 12 候选）；目录重扫有绑定时降为 15s
@@ -154,9 +161,9 @@ tests/                              单元/隐私/UIA/匹配/基准/实机回归
 ## 测试
 
 ```bat
-D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（290+）
+D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（320+）
 D:\miniconda3\envs\deskpet\python.exe tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json    # 合成基准（队列/预算/churn 上限）
-D:\miniconda3\envs\deskpet\python.exe tools\terminal_window_probe.py --list      # WT 窗口实机 probe（list/validate/activate）
+D:\miniconda3\envs\deskpet\python.exe tools\terminal_window_probe.py --list      # WT 窗口实机 probe（list/validate/activate/resolve）
 D:\miniconda3\envs\deskpet\python.exe tools\terminal_observer_probe.py           # UIA 观察实机 probe（默认不打印终端原文）
 D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\regression.py                # 位置/气泡/缩放/托盘/自启
 D:\miniconda3\envs\deskpet\python.exe -X utf8 tests\replay_real.py               # 真实会话数据回放
