@@ -143,8 +143,10 @@ def run(pets_max: int = 8, report_path: str = "") -> int:
             state_paths = {}
             for state in ("walk", "attack", "die", "special", "sleep"):
                 gif = Path(tmp) / f"{state}.gif"
-                frames = [Image.new("P", (240, 240), color=(i * 13) % 256)
-                          for i in range(8)]
+                # RGB 帧保证 Tk 可按 -index 读取每一帧
+                frames = [Image.new("RGB", (240, 240),
+                                    (i * 29 % 256, i * 67 % 256,
+                                     i * 13 % 256)) for i in range(8)]
                 frames[0].save(gif, save_all=True, append_images=frames[1:],
                                duration=83, loop=0)
                 Path(str(gif) + ".json").write_text(json.dumps(
@@ -160,7 +162,6 @@ def run(pets_max: int = 8, report_path: str = "") -> int:
                 churn_sched.register(cursor, lambda _vid: None)
                 cursors.append(cursor)
             states = list(state_paths)
-            displayed = None
             for i in range(3000):
                 cursor = cursors[i % len(cursors)]
                 state = states[(i // 7) % len(states)]
@@ -169,32 +170,38 @@ def run(pets_max: int = 8, report_path: str = "") -> int:
                 if meta is not None:
                     cursor.play(path, state, meta)
                 cursor.frame_index = i % 8
-                displayed = churn_sched.frame_image(cursor)
+                img = churn_sched.frame_image(cursor)
+                if img is not None:
+                    # PetView 语义：真正拿到帧才更新 displayed key
+                    cursor.displayed_frame_key = \
+                        churn_sched.cursor_frame_key(cursor)
+            # 确定性驱动 decode 队列（一个 slice 一帧）直至排空
+            guard = 0
+            while churn_sched.decode_queue_len() and guard < 5000:
+                churn_sched._decode_slice()
+                for cursor in cursors:
+                    img = churn_sched.frame_image(cursor)
+                    if img is not None:
+                        cursor.displayed_frame_key = \
+                            churn_sched.cursor_frame_key(cursor)
+                guard += 1
             checks.append(("五状态 churn 后 cache_bytes ≤ 预算",
                            churn_cache.total_bytes() <= frame_budget))
-            # 正在显示的 frame 不被逐出：连续两次取同一 (path,index)
-            # 必须返回同一 PhotoImage 对象（被逐出会重新解码）
-            shown = {}
-            keep_ok = displayed is not None
+            # AC43-ANIM-01：正在显示的 frame（displayed_frame_key）
+            # 不被逐出——lookup 同一 key 仍返回缓存对象
+            keep_ok = True
             for cursor in cursors:
-                if cursor.path:
-                    img = churn_sched.frame_image(cursor)
-                    key = (cursor.path, min(cursor.frame_index,
-                                            cursor.frames - 1))
-                    if key in shown and shown[key] is not img:
-                        keep_ok = False
-                    shown[key] = img
-            for cursor in cursors:
-                if cursor.path:
-                    img2 = churn_sched.frame_image(cursor)
-                    key = (cursor.path, min(cursor.frame_index,
-                                            cursor.frames - 1))
-                    if shown.get(key) is not img2:
-                        keep_ok = False
+                key = cursor.displayed_frame_key
+                if key is None:
+                    continue
+                if churn_cache.lookup_frame(key) is None:
+                    keep_ok = False   # 显示帧被逐出（lookup 不解码）
             checks.append(("正在显示的 frame 不被逐出", keep_ok))
             checks.append(("churn scheduler 单 after 槽位",
                            churn_sched._after_id is None
                            or churn_sched._after_id is not None))
+            checks.append(("decode 队列有界（≤16）",
+                           churn_sched.decode_queue_len() <= 16))
             for cursor in cursors:
                 churn_sched.unregister(cursor.view_id)
 

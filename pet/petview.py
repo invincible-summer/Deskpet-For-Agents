@@ -119,6 +119,9 @@ class PetView:
         self._win_size: tuple[int, int] | None = None
         self._pet_item = None
         self._pet_image = None
+        # v4.3 §6.3：当前显示帧的 FrameKey（与 _pet_image 对应）；
+        # 与 cursor 请求 key 相同 → 沿用当前图，不再次向 cache 请求
+        self._pet_frame_key = None
         self._dpi = 0
         self._skin_paths: dict[str, str] = {}
         self._build_key = None
@@ -420,7 +423,21 @@ class PetView:
         gap = max(2, round(GAP * scale * self.dpi() / 96))
         win_h = (block_h + gap if n else 0) + ph + MARGIN
         self._ensure_window(win_w, win_h)
-        img = self.scheduler.frame_image(self.cursor)
+        # v4.3 §6.3：请求 key 与当前显示 key 相同 → 沿用 _pet_image；
+        # cache miss → scheduler 入队 CURRENT 并返回 None，本 view 保持
+        # 旧图（不闪白、不 busy-wait、不 nested update，§6.4），气泡/
+        # geometry 照常绘制，解码完成后由 scheduler 回调再触发重绘。
+        img = None
+        if self.cursor.path:
+            key = self.scheduler.cursor_frame_key(self.cursor)
+            if key == self._pet_frame_key and self._pet_image is not None:
+                img = self._pet_image
+            else:
+                img = self.scheduler.frame_image(self.cursor)
+                if img is not None:
+                    self._pet_frame_key = key
+                    # §6.2：只有真正替换 _pet_image 时才更新保护集合
+                    self.cursor.displayed_frame_key = key
         if img is not None:
             if self._pet_item is None:
                 self._pet_item = c.create_image(
@@ -757,10 +774,13 @@ class PetViewManager:
         return results
 
     def stats(self) -> dict:
-        out = self.cache.stats()
+        out = self.cache.stats(
+            protected_frames=self.scheduler.protected_frames())
         out.update({
             "pet_views": len(self.views),
             "skin_build_pending": self.build_manager.pending_count(),
+            "cold_frame_decodes": self.scheduler.cold_decode_count,
+            "cold_frame_decode_queue": self.scheduler.decode_queue_len(),
         })
         return out
 
