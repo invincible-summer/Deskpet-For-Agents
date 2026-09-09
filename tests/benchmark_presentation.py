@@ -205,6 +205,64 @@ def run(pets_max: int = 8, report_path: str = "") -> int:
             for cursor in cursors:
                 churn_sched.unregister(cursor.view_id)
 
+            # ---- v4.3 §19.2：不同 skin path 并存时 frame 级全局 LRU 收敛
+            # 8 套皮肤（不同 path，真实 GIF）× 显示帧 + 冷帧轮转：
+            # 预算仍闭合、显示帧仍受保护
+            multi_budget = 2 * 1024 * 1024
+            multi_cache = SharedAnimationCache(max_bytes=multi_budget)
+            multi_sched = AnimationScheduler(app.root, multi_cache)
+            multi_paths = []
+            for i in range(8):
+                gif = Path(tmp) / f"skin{i}.gif"
+                frames = [Image.new("RGB", (240, 240),
+                                    (i * 31 % 256, f * 17 % 256,
+                                     (i + f) * 7 % 256))
+                          for f in range(4)]
+                frames[0].save(gif, save_all=True,
+                               append_images=frames[1:],
+                               duration=100, loop=0)
+                Path(str(gif) + ".json").write_text(json.dumps(
+                    {"frames": 4, "width": 240, "height": 240,
+                     "delay_ms": 100, "loop": True}), encoding="utf-8")
+                multi_paths.append(str(gif))
+            multi_cursors = []
+            for i, path in enumerate(multi_paths):
+                cursor = AnimationCursor(f"multi-{i}")
+                cursor.path = path
+                cursor.frames = 4
+                multi_sched.register(cursor, lambda _v: None)
+                multi_cursors.append(cursor)
+            decoded_any = [False]
+
+            def _drive(cursor):
+                img = multi_sched.frame_image(cursor)
+                while multi_sched.decode_queue_len():
+                    multi_sched._decode_slice()
+                    img = multi_sched.frame_image(cursor)
+                if img is not None:
+                    cursor.displayed_frame_key = \
+                        multi_sched.cursor_frame_key(cursor)
+                    decoded_any[0] = True
+                return img
+
+            for cycle in range(40):
+                cursor = multi_cursors[cycle % 8]
+                cursor.frame_index = cycle % 4
+                _drive(cursor)
+            checks.append(("多皮肤轮转确有真实解码（非空转）",
+                           decoded_any[0]))
+            checks.append(("多皮肤 frame LRU：cache_bytes ≤ 预算",
+                           multi_cache.total_bytes() <= multi_budget))
+            multi_keep = all(
+                c.displayed_frame_key is None
+                or multi_cache.lookup_frame(c.displayed_frame_key)
+                is not None
+                for c in multi_cursors)
+            checks.append(("多皮肤：显示帧不被逐出", multi_keep))
+            for cursor in multi_cursors:
+                multi_sched.unregister(cursor.view_id)
+            multi_sched.stop()
+
         cache_stats = app.pet_manager.cache.stats()
         scheduler = app.pet_manager.scheduler
 
