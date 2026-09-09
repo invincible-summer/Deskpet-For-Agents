@@ -354,7 +354,7 @@ class AggregateUiSmokeTests(unittest.TestCase):
             activated = []
             view = app.pet_manager.views["pet-1"]
             view._on_activate = lambda key: activated.append(key)
-            view._on_double()
+            view._on_body_double()
             self.assertEqual(activated, [])
 
             # 气泡与单个监听一致：单卡（显示 attention=WAITING 的 b），

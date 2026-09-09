@@ -197,7 +197,7 @@ class FleetUiTests(unittest.TestCase):
             view = app.pet_manager.views["pet-1"]
             activated = []
             view._on_activate = lambda key: activated.append(key)
-            view._on_double()
+            view._on_body_double()
             self.assertEqual(activated, [a.key])
         finally:
             app.quit()

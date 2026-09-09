@@ -176,12 +176,14 @@ class SingleAgentBubbleRenderer(BubbleRendererBase):
             add(c.create_text(ox+pad, ty, text=line, anchor='nw', font=font, fill=font_color))
             ty += font.metrics('linespace')
         by = y1-pad-m['button']
-        # 底行整体是激活区：携带 exact key（由 model.agent_key 提供）
+        # 整个可见气泡矩形都是双击激活区（v4.1.3 §12），携带绘制时
+        # 固化的 exact key——visual identity == click identity。
+        # 实际 action 只由 PetWindow 的 <Double-Button-1> handler 执行。
         key_for_hit = getattr(self.model, 'agent_key', '')
         if key_for_hit:
             self.btn_boxes['activate'] = (ox+pad, by, x1-pad, y1-pad)
             self._hit_boxes.append((
-                (ox+pad, by, x1-pad, y1-pad),
+                (ox, oy, x1, y1),
                 HitTarget(action="activate_agent", agent_key=key_for_hit)))
         add(c.create_text(ox+pad, by+m['button']/2, anchor='w', font=font,
                           text=fit_text(self.model.footer, self.w-2*pad, font.measure), fill='#6a7c75'))

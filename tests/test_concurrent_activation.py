@@ -1,12 +1,14 @@
-"""并发激活测试矩阵（v4.1.1 plan §20）。
+"""并发激活测试矩阵（v4.1.3 §14/§29）。
 
   * Fleet body 双击 → 各自 exact agent_key（绝不走 focused_key）；
-  * Fleet 气泡底行 → 各自 exact agent_key；
+  * Fleet 气泡双击 → 各自 exact agent_key；
   * 不同 Agent 映射不同 HWND → try_set_foreground 用各自 exact hwnd；
   * 两个 Agent 同属一个 Terminal window → 都前置同一窗口且不切 Tab
     （window-level 语义，防止后续又当 bug 重引入 exact tab selection）；
   * Aggregate 气泡 race：点击瞬间 attention 变化不改变激活目标
-    （visual identity == click identity，由 model.agent_key 固化）。
+    （visual identity == click identity，由 model.agent_key 固化）；
+  * 三模式矩阵（§29）：气泡/body 均双击激活（AGGREGATE body 只互动）、
+    气泡单击不激活、一次双击只一次 activation。
 """
 from __future__ import annotations
 import sys
@@ -142,8 +144,8 @@ class FleetBodyActivationTests(unittest.TestCase):
             activated = []
             view1._on_activate = activated.append
             view2._on_activate = activated.append
-            view1._on_double()
-            view2._on_double()
+            view1._on_body_double()
+            view2._on_body_double()
             # pet-1/pet-2 各自 exact key（自动分配按注意力排序）
             keys = {view1.agent_key, view2.agent_key}
             self.assertEqual(activated[0], view1.agent_key)
@@ -167,7 +169,7 @@ class FleetBodyActivationTests(unittest.TestCase):
                 self.skipTest("pet-1 绑定的就是 focused Agent")
             activated = []
             view1._on_activate = activated.append
-            view1._on_double()
+            view1._on_body_double()
             self.assertEqual(activated, [view1.agent_key])
         finally:
             app.quit()
@@ -287,6 +289,141 @@ class AggregateBubbleRaceTests(unittest.TestCase):
             view._on_hit_tag(tag)
             self.assertEqual(tag, ("activate", drawn_key))
             self.assertEqual(activated, [drawn_key])
+        finally:
+            app.quit()
+
+
+class _Ev:
+    """极简点击事件（x/y 像素坐标）。"""
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+class InteractionModeMatrixTests(unittest.TestCase):
+    """§29 完整矩阵：
+
+    | 模式       | 气泡单击 | 气泡双击       | body 双击       |
+    |-----------|---------|---------------|----------------|
+    | SINGLE    | 无动作   | exact 激活     | exact 激活     |
+    | AGGREGATE | 无动作   | 绘制 key 激活 | 只互动          |
+    | FLEET     | 无动作   | own exact 激活 | own exact 激活 |
+    """
+
+    def _make(self, enabled, mode, slots=None, n_agents=1):
+        app = make_app(slots or [_slot("pet-1")])
+        app.config.data["presentation"]["concurrent"]["enabled"] = enabled
+        app.config.data["presentation"]["concurrent"]["mode"] = mode
+        agents = [inst(AgentKind.CODEX, i + 1, cwd=f"/w/p{i}")
+                  for i in range(n_agents)]
+        app.monitor.instances = {a.key: a for a in agents}
+        app.monitor.snapshots = {a.key: snap(a) for a in agents}
+        app._aggregate()
+        return app
+
+    def _bubble_center(self, view):
+        view.redraw()
+        self.assertTrue(view.bubble._hit_boxes,
+                        "气泡已绘制且携带激活区")
+        x0, y0, x1, y1 = view.bubble._hit_boxes[0][0]
+        return (x0 + x1) // 2, (y0 + y1) // 2
+
+    def test_single_bubble_single_press_no_activation_no_drag(self):
+        """§29：气泡单击不激活（等待双击），也不启动拖动。"""
+        app = self._make(enabled=False, mode="aggregate", n_agents=1)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            activated = []
+            view._on_activate = activated.append
+            cx, cy = self._bubble_center(view)
+            ret = view.window._on_press(_Ev(cx, cy))
+            self.assertEqual(ret, "break")
+            self.assertEqual(activated, [])
+            self.assertIsNone(view.window._drag_off)
+        finally:
+            app.quit()
+
+    def test_single_bubble_double_activates_exact_agent(self):
+        app = self._make(enabled=False, mode="aggregate", n_agents=1)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            self.assertTrue(view.agent_key)
+            activated = []
+            view._on_activate = activated.append
+            cx, cy = self._bubble_center(view)
+            ret = view.window._on_double(_Ev(cx, cy))
+            self.assertEqual(ret, "break")
+            self.assertEqual(activated, [view.agent_key])
+        finally:
+            app.quit()
+
+    def test_single_body_double_activates_exact_agent(self):
+        app = self._make(enabled=False, mode="aggregate", n_agents=1)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            self.assertTrue(view.body_activates)   # SINGLE：body 双击激活
+            activated = []
+            view._on_activate = activated.append
+            view._on_body_double()
+            self.assertEqual(activated, [view.agent_key])
+        finally:
+            app.quit()
+
+    def test_aggregate_body_double_interacts_only(self):
+        """§29：AGGREGATE 下 body 双击只互动，绝不激活。"""
+        app = self._make(enabled=True, mode="aggregate", n_agents=2)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            self.assertFalse(view.body_activates)
+            activated = []
+            interacted = []
+            view._on_activate = activated.append
+            view._on_interact_cb = lambda: interacted.append(1)
+            view._on_body_double()
+            self.assertEqual(interacted, [1])
+            self.assertEqual(activated, [])
+        finally:
+            app.quit()
+
+    def test_aggregate_bubble_double_uses_drawn_key(self):
+        app = self._make(enabled=True, mode="aggregate", n_agents=2)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            activated = []
+            view._on_activate = activated.append
+            cx, cy = self._bubble_center(view)
+            view.window._on_double(_Ev(cx, cy))
+            self.assertEqual(activated, [view.bubble.model.agent_key])
+        finally:
+            app.quit()
+
+    def test_one_double_click_single_activation(self):
+        """§29：一次双击只产生一次 activation callback。"""
+        app = self._make(enabled=False, mode="aggregate", n_agents=1)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            activated = []
+            view._on_activate = activated.append
+            cx, cy = self._bubble_center(view)
+            # 双击 = press/press/double 序列；press 不激活，double 激活一次
+            view.window._on_press(_Ev(cx, cy))
+            view.window._on_press(_Ev(cx, cy))
+            view.window._on_double(_Ev(cx, cy))
+            self.assertEqual(activated, [view.agent_key])
+        finally:
+            app.quit()
+
+    def test_fleet_bubble_double_own_exact_agent(self):
+        app = self._make(enabled=True, mode="fleet",
+                         slots=[_slot("pet-1"), _slot("pet-2")], n_agents=2)
+        try:
+            for view in app.pet_manager.views.values():
+                self.assertTrue(view.agent_key)
+                activated = []
+                view._on_activate = activated.append
+                cx, cy = self._bubble_center(view)
+                view.window._on_double(_Ev(cx, cy))
+                self.assertEqual(activated, [view.agent_key])
         finally:
             app.quit()
 

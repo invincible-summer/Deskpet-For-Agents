@@ -44,9 +44,9 @@ class PetWindow:
         self.canvas.bind("<Button-3>", self._on_menu)
         self.canvas.bind("<Double-Button-1>", self._on_double)
 
-        self.on_click_button = None   # cb(tag)  气泡按钮点击
+        self.on_bubble_double = None  # cb(tag)  气泡双击（激活）
+        self.on_body_double = None    # cb()     body 双击（互动/激活）
         self.on_menu = None           # cb(menu) 右键菜单构建
-        self.on_interact = None       # cb()     双击互动
         self.on_moved = None          # cb()     拖动结束
 
     @property
@@ -132,13 +132,13 @@ class PetWindow:
     def set_topmost(self, flag: bool):
         self._apply_topmost()
 
-    # ---- 交互 ----
+    # ---- 交互（v4.1.3 §11：气泡/body 都是双击激活；单击不激活） ----
     def _on_press(self, ev):
         tag = self.hit_button(ev.x, ev.y)
         if tag:
-            if self.on_click_button:
-                self.on_click_button(tag)
-            return
+            # 单击气泡：不激活、也不启动拖动（等待可能的第二次点击）
+            self._drag_off = None
+            return "break"
         self._drag_off = (ev.x, ev.y)
 
     def _on_drag(self, ev):
@@ -156,12 +156,19 @@ class PetWindow:
             if self.on_moved:
                 self.on_moved()
 
-    def _on_double(self, _ev):
-        if self.hit_button(_ev.x, _ev.y):
-            return "break"
+    def _on_double(self, ev):
+        """双击分发：一次 double-click 只产生一次 callback（§11.3）。"""
         self._drag_off = None
-        if self.on_interact:
-            self.on_interact()
+
+        tag = self.hit_button(ev.x, ev.y)
+        if tag:
+            if self.on_bubble_double:
+                self.on_bubble_double(tag)
+            return "break"
+
+        if self.on_body_double:
+            self.on_body_double()
+        return "break"
 
     def _on_menu(self, ev):
         menu = tk.Menu(self.root, tearoff=0)

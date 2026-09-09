@@ -82,9 +82,9 @@ class PetView:
         self.hidden = False
 
         self.window.bind_hit(self._hit)
-        self.window.on_click_button = self._on_hit_tag
+        self.window.on_bubble_double = self._on_hit_tag
+        self.window.on_body_double = self._on_body_double
         self.window.on_menu = on_menu
-        self.window.on_interact = self._on_double
         self.window.on_moved = lambda: on_moved(self)
         self.scheduler.register(self.cursor, self._on_frame)
         self._on_interact_cb = on_interact
@@ -195,17 +195,19 @@ class PetView:
         return self.bubble.hit_button(x, y)
 
     def _on_hit_tag(self, tag):
-        """气泡点击：('activate', exact_agent_key) → 精确激活。"""
+        """气泡双击：('activate', exact_agent_key) → 精确激活（绘制时
+        固化的 key；现场绝不重新读 attention/focused，§12）。"""
         if isinstance(tag, tuple) and len(tag) == 2 and tag[0] == "activate":
             self._on_activate(tag[1])
 
-    def _on_double(self):
-        """双击 body：SINGLE/FLEET（绑定 Agent）→ exact 激活；
-        AGGREGATE → 只互动，绝不激活（v4plan §7.1）；空 slot → picker。"""
+    def _on_body_double(self):
+        """双击 body（§13 三模式矩阵）：SINGLE/FLEET（绑定 Agent）→
+        exact 激活；AGGREGATE → 只互动，绝不激活；空 slot → picker。"""
         if not self.body_activates:
             if self._on_interact_cb:
                 self._on_interact_cb()
             return
+
         if self.agent_key:
             self._on_activate(self.agent_key)
         elif self._on_double_vacant:
