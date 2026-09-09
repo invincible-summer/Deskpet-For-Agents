@@ -51,6 +51,71 @@ def _inject_agents(app, n=2):
     return agents
 
 
+class DiscreteSliderTests(unittest.TestCase):
+    """§13.1/§13.2：snap/键盘/off-step 自定义值/即时 command。"""
+
+    def setUp(self):
+        import tkinter as tk
+        try:
+            self.root = tk.Tk()
+        except Exception:
+            raise unittest.SkipTest("no display")
+        self.root.withdraw()
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def _slider(self, values=None):
+        from pet.widgets import DiscreteSlider
+        calls = []
+        slider = DiscreteSlider(self.root, values or (0.5, 0.75, 1.0,
+                                                      1.25, 1.5),
+                                command=calls.append)
+        slider.pack()
+        self.root.update()
+        return slider, calls
+
+    def test_drag_snaps_to_nearest_index(self):
+        slider, calls = self._slider()
+        # 拖到两个合法值之间（index 1.4）→ 立即 snap 到 1
+        slider._on_drag(1.4)
+        self.assertAlmostEqual(slider.value(), 0.75)
+        self.assertEqual(calls, [0.75])
+        slider._on_drag(1.6)
+        self.assertAlmostEqual(slider.value(), 1.0)
+        self.assertEqual(calls, [0.75, 1.0])
+
+    def test_keyboard_steps_invoke_immediately(self):
+        slider, calls = self._slider()
+        slider.set_external(1.0)
+        self.assertEqual(calls, [])   # 外部同步不触发
+        slider._step(1)
+        self.assertAlmostEqual(slider.value(), 1.25)
+        self.assertEqual(calls[-1], 1.25)
+        slider._step(-1)
+        slider._step(-1)
+        self.assertAlmostEqual(slider.value(), 0.75)
+        # Home/End
+        slider._set_index(0, invoke=True)
+        self.assertAlmostEqual(slider.value(), 0.5)
+        slider._set_index(len(slider._values) - 1, invoke=True)
+        self.assertAlmostEqual(slider.value(), 1.5)
+
+    def test_off_step_config_shown_as_custom_not_rewritten(self):
+        slider, calls = self._slider()
+        slider.set_external(1.37)   # 非 step 值：不触发 command
+        self.assertEqual(calls, [])
+        self.assertAlmostEqual(slider.value(), 1.25)   # thumb 最近 step
+        self.assertIn("自定义", slider._value_label["text"])
+        # 用户第一次移动 → 进入合法离散值
+        slider._step(1)
+        self.assertAlmostEqual(slider.value(), 1.5)
+        self.assertEqual(calls, [1.5])
+
+
 class DashboardV43Tests(unittest.TestCase):
     def test_nav_pages_and_lazy_build(self):
         app = _make_app()

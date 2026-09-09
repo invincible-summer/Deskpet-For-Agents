@@ -1,4 +1,4 @@
-# DeskPet V4.2.3 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
+# DeskPet V4.3.0 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现 + 非阻塞多皮肤 UI）
 
 一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
 
@@ -6,7 +6,7 @@ DeskPet 不创建、不托管、不控制任何 Agent：不配置 hooks、不注
 
 **终端唤起语义（V4.1.3，v3-compatible 被动 heuristic；V4.1.4 增强）**：DeskPet 的 Terminal window wake 使用被动启发式——Windows native 优先使用进程祖先关系（多个候选窗口时再按标题/屏幕证据细分）；WSL 使用当前可观察 TermControl 标题**与每 control 最近一次可见屏幕文本的内存摘要**（V4.1.4：标题常停在 profile 名如 "Ubuntu"，屏幕上的项目路径/Agent 标识才能把多个窗口区分开）做 kind/cwd/user/distro 评分。高置信匹配失败但仍有一个 v3 best-positive control 时，DeskPet 可以把它所属的顶层 Terminal window 作为用户显式唤起候选；这不会自动授予 Terminal text/approval attribution。屏幕摘要只在内存参与评分（产出 int 分数与证据 token），绝不进入绑定、日志或配置。DeskPet 不切换 Tab/Pane，也不发送键盘输入。Windows Terminal 目前没有稳定的公开"按 `WT_SESSION` 激活既有标签页"接口（[microsoft/terminal#19783](https://github.com/microsoft/terminal/issues/19783)，closed/not_planned），因此只承诺 window 级唤起；候选窗口经 `WindowIdentity`（HWND+PID+进程创建时间+窗口类）校验后才动作，OS 拒绝抢前台时闪烁任务栏提醒，绝不绕过。
 
-V4.1 的能力概览：
+V4.3 的能力概览：
 
 1. **终端窗口唤起**：点击某 Agent 时恢复并前置它所在的 Windows Terminal 顶层窗口；窗口归属用 `WindowIdentity`（HWND+PID+进程创建时间+窗口类）安全校验，stale 即 fail-closed；OS 拒绝抢前台时闪烁任务栏提醒，绝不绕过系统策略（无键盘注入、无剪贴板注入）。
 2. **并发呈现（手动开启）**：仪表盘"桌宠与外观"页可开启；支持"单宠聚合"（一只桌宠把各 Agent 的卡片叠成一摞气泡，V4.1.4，双击对应气泡唤起对应终端）与"多宠分离"（每个 Agent 一只桌宠，**自动绑定**现有 Agent，没有绑定的槽位不显示桌宠——不是"设了 3 就唤起 3 只"）。
@@ -44,7 +44,10 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 - **语义化状态气泡**：`Agent · Mode · Phase` + Goal（≤120 字）+ 当前活动摘要（≤160 字，本地规则压缩，不调用 LLM）
 - **等待审批检测**：Kimi 来自 wire durable `interaction.request(kind=approval)`（EXACT；legacy `ApprovalRequest`/`approval.request` 兼容兜底），`question`/`user_tool` 归类为 INPUT 而非 WAITING；Codex/Claude 来自 Windows Terminal UIA 当前可见审批 UI（高置信 + 1.5s TTL 复检）——**静默永远不被推断为等待审批**
 - **多 Agent**：自动跟随（WAITING > INPUT > ERROR > WORKING …，工作中粘性），或并发模式（单宠聚合/多宠分离）
-- **仪表盘 V4.1.4**：左侧导航六页（概览/Agents/桌宠与外观/监听与隐私/诊断/设置），自适应窗口大小；PID 等技术细节在"详情"高级诊断
+- **仪表盘 V4.3**：左侧导航七页（概览/Agents/桌宠/外观/监听与隐私/诊断/设置），页面懒构建 + retained 行（状态变化只 configure 不重建）、只有当前页刷新；失去焦点自动收起；PID/HWND 等运行期细节收在“高级诊断”折叠区
+- **每只桌宠独立皮肤（V4.3）**：Fleet 每个槽位可单独选皮肤（同一皮肤可被多只重复选择），“跟随全局”继承；换皮先请求构建、完成前保持当前画面，失败保持旧画面绝不空白
+- **外观即时生效（V4.3）**：整体大小/速度/气泡宽高/文字缩放全部为离散值滑块，每跨一档立即应用；无 Apply 按钮，配置经 650ms debounce 原子落盘
+- **非阻塞 UI（V4.3）**：单一 UiCoordinator bridge timer（125/200/500ms 三档自适应）+ 合并式 render flush；Monitor 语义 revision 不变则零 reconcile；冷动画帧每 idle slice 最多解码 1 帧、frame 级全局 LRU 保护正在显示的帧；配置保存在独立 transient 线程写盘；皮肤导入（复制/校验/manifest）在后台单 job lane 进行
 - **双击桌宠/气泡/卡片按钮**：唤起该 Agent 所在的 Windows Terminal 窗口（公共 Win32 API 恢复并前置；foreground 被拒时闪烁任务栏；AGGREGATE 下双击桌宠只互动）
 - **系统集成**：托盘图标（程序内绘制的原创小猫，**不使用桌宠形象素材**）、开机自启、隐藏、换肤、缩放、锁定动画
 - **隐私**：`/proc/<pid>/environ` 只在 WSL 内部按 allowlist（`WT_SESSION`/`CODEX_HOME` 等 9 项）过滤后才进入 Python；终端文本只在内存、绝不落盘
@@ -61,11 +64,11 @@ Setup-Desktop.bat
 Start-Desktop.bat
 ```
 
-安装与启动脚本都按"确定性"设计：Setup 用 `constraints-v4.2.3.txt` 锁定 CI 已验证的 Python 3.12 依赖集；Start 只使用 `.venv\Scripts\pythonw.exe`（隐藏控制台），不 fallback 到任意 Conda/System Python——"能双击"不能以"随机使用一个缺依赖环境"为代价。
+安装与启动脚本都按"确定性"设计：Setup 用 `constraints-v4.3.0.txt` 锁定 CI 已验证的 Python 3.12 依赖集；Start 只使用 `.venv\Scripts\pythonw.exe`（隐藏控制台），不 fallback 到任意 Conda/System Python——"能双击"不能以"随机使用一个缺依赖环境"为代价。
 
 全新安装默认皮肤为程序化原创 fallback `builtin-cat`（`pet/icon.py` 绘制，无版权素材依赖）；导入自己的皮肤后完全走原流程。已有用户 config 中的自定义皮肤原样保留。
 
-旧配置自动迁移到当前 schema（`config_version=4`；迁移会删除已废弃键、清空运行期绑定，从不写入 Agent 身份）。
+旧配置自动迁移到当前 schema（`config_version=5`；v5 迁移移除已废弃的并发 enabled/mode 持久键——它们现在是运行期 session state，重启固定恢复“并行监听 + 单宠聚合”；迁移从不写入 Agent 身份）。
 
 依赖已拆分：`requirements-core.txt`（psutil/Pillow/comtypes，常驻监控路径）与 `requirements-convert.txt`（imageio-ffmpeg/numpy/scipy，仅皮肤转换期使用，转换在独立子进程完成）；完整安装仍是 `pip install -r requirements.txt`（release 安装由 constraints 锁定版本）。
 
@@ -98,7 +101,7 @@ Windows Terminal 没有 `WT_SESSION → tab/pane` 公开接口，DeskPet 只做 
 
 ## 稳定性设计
 
-- **线程架构**：Tk UI ｜ Monitor Core（0.5s）｜ ProcessProbe worker（3s，single-slot）｜ UIA MTA —— WSL 卡顿不卡气泡
+- **线程架构（V4.3 仍为 5 常驻线程上限）**：Tk UI ｜ Monitor Core ｜ ProcessProbe worker ｜ UIA MTA ｜ WindowsExitWatcher；临时 worker 仅用户操作产生：`deskpet-convert`（皮肤 build/import，≤1）与 `deskpet-config-save`（配置保存，≤1）—— WSL 卡顿、皮肤转换、配置写盘都不卡 Tk
 - **进程身份**：key 含启动 token（`wsl:Ubuntu|codex|4812|<ticks>`），PID 复用不继承旧绑定；wrapper/runtime 折叠（npm shim → node 只保留最深 runtime，不跨 kind 折叠）；`/proc` ticks 缺失时用稳定 fallback 代次 token，绝不退化成裸 PID
 - **来源隔离与三态生命周期**：探测健康按真实 source（`windows` / `wsl:Ubuntu` / `wsl:Debian`…）判定，一个 distro 扫描失败不污染其他来源的实例与"状态可能延迟"标记。WSL source 有三种内部语义（V3.1.1）：
   1. **healthy + instances** —— 发行版运行且 Agent 被发现；
@@ -166,16 +169,17 @@ tests/                              单元/隐私/UIA/匹配/基准/实机回归
 
 ```bat
 :: 使用 Setup-Desktop.bat 创建的 repo 环境（或任何 Python 3.12 + requirements）
-.venv\Scripts\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（380+）
+.venv\Scripts\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（479+）
 .venv\Scripts\python.exe tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json    # 合成基准（队列/预算/churn 上限）
 .venv\Scripts\python.exe tests\benchmark_presentation.py            # Presentation/Fleet/动画缓存基准（blocking）
+.venv\Scripts\python.exe testsenchmark_ui_architecture.py         # UI 架构基准：revision 驱动/dirty-view/单 worker/单 bridge（blocking）
 .venv\Scripts\python.exe tools\terminal_window_probe.py --list      # WT 窗口实机 probe（list/validate/activate/resolve）
 .venv\Scripts\python.exe tools\terminal_observer_probe.py           # UIA 观察实机 probe（默认不打印终端原文）
 .venv\Scripts\python.exe -X utf8 tests\regression.py                # 位置/气泡/缩放/托盘/自启
 .venv\Scripts\python.exe -X utf8 tests\replay_real.py               # 真实会话数据回放
 ```
 
-CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试（含 window 激活逻辑、并发激活矩阵、source 停扫、config 运行时测试）+ monitor benchmark 5000 ticks + presentation benchmark（`PYTHONUTF8=1`，benchmark 报告以 artifact 上传）。真实 Windows Terminal foreground policy / UIA 事件接受度属于本机 manual acceptance：CI 只验证纯逻辑、Win32 调用契约 mock、资源边界和 UI dataflow。**Release acceptance requires GitHub Actions green**：workflow conclusion=success 是发布验收的必要条件，CI 红期间不标记版本完成。
+CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试（含 window 激活逻辑、并发激活矩阵、source 停扫、config 运行时测试）+ monitor benchmark 5000 ticks + presentation benchmark + UI architecture benchmark（`PYTHONUTF8=1`，benchmark 报告以 artifact 上传）。真实 Windows Terminal foreground policy / UIA 事件接受度属于本机 manual acceptance：CI 只验证纯逻辑、Win32 调用契约 mock、资源边界和 UI dataflow。**Release acceptance requires GitHub Actions green**：workflow conclusion=success 是发布验收的必要条件，CI 红期间不标记版本完成。
 
 ## 已知边界（如实说明）
 

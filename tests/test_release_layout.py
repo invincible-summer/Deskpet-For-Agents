@@ -60,7 +60,7 @@ class ReleaseLayoutTests(unittest.TestCase):
 
     def test_setup_script_is_one_shot_with_constraints(self):
         text = (ROOT / "Setup-Desktop.bat").read_text(encoding="utf-8")
-        self.assertIn("constraints-v4.2.3.txt", text)
+        self.assertIn("constraints-v4.3.0.txt", text)
         self.assertIn("3.12", text)
         self.assertIn("venv", text.lower())
         self.assertNotIn("conda", text.lower())
@@ -68,7 +68,7 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertIn("pet.config", text)
 
     def test_constraints_file_pins_verified_set(self):
-        path = ROOT / "constraints-v4.2.3.txt"
+        path = ROOT / "constraints-v4.3.0.txt"
         self.assertTrue(path.exists())
         text = path.read_text(encoding="utf-8")
         for pin in ("psutil==7.2.2", "Pillow==12.3.0", "comtypes==1.4.16",
@@ -78,8 +78,8 @@ class ReleaseLayoutTests(unittest.TestCase):
     def test_version_module_is_single_source(self):
         from pet.version import APP_LABEL, APP_NAME, APP_VERSION
         self.assertEqual(APP_NAME, "DeskPet")
-        self.assertEqual(APP_VERSION, "4.2.3")
-        self.assertEqual(APP_LABEL, "DeskPet V4.2.3")
+        self.assertEqual(APP_VERSION, "4.3.0")
+        self.assertEqual(APP_LABEL, "DeskPet V4.3.0")
         import pet.dashboard as dashboard
         self.assertEqual(dashboard.APP_VERSION, APP_LABEL)
 

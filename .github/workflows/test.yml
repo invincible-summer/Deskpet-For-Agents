@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install -r requirements.txt -c constraints-v4.2.3.txt
+        run: pip install -r requirements.txt -c constraints-v4.3.0.txt
       - name: Byte-compile
         run: python -m compileall agents pet actions tools
       - name: Unit tests
@@ -26,6 +26,8 @@ jobs:
         run: python tests/benchmark_monitor.py --ticks 5000 --report benchmark-report.json
       - name: Presentation benchmark
         run: python tests/benchmark_presentation.py --report presentation-benchmark.json
+      - name: UI architecture benchmark
+        run: python tests/benchmark_ui_architecture.py --report ui-architecture-benchmark.json
       - name: Upload benchmark report
         if: always()
         uses: actions/upload-artifact@v4
@@ -38,6 +40,12 @@ jobs:
         with:
           name: presentation-benchmark
           path: presentation-benchmark.json
+      - name: Upload UI architecture benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-architecture-benchmark
+          path: ui-architecture-benchmark.json
       # 单测已覆盖：terminal window activation 逻辑、并发激活矩阵、
       # source-disabled 停扫、config 运行时 clamp。
       # 真实 Windows Terminal foreground policy / UIA 事件接受度属于

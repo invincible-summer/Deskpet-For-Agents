@@ -1,5 +1,5 @@
 @echo off
-rem DeskPet one-time setup (v4.2.3 section 10.2): repo-local .venv only.
+rem DeskPet one-time setup (v4.3.0 release setup): repo-local .venv only.
 rem Runs once; Start-Desktop.bat only starts and never installs.
 setlocal EnableExtensions
 cd /d "%~dp0"
@@ -46,8 +46,8 @@ if not exist "%VENV_PY%" (
 )
 
 :install
-echo Installing dependencies (pinned by constraints-v4.2.3.txt)...
-"%VENV_PY%" -m pip install -r requirements.txt -c constraints-v4.2.3.txt
+echo Installing dependencies (pinned by constraints-v4.3.0.txt)...
+"%VENV_PY%" -m pip install -r requirements.txt -c constraints-v4.3.0.txt
 if errorlevel 1 (
     echo [ERROR] Dependency installation failed.
     exit /b 1
