@@ -74,7 +74,7 @@ class PetApp:
         self._closing = False
 
         if getattr(config, "migration_notice", False):
-            self.toast("DeskPet V4.1.3：被动监听 · 终端窗口唤起 · 并发需手动开启", 8)
+            self.toast("DeskPet V4.1.4：被动监听 · 终端窗口唤起 · 并发需手动开启", 8)
         if bool(self.config.get("tray_enabled", True)):
             self._start_tray_runtime()
 
@@ -205,6 +205,7 @@ class PetApp:
             view.bubble.model.text = text
             view.bubble.model.footer = ""
             view.bubble.model.agent_key = ""
+            view.bubble.model.badge = ""
             view.bubble.model.accent = "#487f73"
 
     def _poll_build(self):

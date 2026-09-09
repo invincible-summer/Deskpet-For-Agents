@@ -189,6 +189,118 @@ class SoleWindowFallbackTests(unittest.TestCase):
         self.assertEqual(b.reason, "no-terminal-window")
 
 
+class ScreenEvidenceTests(unittest.TestCase):
+    """v4.1.4：标题停在 profile 名（"Ubuntu"）时，屏幕摘要区分窗口。
+
+    实机回归（2026-09-09）：两个 WT 窗口各运行一个 Agent，标题全是
+    "Ubuntu" → distro+1 并列 → 所有 Agent 坍缩到同一个窗口。屏幕上的
+    Agent 标识/项目路径（仅内存摘要）让 mutual-unique 恢复区分。
+    """
+
+    def _setup(self):
+        resolver = make_resolver([(68024, 12044, "Ubuntu"),
+                                  (984948, 12044, "Ubuntu")])
+        kimi = _wsl(kind=AgentKind.KIMI, cwd="/home/u/Edu_Agent",
+                    user="u", pid=1)
+        claude = _wsl(kind=AgentKind.CLAUDE, cwd="/home/u/LCR",
+                      user="u", pid=2)
+        controls = {
+            (68024, (1,)): control(68024, (1,), "Ubuntu"),
+            (984948, (1,)): control(984948, (1,), "Ubuntu"),
+        }
+        return resolver, kimi, claude, controls
+
+    def test_without_screens_ties_collapse_to_same_window(self):
+        """v4.1.3 基线（修复前行为）：无屏幕证据 → 全部 AMBIGUOUS 同窗口。"""
+        resolver, kimi, claude, controls = self._setup()
+        out = resolver.resolve([kimi, claude], controls, NOW)
+        self.assertEqual(out[kimi.key].confidence,
+                         WindowBindingConfidence.AMBIGUOUS)
+        self.assertEqual(out[kimi.key].hwnd, out[claude.key].hwnd)
+        self.assertEqual(out[kimi.key].score, 1)   # 只有 distro 弱证据
+
+    def test_screens_split_agents_to_distinct_windows_high(self):
+        resolver, kimi, claude, controls = self._setup()
+        screens = {
+            (68024, (1,)): "Kimi CLI · ~/Edu_Agent · u@box",
+            (984948, (1,)): "Claude Code · ~/LCR · u@box",
+        }
+        out = resolver.resolve([kimi, claude], controls, NOW, screens=screens)
+        self.assertEqual(out[kimi.key].confidence, WindowBindingConfidence.HIGH)
+        self.assertEqual(out[kimi.key].hwnd, 68024)
+        self.assertEqual(out[claude.key].confidence, WindowBindingConfidence.HIGH)
+        self.assertEqual(out[claude.key].hwnd, 984948)
+        self.assertGreaterEqual(out[kimi.key].score, 5)   # kind+cwd+user@
+
+    def test_screen_text_never_enters_binding(self):
+        """隐私合同：屏幕文本只产生分数/证据 token，不进 title/reason。"""
+        resolver, kimi, claude, controls = self._setup()
+        screens = {
+            (68024, (1,)): "Kimi CLI · ~/Edu_Agent · SECRETTOKEN123",
+            (984948, (1,)): "Claude Code · ~/LCR · u@box",
+        }
+        out = resolver.resolve([kimi, claude], controls, NOW, screens=screens)
+        binding = out[kimi.key]
+        self.assertNotIn("SECRETTOKEN123", binding.title)
+        self.assertNotIn("SECRETTOKEN123", binding.reason)
+        self.assertEqual(binding.title, "Ubuntu")   # 只携带 control 标题
+
+    def test_partial_screens_still_best_positive(self):
+        """只有部分 control 有屏幕摘要：不猜，退回 v3 AMBIGUOUS 候选。"""
+        resolver, kimi, claude, controls = self._setup()
+        screens = {(68024, (1,)): "Kimi CLI · ~/Edu_Agent · u@box"}
+        out = resolver.resolve([kimi, claude], controls, NOW, screens=screens)
+        # kimi: A=6/B=1 唯一；claude: A/B 都只有 user@ 并列 → AMBIGUOUS
+        self.assertEqual(out[kimi.key].confidence, WindowBindingConfidence.HIGH)
+        self.assertEqual(out[claude.key].confidence,
+                         WindowBindingConfidence.AMBIGUOUS)
+
+
+class NativeMultiWindowScoringTests(unittest.TestCase):
+    """v4.1.4：native 多窗口祖先先走评分链（屏幕/标题证据可定位）。"""
+
+    def test_native_multi_window_screen_evidence_high(self):
+        resolver = make_resolver([(1, 10, "wt"), (2, 10, "wt")],
+                                 ancestors=lambda pid: {10})
+        inst = AgentInstance(AgentKind.CODEX, 99, "windows",
+                             process_token="9", cwd="C:\\proj\\alpha")
+        controls = {
+            (1, (1,)): control(1, (1,), "Ubuntu"),
+            (2, (1,)): control(2, (1,), "Ubuntu"),
+        }
+        screens = {(2, (1,)): "codex · C:\\proj\\alpha"}
+        b = resolver.resolve([inst], controls, NOW, screens=screens)[inst.key]
+        self.assertEqual(b.confidence, WindowBindingConfidence.HIGH)
+        self.assertEqual(b.hwnd, 2)
+        self.assertTrue(b.wakeable)
+
+    def test_native_multi_window_ancestor_bounds_candidates(self):
+        """祖先窗口集限定候选：窗口集外的 control 证据再强也不选。"""
+        resolver = make_resolver([(1, 10, "wt"), (2, 10, "wt"),
+                                  (3, 20, "wt")],
+                                 ancestors=lambda pid: {10})
+        inst = AgentInstance(AgentKind.CODEX, 99, "windows",
+                             process_token="9", cwd="C:\\proj\\alpha")
+        controls = {
+            (1, (1,)): control(1, (1,), "PowerShell"),
+            (2, (1,)): control(2, (1,), "PowerShell"),
+            (3, (1,)): control(3, (1,), "codex alpha"),
+        }
+        b = resolver.resolve([inst], controls, NOW)[inst.key]
+        self.assertEqual(b.confidence, WindowBindingConfidence.AMBIGUOUS)
+        self.assertIsNone(b.window)              # 不猜窗口集外的强证据
+        self.assertEqual(b.reason, "multi-window-ancestor")
+
+    def test_native_multi_window_no_evidence_ambiguous_no_window(self):
+        resolver = make_resolver([(1, 10, "wt"), (2, 10, "wt")],
+                                 ancestors=lambda pid: {10})
+        inst = AgentInstance(AgentKind.CODEX, 99, "windows", process_token="9")
+        b = resolver.resolve([inst], {}, NOW)[inst.key]
+        self.assertEqual(b.confidence, WindowBindingConfidence.AMBIGUOUS)
+        self.assertIsNone(b.window)
+        self.assertEqual(b.reason, "multi-window-ancestor")
+
+
 class OrderIndependenceTests(unittest.TestCase):
     """§25-10：resolver 输出与 Agent 输入顺序无关。"""
 

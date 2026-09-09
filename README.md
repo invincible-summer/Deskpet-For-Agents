@@ -1,15 +1,15 @@
-# DeskPet V4.1.3 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
+# DeskPet V4.1.4 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
 
 一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
 
 DeskPet 不创建、不托管、不控制任何 Agent：不配置 hooks、不注入进程、不发送键盘事件、不自动审批。
 
-**终端唤起语义（V4.1.3，v3-compatible 被动 heuristic）**：DeskPet 的 Terminal window wake 使用被动启发式——Windows native 优先使用进程祖先关系；WSL 使用当前可观察 TermControl 标题做 kind/cwd/user/distro 评分。高置信匹配失败但仍有一个 v3 best-positive control 时，DeskPet 可以把它所属的顶层 Terminal window 作为用户显式唤起候选；这不会自动授予 Terminal text/approval attribution。DeskPet 不切换 Tab/Pane，也不发送键盘输入。Windows Terminal 目前没有稳定的公开"按 `WT_SESSION` 激活既有标签页"接口（[microsoft/terminal#19783](https://github.com/microsoft/terminal/issues/19783)，closed/not_planned），因此只承诺 window 级唤起；候选窗口经 `WindowIdentity`（HWND+PID+进程创建时间+窗口类）校验后才动作，OS 拒绝抢前台时闪烁任务栏提醒，绝不绕过。
+**终端唤起语义（V4.1.3，v3-compatible 被动 heuristic；V4.1.4 增强）**：DeskPet 的 Terminal window wake 使用被动启发式——Windows native 优先使用进程祖先关系（多个候选窗口时再按标题/屏幕证据细分）；WSL 使用当前可观察 TermControl 标题**与每 control 最近一次可见屏幕文本的内存摘要**（V4.1.4：标题常停在 profile 名如 "Ubuntu"，屏幕上的项目路径/Agent 标识才能把多个窗口区分开）做 kind/cwd/user/distro 评分。高置信匹配失败但仍有一个 v3 best-positive control 时，DeskPet 可以把它所属的顶层 Terminal window 作为用户显式唤起候选；这不会自动授予 Terminal text/approval attribution。屏幕摘要只在内存参与评分（产出 int 分数与证据 token），绝不进入绑定、日志或配置。DeskPet 不切换 Tab/Pane，也不发送键盘输入。Windows Terminal 目前没有稳定的公开"按 `WT_SESSION` 激活既有标签页"接口（[microsoft/terminal#19783](https://github.com/microsoft/terminal/issues/19783)，closed/not_planned），因此只承诺 window 级唤起；候选窗口经 `WindowIdentity`（HWND+PID+进程创建时间+窗口类）校验后才动作，OS 拒绝抢前台时闪烁任务栏提醒，绝不绕过。
 
 V4.1 的能力概览：
 
 1. **终端窗口唤起**：点击某 Agent 时恢复并前置它所在的 Windows Terminal 顶层窗口；窗口归属用 `WindowIdentity`（HWND+PID+进程创建时间+窗口类）安全校验，stale 即 fail-closed；OS 拒绝抢前台时闪烁任务栏提醒，绝不绕过系统策略（无键盘注入、无剪贴板注入）。
-2. **并发呈现（手动开启）**：仪表盘"桌宠与外观"页可开启；支持"单宠聚合"（一只桌宠显示当前最需要注意的 Agent，气泡与单个监听完全一致）与"多宠分离"（每个 Agent 一只桌宠，**自动绑定**现有 Agent，没有绑定的槽位不显示桌宠——不是"设了 3 就唤起 3 只"）。
+2. **并发呈现（手动开启）**：仪表盘"桌宠与外观"页可开启；支持"单宠聚合"（一只桌宠依次轮播各 Agent 的单卡气泡，V4.1.4）与"多宠分离"（每个 Agent 一只桌宠，**自动绑定**现有 Agent，没有绑定的槽位不显示桌宠——不是"设了 3 就唤起 3 只"）。
 3. **可靠设置持久化 + 自启修复**：设置写入失败会明确提示；开机自启能识别"注册路径已失效"并一键修复。
 4. **精确退出生命周期**：Agent CLI 进程退出即从列表消失（terminal/shell 还开着也不会"复活"）；Windows 上事件驱动、零轮询。
 
@@ -33,7 +33,7 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 等待审批时气泡提示"请在终端处理"。**交互（V4.1.3 固定三种模式，均为双击）**：
 
 - 非并发 SINGLE：双击桌宠或气泡 → 唤起该 Agent 的 Terminal 窗口
-- 并发 AGGREGATE（单宠聚合）：双击气泡 → 唤起当前绘制 Agent 的 Terminal；双击桌宠 → 只互动
+- 并发 AGGREGATE（单宠聚合）：多张候选卡在**同一桌宠上依次轮播**（V4.1.4，默认 5s/张，`presentation.concurrent.rotate_sec` 可调 2–30s，右上角 "2/3" 角标指示当前位置；新出现的等待审批/错误卡片立即插播一次）；双击气泡 → 唤起**当前显示** Agent 的 Terminal；双击桌宠 → 只互动
 - 并发 FLEET（多宠分离）：双击各自的桌宠或气泡 → 唤起各自 Agent 的 Terminal
 
 气泡/桌宠单击不激活。仪表盘卡片"打开终端"按钮与托盘 Agents 子菜单同样按 exact agent_key 唤起。托盘左键 = 显示/恢复桌宠（绝不隐藏已可见的桌宠），右键 = 完整菜单。
@@ -44,7 +44,7 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 - **语义化状态气泡**：`Agent · Mode · Phase` + Goal（≤120 字）+ 当前活动摘要（≤160 字，本地规则压缩，不调用 LLM）
 - **等待审批检测**：Kimi 来自 wire `ApprovalRequest`（精确）；Codex/Claude 来自 Windows Terminal UIA 当前可见审批 UI（高置信 + 1.5s TTL 复检）——**静默永远不被推断为等待审批**
 - **多 Agent**：自动跟随（WAITING > INPUT > ERROR > WORKING …，工作中粘性），或并发模式（单宠聚合/多宠分离）
-- **仪表盘 V4.1.3**：左侧导航六页（概览/Agents/桌宠与外观/监听与隐私/诊断/设置），自适应窗口大小；PID 等技术细节在"详情"高级诊断
+- **仪表盘 V4.1.4**：左侧导航六页（概览/Agents/桌宠与外观/监听与隐私/诊断/设置），自适应窗口大小；PID 等技术细节在"详情"高级诊断
 - **双击桌宠/气泡/卡片按钮**：唤起该 Agent 所在的 Windows Terminal 窗口（公共 Win32 API 恢复并前置；foreground 被拒时闪烁任务栏；AGGREGATE 下双击桌宠只互动）
 - **系统集成**：托盘图标、开机自启、隐藏、换肤、缩放、锁定动画
 - **隐私**：`/proc/<pid>/environ` 只在 WSL 内部按 allowlist（`WT_SESSION`/`CODEX_HOME` 等 9 项）过滤后才进入 Python；终端文本只在内存、绝不落盘
@@ -161,7 +161,7 @@ tests/                              单元/隐私/UIA/匹配/基准/实机回归
 ## 测试
 
 ```bat
-D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（320+）
+D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（340+）
 D:\miniconda3\envs\deskpet\python.exe tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json    # 合成基准（队列/预算/churn 上限）
 D:\miniconda3\envs\deskpet\python.exe tools\terminal_window_probe.py --list      # WT 窗口实机 probe（list/validate/activate/resolve）
 D:\miniconda3\envs\deskpet\python.exe tools\terminal_observer_probe.py           # UIA 观察实机 probe（默认不打印终端原文）

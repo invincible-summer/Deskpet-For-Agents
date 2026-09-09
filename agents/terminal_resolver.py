@@ -6,6 +6,9 @@
     失败但存在正向 best control 时仍保留其 HWND（AMBIGUOUS）；桌面只
     有一个 WT 顶层窗口时保留该 HWND（NONE）。confidence 不是
     activation gate，wakeability 只由 binding.window 决定。
+    v4.1.4：标题证据补一条"最近可见屏幕文本"摘要（仅内存）——标题
+    停在 profile 名（"Ubuntu"）时多个 Agent 会并列坍缩到同一个窗口，
+    屏幕上的项目路径/Agent 标识能把它们区分开。
   * TerminalObservationResolver —— 保持 v4.1.2 严格链：只有 CONFIRMED
     （祖先唯一窗口 + 该窗口唯一被观察 control）和 HIGH（标题证据互相
     唯一）才生成 binding；低置信 Window 候选可供用户显式唤起，但绝不
@@ -128,19 +131,36 @@ class _BaseTerminalTitleScorer:
 
 
 class _V3WindowControlScorer(_BaseTerminalTitleScorer):
-    """Window 唤起链的 control 评分（§4.3）：只用 TermControl 自身标题。
+    """Window 唤起链的 control 评分（§4.3 + v4.1.4 屏幕证据）。
 
-    WT 顶层窗口标题是窗口级共享证据，不进入 Window wake 评分——
-    这是 v3 的决策拓扑，v4.1.3 不再增强。
+    两条证据：TermControl 自身标题 + 该 control 最近一次可见屏幕文本
+    （内存摘要）。权重仍是 v3 的 kind+3 / cwd+2 / user@+1 / distro+1，
+    屏幕只是补足标题缺失的证据（标题停在 profile 名 "Ubuntu" 时，
+    TUI 屏幕上的项目路径/Agent 标识仍能区分不同窗口）。屏幕文本
+    绝不进入 binding（只产生 int 分数与证据 token），观察归属链
+    （TerminalObservationResolver）不接受屏幕证据。
     """
 
     def score_control(self, inst: AgentInstance,
-                      control: ObservedTerminalControl) -> int:
-        return self.score_title(inst, control.title)[0]
+                      control: ObservedTerminalControl,
+                      screen: str = "") -> int:
+        best = 0
+        for text in (control.title, screen):
+            if text:
+                best = max(best, self.score_title(inst, text)[0])
+        return best
 
     def reason_for(self, inst: AgentInstance,
-                   control: ObservedTerminalControl) -> str:
-        return self.score_title(inst, control.title)[1] or "no-evidence"
+                   control: ObservedTerminalControl,
+                   screen: str = "") -> str:
+        best = ""
+        for text in (control.title, screen):
+            if not text:
+                continue
+            reason = self.score_title(inst, text)[1]
+            if len(reason) > len(best):
+                best = reason
+        return best or "no-evidence"
 
 
 class _ObservationScorer(_BaseTerminalTitleScorer):
@@ -274,13 +294,15 @@ class _WindowTitleIndex:
 
 
 class TerminalWindowResolver:
-    """Agent → Windows Terminal 顶层窗口候选（v4.1.3 §6）。
+    """Agent → Windows Terminal 顶层窗口候选（v4.1.3 §6 + v4.1.4 修正）。
 
-    v3 决策顺序（§6.3）：
+    决策顺序：
       1. native PID ancestor 唯一窗口 → CONFIRMED（不受 control 数量
-         影响）；>1 窗口 → AMBIGUOUS + window=None
-      2. Agent ↔ control mutual-unique（min_score=3, margin=1）
-         → HIGH + control.hwnd
+         影响）；>1 祖先窗口 → 带着祖先窗口集落入评分链（标题/屏幕
+         证据可能仍能唯一定位），评分无正向证据才 AMBIGUOUS +
+         window=None（multi-window-ancestor）
+      2. Agent ↔ control mutual-unique（min_score=3, margin=1；
+         证据 = control 标题 + 屏幕摘要）→ HIGH + control.hwnd
       3. mutual-unique 失败但存在正向 best control → AMBIGUOUS +
          best control.hwnd（★ v3 关键行为）
       4. 无正向证据 + 唯一 WT 窗口 → NONE + 该窗口（single-window-
@@ -313,14 +335,24 @@ class TerminalWindowResolver:
         """stale activation 路径：强制下一次 resolve 重新枚举（§8.3）。"""
         self._catalog.invalidate()
 
-    def resolve(self, instances: list, controls: dict,
-                now: float) -> dict[str, TerminalWindowBinding]:
+    def resolve(self, instances: list, controls: dict, now: float,
+                screens: dict | None = None) -> dict[str, TerminalWindowBinding]:
+        """screens：control_id → 最近可见屏幕文本（内存摘要，可空）。
+
+        只作为 Window 唤起评分的证据补充；不进入 binding 的
+        title/reason 文本（只有 int 分数与证据 token）。
+        """
+        screens = screens or {}
         self._catalog.refresh()
         rows = self._catalog.rows()
         hwnds = self._catalog.hwnds()
 
         out: dict[str, TerminalWindowBinding] = {}
         scored_instances: list = []
+        # native 多窗口祖先：先带着祖先窗口集走评分链，评分无正向
+        # 证据才回退 AMBIGUOUS+None（v4.1.4：全部 WT 窗口共享同一
+        # WindowsTerminal.exe 进程，>1 窗口时标题/屏幕证据仍可能定位）
+        multi_ancestor_bounds: dict[str, set[int]] = {}
 
         for inst in instances:
             key = inst.key
@@ -338,20 +370,23 @@ class TerminalWindowResolver:
                         "windows-ancestor")
                     continue
                 if len(matches) > 1:
-                    out[key] = TerminalWindowBinding(
-                        confidence=WindowBindingConfidence.AMBIGUOUS,
-                        last_seen=now, reason="multi-window-ancestor")
+                    multi_ancestor_bounds[key] = set(matches)
+                    scored_instances.append(inst)
                     continue
                 # 祖先链找不到窗口（非 WT 宿主或已退出）→ 落到 v3 打分路径
             scored_instances.append(inst)
 
-        # ---- v3 评分：Agent ↔ ObservedTerminalControl（只用 control 标题）
+        # ---- v3 评分：Agent ↔ ObservedTerminalControl（标题 + 屏幕摘要）
         inst_by_key = {inst.key: inst for inst in scored_instances}
         control_ids = list(controls.keys())
 
         def score_fn(agent_key: str, control_id: tuple) -> int:
+            bound = multi_ancestor_bounds.get(agent_key)
+            if bound is not None and controls[control_id].hwnd not in bound:
+                return -1   # 祖先链已限定候选窗口集（score_matrix 视为不可配对）
             return self._scorer.score_control(
-                inst_by_key[agent_key], controls[control_id])
+                inst_by_key[agent_key], controls[control_id],
+                screens.get(control_id, ""))
 
         decisions = mutual_unique_matches(
             [inst.key for inst in scored_instances], control_ids, score_fn,
@@ -369,7 +404,8 @@ class TerminalWindowResolver:
                 control = controls[dec.right]
                 out[key] = self._binding_from_hwnd(
                     control.hwnd, now, WindowBindingConfidence.HIGH,
-                    self._scorer.reason_for(inst, control),
+                    self._scorer.reason_for(inst, control,
+                                            screens.get(dec.right, "")),
                     score=dec.score, runner_up=runner_up,
                     title=control.title)
                 continue
@@ -383,6 +419,12 @@ class TerminalWindowResolver:
                     "best-positive-candidate",
                     score=best_score, runner_up=runner_up,
                     title=control.title)
+                continue
+            if key in multi_ancestor_bounds:
+                # 评分链也没能从祖先窗口集中挑出候选 → 诚实 AMBIGUOUS
+                out[key] = TerminalWindowBinding(
+                    confidence=WindowBindingConfidence.AMBIGUOUS,
+                    last_seen=now, reason="multi-window-ancestor")
                 continue
             if len(hwnds) == 1:
                 # 唯一 WT 顶层窗口兜底（§6.3-3）：可唤起，不归属证据

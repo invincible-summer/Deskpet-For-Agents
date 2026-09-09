@@ -42,6 +42,23 @@ class NOTIFYICONDATAW(ctypes.Structure):
 
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
 
+# 进程级共享 wndproc（v4.1.4 崩溃修复）：窗口类进程内只注册一次，
+# 注册进类的回调必须与类同生命周期。挂在实例上的 WNDPROC 在实例
+# 被 GC 后 trampoline 即释放，而类仍指向该地址——后续实例
+# CreateWindowExW 分发 WM_NCCREATE 时会跳进已释放代码
+# （access violation）。产品里托盘图标开关切换同样会创建第二个
+# TrayIcon，因此这里必须用模块级回调 + 当前实例路由（同一时刻
+# 只有一个 TrayIcon 存活，见 TrayIcon）。
+_current_icon: "TrayIcon | None" = None
+
+
+@WNDPROC
+def _shared_wndproc(hwnd, msg, wparam, lparam):
+    icon = _current_icon
+    if icon is not None:
+        return icon._handle_message(hwnd, msg, wparam, lparam)
+    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
 
 class WNDCLASSW(ctypes.Structure):
     _fields_ = [
@@ -57,6 +74,8 @@ user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
 
 
 class TrayIcon:
+    """同一时刻进程内只应有一个 TrayIcon 存活（消息按当前实例路由）。"""
+
     def __init__(self, tooltip: str = "DeskPet"):
         self.events: "queue.Queue" = queue.Queue()
         self.tooltip = tooltip
@@ -64,7 +83,6 @@ class TrayIcon:
         self._thread_id = 0
         self._ready = threading.Event()
         self._hwnd = None
-        self._wndproc_ref = None          # 保住回调引用防 GC
         self._nid: NOTIFYICONDATAW | None = None
         self._hicon = None
 
@@ -98,50 +116,55 @@ class TrayIcon:
 
     # ---- worker 线程 ----
     def _run(self):
+        global _current_icon
+        _current_icon = self
         self._thread_id = int(kernel32.GetCurrentThreadId())
         hinst = kernel32.GetModuleHandleW(None)
         cls = "DeskPetTrayWnd"
 
-        @WNDPROC
-        def wndproc(hwnd, msg, wparam, lparam):
-            if msg == WM_APP_TRAY:
-                # lParam 低字 = 鼠标消息
-                ev = {0x0202: "left", 0x0205: "right", 0x0204: "right"}.get(
-                    lparam & 0xFFFF)
-                if ev:
-                    self.events.put(ev)
-                return 0
-            if msg == WM_APP_QUIT:
-                self._remove()
-                user32.PostQuitMessage(0)
-                return 0
-            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-        self._wndproc_ref = wndproc
         wc = WNDCLASSW()
-        wc.lpfnWndProc = wndproc
+        wc.lpfnWndProc = _shared_wndproc   # 模块级：与窗口类同生命周期
         wc.hInstance = hinst
         wc.lpszClassName = cls
         if not user32.RegisterClassW(ctypes.byref(wc)):
-            # 已注册（重复启动托盘）
+            # 已注册（重复启动托盘）：类仍指向共享 wndproc，安全复用
             pass
-        hwnd = user32.CreateWindowExW(0, cls, "DeskPetTray", 0, 0, 0, 0, 0,
-                                      None, None, hinst, None)
-        if not hwnd:
-            self.events.put(("error", "CreateWindowExW failed"))
-            return
-        self._hwnd = hwnd
-        self._add_icon()
-        self._ready.set()
+        try:
+            hwnd = user32.CreateWindowExW(0, cls, "DeskPetTray", 0, 0, 0, 0, 0,
+                                          None, None, hinst, None)
+            if not hwnd:
+                self.events.put(("error", "CreateWindowExW failed"))
+                return
+            self._hwnd = hwnd
+            self._add_icon()
+            self._ready.set()
 
-        msg = wt.MSG()
-        lpmsg = ctypes.byref(msg)
-        while user32.GetMessageW(lpmsg, None, 0, 0) > 0:
-            user32.TranslateMessage(lpmsg)
-            user32.DispatchMessageW(lpmsg)
-        user32.DestroyWindow(hwnd)
-        if self._hicon:
-            user32.DestroyIcon(self._hicon)
+            msg = wt.MSG()
+            lpmsg = ctypes.byref(msg)
+            while user32.GetMessageW(lpmsg, None, 0, 0) > 0:
+                user32.TranslateMessage(lpmsg)
+                user32.DispatchMessageW(lpmsg)
+            user32.DestroyWindow(hwnd)
+        finally:
+            if self._hicon:
+                user32.DestroyIcon(self._hicon)
+                self._hicon = None
+            if _current_icon is self:
+                _current_icon = None
+
+    def _handle_message(self, hwnd, msg, wparam, lparam):
+        if msg == WM_APP_TRAY:
+            # lParam 低字 = 鼠标消息
+            ev = {0x0202: "left", 0x0205: "right", 0x0204: "right"}.get(
+                lparam & 0xFFFF)
+            if ev:
+                self.events.put(ev)
+            return 0
+        if msg == WM_APP_QUIT:
+            self._remove()
+            user32.PostQuitMessage(0)
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _load_icon(self) -> int:
         ico = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

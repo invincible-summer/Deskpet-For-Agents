@@ -24,6 +24,10 @@ from .presentation import PresentationMode, PresentationState
 
 MARGIN = 8
 GAP = 4
+# 聚合模式气泡轮播（v4.1.4）：同一桌宠依次展示每个 Agent 的单卡气泡，
+# 每张卡携带自己的 agent_key（双击 = 激活该 Agent 的终端窗口）。
+AGGREGATE_ROTATE_SEC = 5.0
+AGGREGATE_ROTATE_MIN, AGGREGATE_ROTATE_MAX = 2.0, 30.0
 
 
 class ResolvedViewConfig:
@@ -219,6 +223,7 @@ class PetView:
     def set_single_model(self, target):
         """填充单卡气泡模型（并发模式与单个监听完全一致的气泡）。"""
         m = self.bubble.model
+        m.badge = ""
         if target is None:
             m.visible = False
             m.agent_key = ""
@@ -347,6 +352,11 @@ class PetViewManager:
             __import__("pet.skins", fromlist=["SkinBuildManager"]).SkinBuildManager())
         self.views: dict[str, PetView] = {}
         self._hooks = None   # app 提供 activate/menu/interact/moved 回调
+        # 聚合气泡轮播状态（v4.1.4）
+        self._agg_sig: tuple | None = None
+        self._agg_idx = 0
+        self._agg_next_switch = 0.0
+        self._agg_attention_seen: frozenset[str] = frozenset()
 
     def set_hooks(self, on_activate, on_menu, on_interact, on_moved,
                   on_double_vacant=None):
@@ -401,6 +411,8 @@ class PetViewManager:
         Fleet：只有绑定了 Agent 的 slot 才有桌宠（没有绑定不显示，
         桌宠数量跟随绑定数而不是 slot 配置数）；每只桌宠的气泡与
         单个监听完全一致（单卡，无 "N Agents" 栈卡）。
+        Aggregate：单宠 "pet-1"，多张候选卡依次轮播（v4.1.4），
+        每张卡携带自己的 agent_key——双击气泡激活该 Agent 的终端。
         """
         if state.mode is PresentationMode.FLEET:
             live = set(state.slot_keys)
@@ -419,12 +431,60 @@ class PetViewManager:
                 if slot_id != "pet-1":
                     self.remove_view(slot_id)
             view = self.views["pet-1"]
-            key = state.focused_key
+            # aggregate：body 不激活（气泡才激活）；气泡在多个候选卡间
+            # 依次轮播，每张卡携带自己的 agent_key（v4.1.4）
+            rotating = (state.mode is PresentationMode.AGGREGATE
+                        and len(state.cards) > 1)
+            if rotating:
+                key, idx = self._aggregate_rotation(state, now)
+            else:
+                self._agg_sig = None
+                key = state.focused_key
+                idx = -1
             view.set_agent(key)
-            # aggregate：body 不激活（气泡底行才激活）；single：双击激活
             view.set_body_activation(
                 state.mode is not PresentationMode.AGGREGATE)
             view.set_single_model(targets.get(key) if key else None)
+            if rotating and key:
+                view.bubble.model.badge = f"{idx + 1}/{len(state.cards)}"
+
+    def _rotate_sec(self) -> float:
+        try:
+            value = float(self.config.get(
+                "presentation.concurrent.rotate_sec", AGGREGATE_ROTATE_SEC))
+        except (TypeError, ValueError):
+            value = AGGREGATE_ROTATE_SEC
+        return max(AGGREGATE_ROTATE_MIN,
+                   min(AGGREGATE_ROTATE_MAX, value))
+
+    def _aggregate_rotation(self, state, now: float) -> tuple[str, int]:
+        """聚合轮播：同一桌宠依次显示 state.cards 的单卡气泡。
+
+        * 卡集合/焦点变化 → 从焦点（无则第 0 张，通常是 attention）重开；
+        * 每 rotate_sec 轮换到下一张；
+        * 新出现的紧急卡（WAITING/INPUT/ERROR）立即插播一次，不打断
+          后续轮换节奏。
+        """
+        keys = [c.agent_key for c in state.cards]
+        sig = (frozenset(keys), state.focused_key)
+        rotate = self._rotate_sec()
+        if sig != self._agg_sig:
+            self._agg_sig = sig
+            self._agg_idx = (keys.index(state.focused_key)
+                             if state.focused_key in keys else 0)
+            self._agg_next_switch = now + rotate
+        attention = frozenset(
+            c.agent_key for c in state.cards if c.attention)
+        urgent_new = attention - self._agg_attention_seen
+        if urgent_new:
+            jump = next(k for k in keys if k in urgent_new)
+            self._agg_idx = keys.index(jump)
+            self._agg_next_switch = now + rotate
+        elif now >= self._agg_next_switch:
+            self._agg_idx = (self._agg_idx + 1) % len(keys)
+            self._agg_next_switch = now + rotate
+        self._agg_attention_seen = attention
+        return keys[self._agg_idx], self._agg_idx
 
     def apply_animation(self, state: PresentationState,
                         targets: dict, now: float, force_state: str = ""):

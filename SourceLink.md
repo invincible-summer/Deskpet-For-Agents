@@ -1,17 +1,48 @@
-# DeskPet V4.1.3 — SourceLink / Evidence Map
+# DeskPet V4.1.4 — SourceLink / Evidence Map
 
 > 审计日期：2026-09-08（V4.1）；V4.1.2 window-only 收敛更新：2026-09-09；
-> V4.1.3 v3 wake 语义恢复更新：2026-09-09  
+> V4.1.3 v3 wake 语义恢复更新：2026-09-09；V4.1.4 窗口区分修复：2026-09-09  
 > DeskPet 审计基线：`invincible-summer/DeskPet@af8236d15dc3bfecaa89464e1b77d7f84c2b09be`  
 >
 > 本文件是证据链与接口依据。链接分为：
 >
-> - **实现合同**：Microsoft/Linux 官方 API 文档，可作为代码语义依据；
+> - **实现合同**：Microsoft/Linux 官方 API 文档，可以作为代码语义依据；
 > - **上游当前行为**：Windows Terminal 当前源码，说明现行实现，但必须 feature-detect，不能把内部源码细节当永久公开 ABI；
 > - **能力缺口证据**：Windows Terminal 官方仓库 issue，证明截至当前公开接口仍缺某项能力；issue 本身不是 API 合同；
-> - **DeskPet 内部审计证据**：固定到本次审计 commit，便于之后核对 V3→V4.1→V4.1.2→V4.1.3 修改。
+> - **DeskPet 内部审计证据**：固定到本次审计 commit，便于之后核对 V3→V4.1→V4.1.2→V4.1.3→V4.1.4 修改。
 
-## 0. V4.1.3 v3 wake 语义恢复（决策依据）
+## 0. V4.1.4 窗口区分修复（决策依据）
+
+**实机复现（2026-09-09）：两个 WT 窗口各运行一个 WSL Agent，TermControl
+标题与窗口标题全部停在 profile 名 "Ubuntu" → 每个 Agent 对每个 control
+只得 distro+1 → 并列 → `best_effort_scores` 确定性排序给所有 Agent 选了
+同一个 control → 全部绑定同一窗口（错误唤起）。**
+
+- **屏幕摘要证据（`agents/terminal_uia.py` / `agents/terminal_resolver.py`）**：
+  Observer 为每个 control 维持"最近一次可见屏幕文本"内存摘要（复用
+  TextPattern `GetVisibleRanges()` 有界读取通道：全局 ≤6/s、单 control
+  ≥0.5s、缺失/30s 过期才补读、每次 poll ≤2 个；事件驱动的审批读取顺带
+  更新）。Window 唤起评分把摘要作为第二证据（v3 权重不变，`score_control`
+  取标题/屏幕的较大分）——TUI 屏幕上的项目路径与 Agent 标识能让
+  mutual-unique 恢复区分。**观察归属链不接受屏幕证据**（仍只认严格
+  CONFIRMED/HIGH）；摘要绝不进入 binding/log/config（只有 int 分数与
+  证据 token），遵守"终端文本只在内存"的隐私合同。
+- **native 多窗口祖先后备评分**：全部 WT 顶层窗口共享同一
+  WindowsTerminal.exe 进程，>1 窗口时祖先链只能给出候选集——V4.1.4
+  让这些 Agent 带着祖先窗口集落入评分链（`score_fn` 对集外 control
+  返回不可配对），评分无正向证据才回退 `AMBIGUOUS+None
+  (multi-window-ancestor)`。
+- **聚合气泡轮播（`pet/petview.py`）**：AGGREGATE 单宠在多张候选卡间
+  依次轮播（默认 5s，`presentation.concurrent.rotate_sec` clamp 2–30），
+  每张卡携带自己的 agent_key（双击气泡 = 唤起当前显示 Agent 的终端），
+  右上角 "2/3" 角标；新出现的 WAITING/INPUT/ERROR 卡立即插播一次。
+- **托盘崩溃修复（`pet/tray.py`）**：窗口类 "DeskPetTrayWnd" 进程内只
+  注册一次，注册进类的 WNDPROC 必须与类同生命周期——挂实例上的回调
+  在实例 GC 后 trampoline 释放，类仍指向该地址，后续实例
+  `CreateWindowExW` 分发消息即 access violation（托盘开关切换/测试
+  序列可稳定复现）。改为模块级共享 wndproc + 当前实例路由。
+
+## 0.1 V4.1.3 v3 wake 语义恢复（决策依据）
 
 **V4.1.2 把"证据不够唯一"一律折叠成 `AMBIGUOUS + window=None`，导致
 v3 已验证可用的"只要被动 resolver 能给出候选 HWND，用户就可以显式

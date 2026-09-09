@@ -34,6 +34,7 @@ class BubbleModel:
     accent: str = "#487f73"
     visible: bool = False
     agent_key: str = ""   # 携带 exact key：点击底行 = 激活该 Agent
+    badge: str = ""       # 聚合轮播角标（"2/3"）；空 = 不显示
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,10 @@ class SingleAgentBubbleRenderer(BubbleRendererBase):
                              fill=bg, outline=border, width=1))
         title = fit_text(self.model.status or 'DeskPet', self.w-2*pad, font.measure)
         add(c.create_text(ox+pad, oy+pad, text=title, anchor='nw', font=font, fill=self.model.accent))
+        if self.model.badge:   # 聚合轮播角标（"2/3"）
+            badge = fit_text(self.model.badge, self.w//3, font.measure)
+            add(c.create_text(x1-pad, oy+pad, text=badge, anchor='ne',
+                              font=font, fill='#8a9a92'))
         ty = oy+pad+font.metrics('linespace')+m['gap']
         for line in self.disp_lines:
             add(c.create_text(ox+pad, ty, text=line, anchor='nw', font=font, fill=font_color))

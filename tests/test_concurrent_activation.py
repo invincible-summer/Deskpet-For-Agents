@@ -428,5 +428,121 @@ class InteractionModeMatrixTests(unittest.TestCase):
             app.quit()
 
 
+class AggregateRotationTests(unittest.TestCase):
+    """v4.1.4 聚合轮播：同一桌宠依次展示每个 Agent 的单卡气泡。
+
+    * 每张卡携带自己的 agent_key（双击气泡激活该 Agent 的终端窗口，
+      轮播到谁就激活谁）；
+    * 卡集合/焦点变化从焦点重开；每 rotate_sec 轮换；
+    * 新出现的紧急卡（WAITING/INPUT/ERROR）立即插播一次；
+    * 单卡/SINGLE/FLEET 不轮播、无角标。
+    """
+
+    def _app(self, n=3, mode="aggregate"):
+        app = make_app([_slot("pet-1")])
+        app.config.data["presentation"]["concurrent"]["enabled"] = True
+        app.config.data["presentation"]["concurrent"]["mode"] = mode
+        agents = [inst(AgentKind.CODEX, i + 1, cwd=f"/w/p{i}")
+                  for i in range(n)]
+        app.monitor.instances = {a.key: a for a in agents}
+        app.monitor.snapshots = {a.key: snap(a) for a in agents}
+        return app, agents
+
+    def _tick(self, app, now):
+        targets = app.monitor.get_targets()
+        state = app.presentation.reconcile(targets, now)
+        app.pet_manager.sync(state, targets, now)
+        app._presentation_state = state
+        return state
+
+    def test_rotation_cycles_all_cards_with_badge(self):
+        app, agents = self._app(3)
+        try:
+            order = []
+            for tick in range(7):
+                now = NOW + tick * 6.0
+                self._tick(app, now)
+                view = app.pet_manager.views["pet-1"]
+                order.append(view.bubble.model.agent_key)
+                # 角标 = 当前是第几张卡（1-based）
+                self.assertEqual(view.bubble.model.badge,
+                                 f"{tick % 3 + 1}/3")
+            # 依次轮播 a1→a2→a3→a1…（attention 序 = 启动序）
+            self.assertEqual(order, [agents[i % 3].key for i in range(7)])
+        finally:
+            app.quit()
+
+    def test_rotated_bubble_double_activates_current_card(self):
+        """轮播到第 2 张时双击气泡 → 激活的是当前显示的 Agent。"""
+        app, agents = self._app(2)
+        try:
+            self._tick(app, NOW)
+            self._tick(app, NOW + 6.0)          # 轮换到第 2 张
+            view = app.pet_manager.views["pet-1"]
+            self.assertEqual(view.bubble.model.agent_key, agents[1].key)
+            view.redraw()
+            activated = []
+            view._on_activate = activated.append
+            box = view.bubble._hit_boxes[0][0]
+            tag = view._hit((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
+            self.assertEqual(tag, ("activate", agents[1].key))
+            view._on_hit_tag(tag)
+            self.assertEqual(activated, [agents[1].key])
+        finally:
+            app.quit()
+
+    def test_urgent_card_inserted_once(self):
+        """新 WAITING 卡立即插播，之后轮换继续（不卡死在紧急卡）。"""
+        app, agents = self._app(3)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            self._tick(app, NOW)                 # 显示 a1
+            self.assertEqual(view.bubble.model.agent_key, agents[0].key)
+            # a3 变 WAITING → 下一 tick 立即插播
+            app.monitor.snapshots[agents[2].key] = snap(
+                agents[2], Status.WAITING)
+            self._tick(app, NOW + 0.5)
+            self.assertEqual(view.bubble.model.agent_key, agents[2].key)
+            # 之后照常轮换（不再被同一紧急卡反复抢占）
+            self._tick(app, NOW + 6.0)
+            self._tick(app, NOW + 12.0)
+            keys = {a.key for a in agents}
+            self.assertIn(view.bubble.model.agent_key, keys)
+            self.assertNotEqual(view.bubble.model.agent_key, agents[2].key)
+        finally:
+            app.quit()
+
+    def test_focus_change_restarts_at_focused_card(self):
+        app, agents = self._app(3)
+        try:
+            self._tick(app, NOW)
+            app.presentation.set_focus(agents[2].key)
+            self._tick(app, NOW + 0.5)
+            view = app.pet_manager.views["pet-1"]
+            self.assertEqual(view.bubble.model.agent_key, agents[2].key)
+        finally:
+            app.quit()
+
+    def test_single_card_and_fleet_no_rotation_badge(self):
+        app, agents = self._app(1)
+        try:
+            self._tick(app, NOW)
+            self._tick(app, NOW + 30.0)
+            view = app.pet_manager.views["pet-1"]
+            self.assertEqual(view.bubble.model.agent_key, agents[0].key)
+            self.assertEqual(view.bubble.model.badge, "")
+        finally:
+            app.quit()
+        app, agents = self._app(2, mode="fleet")
+        try:
+            app.config.data["presentation"]["concurrent"]["slots"] = [
+                _slot("pet-1"), _slot("pet-2")]
+            self._tick(app, NOW)
+            for view in app.pet_manager.views.values():
+                self.assertEqual(view.bubble.model.badge, "")
+        finally:
+            app.quit()
+
+
 if __name__ == "__main__":
     unittest.main()

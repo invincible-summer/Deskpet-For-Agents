@@ -341,6 +341,28 @@ class TrayDashboardVisibilityTests(unittest.TestCase):
         finally:
             app.quit()
 
+    def test_tray_icon_survives_replacement_cycles(self):
+        """v4.1.4 崩溃回归：窗口类进程级注册，实例回收后类回调不得悬空。
+
+        旧行为：WNDPROC 挂在 TrayIcon 实例上，首个实例被 GC 后
+        ctypes trampoline 释放，而 "DeskPetTrayWnd" 类仍指向它——
+        后续实例 CreateWindowExW 即 access violation。共享模块级
+        wndproc 后必须可无限次换代。
+        """
+        import gc
+        from pet.tray import TrayIcon
+        for i in range(3):
+            icon = TrayIcon(f"DeskPet test {i}")
+            icon.start()
+            icon.stop()
+            del icon
+            gc.collect()
+        final = TrayIcon("DeskPet test final")
+        final.start()
+        final.stop()
+        self.assertTrue(final.events.empty(),
+                        "托盘创建/换代过程中不得产生 error 事件")
+
     def test_explicit_menu_hide_still_works(self):
         """右键菜单的显式隐藏不受 tray 左键修复影响。"""
         app = self._app()

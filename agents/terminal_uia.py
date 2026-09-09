@@ -66,6 +66,12 @@ REDISCOVER_SEC = 20.0     # control 重新发现周期（safety refresh；正常
 TEXT_CHANGED_DEBOUNCE = 0.15        # TextChanged → 可见读取的 debounce
 CONTROL_VISIBLE_READ_MIN_INTERVAL = 0.5   # 单 control 可见读取最小间隔
 GLOBAL_VISIBLE_READ_LIMIT = 6         # 全局可见读取预算（次/秒）
+# 屏幕摘要通道（v4.1.4）：窗口候选评分用的每 control 最近一次可见读取。
+# 只存内存、绝不持久化/展示/写日志；事件驱动的 _inspect_visible 顺带
+# 更新，缺失/过期才补读，且与审批通道共享同一套读取预算。
+SCREEN_DIGEST_STALE_SEC = 30.0       # 无事件时的最长可信时间
+SCREEN_DIGEST_MIN_INTERVAL = 2.0     # 单 control 摘要补读最小间隔
+SCREEN_DIGEST_PER_POLL = 2           # 每次 poll 最多补读的 control 数
 WEAK_TRIGGER_RE = re.compile(
     r"(would you like|do you want|approve|approval|permission|permissions|"
     r"proceed|don't ask|tell (?:codex|claude|kimi)|waiting for|confirm|"
@@ -772,13 +778,16 @@ class TerminalObserver:
         self._dirty_controls: dict[tuple, float] = {}
         self._last_visible_read: dict[tuple, float] = {}
         self._visible_read_times: deque = deque()   # 全局预算滑动窗口
+        # 屏幕摘要（v4.1.4）：窗口候选评分证据，仅内存
+        self._screens: dict[tuple, str] = {}
+        self._screen_read_at: dict[tuple, float] = {}
         self._last_discover = 0.0
         self._structure_dirty = False
         self._started = False
         # 诊断计数（不含任何终端文本）
         self.stats = {"events": 0, "dropped": 0, "visible_reads": 0,
                       "rediscoveries": 0, "triggers": 0,
-                      "text_fallback_reads": 0}
+                      "text_fallback_reads": 0, "screen_reads": 0}
         backend.event_sink = self._on_event
 
     # ---- UIA callback 线程入口：只入队，绝不阻塞 ----
@@ -842,7 +851,8 @@ class TerminalObserver:
                     self.observations.pop(control_id, None)
             for table in (self.activity, self._waiting_recheck, self.rings,
                           self._ring_len, self._dirty_controls,
-                          self._last_visible_read):
+                          self._last_visible_read, self._screens,
+                          self._screen_read_at):
                 for control_id in list(table):
                     if control_id not in new_map:
                         table.pop(control_id, None)
@@ -906,6 +916,54 @@ class TerminalObserver:
                 self._inspect_visible(control_id, now)
 
         self._drain_dirty(now)
+        self.refresh_screen_digests(now)
+
+    # ---- 屏幕摘要（窗口候选评分证据，v4.1.4） ----
+    def screen_texts(self) -> dict[tuple, str]:
+        """每 control 最近一次可见屏幕文本的快照（仅内存，绝不外显）。"""
+        return dict(self._screens)
+
+    def refresh_screen_digests(self, now: float):
+        """为缺失/过期的 control 补读屏幕摘要。
+
+        与审批通道共用同一预算（全局 ≤6/s、单 control ≥0.5s），
+        每次 poll 最多补读 SCREEN_DIGEST_PER_POLL 个，不新增线程/
+        轮询循环。事件驱动的 _inspect_visible 会顺带更新摘要，
+        正常运行时这里几乎不读。
+        """
+        if not self._started or not self.controls:
+            return
+        while (self._visible_read_times
+               and now - self._visible_read_times[0] > 1.0):
+            self._visible_read_times.popleft()
+        picked = 0
+        for control_id in self.controls:
+            read_at = self._screen_read_at.get(control_id, 0.0)
+            fresh = (control_id in self._screens
+                     and now - read_at < SCREEN_DIGEST_STALE_SEC)
+            if fresh or now - read_at < SCREEN_DIGEST_MIN_INTERVAL:
+                continue
+            if self._screen_read(control_id, now):
+                picked += 1
+            if picked >= SCREEN_DIGEST_PER_POLL:
+                break
+
+    def _screen_read(self, control_id: tuple, now: float) -> bool:
+        if now - self._last_visible_read.get(control_id, 0.0) < \
+                CONTROL_VISIBLE_READ_MIN_INTERVAL:
+            return False
+        if len(self._visible_read_times) >= GLOBAL_VISIBLE_READ_LIMIT:
+            return False
+        try:
+            visible = self.backend.read_visible(control_id)
+        except Exception:
+            return False
+        self._last_visible_read[control_id] = now
+        self._visible_read_times.append(now)
+        self.stats["screen_reads"] += 1
+        self._screens[control_id] = str(visible or "")[:VISIBLE_MAX]
+        self._screen_read_at[control_id] = now
+        return True
 
     def _drain_dirty(self, now: float):
         """处理 TextChanged debounce 到期的可见读取（多重限流）。"""
@@ -953,6 +1011,9 @@ class TerminalObserver:
             visible = self.backend.read_visible(control_id)
         except Exception:
             visible = ""
+        # 顺带更新屏幕摘要（同一次读取服务两个通道，不多花预算）
+        self._screens[control_id] = str(visible or "")[:VISIBLE_MAX]
+        self._screen_read_at[control_id] = now
         obs_list: list[Observation] = []
         for recognizer in self.recognizers:
             try:

@@ -94,26 +94,38 @@ def resolve() -> int:
         print(f"WSL 扫描失败：{exc!r}")
 
     controls = {}
+    screens = {}
     backend = UiaBackend()
     if backend.start():
         observer = TerminalObserver(backend, cfg={"terminal_observer": True})
         try:
-            observer.refresh_controls(force=True)
-            observer.poll(time.time())
+            observer.start()   # _started=True：poll 与屏幕摘要通道才生效
+            # 屏幕摘要冷启动：最多等 ~3s 让每 control 读到一次可见文本
+            # （与产品内共享同一预算；输出绝不包含文本内容）
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                observer.poll(time.time())
+                if observer.controls and len(observer.screen_texts()) >= \
+                        len(observer.controls):
+                    break
+                time.sleep(0.4)
             controls = dict(observer.controls)
+            screens = observer.screen_texts()
         finally:
             observer.stop()
     else:
         print("UIA 不可用（只影响 WSL 标题评分；native 祖先链与唯一窗口"
               "兜底不受影响）")
 
-    print(f"agents={len(instances)} wt_controls={len(controls)}")
+    print(f"agents={len(instances)} wt_controls={len(controls)} "
+          f"screens={len(screens)}/{len(controls)}")
     if not instances:
         print("没有发现 Agent 进程")
         return 0
 
     resolver = TerminalWindowResolver()
-    bindings = resolver.resolve(list(instances), controls, time.time())
+    bindings = resolver.resolve(list(instances), controls, time.time(),
+                                screens=screens)
     for inst in instances:
         b = bindings.get(inst.key)
         print("-" * 60)

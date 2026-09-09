@@ -126,11 +126,13 @@ class WindowsTerminalService:
         （fail-closed，不抛出——Monitor 主循环不能被 UIA/Win32 异常打断）。
         """
         controls = self.observed_controls()
+        screens = (self.observer.screen_texts()
+                   if self.observer is not None else {})
         try:
             # Window 目录来自 enum_windows，不依赖 UIA layout（§8.1）；
-            # UIA controls 只是 v3 WSL 标题 hint。
+            # UIA controls 只是 v3 WSL 标题 hint + 屏幕摘要证据。
             window_bindings = self.window_resolver.resolve(
-                list(instances), controls, now)
+                list(instances), controls, now, screens=screens)
         except Exception:
             window_bindings = {}
         try:

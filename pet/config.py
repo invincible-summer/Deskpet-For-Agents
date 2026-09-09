@@ -69,6 +69,7 @@ DEFAULTS = {
             "enabled": False,         # 并发必须用户手动开启（v4plan §6.1）
             "mode": "aggregate",      # aggregate | fleet
             "max_targets": 3,        # 展示上限 1..8（不是 Monitor 发现上限）
+            "rotate_sec": 5,         # 聚合气泡轮播间隔秒（2..30，v4.1.4）
             "eligible_kinds": {"codex": True, "claude": True,
                                "kimi": True, "pi": True},
             "slots": [
@@ -194,6 +195,8 @@ def normalize(data: dict) -> dict:
         concurrent["enabled"] = bool(concurrent.get("enabled", False))
         concurrent["max_targets"] = int(_clamp(
             concurrent.get("max_targets", 3), 1, 8))
+        concurrent["rotate_sec"] = float(_clamp(
+            concurrent.get("rotate_sec", 5), 2, 30))
         eligible = concurrent.get("eligible_kinds")
         if not isinstance(eligible, dict):
             concurrent["eligible_kinds"] = {k: True for k in _KIND_KEYS}

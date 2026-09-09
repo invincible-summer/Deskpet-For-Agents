@@ -17,6 +17,7 @@ from agents.terminal_uia import (
     EVENT_QUEUE_MAX,
     GLOBAL_VISIBLE_READ_LIMIT,
     RING_MAX,
+    SCREEN_DIGEST_PER_POLL,
     UIA_CALL_QUEUE_MAX,
     WT_WINDOW_CLASS,
     CodexTerminalRecognizer,
@@ -136,6 +137,12 @@ def make_observer(backend=None):
     return observer, backend
 
 
+def seed_screen_digest(observer, control_id, text="seeded", ts=NOW):
+    """预置新鲜屏幕摘要：摘要补读通道跳过，测试聚焦审批/活动通道。"""
+    observer._screens[control_id] = text
+    observer._screen_read_at[control_id] = ts
+
+
 class RecognizerTests(unittest.TestCase):
     def test_codex_requires_heading_and_options(self):
         rec = CodexTerminalRecognizer()
@@ -191,6 +198,7 @@ class ObserverFlowTests(unittest.TestCase):
         control_id = (11, (1,))
         backend.controls[control_id] = control(11, (1,), "x")
         observer.refresh_controls(force=True)
+        seed_screen_digest(observer, control_id)
         backend.emit(control_id, "notification", "progress: compiling 42%")
         observer.poll(NOW)
         self.assertEqual(observer.observations, {})
@@ -296,6 +304,7 @@ class TextChangedFallbackTests(unittest.TestCase):
         backend.controls[control_id] = control(11, (1,), "x")
         observer.refresh_controls(force=True)
         backend.visible[control_id] = visible
+        seed_screen_digest(observer, control_id)
         return observer, backend
 
     def test_text_changed_schedules_bounded_visible_read(self):
@@ -356,6 +365,84 @@ class TextChangedFallbackTests(unittest.TestCase):
         # 审批等待期间走 0.75s 复检通道，不进 debounce 队列
         self.assertIn((11, (1,)), observer._waiting_recheck)
         self.assertNotIn((11, (1,)), observer._dirty_controls)
+
+
+class ScreenDigestTests(unittest.TestCase):
+    """v4.1.4 屏幕摘要通道：窗口候选评分证据。
+
+    合同：仅内存（screen_texts 只给 resolver 评分，绝不外显/持久化）；
+    缺失/过期才补读；与审批通道共享全局 ≤6/s 与单 control ≥0.5s 预算；
+    _inspect_visible 顺带更新；control 消失即清理。
+    """
+
+    def _observer(self, n=5):
+        observer, backend = make_observer()
+        for i in range(n):
+            cid = (11, (i,))
+            backend.controls[cid] = control(11, (i,), f"p{i}")
+            backend.visible[cid] = f"screen text {i}"
+        observer.refresh_controls(force=True)
+        return observer, backend
+
+    def test_poll_populates_digests_bounded_per_poll(self):
+        observer, backend = self._observer(5)
+        observer.poll(NOW)
+        self.assertEqual(len(observer.screen_texts()), SCREEN_DIGEST_PER_POLL)
+        observer.poll(NOW + 3.0)
+        self.assertEqual(len(observer.screen_texts()), 4)
+        observer.poll(NOW + 6.0)
+        self.assertEqual(len(observer.screen_texts()), 5)
+        # 摘要内容 = 可见文本（只留在内存）
+        self.assertIn("screen text 0",
+                      observer.screen_texts()[(11, (0,))])
+
+    def test_digest_reads_share_global_budget(self):
+        observer, backend = self._observer(8)
+        observer.poll(NOW)
+        observer.poll(NOW + 0.4)
+        observer.poll(NOW + 0.8)
+        observer.poll(NOW + 0.95)
+        # 1s 窗口内总读取（含摘要通道）≤ 6
+        self.assertLessEqual(len(observer.screen_texts()),
+                             GLOBAL_VISIBLE_READ_LIMIT)
+        # 窗口滑过后补齐
+        observer.poll(NOW + 2.5)
+        self.assertEqual(len(observer.screen_texts()), 8)
+
+    def test_fresh_digest_not_reread(self):
+        observer, backend = self._observer(1)
+        observer.poll(NOW)
+        reads = len(backend.reads)
+        observer.poll(NOW + 1.0)
+        self.assertEqual(len(backend.reads), reads)   # 30s 内不重复读
+
+    def test_inspect_visible_updates_digest(self):
+        observer, backend = make_observer()
+        cid = (11, (1,))
+        backend.controls[cid] = control(11, (1,), "codex")
+        observer.refresh_controls(force=True)
+        backend.visible[cid] = CODEX_APPROVAL_VISIBLE
+        backend.emit(cid, "notification",
+                     "Would you like to run the following command?", ts=NOW)
+        observer.poll(NOW)
+        # 审批通道的同一次读取顺带填充摘要，不额外读
+        self.assertIn("Would you like to run",
+                      observer.screen_texts()[cid])
+        self.assertEqual(backend.reads.count(cid), 1)
+
+    def test_removed_control_prunes_digest(self):
+        observer, backend = self._observer(1)
+        observer.poll(NOW)
+        self.assertTrue(observer.screen_texts())
+        del backend.controls[(11, (0,))]
+        observer.refresh_controls(force=True)
+        self.assertEqual(observer.screen_texts(), {})
+
+    def test_stopped_observer_skips_digest(self):
+        observer, backend = self._observer(1)
+        observer._started = False
+        observer.poll(NOW)
+        self.assertEqual(observer.screen_texts(), {})
 
 
 class StructureChangedTests(unittest.TestCase):
