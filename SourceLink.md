@@ -1,7 +1,7 @@
-# DeskPet V4.1.4 — SourceLink / Evidence Map
+# DeskPet V4.1.5 — SourceLink / Evidence Map
 
 > 审计日期：2026-09-08（V4.1）；V4.1.2 window-only 收敛更新：2026-09-09；
-> V4.1.3 v3 wake 语义恢复更新：2026-09-09；V4.1.4 窗口区分修复：2026-09-09  
+> V4.1.3 v3 wake 语义恢复更新：2026-09-09；V4.1.4 窗口区分修复：2026-09-09；V4.1.5 托盘小猫图标：2026-09-09  
 > DeskPet 审计基线：`invincible-summer/DeskPet@af8236d15dc3bfecaa89464e1b77d7f84c2b09be`  
 >
 > 本文件是证据链与接口依据。链接分为：
@@ -11,7 +11,24 @@
 > - **能力缺口证据**：Windows Terminal 官方仓库 issue，证明截至当前公开接口仍缺某项能力；issue 本身不是 API 合同；
 > - **DeskPet 内部审计证据**：固定到本次审计 commit，便于之后核对 V3→V4.1→V4.1.2→V4.1.3→V4.1.4 修改。
 
-## 0. V4.1.4 窗口区分修复（决策依据）
+## 0. V4.1.5 托盘小猫图标（决策依据）
+
+**托盘图标不再使用桌宠形象（2026-09-09 决定）：**
+
+- **版权立场**：皮肤是用户自备素材（.gitignore"素材版权保护"段），
+  旧 `assets/icon.ico` 由 `tests/make_icon.py` 从皮肤 `walk.gif` 裁帧
+  生成——等于把版权形象做成应用图标分发，与"素材不入库"立场冲突。
+- **新方案（`pet/icon.py`）**：图标 100% 由代码绘制（椭圆+三角+线，
+  4x 超采样抗锯齿），16–256 每档尺寸**原生绘制**保证 16px 任务栏
+  清晰；仓库继续保持零二进制素材。
+- **自愈（`ensure_icon_ico`）**：托盘线程加载前对 `assets/icon.ico`
+  做内容哈希比对——缺失生成、旧版桌宠图标自动重写（临时文件 + 原子
+  替换）；PIL 不可用/目录不可写 → 回退 `IDI_APPLICATION`，绝不影响
+  启动。`tools/make_icon.py` 保留为手动重建入口。
+- **hIcon 生命周期不变**：仍由 `TrayIcon` 线程 `LoadImageW` 加载、
+  `stop()` 时 `DestroyIcon`（v4.1.4 模块级 wndproc 修复语义保持）。
+
+## 0.1 V4.1.4 窗口区分修复（决策依据）
 
 **实机复现（2026-09-09）：两个 WT 窗口各运行一个 WSL Agent，TermControl
 标题与窗口标题全部停在 profile 名 "Ubuntu" → 每个 Agent 对每个 control
@@ -49,7 +66,7 @@
   `CreateWindowExW` 分发消息即 access violation（托盘开关切换/测试
   序列可稳定复现）。改为模块级共享 wndproc + 当前实例路由。
 
-## 0.1 V4.1.3 v3 wake 语义恢复（决策依据）
+## 0.2 V4.1.3 v3 wake 语义恢复（决策依据）
 
 **V4.1.2 把"证据不够唯一"一律折叠成 `AMBIGUOUS + window=None`，导致
 v3 已验证可用的"只要被动 resolver 能给出候选 HWND，用户就可以显式
@@ -86,7 +103,7 @@ V4.1.3 恢复 v3 candidate selection，同时保留 v4.1.2 的强
 - microsoft/terminal#19783 结论不变：仍只承诺 window 级唤起，
   不切 Tab/Pane、不发送键盘输入。
 
-## 0.1 V4.1.2 Core Convergence（window-only）决策依据（仍然有效）
+## 0.3 V4.1.2 Core Convergence（window-only）决策依据（仍然有效）
 
 **exact Window → Tab → Pane 激活设计（V4.1）已 abandoned**，不再作为当前实现要求：
 

@@ -1,4 +1,4 @@
-# DeskPet V4.1.4 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
+# DeskPet V4.1.5 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现）
 
 一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
 
@@ -46,7 +46,7 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 - **多 Agent**：自动跟随（WAITING > INPUT > ERROR > WORKING …，工作中粘性），或并发模式（单宠聚合/多宠分离）
 - **仪表盘 V4.1.4**：左侧导航六页（概览/Agents/桌宠与外观/监听与隐私/诊断/设置），自适应窗口大小；PID 等技术细节在"详情"高级诊断
 - **双击桌宠/气泡/卡片按钮**：唤起该 Agent 所在的 Windows Terminal 窗口（公共 Win32 API 恢复并前置；foreground 被拒时闪烁任务栏；AGGREGATE 下双击桌宠只互动）
-- **系统集成**：托盘图标、开机自启、隐藏、换肤、缩放、锁定动画
+- **系统集成**：托盘图标（程序内绘制的原创小猫，**不使用桌宠形象素材**）、开机自启、隐藏、换肤、缩放、锁定动画
 - **隐私**：`/proc/<pid>/environ` 只在 WSL 内部按 allowlist（`WT_SESSION`/`CODEX_HOME` 等 9 项）过滤后才进入 Python；终端文本只在内存、绝不落盘
 
 ## 快速开始
@@ -161,7 +161,7 @@ tests/                              单元/隐私/UIA/匹配/基准/实机回归
 ## 测试
 
 ```bat
-D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（340+）
+D:\miniconda3\envs\deskpet\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（350+）
 D:\miniconda3\envs\deskpet\python.exe tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json    # 合成基准（队列/预算/churn 上限）
 D:\miniconda3\envs\deskpet\python.exe tools\terminal_window_probe.py --list      # WT 窗口实机 probe（list/validate/activate/resolve）
 D:\miniconda3\envs\deskpet\python.exe tools\terminal_observer_probe.py           # UIA 观察实机 probe（默认不打印终端原文）

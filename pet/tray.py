@@ -167,9 +167,15 @@ class TrayIcon:
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _load_icon(self) -> int:
-        ico = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "assets", "icon.ico")
-        if os.path.isfile(ico):
+        # V4.1.5：托盘图标 = 程序化绘制的原创小猫（pet/icon.py），
+        # 不再使用桌宠形象/皮肤素材；生成失败回退系统默认图标。
+        ico = None
+        try:
+            from .icon import ensure_icon_ico
+            ico = ensure_icon_ico()
+        except Exception:
+            ico = None
+        if ico and os.path.isfile(ico):
             hicon = user32.LoadImageW(None, ico, 1, 0, 0,
                                       0x10 | 0x00000040)  # LR_LOADFROMFILE|LR_DEFAULTSIZE
             if hicon:
