@@ -428,14 +428,14 @@ class InteractionModeMatrixTests(unittest.TestCase):
             app.quit()
 
 
-class AggregateRotationTests(unittest.TestCase):
-    """v4.1.4 聚合轮播：同一桌宠依次展示每个 Agent 的单卡气泡。
+class AggregateStackTests(unittest.TestCase):
+    """v4.1.4 聚合叠层：同一桌宠把每张 Agent 卡片叠成一摞。
 
-    * 每张卡携带自己的 agent_key（双击气泡激活该 Agent 的终端窗口，
-      轮播到谁就激活谁）；
-    * 卡集合/焦点变化从焦点重开；每 rotate_sec 轮换；
-    * 新出现的紧急卡（WAITING/INPUT/ERROR）立即插播一次；
-    * 单卡/SINGLE/FLEET 不轮播、无角标。
+    * 主卡（focused/attention 优先）最下、带指向桌宠的尾巴；
+     上方卡片无尾巴、小间隔、不粘连；
+    * 每张卡携带自己的 agent_key——双击对应气泡唤起对应终端窗口；
+    * 单卡/SINGLE/FLEET 无叠层；toast 期间叠层暂隐；
+    * Agent 退出后叠层收缩，不留残留渲染器。
     """
 
     def _app(self, n=3, mode="aggregate"):
@@ -446,100 +446,148 @@ class AggregateRotationTests(unittest.TestCase):
                   for i in range(n)]
         app.monitor.instances = {a.key: a for a in agents}
         app.monitor.snapshots = {a.key: snap(a) for a in agents}
+        app._aggregate()
         return app, agents
 
-    def _tick(self, app, now):
-        targets = app.monitor.get_targets()
-        state = app.presentation.reconcile(targets, now)
-        app.pet_manager.sync(state, targets, now)
-        app._presentation_state = state
-        return state
+    @staticmethod
+    def _band(renderer):
+        """该渲染器当前命中盒的 y 区间。"""
+        x0, y0, x1, y1 = renderer._hit_boxes[0][0]
+        return y0, y1
 
-    def test_rotation_cycles_all_cards_with_badge(self):
+    def test_stack_shows_all_cards_attention_first_at_bottom(self):
         app, agents = self._app(3)
         try:
-            order = []
-            for tick in range(7):
-                now = NOW + tick * 6.0
-                self._tick(app, now)
-                view = app.pet_manager.views["pet-1"]
-                order.append(view.bubble.model.agent_key)
-                # 角标 = 当前是第几张卡（1-based）
-                self.assertEqual(view.bubble.model.badge,
-                                 f"{tick % 3 + 1}/3")
-            # 依次轮播 a1→a2→a3→a1…（attention 序 = 启动序）
-            self.assertEqual(order, [agents[i % 3].key for i in range(7)])
+            view = app.pet_manager.views["pet-1"]
+            # 主卡 = attention 序第一（启动序），其余按序叠上
+            self.assertEqual(view.bubble.model.agent_key, agents[0].key)
+            self.assertEqual([b.model.agent_key for b in view.stack_bubbles],
+                             [agents[1].key, agents[2].key])
+            for model in ([view.bubble.model]
+                          + [b.model for b in view.stack_bubbles]):
+                self.assertTrue(model.visible)
+            self.assertFalse(view.body_activates)   # aggregate body 只互动
         finally:
             app.quit()
 
-    def test_rotated_bubble_double_activates_current_card(self):
-        """轮播到第 2 张时双击气泡 → 激活的是当前显示的 Agent。"""
-        app, agents = self._app(2)
+    def test_double_click_each_bubble_activates_its_agent(self):
+        app, agents = self._app(3)
         try:
-            self._tick(app, NOW)
-            self._tick(app, NOW + 6.0)          # 轮换到第 2 张
             view = app.pet_manager.views["pet-1"]
-            self.assertEqual(view.bubble.model.agent_key, agents[1].key)
             view.redraw()
             activated = []
             view._on_activate = activated.append
-            box = view.bubble._hit_boxes[0][0]
-            tag = view._hit((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
-            self.assertEqual(tag, ("activate", agents[1].key))
-            view._on_hit_tag(tag)
-            self.assertEqual(activated, [agents[1].key])
+            renderers = [view.bubble] + view.stack_bubbles
+            expected = [agents[0].key, agents[1].key, agents[2].key]
+            for renderer, key in zip(renderers, expected):
+                box = renderer._hit_boxes[0][0]
+                cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+                tag = view._hit(cx, cy)
+                self.assertEqual(tag, ("activate", key))
+                view.window._on_double(_Ev(cx, cy))
+            self.assertEqual(activated, expected)   # 各自 exact 唤起
         finally:
             app.quit()
 
-    def test_urgent_card_inserted_once(self):
-        """新 WAITING 卡立即插播，之后轮换继续（不卡死在紧急卡）。"""
+    def test_only_bottom_bubble_has_tail(self):
+        """主卡带指向桌宠的倒三角（3 点 polygon）；叠卡无尾巴。"""
         app, agents = self._app(3)
         try:
             view = app.pet_manager.views["pet-1"]
-            self._tick(app, NOW)                 # 显示 a1
-            self.assertEqual(view.bubble.model.agent_key, agents[0].key)
-            # a3 变 WAITING → 下一 tick 立即插播
-            app.monitor.snapshots[agents[2].key] = snap(
-                agents[2], Status.WAITING)
-            self._tick(app, NOW + 0.5)
-            self.assertEqual(view.bubble.model.agent_key, agents[2].key)
-            # 之后照常轮换（不再被同一紧急卡反复抢占）
-            self._tick(app, NOW + 6.0)
-            self._tick(app, NOW + 12.0)
-            keys = {a.key for a in agents}
-            self.assertIn(view.bubble.model.agent_key, keys)
-            self.assertNotEqual(view.bubble.model.agent_key, agents[2].key)
+            view.redraw()
+            canvas = view.window.canvas
+
+            def has_triangle(renderer) -> bool:
+                for item in renderer._items:
+                    try:
+                        coords = canvas.coords(item)
+                    except Exception:
+                        continue
+                    if len(coords) == 6:   # 3 顶点 polygon = 尾巴
+                        return True
+                return False
+
+            self.assertTrue(has_triangle(view.bubble))
+            for renderer in view.stack_bubbles:
+                self.assertFalse(has_triangle(renderer))
+                # 每张叠卡都是完整卡片：圆角矩形 + 标题/正文/脚注文字
+                texts = [i for i in renderer._items
+                         if canvas.type(i) == "text"]
+                rects = [i for i in renderer._items
+                         if canvas.type(i) == "polygon"
+                         and len(canvas.coords(i)) > 6]
+                self.assertGreaterEqual(len(texts), 3)
+                self.assertEqual(len(rects), 1)
         finally:
             app.quit()
 
-    def test_focus_change_restarts_at_focused_card(self):
+    def test_stack_cards_separated_by_small_gap(self):
+        """卡片间有小间隔（不粘连、也不留太宽）。"""
         app, agents = self._app(3)
         try:
-            self._tick(app, NOW)
-            app.presentation.set_focus(agents[2].key)
-            self._tick(app, NOW + 0.5)
             view = app.pet_manager.views["pet-1"]
-            self.assertEqual(view.bubble.model.agent_key, agents[2].key)
+            view.redraw()
+            # 自上而下：stack[1] → stack[0] → 主卡（离桌宠最近）。
+            # 相邻间隔 = 下卡顶边 − 上卡底边。
+            _, top_y1 = self._band(view.stack_bubbles[1])
+            mid_y0, mid_y1 = self._band(view.stack_bubbles[0])
+            primary_y0, _ = self._band(view.bubble)
+            gap_upper = mid_y0 - top_y1
+            gap_lower = primary_y0 - mid_y1
+            for gap in (gap_upper, gap_lower):
+                self.assertGreater(gap, 0)          # 不粘连
+                self.assertLessEqual(gap, 30)       # 一点点间隔
+            self.assertEqual(gap_upper, gap_lower)  # 间隔一致
+            # 上面的卡永远在下面的卡上方
+            self.assertLess(top_y1, mid_y0)
+            self.assertLess(mid_y1, primary_y0)
         finally:
             app.quit()
 
-    def test_single_card_and_fleet_no_rotation_badge(self):
+    def test_toast_hides_stack_until_next_sync(self):
+        app, agents = self._app(3)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            app.toast("测试提示", 5)
+            app._apply_toasts()
+            for renderer in view.stack_bubbles:
+                self.assertFalse(renderer.model.visible)
+            self.assertEqual(view.bubble.model.text, "测试提示")
+            # toast 过期后下一轮 aggregate 恢复叠层
+            app._toast = None
+            app._aggregate()
+            self.assertTrue(view.stack_bubbles[0].model.visible)
+        finally:
+            app.quit()
+
+    def test_agent_exit_shrinks_stack(self):
+        app, agents = self._app(3)
+        try:
+            view = app.pet_manager.views["pet-1"]
+            self.assertEqual(len(view.stack_bubbles), 2)
+            app.monitor.instances.pop(agents[2].key)
+            app.monitor.snapshots.pop(agents[2].key)
+            app._aggregate()
+            self.assertEqual(len(view.stack_bubbles), 1)
+            self.assertEqual(view.stack_bubbles[0].model.agent_key,
+                             agents[1].key)
+        finally:
+            app.quit()
+
+    def test_single_card_and_fleet_no_stack(self):
         app, agents = self._app(1)
         try:
-            self._tick(app, NOW)
-            self._tick(app, NOW + 30.0)
-            view = app.pet_manager.views["pet-1"]
-            self.assertEqual(view.bubble.model.agent_key, agents[0].key)
-            self.assertEqual(view.bubble.model.badge, "")
+            self.assertEqual(app.pet_manager.views["pet-1"].stack_bubbles,
+                             [])
         finally:
             app.quit()
         app, agents = self._app(2, mode="fleet")
         try:
             app.config.data["presentation"]["concurrent"]["slots"] = [
                 _slot("pet-1"), _slot("pet-2")]
-            self._tick(app, NOW)
+            app._aggregate()
             for view in app.pet_manager.views.values():
-                self.assertEqual(view.bubble.model.badge, "")
+                self.assertEqual(view.stack_bubbles, [])
         finally:
             app.quit()
 

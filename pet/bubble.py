@@ -1,8 +1,8 @@
 """Fixed, scalable status card. Layout and canvas items change only when needed.
 
-V4.1.1（用户反馈）：并发（aggregate/fleet）的气泡与单个监听完全一致——
-单卡 SingleAgentBubbleRenderer；删除 "N Agents" 多卡片栈（会造成文本框
-重叠，且信息与单卡重复）。
+V4.1.1：并发气泡与单个监听一致的单卡渲染器（删除 "N Agents" 文本栈）。
+V4.1.4：聚合模式把多个 SingleAgentBubbleRenderer 叠成一摞（PetView
+负责几何与命中）——主卡带尾巴，上方卡片 draw_tail=False。
 
   * BubbleRendererBase 共享 DPI metrics / 文本适配 / 圆角 / 字体缓存 /
     hit testing；
@@ -33,8 +33,7 @@ class BubbleModel:
     footer: str = "打开终端"
     accent: str = "#487f73"
     visible: bool = False
-    agent_key: str = ""   # 携带 exact key：点击底行 = 激活该 Agent
-    badge: str = ""       # 聚合轮播角标（"2/3"）；空 = 不显示
+    agent_key: str = ""   # 携带 exact key：双击气泡 = 激活该 Agent
 
 
 @dataclass(frozen=True)
@@ -151,12 +150,13 @@ class SingleAgentBubbleRenderer(BubbleRendererBase):
             self._layout_key = key
         return self.w, self.h
 
-    def draw(self, ox, oy, pet_cx, pet_top):
+    def draw(self, ox, oy, pet_cx, pet_top, draw_tail=True):
+        """draw_tail=False：聚合叠层时上方卡片不画指向桌宠的尾巴。"""
         cfg = self.config.get('bubble') or {}; m = self._metrics()
         bg = cfg.get('bg', '#fffdf8'); border = cfg.get('border', '#d7dfdc')
         font_color = cfg.get('font_color', '#1f2430')
-        key = (ox, oy, pet_cx, pet_top, repr(self.model), self._layout_key,
-               bg, border, font_color)
+        key = (ox, oy, pet_cx, pet_top, draw_tail, repr(self.model),
+               self._layout_key, bg, border, font_color)
         if key == self._draw_key: return
         self._draw_key = key
         c = self.canvas
@@ -165,17 +165,14 @@ class SingleAgentBubbleRenderer(BubbleRendererBase):
         if not self.model.visible: return
         font = self.font(); pad = m['pad']; x1 = ox+self.w; y1 = oy+self.h
         def add(item): self._items.append(item)
-        tail = min(m['radius'], self.w//8)
-        add(c.create_polygon(pet_cx-tail, y1-1, pet_cx, pet_top, pet_cx+tail, y1-1,
-                             fill=bg, outline=border))
+        if draw_tail:
+            tail = min(m['radius'], self.w//8)
+            add(c.create_polygon(pet_cx-tail, y1-1, pet_cx, pet_top, pet_cx+tail, y1-1,
+                                 fill=bg, outline=border))
         add(c.create_polygon(round_rect_points(ox, oy, x1, y1, m['radius']), smooth=True,
                              fill=bg, outline=border, width=1))
         title = fit_text(self.model.status or 'DeskPet', self.w-2*pad, font.measure)
         add(c.create_text(ox+pad, oy+pad, text=title, anchor='nw', font=font, fill=self.model.accent))
-        if self.model.badge:   # 聚合轮播角标（"2/3"）
-            badge = fit_text(self.model.badge, self.w//3, font.measure)
-            add(c.create_text(x1-pad, oy+pad, text=badge, anchor='ne',
-                              font=font, fill='#8a9a92'))
         ty = oy+pad+font.metrics('linespace')+m['gap']
         for line in self.disp_lines:
             add(c.create_text(ox+pad, ty, text=line, anchor='nw', font=font, fill=font_color))
@@ -205,6 +202,16 @@ class SingleAgentBubbleRenderer(BubbleRendererBase):
         self.btn_boxes.clear()
         self._hit_boxes = []
         self._draw_key = None
+
+    def destroy_items(self):
+        """从 canvas 真正删除全部条目（叠层收缩/视图回收时防残留）。"""
+        c = self.canvas
+        for item in self._items:
+            try:
+                c.delete(item)
+            except Exception:
+                pass
+        self.clear_items()
 
 
 # V3 兼容别名（Phase G 前逐步迁移调用方）

@@ -32,10 +32,12 @@
   让这些 Agent 带着祖先窗口集落入评分链（`score_fn` 对集外 control
   返回不可配对），评分无正向证据才回退 `AMBIGUOUS+None
   (multi-window-ancestor)`。
-- **聚合气泡轮播（`pet/petview.py`）**：AGGREGATE 单宠在多张候选卡间
-  依次轮播（默认 5s，`presentation.concurrent.rotate_sec` clamp 2–30），
-  每张卡携带自己的 agent_key（双击气泡 = 唤起当前显示 Agent 的终端），
-  右上角 "2/3" 角标；新出现的 WAITING/INPUT/ERROR 卡立即插播一次。
+- **聚合叠层气泡（`pet/petview.py` / `pet/bubble.py`）**：AGGREGATE 单宠
+  把每张候选卡叠成一摞——主卡（focused/attention 优先）最下、带指向
+  桌宠的倒三角尾巴，上方卡片 `draw_tail=False`、卡片间只留小间隔
+  （STACK_GAP=6 逻辑像素，随 scale/DPI 缩放）；每张卡携带自己的
+  agent_key，双击对应气泡 = 唤起该 Agent 的终端窗口（visual identity
+  == click identity）；toast 期间叠层暂隐。
 - **托盘崩溃修复（`pet/tray.py`）**：窗口类 "DeskPetTrayWnd" 进程内只
   注册一次，注册进类的 WNDPROC 必须与类同生命周期——挂实例上的回调
   在实例 GC 后 trampoline 释放，类仍指向该地址，后续实例

@@ -200,12 +200,14 @@ class PetApp:
         if not text:
             return
         for view in self.pet_manager.views.values():
+            # toast 期间只显示主卡提示，叠层卡片暂隐（下一轮 sync 恢复）
+            for renderer in view.stack_bubbles:
+                renderer.model.visible = False
             view.bubble.model.visible = True
             view.bubble.model.status = "DeskPet"
             view.bubble.model.text = text
             view.bubble.model.footer = ""
             view.bubble.model.agent_key = ""
-            view.bubble.model.badge = ""
             view.bubble.model.accent = "#487f73"
 
     def _poll_build(self):

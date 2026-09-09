@@ -24,10 +24,10 @@ from .presentation import PresentationMode, PresentationState
 
 MARGIN = 8
 GAP = 4
-# 聚合模式气泡轮播（v4.1.4）：同一桌宠依次展示每个 Agent 的单卡气泡，
-# 每张卡携带自己的 agent_key（双击 = 激活该 Agent 的终端窗口）。
-AGGREGATE_ROTATE_SEC = 5.0
-AGGREGATE_ROTATE_MIN, AGGREGATE_ROTATE_MAX = 2.0, 30.0
+# 聚合叠层气泡（v4.1.4）：同一桌宠上把每张 Agent 卡片叠成一小摞——
+# 最底一张带指向桌宠的尾巴，上方卡片无尾巴、只留小间隔；每张卡
+# 携带自己的 agent_key（双击该气泡 = 唤起该 Agent 的终端窗口）。
+STACK_GAP = 6   # 叠层卡片间隔（逻辑像素，随 scale/DPI 缩放）
 
 
 class ResolvedViewConfig:
@@ -81,6 +81,9 @@ class PetView:
 
         self.window = PetWindow(master, view_config)
         self.bubble = SingleAgentBubbleRenderer(self.window.canvas, view_config)
+        # 聚合叠层：主卡（self.bubble）之上的额外卡片（无尾巴），
+        # 顺序 = 距主卡由近到远
+        self.stack_bubbles: list[SingleAgentBubbleRenderer] = []
         self.cursor = AnimationCursor(view_id)
         self.agent_key = ""
         self.hidden = False
@@ -196,7 +199,14 @@ class PetView:
         self.redraw()
 
     def _hit(self, x, y):
-        return self.bubble.hit_button(x, y)
+        tag = self.bubble.hit_button(x, y)
+        if tag:
+            return tag
+        for renderer in self.stack_bubbles:
+            tag = renderer.hit_button(x, y)
+            if tag:
+                return tag
+        return None
 
     def _on_hit_tag(self, tag):
         """气泡双击：('activate', exact_agent_key) → 精确激活（绘制时
@@ -222,8 +232,32 @@ class PetView:
 
     def set_single_model(self, target):
         """填充单卡气泡模型（并发模式与单个监听完全一致的气泡）。"""
-        m = self.bubble.model
-        m.badge = ""
+        self._fill_model(self.bubble.model, target)
+
+    def set_stacked_models(self, primary, stack):
+        """聚合叠层：主卡（最下，带尾巴）+ 上方无尾巴叠卡（v4.1.4）。
+
+        primary = cards[0]（focused/attention 优先），stack = 其余卡，
+        顺序 = 距主卡由近到远。卡片数量收缩时销毁多余渲染器条目。
+        """
+        self._fill_model(self.bubble.model, primary)
+        while len(self.stack_bubbles) < len(stack):
+            self.stack_bubbles.append(SingleAgentBubbleRenderer(
+                self.window.canvas, self.view_config))
+        for renderer, target in zip(self.stack_bubbles, stack):
+            self._fill_model(renderer.model, target)
+        for renderer in self.stack_bubbles[len(stack):]:
+            renderer.model.visible = False
+            renderer.destroy_items()
+        del self.stack_bubbles[len(stack):]
+
+    def clear_stack(self):
+        """离开聚合多卡状态：收回叠层（canvas 条目一并删除）。"""
+        for renderer in self.stack_bubbles:
+            renderer.destroy_items()
+        self.stack_bubbles = []
+
+    def _fill_model(self, m, target):
         if target is None:
             m.visible = False
             m.agent_key = ""
@@ -301,18 +335,25 @@ class PetView:
         c = self.window.canvas
         pw, ph = self.cursor.size
         bw, bh = self.bubble.layout()
+        for renderer in self.stack_bubbles:
+            renderer.layout()
+        n_stack = sum(1 for b in self.stack_bubbles if b.model.visible)
         visible = self.bubble.model.visible
-        if pw <= 0:
-            if visible:
-                win_w = bw + MARGIN * 2
-                win_h = bh + MARGIN * 2
-                self._ensure_window(win_w, win_h)
-                self._draw_bubble(win_w, win_h, bw, pet_top=win_h - 2)
-            return
-        win_w = max(pw, bw if visible else 0) + MARGIN * 2
+        n = n_stack + 1 if visible else 0
         scale = float(self.view_config.get("scale", 1) or 1)
+        stack_gap = max(2, round(STACK_GAP * scale * self.dpi() / 96))
+        block_h = n * bh + (n - 1) * stack_gap if n else 0
+        if pw <= 0:
+            if n:
+                self._ensure_window(bw + MARGIN * 2,
+                                    block_h + MARGIN * 2)
+                self._draw_bubble_stack(win_w=bw + MARGIN * 2, bw=bw,
+                                        block_h=block_h, stack_gap=stack_gap,
+                                        pet_top=block_h + MARGIN * 2 - 2)
+            return
+        win_w = max(pw, bw if n else 0) + MARGIN * 2
         gap = max(2, round(GAP * scale * self.dpi() / 96))
-        win_h = (bh + gap if visible else 0) + ph + MARGIN
+        win_h = (block_h + gap if n else 0) + ph + MARGIN
         self._ensure_window(win_w, win_h)
         img = self.scheduler.frame_image(self.cursor)
         if img is not None:
@@ -325,10 +366,23 @@ class PetView:
                     c.itemconfigure(self._pet_item, image=img)
             self._pet_image = img
         # 尾巴尖端 = 桌宠顶部（V3 语义 win_h-ph-2），不再伸到窗口底
-        self._draw_bubble(win_w, win_h, bw, pet_top=win_h - ph - 2)
+        self._draw_bubble_stack(win_w=win_w, bw=bw, block_h=block_h,
+                                stack_gap=stack_gap, pet_top=win_h - ph - 2)
 
-    def _draw_bubble(self, win_w, win_h, bw, pet_top):
-        self.bubble.draw((win_w - bw) // 2, 0, win_w // 2, pet_top)
+    def _draw_bubble_stack(self, win_w, bw, block_h, stack_gap, pet_top):
+        """气泡块自窗口顶部 y=0 起：主卡（带尾巴）在块底，叠卡向上。
+
+        不可见的渲染器也必须调 draw——draw 开头会删除旧 canvas 条目，
+        跳过调用会让隐藏的卡片残留在画面上。
+        """
+        ox = (win_w - bw) // 2
+        pet_cx = win_w // 2
+        self.bubble.draw(ox, block_h - self.bubble.h, pet_cx, pet_top)
+        y = block_h - self.bubble.h
+        for renderer in self.stack_bubbles:
+            if renderer.model.visible:
+                y -= renderer.h + stack_gap
+            renderer.draw(ox, y, pet_cx, pet_top, draw_tail=False)
 
     def anchor_from_window(self):
         w, h = self._win_size or (self.window.canvas.winfo_width(),
@@ -352,11 +406,6 @@ class PetViewManager:
             __import__("pet.skins", fromlist=["SkinBuildManager"]).SkinBuildManager())
         self.views: dict[str, PetView] = {}
         self._hooks = None   # app 提供 activate/menu/interact/moved 回调
-        # 聚合气泡轮播状态（v4.1.4）
-        self._agg_sig: tuple | None = None
-        self._agg_idx = 0
-        self._agg_next_switch = 0.0
-        self._agg_attention_seen: frozenset[str] = frozenset()
 
     def set_hooks(self, on_activate, on_menu, on_interact, on_moved,
                   on_double_vacant=None):
@@ -411,8 +460,9 @@ class PetViewManager:
         Fleet：只有绑定了 Agent 的 slot 才有桌宠（没有绑定不显示，
         桌宠数量跟随绑定数而不是 slot 配置数）；每只桌宠的气泡与
         单个监听完全一致（单卡，无 "N Agents" 栈卡）。
-        Aggregate：单宠 "pet-1"，多张候选卡依次轮播（v4.1.4），
-        每张卡携带自己的 agent_key——双击气泡激活该 Agent 的终端。
+        Aggregate：单宠 "pet-1"，多张候选卡叠成一摞（v4.1.4）——
+        主卡（focused/attention 优先，带尾巴）最下，其余卡小间隔叠上，
+        每张卡携带自己的 agent_key，双击该气泡唤起该 Agent 的终端。
         """
         if state.mode is PresentationMode.FLEET:
             live = set(state.slot_keys)
@@ -431,60 +481,20 @@ class PetViewManager:
                 if slot_id != "pet-1":
                     self.remove_view(slot_id)
             view = self.views["pet-1"]
-            # aggregate：body 不激活（气泡才激活）；气泡在多个候选卡间
-            # 依次轮播，每张卡携带自己的 agent_key（v4.1.4）
-            rotating = (state.mode is PresentationMode.AGGREGATE
-                        and len(state.cards) > 1)
-            if rotating:
-                key, idx = self._aggregate_rotation(state, now)
-            else:
-                self._agg_sig = None
-                key = state.focused_key
-                idx = -1
-            view.set_agent(key)
             view.set_body_activation(
                 state.mode is not PresentationMode.AGGREGATE)
-            view.set_single_model(targets.get(key) if key else None)
-            if rotating and key:
-                view.bubble.model.badge = f"{idx + 1}/{len(state.cards)}"
-
-    def _rotate_sec(self) -> float:
-        try:
-            value = float(self.config.get(
-                "presentation.concurrent.rotate_sec", AGGREGATE_ROTATE_SEC))
-        except (TypeError, ValueError):
-            value = AGGREGATE_ROTATE_SEC
-        return max(AGGREGATE_ROTATE_MIN,
-                   min(AGGREGATE_ROTATE_MAX, value))
-
-    def _aggregate_rotation(self, state, now: float) -> tuple[str, int]:
-        """聚合轮播：同一桌宠依次显示 state.cards 的单卡气泡。
-
-        * 卡集合/焦点变化 → 从焦点（无则第 0 张，通常是 attention）重开；
-        * 每 rotate_sec 轮换到下一张；
-        * 新出现的紧急卡（WAITING/INPUT/ERROR）立即插播一次，不打断
-          后续轮换节奏。
-        """
-        keys = [c.agent_key for c in state.cards]
-        sig = (frozenset(keys), state.focused_key)
-        rotate = self._rotate_sec()
-        if sig != self._agg_sig:
-            self._agg_sig = sig
-            self._agg_idx = (keys.index(state.focused_key)
-                             if state.focused_key in keys else 0)
-            self._agg_next_switch = now + rotate
-        attention = frozenset(
-            c.agent_key for c in state.cards if c.attention)
-        urgent_new = attention - self._agg_attention_seen
-        if urgent_new:
-            jump = next(k for k in keys if k in urgent_new)
-            self._agg_idx = keys.index(jump)
-            self._agg_next_switch = now + rotate
-        elif now >= self._agg_next_switch:
-            self._agg_idx = (self._agg_idx + 1) % len(keys)
-            self._agg_next_switch = now + rotate
-        self._agg_attention_seen = attention
-        return keys[self._agg_idx], self._agg_idx
+            if (state.mode is PresentationMode.AGGREGATE
+                    and len(state.cards) > 1):
+                keys = [c.agent_key for c in state.cards]
+                view.set_agent(keys[0])
+                view.set_stacked_models(
+                    targets.get(keys[0]),
+                    [targets.get(k) for k in keys[1:]])
+            else:
+                view.clear_stack()
+                key = state.focused_key
+                view.set_agent(key)
+                view.set_single_model(targets.get(key) if key else None)
 
     def apply_animation(self, state: PresentationState,
                         targets: dict, now: float, force_state: str = ""):
