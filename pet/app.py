@@ -124,10 +124,11 @@ class PetApp:
         self._agent_picker = None
         self.dashboard: Dashboard | None = None
         self.tray = None
-        # v4.3.1 DP43-R09：rapid off→on 的托盘重启重试（O(1) after 轮询）
-        self._tray_restart_after = None
-        self._tray_restart_attempts = 0
-        self._active_menu = None
+        # v4.3.1 DP43-R15 §6.7：FAILED generation 的有界 retry 门——同一
+        # desired session 内不自动重建；用户重新切换 intent / hide 恢复
+        # 入口出现 / 显式重试才清。
+        self._tray_generation_failed = False
+        self._tray_failure_reason = ""
         self._presentation_state: PresentationState | None = None
 
         self._toast: tuple[str, float] | None = None
@@ -141,8 +142,7 @@ class PetApp:
         if getattr(config, "migration_notice", False):
             self.toast(f"{APP_LABEL}：被动监听 · 终端窗口唤起 · "
                        "启动默认并行监听 + 单宠聚合", 8)
-        if bool(self.config.get("tray_enabled", True)):
-            self._start_tray_runtime()
+        self._reconcile_tray_runtime()
 
     # ================= 交互入口 =================
     def interact(self):
@@ -340,6 +340,9 @@ class PetApp:
         self.pet_manager.sync(state, targets, now)
         force_state = str(self.config.get("force_state") or "")
         self.pet_manager.apply_animation(state, targets, now, force_state)
+        # DP43-R15：Agent 集合只在语义 revision 变化时刷新 tray 菜单
+        # snapshot（O(#agents)，非每 tick）
+        self._update_tray_snapshot(targets)
 
     def _apply_toasts(self):
         """提示绘制规则（v4.1.4，v4.3 §4.4 C 步）：
@@ -522,12 +525,19 @@ class PetApp:
 
     # ================= 显示/隐藏/托盘/自启 =================
     def hide_pet(self):
+        was_desired = self._tray_desired()
         self.pet_manager.hide_all()
-        self._start_tray_runtime()   # 隐藏后必须留托盘入口恢复（不写配置）
+        if not was_desired:
+            # hide 恢复入口 intent 从 false→true：清除 FAILED session 门
+            self._tray_generation_failed = False
+        self._reconcile_tray_runtime()   # 隐藏后必须留托盘入口恢复（不写配置）
         self.toast("桌宠已隐藏，点击托盘图标恢复", 4)
+        self._update_tray_snapshot()
 
     def show_pet(self):
         self.pet_manager.show_all()
+        self._reconcile_tray_runtime()
+        self._update_tray_snapshot()
 
     @property
     def pet_visible(self) -> bool:
@@ -549,6 +559,8 @@ class PetApp:
             self.pet_manager.reassert_visible_windows()
         else:
             self.pet_manager.show_all()
+            self._reconcile_tray_runtime()   # user_hidden 解除 → desired 可能变 false
+            self._update_tray_snapshot()
             self._schedule_reassert()
 
     def _schedule_reassert(self):
@@ -568,58 +580,87 @@ class PetApp:
             return
         self.pet_manager.reassert_visible_windows()
 
-    def _start_tray_runtime(self):
-        """启动/显示托盘图标（纯运行期，不写配置——v4.1.1 §17）。
+    # ================= 托盘（DP43-R15 §6.7 reconcile） =================
+    def _tray_desired(self) -> bool:
+        """desired = tray_enabled OR user_hidden。
 
-        v4.3.1 DP43-R09 §17.10：同一时刻最多一个 live TrayIcon。
-        旧实例 stopping 期间不创建 replacement，用 O(1) after 轮询
-        等 status 终态（绝不 join、不同时启动两个）。
+        用户显式"隐藏全部桌宠"时，Tray 是现有设计声明的恢复入口：即
+        使用户配置默认不显示 Tray，也不能在 Pet 已隐藏的 session 中把
+        最后入口删掉。
         """
-        if os.name != "nt":
+        return (bool(self.config.get("tray_enabled", True))
+                or bool(self.pet_manager.user_hidden))
+
+    def _reconcile_tray_runtime(self):
+        """desired/current 状态矩阵（plan §6.7）。
+
+        * self.tray 持有当前 generation 直到终态（STOPPING 期间只改
+          desired，不替换 owner——同一时刻最多一个 live TrayIcon）；
+        * harvest 并入 UiCoordinator bridge 的 tray drain hook（本方法
+          由 bridge 每 tick 调用），无 100ms restart timer；
+        * FAILED 在同一 desired session 内不自动重建（有界 retry）。
+        """
+        if os.name != "nt" or self._closing:
             return
-        if self._tray_restart_after is not None:
-            return   # 已安排重启重试
         from .tray import TrayIcon, TrayState
+        desired = self._tray_desired()
         tray = self.tray
-        if tray is not None:
-            state = tray.status()
-            if state in (TrayState.READY, TrayState.STARTING):
+        if tray is None:
+            if desired and not self._tray_generation_failed:
+                self._spawn_tray_generation()
+            return
+        state = tray.status()
+        if state in (TrayState.STARTING, TrayState.READY):
+            if not desired:
+                tray.request_stop()
+            elif state is TrayState.READY:
                 tray.show_icon()
-                return
-            if not tray.join_for_shutdown(0):
-                # 旧线程仍在收尾：稍后重试（O(1) 检查，不 join）
-                self._tray_restart_attempts += 1
-                if self._tray_restart_attempts > 30:
-                    # 有界放弃（约 3s）：用户可再次切换托盘重试
-                    self._tray_restart_attempts = 0
-                    return
-                self._tray_restart_after = self.root.after(
-                    100, self._retry_tray_start)
-                return
-            self._tray_restart_attempts = 0
+            return
+        if state is TrayState.STOPPING:
+            return   # 等旧 generation 终态；下一次 bridge tick 再收割
+        # terminal：STOPPED / FAILED → reap
+        if state is TrayState.FAILED:
+            if not self._tray_generation_failed:
+                self._tray_generation_failed = True
+                self._tray_failure_reason = tray.last_error()
+        self.tray = None
+        if desired and not self._tray_generation_failed:
+            self._spawn_tray_generation()
+
+    def _spawn_tray_generation(self):
+        from .tray import TrayIcon
         self.tray = TrayIcon("DeskPet - 左键显示桌宠，右键菜单")
         self.tray.start()
 
-    def _retry_tray_start(self):
-        self._tray_restart_after = None
-        if self._closing:
+    def _update_tray_snapshot(self, targets: dict | None = None):
+        """用最新呈现事实构建 immutable 菜单模型换入 worker（O(#agents)）。"""
+        tray = self.tray
+        if tray is None:
             return
-        self._start_tray_runtime()
-
-    def _stop_tray_runtime(self):
-        """运行期关闭托盘（DP43-R09 §17.6）：只投递退出，立即返回。"""
-        if self.tray:
-            self.tray.request_stop()
-            self.tray = None
+        from .tray import TrayAgentItem, TrayMenuSnapshot
+        if targets is None:
+            targets = self.monitor.get_targets()
+        items = []
+        for key, t in sorted(targets.items()):
+            s = t.snapshot
+            items.append(TrayAgentItem(
+                key=key,
+                label=f"{s.kind.label} · "
+                      f"{t.instance.project or t.instance.source} · "
+                      f"{status_text(s)}"))
+        tray.update_menu_snapshot(TrayMenuSnapshot(
+            pet_visible=self.pet_visible, agents=tuple(items)))
 
     def set_tray_enabled(self, enabled: bool):
-        """用户显式切换托盘：运行期启停 + 一次性持久化（§17）。"""
+        """用户显式切换托盘：运行期启停 + 一次性持久化（§17）。
+
+        显式重新开启 = 受控 retry：清除 FAILED session 门。
+        """
         if enabled:
-            self._start_tray_runtime()
-        else:
-            self._stop_tray_runtime()
+            self._tray_generation_failed = False
         self.config.set("tray_enabled", enabled)
         self.config_saver.request_save()
+        self._reconcile_tray_runtime()
         self.ui.kick()   # bridge 档位可能变化（200↔500ms）
 
     def toggle_autostart(self) -> bool:
@@ -627,7 +668,14 @@ class PetApp:
         return result.enabled
 
     def _poll_tray_events(self):
-        """bridge 每 tick 的有界收割（DP43-R09 §17.9：<= TRAY_DRAIN_MAX）。"""
+        """bridge 每 tick：先 reconcile（收割 terminal generation），再
+        有界收割语义事件（DP43-R09 §17.9：<= TRAY_DRAIN_MAX）。
+
+        native menu 已在 tray worker 内确定性结束（TrackPopupMenuEx
+        返回 → DestroyMenu → NIM_SETFOCUS → 事件入队），Tk 收到时
+        原生交互早已完成。
+        """
+        self._reconcile_tray_runtime()
         tray = self.tray
         if tray is None:
             return
@@ -636,12 +684,20 @@ class PetApp:
                 ev = tray.events.get_nowait()
             except queue.Empty:
                 break
-            kind = getattr(ev, "kind", "")
-            if kind == "left":
-                # 左键只显示/恢复，绝不隐藏可见桌宠（§15）
+            command = getattr(ev, "command", "")
+            if command == "restore":
+                # 左键/键盘激活只显示/恢复，绝不隐藏可见桌宠（§15）
                 self.restore_pet_from_tray()
-            elif kind == "right":
-                self._tray_menu()
+            elif command == "toggle_visible":
+                self.toggle_visible()
+            elif command == "dashboard":
+                self.open_dashboard()
+            elif command == "rescan":
+                self.monitor.rescan()
+            elif command == "activate":
+                self.activate_agent(getattr(ev, "agent_key", "") or "")
+            elif command == "quit":
+                self.quit()
 
     # ================= ephemeral 菜单生命周期（v4.2.3 §9） =================
     def _destroy_menu(self, menu):
@@ -660,55 +716,6 @@ class PetApp:
             menu.destroy()
         except tk.TclError:
             pass
-
-    def _dismiss_active_menu(self):
-        """销毁当前 tray popup（进程内最多一个）；幂等。"""
-        menu = self._active_menu
-        self._active_menu = None
-        self._destroy_menu(menu)
-
-    def _tray_menu(self):
-        # v4.2.3 §9：先确定性销毁旧 popup（最多一个 tray menu），
-        # tk_popup + finally 销毁，不长期持有 _active_menu，不加
-        # click-away polling/focus watcher。
-        # v4.3：弹出前对托盘隐藏窗口做 Win32 前台准备——没有前台状态
-        # 的 TrackPopupMenu 点击菜单外不收起、模态循环不退出（经典
-        # tray-menu 缺陷，用户实测卡死需手动点击）。
-        self._dismiss_active_menu()
-        menu = self._build_tray_menu()
-        self._active_menu = menu
-        from actions import winkeys
-        hwnd = self.tray.menu_hwnd if self.tray is not None else None
-        try:
-            import ctypes
-            pt = ctypes.wintypes.POINT()
-            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-            if hwnd:
-                winkeys.prepare_menu_popup(hwnd)
-            menu.tk_popup(pt.x, pt.y)
-        except (OSError, tk.TclError):
-            pass
-        finally:
-            if hwnd:
-                winkeys.finish_menu_popup(hwnd)
-            # quit() 等 command 可能已销毁并清空 _active_menu（幂等）；
-            # 只有仍为当前对象时才清属性，销毁本身无条件执行。
-            if self._active_menu is menu:
-                self._active_menu = None
-            self._destroy_menu(menu)
-
-    def _build_tray_menu(self) -> tk.Menu:
-        """构建托盘菜单（DP43 菜单存活审计：可独立测试每个 entry）。"""
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(
-            label="显示桌宠" if not self.pet_visible else "隐藏桌宠",
-            command=self.toggle_visible)
-        self._agents_submenu(menu)
-        menu.add_command(label="仪表盘", command=self.open_dashboard)
-        menu.add_command(label="重新扫描", command=self.monitor.rescan)
-        menu.add_separator()
-        menu.add_command(label="退出", command=self.quit)
-        return menu
 
     def _agents_submenu(self, menu):
         """Agents 子菜单：每项捕获 exact key（§8.4/§8.5）。
@@ -903,15 +910,11 @@ class PetApp:
             self.monitor.stop()
             self.pet_manager.stop()
             if self.tray is not None:
-                # DP43-R09 §17.11：最终退出允许 request_stop + bounded join
+                # DP43-R15：request_stop 先发 WM_CANCELMODE 结束可能
+                # active 的 native menu；最终退出允许 bounded join
                 self.tray.request_stop()
                 self.tray.join_for_shutdown(1.0)
-            if self._tray_restart_after is not None:
-                try:
-                    self.root.after_cancel(self._tray_restart_after)
-                except tk.TclError:
-                    pass
-                self._tray_restart_after = None
+                self.tray = None
             if self.dashboard is not None:
                 try:
                     self.dashboard.shutdown()
@@ -921,7 +924,6 @@ class PetApp:
             # 恰一个 worker，不再在 Tk 同步写盘/双 writer）
             self.config_saver.flush_for_shutdown()
         finally:
-            self._dismiss_active_menu()   # v4.2.3 §9：幂等，不 double-destroy
             self._destroy_agent_picker()  # v4.3：不留死弹窗
             for attr in ("_janitor_after", "_skin_after", "_reassert_after",
                          "_toast_after"):

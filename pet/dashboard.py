@@ -1271,6 +1271,18 @@ class DiagnosticsPage(DashboardPage):
                      f" / high {_count('high')}"
                      f" / 候选(ambiguous) {_count('ambiguous')}"
                      f" / 唯一窗口兜底 {_sole_window_count()}")
+        # DP43-R15 §3.5：tray 生命周期状态可见（state/last_error/
+        # menu-open 失败计数/丢弃事件计数）
+        lines.append("Tray")
+        tray = app.tray
+        tray_state = tray.status().value if tray is not None else "off"
+        lines.append(f"  state          {tray_state}")
+        tray_err = tray.last_error() if tray is not None else ""
+        if tray_err:
+            lines.append(f"  last_error     {tray_err[:60]}")
+        lines.append(
+            f"  menu_fail      {tray.menu_open_failures() if tray is not None else 0}"
+            f" · dropped {tray.dropped_events if tray is not None else 0}")
         text = "\n".join(lines)
         if text != self._health_signature:
             self._health_signature = text

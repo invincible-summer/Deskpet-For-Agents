@@ -312,16 +312,18 @@ class UiContractTests(unittest.TestCase):
         只有用户显式切换（set_tray_enabled）才持久化 tray_enabled。
         v4.3 §8.2：持久化机制从 set_and_commit 改为 内存 set（立即
         生效）+ ConfigSaveCoordinator.request_save()（debounce 落盘）。
+        v4.3.1 DP43-R15：_start/_stop_tray_runtime 收敛为单一
+        _reconcile_tray_runtime 状态矩阵（desired/current）。
         """
         src = self._source("pet", "app.py")
-        self.assertIn("def _start_tray_runtime", src)
+        self.assertIn("def _reconcile_tray_runtime", src)
         self.assertIn("def set_tray_enabled", src)
 
         def method_body(name):
             return src.split(f"def {name}")[1].split("\n\n    def ")[0]
 
-        # _start_tray_runtime 不做任何持久化
-        body = method_body("_start_tray_runtime")
+        # reconcile 不做任何持久化
+        body = method_body("_reconcile_tray_runtime")
         self.assertNotIn("set_and_commit", body)
         self.assertNotIn("config.save", body)
         self.assertNotIn("request_save", body)

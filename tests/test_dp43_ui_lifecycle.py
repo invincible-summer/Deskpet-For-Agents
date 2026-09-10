@@ -174,6 +174,9 @@ class TrayGenerationRedTests(unittest.TestCase):
             def status(self):
                 return self._state
 
+            def start(self):
+                pass
+
             def request_stop(self):
                 self.stops += 1
                 self._state = TrayState.STOPPING
@@ -224,12 +227,15 @@ class TrayGenerationRedTests(unittest.TestCase):
         from pet.tray import TrayState
 
         class SlowStopTray:
-            def __init__(self):
+            def __init__(self, tooltip=''):
                 self.events = queue.Queue()
                 self._state = TrayState.READY
 
             def status(self):
                 return self._state
+
+            def start(self):
+                pass
 
             def request_stop(self):
                 self._state = TrayState.STOPPING
@@ -238,6 +244,9 @@ class TrayGenerationRedTests(unittest.TestCase):
                 return False
 
             def show_icon(self):
+                pass
+
+            def update_menu_snapshot(self, *a, **k):
                 pass
 
         with patch('pet.tray.TrayIcon', SlowStopTray):
@@ -263,35 +272,36 @@ class TrayProtocolRedTests(unittest.TestCase):
         return icon
 
     def test_one_right_gesture_exactly_one_context_request(self):
-        from pet.tray import WM_APP_TRAY
+        from pet.tray import WM_APP_TRAY, TrayIcon
         icon = self._bare_icon()
-        # VERSION_4：Shell 对 context selection 发送 WM_CONTEXTMENU
-        icon._handle_message(1, WM_APP_TRAY, 0, 0x007B)
-        # legacy 组合不再产生任何语义事件
-        icon._handle_message(1, WM_APP_TRAY, 0, 0x0204)   # WM_RBUTTONDOWN
-        icon._handle_message(1, WM_APP_TRAY, 0, 0x0205)   # WM_RBUTTONUP
-        drained = []
-        while True:
-            try:
-                drained.append(icon.events.get_nowait())
-            except queue.Empty:
-                break
-        self.assertEqual(len(drained), 1,
-                         "一次右键手势必须恰好产生一个语义事件")
-        self.assertEqual(drained[0].kind, 'context')
+        v4 = TrayIcon._ICON_ID << 16   # VERSION_4：HIWORD(lParam)=icon id
+        menu_opens = []
+        with patch.object(icon, '_open_native_menu',
+                          lambda: menu_opens.append(1)):
+            # VERSION_4：Shell 对 context selection（鼠标右键/键盘）发送
+            # WM_CONTEXTMENU——一次手势一个菜单
+            icon._handle_message(1, WM_APP_TRAY, 0, v4 | 0x007B)
+            # legacy 组合不再产生任何语义事件/菜单
+            icon._handle_message(1, WM_APP_TRAY, 0, v4 | 0x0204)
+            icon._handle_message(1, WM_APP_TRAY, 0, v4 | 0x0205)
+        self.assertEqual(menu_opens, [1],
+                         "一次右键手势必须恰好打开一个菜单")
+        self.assertTrue(icon.events.empty(),
+                        "legacy down/up 不得进入语义队列")
 
     def test_left_up_exactly_one_restore(self):
-        from pet.tray import WM_APP_TRAY
+        from pet.tray import WM_APP_TRAY, TrayIcon
         icon = self._bare_icon()
-        icon._handle_message(1, WM_APP_TRAY, 0, 0x0202)   # WM_LBUTTONUP
-        icon._handle_message(1, WM_APP_TRAY, 0, 0x0200)   # WM_LBUTTONDOWN
+        v4 = TrayIcon._ICON_ID << 16
+        icon._handle_message(1, WM_APP_TRAY, 0, v4 | 0x0202)   # WM_LBUTTONUP
+        icon._handle_message(1, WM_APP_TRAY, 0, v4 | 0x0200)   # LBUTTONDOWN
         drained = []
         while True:
             try:
                 drained.append(icon.events.get_nowait())
             except queue.Empty:
                 break
-        self.assertEqual([e.kind for e in drained], ['restore'])
+        self.assertEqual([e.command for e in drained], ['restore'])
 
     def test_hicon_ownership_tracked(self):
         from pet.tray import TrayIcon

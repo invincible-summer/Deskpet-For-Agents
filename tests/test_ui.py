@@ -265,100 +265,10 @@ class TkTests(unittest.TestCase):
 
 
 class MenuEphemeralLifecycleTests(unittest.TestCase):
-    """v4.2.3 §9：tray/pet popup menu 的确定性销毁与 churn 上限。"""
+    """v4.2.3 §9 / DP43-R15：popup menu 的确定性销毁与 churn 上限。
 
-    def _app(self):
-        from pet.app import PetApp
-        from pet.petview import PetView
-        cfg = MemoryConfig()
-        with patch.object(PetApp, '_reload_skins', lambda self: None), \
-             patch.object(PetView, 'load_skin', lambda self, bm: None):
-            return PetApp(cfg)
-
-    def test_dismiss_destroys_and_resets_active_menu(self):
-        app = self._app()
-        try:
-            import tkinter as tkmod
-            menu = tkmod.Menu(app.root, tearoff=0)
-            app._active_menu = menu
-            path = menu._w
-            app._dismiss_active_menu()
-            self.assertIsNone(app._active_menu)
-            self.assertEqual(app.root.tk.call('winfo', 'exists', path), 0)
-            # 幂等：重复 dismiss 不抛
-            app._dismiss_active_menu()
-            app._destroy_menu(None)
-        finally:
-            app.quit()
-
-    def test_tray_menu_uses_tk_popup_and_destroys_in_finally(self):
-        app = self._app()
-        try:
-            destroyed = []
-            popups = []
-            # v4.3 修复：spy 只记录调用，绝不递归真实 tk_popup——
-            # 测试进程无前台状态，真弹的菜单点击外部不收起，会在
-            # 屏幕上留下悬浮幽灵菜单（用户实测卡屏）。
-            popup_args = []
-
-            def spy_popup(self, x, y, entry=""):
-                popups.append(self._w)
-                popup_args.append((x, y))
-            with patch('tkinter.Menu.tk_popup', spy_popup):
-                app._tray_menu()
-            self.assertEqual(len(popups), 1)          # tk_popup 而非 post
-            self.assertEqual(len(popup_args), 1)      # 恰一次、带坐标
-            self.assertTrue(popup_args[0][0] > 0 and popup_args[0][1] > 0)
-            self.assertIsNone(app._active_menu)       # finally 清空
-            # 菜单 widget 已销毁
-            self.assertEqual(app.root.tk.call('winfo', 'exists', popups[0]), 0)
-        finally:
-            app.quit()
-
-    def test_second_tray_menu_destroys_previous(self):
-        app = self._app()
-        try:
-            seen = []
-
-            def spy_popup(self, x, y, entry=""):
-                seen.append(self._w)
-            with patch('tkinter.Menu.tk_popup', spy_popup):
-                app._tray_menu()
-                first = seen[0]
-                self.assertEqual(app.root.tk.call('winfo', 'exists', first), 0)
-                app._tray_menu()
-            # 旧 popup 已确定性销毁：任何时刻 _active_menu 最多 1 个
-            self.assertEqual(app.root.tk.call('winfo', 'exists', first), 0)
-            self.assertIsNone(app._active_menu)
-        finally:
-            app.quit()
-
-    def test_menu_churn_1000_no_widget_growth_or_tclerror(self):
-        app = self._app()
-        try:
-            import tkinter as tkmod
-            paths = []
-            for _ in range(1000):
-                menu = tkmod.Menu(app.root, tearoff=0)
-                app._active_menu = menu
-                paths.append(menu._w)
-                app._dismiss_active_menu()
-            self.assertIsNone(app._active_menu)
-            # 所有历史 menu widget 均已销毁（无线性增长）
-            alive = [p for p in paths
-                     if app.root.tk.call('winfo', 'exists', p)]
-            self.assertEqual(alive, [])
-            # 无新增 after timer（菜单生命周期不靠定时器）
-        finally:
-            app.quit()
-
-
-class MenuForegroundPrepTests(unittest.TestCase):
-    """v4.3：tk_popup 前的 Win32 前台准备。
-
-    无前台状态的 TrackPopupMenu（Tk 菜单 grab）点击菜单外不收起——
-    菜单滞留且抓住全部 Tk 输入，必须点菜单本身才能消掉（用户实测
-    卡死）。prepare 必须在 popup 前、finish 在 finally 中。
+    Tray 菜单已原生化（worker 线程内 HMENU，无 Tk widget）；本类只
+    保留通用 Tk menu 销毁原语 _destroy_menu 的合同。
     """
 
     def _app(self):
@@ -369,49 +279,50 @@ class MenuForegroundPrepTests(unittest.TestCase):
              patch.object(PetView, 'load_skin', lambda self, bm: None):
             return PetApp(cfg)
 
-    def test_tray_menu_prepares_foreground_before_popup(self):
-        from actions import winkeys as wk
+    def test_destroy_menu_idempotent_no_tclerror(self):
         app = self._app()
         try:
-            calls = []
-
-            def spy_popup(self, x, y, entry=""):
-                calls.append("popup")
-
-            class _FakeTray:
-                menu_hwnd = 4321
-
-            app.tray = _FakeTray()
-            with patch.object(wk, 'prepare_menu_popup',
-                              lambda h: calls.append(("prepare", h))
-                              or True), \
-                 patch.object(wk, 'finish_menu_popup',
-                              lambda h: calls.append(("finish", h))), \
-                 patch('tkinter.Menu.tk_popup', spy_popup):
-                app._tray_menu()
-            self.assertEqual(calls[0], ("prepare", 4321))
-            self.assertEqual(calls[1], "popup")
-            self.assertEqual(calls[-1], ("finish", 4321))
-            self.assertIsNone(app._active_menu)   # finally 仍确定性销毁
+            import tkinter as tkmod
+            menu = tkmod.Menu(app.root, tearoff=0)
+            path = menu._w
+            app._destroy_menu(menu)
+            self.assertEqual(app.root.tk.call('winfo', 'exists', path), 0)
+            # 幂等：重复 destroy / None 不抛
+            app._destroy_menu(menu)
+            app._destroy_menu(None)
         finally:
-            app.tray = None
             app.quit()
 
-    def test_tray_menu_without_tray_skips_dance(self):
-        from actions import winkeys as wk
+    def test_menu_churn_1000_no_widget_growth_or_tclerror(self):
         app = self._app()
         try:
-            calls = []
-            with patch.object(wk, 'prepare_menu_popup',
-                              lambda h: calls.append(h)), \
-                 patch.object(wk, 'finish_menu_popup',
-                              lambda h: calls.append(h)), \
-                 patch('tkinter.Menu.tk_popup',
-                       lambda self, x, y, entry="": None):
-                app._tray_menu()
-            self.assertEqual(calls, [])   # 无托盘句柄 → 不做前台操作
+            import tkinter as tkmod
+            paths = []
+            for _ in range(1000):
+                menu = tkmod.Menu(app.root, tearoff=0)
+                paths.append(menu._w)
+                app._destroy_menu(menu)
+            # 所有历史 menu widget 均已销毁（无线性增长）
+            alive = [p for p in paths
+                     if app.root.tk.call('winfo', 'exists', p)]
+            self.assertEqual(alive, [])
+            # 无新增 after timer（菜单生命周期不靠定时器）
         finally:
             app.quit()
+
+
+class MenuForegroundPrepTests(unittest.TestCase):
+    """v4.3：Tk pet 菜单 tk_popup 前的 Win32 前台准备（Phase 2 将由
+    ContextMenuController 接管并移除该 helper；Tray 菜单已原生化）。
+    """
+
+    def _app(self):
+        from pet.app import PetApp
+        from pet.petview import PetView
+        cfg = MemoryConfig()
+        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+             patch.object(PetView, 'load_skin', lambda self, bm: None):
+            return PetApp(cfg)
 
     def test_pet_menu_prepares_foreground_before_popup(self):
         from actions import winkeys as wk
@@ -773,28 +684,38 @@ class TrayLifecycleTests(unittest.TestCase):
         icon.events = queue.Queue(maxsize=TRAY_EVENT_QUEUE_MAX)
         icon.dropped_events = 0
         for _ in range(TRAY_EVENT_QUEUE_MAX):
-            icon.events.put_nowait(TrayEvent("left"))
+            icon.events.put_nowait(TrayEvent("restore"))
         with self.assertRaises(queue.Full):
-            icon.events.put_nowait(TrayEvent("left"))
-        # 满队列下 1000 次 wndproc 调用全部立即返回（丢弃计数，不阻塞）
+            icon.events.put_nowait(TrayEvent("restore"))
+        # 满队列下 1000 次 wndproc 调用全部立即返回（丢弃计数，不阻塞）。
+        # VERSION_4：HIWORD(lParam)=icon id，LOWORD=通知事件
+        lparam = (TrayIcon._ICON_ID << 16) | 0x0202   # WM_LBUTTONUP
         for _ in range(1000):
             self.assertEqual(
-                icon._handle_message(1, WM_APP_TRAY, 0, 0x0202), 0)
+                icon._handle_message(1, WM_APP_TRAY, 0, lparam), 0)
         self.assertEqual(icon.dropped_events, 1000)
         self.assertEqual(icon.events.qsize(), TRAY_EVENT_QUEUE_MAX)
 
     def test_app_tray_drain_bounded(self):
         from pet.app import TRAY_DRAIN_MAX
-        from pet.tray import TrayEvent
+        from pet.tray import TrayEvent, TrayState
         harness = TrayDashboardVisibilityTests()
         app = harness._app()
         try:
-            app.tray = type("T", (), {"events": queue.Queue()})()
+            app.tray = type("T", (), {
+                "events": queue.Queue(),
+                "status": staticmethod(lambda: TrayState.READY),
+                "last_error": staticmethod(lambda: ""),
+                "menu_open_failures": staticmethod(lambda: 0),
+                "request_stop": staticmethod(lambda: None),
+                "show_icon": staticmethod(lambda: None),
+            })()
             total = TRAY_DRAIN_MAX * 2 + 4
             for _ in range(total):
-                app.tray.events.put_nowait(TrayEvent("right"))
-            app._tray_menu = lambda: None   # 右键菜单不真弹
-            app._poll_tray_events()
+                app.tray.events.put_nowait(TrayEvent("dashboard"))
+            with patch.object(app, "open_dashboard") as dash_mock:
+                app._poll_tray_events()
+                self.assertEqual(dash_mock.call_count, TRAY_DRAIN_MAX)
             self.assertEqual(app.tray.events.qsize(), total - TRAY_DRAIN_MAX)
             app.tray = None
         finally:
@@ -848,27 +769,25 @@ class MenuCommandsAliveTests(unittest.TestCase):
                  patch.object(app, "activate_agent") as act_mock, \
                  patch.object(app, "_open_agent_picker") as picker_mock, \
                  patch.object(app, "_rebuild_skin") as rebuild_mock:
-                # Tray 菜单
-                tray_menu = app._build_tray_menu()
-                invoked = []
-                self._walk(tray_menu, invoked, "tray")
-                app._destroy_menu(tray_menu)
-                self.assertGreater(len(invoked), 3)
-                self.assertTrue(quit_mock.called)          # 退出按钮活着
-                # 桌宠右键菜单（非 fleet）
+                # 桌宠右键菜单（非 fleet）；Tray 菜单已原生化（worker
+                # 内 HMENU，由 test_tray_native 覆盖语义映射）
                 pet_menu = tk.Menu(app.root, tearoff=0)
                 app._build_menu(pet_menu)
+                invoked = []
                 self._walk(pet_menu, invoked, "pet")
                 app._destroy_menu(pet_menu)
-                # 关键按钮逐项确认（label 可能带 emoji/空格）
+                # 关键按钮逐项确认（label 可能带 emoji/空格）；"重新扫描"
+                # 是 tray 原生菜单项（test_tray_native 覆盖其语义映射）
                 joined = "\n".join(invoked)
-                for needle in ("退出", "仪表盘", "重新扫描", "重建当前皮肤缓存",
+                for needle in ("退出", "仪表盘", "重建当前皮肤缓存",
                                "暂时隐藏桌宠", "摸摸头"):
                     self.assertIn(needle, joined)
+                self.assertTrue(quit_mock.called)          # 退出按钮活着
                 self.assertTrue(tray_mock.called)          # 设置→托盘图标
                 self.assertTrue(auto_mock.called)          # 设置→开机自启
-                self.assertTrue(rescan_mock.called)
                 self.assertTrue(rebuild_mock.called)       # 重建皮肤缓存
+                # rescan/activate 是 tray 原生菜单与 Agents 子菜单的
+                # 语义（无 Agent 会话下 pet 菜单不含激活项）
         finally:
             app.quit()
 

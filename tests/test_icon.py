@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 import tempfile
@@ -71,17 +72,24 @@ class CatIconTests(unittest.TestCase):
 
     def test_tray_load_icon_uses_cat_not_default(self):
         """tray._load_icon 经 ensure_icon_ico 拿到小猫 HICON（PIL 是 core
-        依赖，正常环境必然生成成功），而非 IDI_APPLICATION 回退。"""
+        依赖，正常环境必然生成成功），而非 IDI_APPLICATION 回退。
+        DP43-R15：返回 (hicon, owns)——文件 icon 归本进程所有，测试销毁
+        后必须复位 ownership，避免 TrayIcon teardown 重复 Destroy。"""
         import pet.tray as tray
         icon = tray.TrayIcon("DeskPet")
         hicon = 0
         try:
-            hicon = icon._load_icon()
+            hicon, owns = icon._load_icon()
             self.assertTrue(hicon)
-            self.assertNotEqual(hicon, tray.user32.LoadIconW(None, 32512))
+            self.assertTrue(owns)
+            default = tray.user32.LoadIconW(
+                None, ctypes.cast(32512, ctypes.c_wchar_p))
+            self.assertNotEqual(hicon, default)
         finally:
             if hicon:
-                tray.user32.DestroyIcon(hicon)
+                icon._hicon = hicon
+                icon._owns_hicon = True
+                icon._destroy_owned_hicon()
 
 
 if __name__ == "__main__":
