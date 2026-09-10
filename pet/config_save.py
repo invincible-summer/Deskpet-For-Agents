@@ -119,6 +119,16 @@ class ConfigSaveCoordinator:
                 return   # 同一失败 revision：等新修改或显式 retry
             self.request_save()
 
+    def begin_shutdown(self) -> None:
+        """退出信号阶段（DP43-R17 §8.2 B）：只停止 debounce 排程。
+
+        不启动/等待任何 writer——最终的有界 flush（deadline 内恰一个
+        最新快照 writer）由 flush_for_shutdown(全局剩余量) 在回收阶段
+        完成；任何时候仍保持 single writer。
+        """
+        self._stopping = True
+        self._cancel_timer()
+
     def flush_for_shutdown(self, timeout: float = FLUSH_TIMEOUT_SEC) -> bool:
         """退出路径（DP43-R02 §6.14）：绝对 deadline 的 bounded 流程。
 

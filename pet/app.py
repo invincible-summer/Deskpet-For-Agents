@@ -1046,6 +1046,7 @@ class PetApp:
                 # request_stop 先发 WM_CANCELMODE 结束可能 active 的
                 # native menu
                 self.tray.request_stop()
+            self.config_saver.begin_shutdown()   # 停 debounce（不写盘）
             # ---- C. 全局 deadline 回收 ----
             deadline = time.monotonic() + SHUTDOWN_BUDGET_SEC
 
