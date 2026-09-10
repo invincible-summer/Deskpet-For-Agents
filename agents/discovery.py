@@ -416,7 +416,11 @@ class WslProcessProbe:
     """
 
     def __init__(self, allow_root_metadata: bool = False):
-        self.allow_root_metadata = bool(allow_root_metadata)
+        # v4.3.1 DP43-R03：root 权限用 Event 承载——Dashboard 运行期切换
+        # 必须立即生效（特别是 True→False 撤权），不得只读一次配置。
+        self._root_metadata_allowed = threading.Event()
+        if allow_root_metadata:
+            self._root_metadata_allowed.set()
         self._distros: list[str] = []
         self._distros_ts = 0.0
         self._lock = threading.Lock()
@@ -547,6 +551,19 @@ class WslProcessProbe:
             return AgentKind.PI
         return None
 
+    # ---- root metadata 权限（v4.3.1 DP43-R03：运行期可撤权） ----
+    def set_allow_root_metadata(self, allowed: bool) -> None:
+        """O(1)、线程安全：True→False 立即阻止后续 root retry；
+        False→True 立即允许后续 root retry。in-flight 的那一次
+        _run_wsl(user="root") 不强制 kill（下不为例）。"""
+        if allowed:
+            self._root_metadata_allowed.set()
+        else:
+            self._root_metadata_allowed.clear()
+
+    def root_metadata_allowed(self) -> bool:
+        return self._root_metadata_allowed.is_set()
+
     # ---- 第三层：仅 canonical PID 的 metadata ----
     def _metadata(self, distro: str, pids: list[int]) -> dict[int, dict]:
         if not pids:
@@ -560,11 +577,13 @@ class WslProcessProbe:
         # 部分进程因权限读不到（如 agent 以 root 运行）。默认不提权：
         # Agent 仍然创建、cwd/home/env 可为空；只有用户显式打开高级选项
         # 才允许一次 root retry（仅读 cwd/token/uid/HOME/allowlist env）。
-        if self.allow_root_metadata:
+        # 权限在真正执行 root retry 前再次检查（DP43-R03）：普通 metadata
+        # 查询与 root retry 之间用户可能已关闭开关。
+        if self._root_metadata_allowed.is_set():
             missing = [p for p in pids if p in meta and not meta[p].get("cwd")]
             missing += [p for p in pids if p not in meta]
             missing = sorted(set(missing))
-            if missing:
+            if missing and self._root_metadata_allowed.is_set():
                 try:
                     text = _run_wsl(distro, build_metadata_script(missing),
                                     user="root")

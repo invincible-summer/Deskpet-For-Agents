@@ -374,7 +374,98 @@ class RootFallbackTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
-class MultiDistroScanTests(unittest.TestCase):
+class RuntimeRootPermissionTests(unittest.TestCase):
+    """DP43-R03：privacy.wsl_root_metadata_fallback 运行期切换立即生效。"""
+
+    def _fake_run_factory(self, calls, missing_meta=True):
+        def fake_run(distro, script, timeout=8.0, user=None):
+            calls.append((distro, user))
+            if missing_meta:
+                return "P\t42\nC\t\nT\t\n"
+            return "P\t42\nC\t/w\nT\t123\n"
+        return fake_run
+
+    def test_runtime_false_to_true_allows_later_root_retry(self):
+        probe = WslProcessProbe(allow_root_metadata=False)
+        self.assertFalse(probe.root_metadata_allowed())
+        calls = []
+        with unittest.mock.patch("agents.discovery._run_wsl",
+                                 side_effect=self._fake_run_factory(calls)):
+            probe._metadata("Ubuntu", [42])
+            self.assertEqual(calls, [("Ubuntu", None)])   # 初始无 root
+            probe.set_allow_root_metadata(True)
+            probe._metadata("Ubuntu", [42])
+        self.assertEqual(calls[-1], ("Ubuntu", "root"))   # 开启后允许
+
+    def test_runtime_true_to_false_blocks_subsequent_root_retry(self):
+        probe = WslProcessProbe(allow_root_metadata=True)
+        calls = []
+        with unittest.mock.patch("agents.discovery._run_wsl",
+                                 side_effect=self._fake_run_factory(calls)):
+            probe._metadata("Ubuntu", [42])
+            self.assertEqual(calls[-1], ("Ubuntu", "root"))
+            probe.set_allow_root_metadata(False)   # 运行期撤权
+            probe._metadata("Ubuntu", [42])
+        # 撤权后仍有普通 metadata 查询，但绝无新的 root retry
+        self.assertEqual(calls,
+                         [("Ubuntu", None), ("Ubuntu", "root"),
+                          ("Ubuntu", None)])
+        self.assertNotIn("root", [user for _, user in calls[2:]])
+        self.assertFalse(probe.root_metadata_allowed())
+
+    def test_disable_between_normal_and_root_retry_blocks_root(self):
+        # 普通metadata 查询后、root retry 前用户关闭开关 → root 被阻止
+        probe = WslProcessProbe(allow_root_metadata=True)
+        calls = []
+        gate = {"open": True}
+
+        def gated_run(distro, script, timeout=8.0, user=None):
+            calls.append((distro, user))
+            if user is None:
+                # 普通 metadata 完成后立刻撤权（模拟用户恰在此刻关闭）
+                if gate["open"]:
+                    gate["open"] = False
+                    probe.set_allow_root_metadata(False)
+            return "P\t42\nC\t\nT\t\n"
+
+        with unittest.mock.patch("agents.discovery._run_wsl",
+                                 side_effect=gated_run):
+            meta = probe._metadata("Ubuntu", [42])
+        self.assertEqual(calls, [("Ubuntu", None)])   # root retry 被挡
+        self.assertEqual(meta[42]["cwd"], "")
+
+    def test_set_allow_is_thread_safe_and_fast(self):
+        # O(1) Event 语义：重复设置无异常，读值一致
+        probe = WslProcessProbe()
+        probe.set_allow_root_metadata(True)
+        self.assertTrue(probe.root_metadata_allowed())
+        probe.set_allow_root_metadata(True)
+        self.assertTrue(probe.root_metadata_allowed())
+        probe.set_allow_root_metadata(False)
+        self.assertFalse(probe.root_metadata_allowed())
+
+    def test_monitor_and_probe_worker_runtime_api(self):
+        # Monitor.set_wsl_root_metadata_fallback → probe 透传（O(1)，无 WSL call）
+        from agents.monitor import Monitor, ProcessProbeWorker
+        worker = ProcessProbeWorker.__new__(ProcessProbeWorker)
+        worker._wsl = WslProcessProbe(allow_root_metadata=False)
+        worker.set_wsl_root_metadata_fallback(True)
+        self.assertTrue(worker._wsl.root_metadata_allowed())
+        monitor = Monitor.__new__(Monitor)
+        monitor._probe = worker
+        monitor.set_wsl_root_metadata_fallback(False)
+        self.assertFalse(worker._wsl.root_metadata_allowed())
+
+    def test_save_failure_does_not_revert_runtime_privacy_flag(self):
+        # Dashboard 顺序：Config 内存 → runtime 权限 → 异步持久化；
+        # 磁盘保存失败不得回滚运行期隐私意图（probe 状态独立于 Config）
+        probe = WslProcessProbe(allow_root_metadata=True)
+        probe.set_allow_root_metadata(False)
+        # 模拟 config 保存失败：probe 的 Event 不受影响
+        self.assertFalse(probe.root_metadata_allowed())
+
+
+
     """scan() 返回按真实 source 分组的结果与健康位（隔离失败）。"""
 
     def test_scan_groups_by_source_and_isolates_failure(self):

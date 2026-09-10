@@ -1,20 +1,24 @@
-# DeskPet v4.2.3 — SourceLink
+# DeskPet v4.3.1 — SourceLink
 
 ## DeskPet implementation baseline
 
-- [DeskPet v4.2.2 audit baseline commit](https://github.com/invincible-summer/Deskpet-For-Agents/commit/3d0ab8e515cd79fa703ee62138789b00f3c8f474) — v4.2.3 计划所依据的固定代码基线。
-- [README.md @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/README.md) — 当前产品合同、安装说明与 Agent 支持范围。
-- [agents/discovery.py @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/agents/discovery.py) — Windows/WSL 进程发现、canonicalization 与现有 ps 字段。
-- [agents/monitor.py @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/agents/monitor.py) — SourceProbeSnapshot 合并、退出级联、状态融合和线程架构。
-- [agents/process_watch.py @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/agents/process_watch.py) — Windows process handle 阻塞退出观察器。
-- [agents/terminal_uia.py @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/agents/terminal_uia.py) — 单 MTA UIA observer、事件订阅、可见文本读取预算。
-- [agents/terminal_resolver.py @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/agents/terminal_resolver.py) — window-only 与 observation-only 双绑定解析。
-- [pet/app.py @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/pet/app.py) — tray menu、Agents 唤醒菜单和应用生命周期。
-- [pet/petwindow.py @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/pet/petwindow.py) — 桌宠 Tk popup menu 的当前实现。
-- [pet/animator.py @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/pet/animator.py) — SharedAnimationCache、单 scheduler 与缓存预算。
-- [pet/icon.py @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/pet/icon.py) — 程序化原创小猫 renderer，可作为公开发行 fallback skin 源。
-- [pet/autostart.py @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/pet/autostart.py) — HKCU Run 健康校验与当前解释器路径生成。
-- [tests/benchmark_monitor.py @ v4.2.2](https://github.com/invincible-summer/Deskpet-For-Agents/blob/3d0ab8e515cd79fa703ee62138789b00f3c8f474/tests/benchmark_monitor.py) — Monitor/UIA 有界队列和资源预算基准。
+- [DeskPet v4.3.0 release commit](https://github.com/invincible-summer/Deskpet-For-Agents/commit/39941c2815581eadf948ab8e4e90d82eb1c52207) — 当前审计/发布基线（v4.3.1 DP43 修复计划 plan.md §1 所固定的代码基线 `39941c2`）。
+- [README.md @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/README.md) — 当前产品合同、安装说明与 Agent 支持范围。
+- [agents/discovery.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/agents/discovery.py) — Windows/WSL 进程发现、canonicalization 与现有 ps 字段。
+- [agents/monitor.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/agents/monitor.py) — SourceProbeSnapshot 合并、退出级联、状态融合和线程架构。
+- [agents/process_watch.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/agents/process_watch.py) — Windows process handle 阻塞退出观察器。
+- [agents/terminal_uia.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/agents/terminal_uia.py) — 单 MTA UIA observer、事件订阅、可见文本读取预算。
+- [agents/terminal_resolver.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/agents/terminal_resolver.py) — window-only 与 observation-only 双绑定解析。
+- [pet/app.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/pet/app.py) — tray menu、Agents 唤醒菜单和应用生命周期。
+- [pet/petwindow.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/pet/petwindow.py) — 桌宠 Tk popup menu 的当前实现。
+- [pet/animator.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/pet/animator.py) — SharedAnimationCache、单 scheduler 与缓存预算。
+- [pet/icon.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/pet/icon.py) — 程序化原创小猫 renderer，可作为公开发行 fallback skin 源。
+- [pet/autostart.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/pet/autostart.py) — HKCU Run 健康校验与当前解释器路径生成。
+- [tests/benchmark_monitor.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/tests/benchmark_monitor.py) — Monitor/UIA 有界队列和资源预算基准。
+
+## Historical baselines
+
+- [DeskPet v4.2.2 audit baseline commit](https://github.com/invincible-summer/Deskpet-For-Agents/commit/3d0ab8e515cd79fa703ee62138789b00f3c8f474) — v4.2.3 计划所依据的固定代码基线（历史追溯）。
 
 ## Windows Terminal / Win32 / UI Automation
 

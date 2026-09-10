@@ -12,16 +12,13 @@ UI 激活 Terminal 只允许 Monitor.activate_target(exact agent_key)。
 Aggregate 模式下桌宠 body 单击/双击只做互动，绝不激活 Terminal。
 """
 import gc
-import glob
 import os
 import queue
 import random
-import shutil
-import tempfile
 import time
 import tkinter as tk
 
-from agents.models import ActivationCode, Status
+from agents.models import ActivationCode
 
 from . import autostart, skins
 from .dashboard import Dashboard
@@ -38,6 +35,9 @@ INTERACT_LINES = [
     "别戳啦，正在盯着 Agent 呢",
     "我的剑已饥渴难耐了！",
 ]
+
+# v4.3.1 DP43-R09 §17.9：单次 bridge drain 的托盘事件上限
+TRAY_DRAIN_MAX = 8
 
 
 class PetApp:
@@ -105,6 +105,7 @@ class PetApp:
             apply_batch=self._aggregate,
             apply_toasts=self._apply_toasts,
             tray_enabled=lambda: bool(self.config.get("tray_enabled", True)),
+            activation_repair_drain=self._drain_activation_repairs,
         )
         self.ui.config_saver = self.config_saver
         # v4.3 §9：异步皮肤导入结果经 build lane → poll_results 收割
@@ -123,6 +124,9 @@ class PetApp:
         self._agent_picker = None
         self.dashboard: Dashboard | None = None
         self.tray = None
+        # v4.3.1 DP43-R09：rapid off→on 的托盘重启重试（O(1) after 轮询）
+        self._tray_restart_after = None
+        self._tray_restart_attempts = 0
         self._active_menu = None
         self._presentation_state: PresentationState | None = None
 
@@ -135,7 +139,8 @@ class PetApp:
         self._closing = False
 
         if getattr(config, "migration_notice", False):
-            self.toast(f"{APP_LABEL}：被动监听 · 终端窗口唤起 · 并发需手动开启", 8)
+            self.toast(f"{APP_LABEL}：被动监听 · 终端窗口唤起 · "
+                       "启动默认并行监听 + 单宠聚合", 8)
         if bool(self.config.get("tray_enabled", True)):
             self._start_tray_runtime()
 
@@ -152,11 +157,15 @@ class PetApp:
         只恢复并前置该 Agent 所在的 Windows Terminal 顶层窗口（候选
         由 v3-compatible resolver 给出，confidence 不拦用户显式唤起）；
         DeskPet 不切换 Terminal 标签页、不发送键盘输入。
+
+        v4.3.1 DP43-R08：cached activation 遇到 stale binding 立即
+        返回（Tk 不做 UIA refresh）；修复经 Monitor 线程一次异步
+        repair，结果由 bridge 收割后做最后一次激活（一次性语义，
+        不循环）。
         """
         result = self.monitor.activate_target(key)
         if result.code == ActivationCode.OK:
-            self.agent_toast(key, "已打开该 Agent 的终端窗口"
-                             + ("（已自动重新识别）" if result.repaired else ""), 2)
+            self.agent_toast(key, "已打开该 Agent 的终端窗口", 2)
         elif result.code == ActivationCode.FOREGROUND_DENIED:
             self.agent_toast(key, "Windows 未允许将终端置于前台，已闪烁任务栏提醒", 4)
         elif result.code == ActivationCode.AGENT_GONE:
@@ -165,9 +174,47 @@ class PetApp:
         elif result.code == ActivationCode.NO_BINDING:
             self.agent_toast(key, "未能定位该 Agent 的终端窗口", 4)
         elif result.code == ActivationCode.STALE_WINDOW:
-            self.agent_toast(key, "原终端窗口已失效，重新识别后仍无法安全打开", 4)
+            self.monitor.request_activation_repair(key)
+            self.ui.kick()   # 立即进入下一 bridge tick 收割 repair 结果
+            self.agent_toast(key, "原终端窗口已失效，正在重新识别…", 4)
         else:
             self.agent_toast(key, "无法打开该 Agent 的终端窗口", 4)
+
+    def _drain_activation_repairs(self):
+        """bridge 每 tick 调用（bounded，<=4 条；DP43-R08 §16.6）。
+
+        repaired → UI 线程做最后一次 activate_cached（最终动作前
+        仍重新核验 is_agent_live + WindowIdentity，fail-closed）；
+        这一次激活不再触发新 repair（一次性语义）。
+        """
+        for res in self.monitor.drain_activation_repairs():
+            if self._closing:
+                break
+            if not res.repaired:
+                self.agent_toast(
+                    res.agent_key,
+                    "原终端窗口已失效，重新识别后仍无法安全打开", 4)
+                continue
+            if not self.monitor.is_live_key(res.agent_key):
+                self.toast("该 Agent 已退出", 4)
+                continue
+            result = self.monitor.activate_target(res.agent_key)
+            if result.code == ActivationCode.OK:
+                self.agent_toast(key=res.agent_key,
+                                 text="已打开该 Agent 的终端窗口（已自动重新识别）",
+                                 sec=2)
+            elif result.code == ActivationCode.AGENT_GONE:
+                self.toast("该 Agent 已退出", 4)
+            elif result.code == ActivationCode.NO_BINDING:
+                self.agent_toast(res.agent_key, "未能定位该 Agent 的终端窗口", 4)
+            elif result.code == ActivationCode.STALE_WINDOW:
+                # repair 后窗口又变（或仍失效）：一次性语义，到此为止
+                self.agent_toast(
+                    res.agent_key,
+                    "原终端窗口已失效，重新识别后仍无法安全打开", 4)
+            elif result.code == ActivationCode.FOREGROUND_DENIED:
+                self.agent_toast(res.agent_key,
+                                 "Windows 未允许将终端置于前台，已闪烁任务栏提醒", 4)
 
     def _focus_and_activate(self, key: str):
         """Dashboard"查看并设为当前"类操作：设焦点 + 激活（§8.5）。
@@ -447,11 +494,11 @@ class PetApp:
             self.toast("终端观察将在重启 DeskPet 后停用", 5)
 
     def _rebuild_skin(self):
-        from .config import CACHE_DIR
-        d = skins.cache_dir(self.config.get("skin", skins.BUILTIN_SKIN), 240)
-        if os.path.isdir(d):
-            shutil.rmtree(d, ignore_errors=True)
-        self._reload_skins()
+        # v4.3.1 DP43-R06：重建走 skin lane 的 staging 事务（force
+        # build → 完整后原子发布），Tk 线程不再 rmtree live cache。
+        for view in self.pet_manager.views.values():
+            view.request_skin_rebuild(self.pet_manager.build_manager)
+        self.ui.kick()
 
     # ================= 皮肤导入（v4.3 §9 异步） =================
     def begin_skin_import(self, src_dir: str, name: str) -> None:
@@ -522,19 +569,47 @@ class PetApp:
         self.pet_manager.reassert_visible_windows()
 
     def _start_tray_runtime(self):
-        """启动/显示托盘图标（纯运行期，不写配置——v4.1.1 §17）。"""
+        """启动/显示托盘图标（纯运行期，不写配置——v4.1.1 §17）。
+
+        v4.3.1 DP43-R09 §17.10：同一时刻最多一个 live TrayIcon。
+        旧实例 stopping 期间不创建 replacement，用 O(1) after 轮询
+        等 status 终态（绝不 join、不同时启动两个）。
+        """
         if os.name != "nt":
             return
-        from .tray import TrayIcon
-        if self.tray is None:
-            self.tray = TrayIcon("DeskPet - 左键显示桌宠，右键菜单")
-            self.tray.start()
-        else:
-            self.tray.show_icon()
+        if self._tray_restart_after is not None:
+            return   # 已安排重启重试
+        from .tray import TrayIcon, TrayState
+        tray = self.tray
+        if tray is not None:
+            state = tray.status()
+            if state in (TrayState.READY, TrayState.STARTING):
+                tray.show_icon()
+                return
+            if not tray.join_for_shutdown(0):
+                # 旧线程仍在收尾：稍后重试（O(1) 检查，不 join）
+                self._tray_restart_attempts += 1
+                if self._tray_restart_attempts > 30:
+                    # 有界放弃（约 3s）：用户可再次切换托盘重试
+                    self._tray_restart_attempts = 0
+                    return
+                self._tray_restart_after = self.root.after(
+                    100, self._retry_tray_start)
+                return
+            self._tray_restart_attempts = 0
+        self.tray = TrayIcon("DeskPet - 左键显示桌宠，右键菜单")
+        self.tray.start()
+
+    def _retry_tray_start(self):
+        self._tray_restart_after = None
+        if self._closing:
+            return
+        self._start_tray_runtime()
 
     def _stop_tray_runtime(self):
+        """运行期关闭托盘（DP43-R09 §17.6）：只投递退出，立即返回。"""
         if self.tray:
-            self.tray.stop()
+            self.tray.request_stop()
             self.tray = None
 
     def set_tray_enabled(self, enabled: bool):
@@ -552,20 +627,21 @@ class PetApp:
         return result.enabled
 
     def _poll_tray_events(self):
-        if not self.tray:
+        """bridge 每 tick 的有界收割（DP43-R09 §17.9：<= TRAY_DRAIN_MAX）。"""
+        tray = self.tray
+        if tray is None:
             return
-        try:
-            while True:
-                ev = self.tray.events.get_nowait()
-                if ev == "left":
-                    # 左键只显示/恢复，绝不隐藏可见桌宠（§15）
-                    self.restore_pet_from_tray()
-                elif ev == "right":
-                    self._tray_menu()
-                elif ev == "error":
-                    self.tray = None
-        except queue.Empty:
-            pass
+        for _ in range(TRAY_DRAIN_MAX):
+            try:
+                ev = tray.events.get_nowait()
+            except queue.Empty:
+                break
+            kind = getattr(ev, "kind", "")
+            if kind == "left":
+                # 左键只显示/恢复，绝不隐藏可见桌宠（§15）
+                self.restore_pet_from_tray()
+            elif kind == "right":
+                self._tray_menu()
 
     # ================= ephemeral 菜单生命周期（v4.2.3 §9） =================
     def _destroy_menu(self, menu):
@@ -599,16 +675,8 @@ class PetApp:
         # 的 TrackPopupMenu 点击菜单外不收起、模态循环不退出（经典
         # tray-menu 缺陷，用户实测卡死需手动点击）。
         self._dismiss_active_menu()
-        menu = tk.Menu(self.root, tearoff=0)
+        menu = self._build_tray_menu()
         self._active_menu = menu
-        menu.add_command(
-            label="显示桌宠" if not self.pet_visible else "隐藏桌宠",
-            command=self.toggle_visible)
-        self._agents_submenu(menu)
-        menu.add_command(label="仪表盘", command=self.open_dashboard)
-        menu.add_command(label="重新扫描", command=self.monitor.rescan)
-        menu.add_separator()
-        menu.add_command(label="退出", command=self.quit)
         from actions import winkeys
         hwnd = self.tray.menu_hwnd if self.tray is not None else None
         try:
@@ -628,6 +696,19 @@ class PetApp:
             if self._active_menu is menu:
                 self._active_menu = None
             self._destroy_menu(menu)
+
+    def _build_tray_menu(self) -> tk.Menu:
+        """构建托盘菜单（DP43 菜单存活审计：可独立测试每个 entry）。"""
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(
+            label="显示桌宠" if not self.pet_visible else "隐藏桌宠",
+            command=self.toggle_visible)
+        self._agents_submenu(menu)
+        menu.add_command(label="仪表盘", command=self.open_dashboard)
+        menu.add_command(label="重新扫描", command=self.monitor.rescan)
+        menu.add_separator()
+        menu.add_command(label="退出", command=self.quit)
+        return menu
 
     def _agents_submenu(self, menu):
         """Agents 子菜单：每项捕获 exact key（§8.4/§8.5）。
@@ -792,41 +873,25 @@ class PetApp:
         # v4.3 §4.5：唯一 bridge timer（125/200/500ms 三档）+ 按需
         # render after_idle；不再有 _poll_monitor/_ui_tick/_poll_build
         self.ui.start()
+        # v4.3.1 DP43-R04：启动时做一次 ready index reconciliation
+        # （校验既有 cache manifest / 清理上次崩溃遗留的 staging 目录），
+        # 全部在 skin lane 后台线程执行
+        self.pet_manager.build_manager.request_maintenance()
         self._janitor_after = self.root.after(600_000, self._janitor)
         self.root.mainloop()
 
     def _janitor(self):
-        """定时清理：日志/事件队列、转换临时目录、皮肤缓存、共享帧缓存。"""
+        """定时清理入口（v4.3.1 DP43-R06：Tk 线程只做 O(1) 调度）。
+
+        日志/事件队列 trim 在 Tk（小集合）；一切 filesystem mutation
+        （converter temp、.deskpet-* 遗留、缺失皮肤 cache、超额尺寸、
+        ready index reconciliation）移交 skin lane 的 maintenance job。
+        """
         if self._closing:
             return
         try:
             self.monitor.trim()
-            now = time.time()
-            tmp = tempfile.gettempdir()
-            for d in glob.glob(os.path.join(tmp, "deskpet_conv_*")):
-                try:
-                    if now - os.path.getmtime(d) > 3600:
-                        shutil.rmtree(d, ignore_errors=True)
-                except OSError:
-                    pass
-            # 清理不存在皮肤的缓存；每个皮肤最多保留 2 个尺寸
-            by_skin: dict[str, list[tuple[float, str]]] = {}
-            if os.path.isdir(skins.CACHE_DIR):
-                for name in os.listdir(skins.CACHE_DIR):
-                    path = os.path.join(skins.CACHE_DIR, name)
-                    skin = name.split("@")[0]
-                    if skin not in skins.list_skins():
-                        shutil.rmtree(path, ignore_errors=True)
-                        continue
-                    try:
-                        by_skin.setdefault(skin, []).append(
-                            (os.path.getmtime(path), path))
-                    except OSError:
-                        pass
-            for items in by_skin.values():
-                items.sort(reverse=True)
-                for _mt, path in items[2:]:
-                    shutil.rmtree(path, ignore_errors=True)
+            self.pet_manager.build_manager.request_maintenance()
         except Exception:
             pass
         self._janitor_after = self.root.after(600_000, self._janitor)
@@ -837,15 +902,23 @@ class PetApp:
             self.ui.stop()
             self.monitor.stop()
             self.pet_manager.stop()
-            if self.tray:
-                self.tray.stop()
+            if self.tray is not None:
+                # DP43-R09 §17.11：最终退出允许 request_stop + bounded join
+                self.tray.request_stop()
+                self.tray.join_for_shutdown(1.0)
+            if self._tray_restart_after is not None:
+                try:
+                    self.root.after_cancel(self._tray_restart_after)
+                except tk.TclError:
+                    pass
+                self._tray_restart_after = None
             if self.dashboard is not None:
                 try:
                     self.dashboard.shutdown()
                 except tk.TclError:
                     pass
-            # v4.3 §8.2：退出时有界 flush（1.5s 等 worker + dirty 兜底
-            # 同步 commit），不再无条件在 Tk 线程写盘
+            # v4.3 §8.2：退出时有界 flush（绝对 deadline；deadline 内
+            # 恰一个 worker，不再在 Tk 同步写盘/双 writer）
             self.config_saver.flush_for_shutdown()
         finally:
             self._dismiss_active_menu()   # v4.2.3 §9：幂等，不 double-destroy

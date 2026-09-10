@@ -130,6 +130,8 @@ class PetView:
         self._dpi = 0
         self._skin_paths: dict[str, str] = {}
         self._build_key = None
+        # v4.3.1 DP43-R01：close 幂等标记（第二次调用直接返回）
+        self._closed = False
         self._state = "sleep"
         # v4.3 §17 皮肤运行态（仅内存，不进 config）
         self.skin_requested_name = ""
@@ -186,20 +188,32 @@ class PetView:
         if self._build_key is not None and self._build_key != key:
             build_manager.forget(self.view_id, self._build_key)
         self._build_key = key
-        paths = skins.built_gifs(skin, height)
+        # v4.3.1 DP43-R04/§12：ready 判定走 manager 内存 index
+        # （已验证 manifest 的唯一 cache 真值）；Tk 路径不再做
+        # built_gifs_any 的 CACHE_DIR listdir。就绪回退用同 skin 同
+        # fps 的就近高度（同样来自 index，无 I/O）。
+        paths = build_manager.ready_paths(skin, height, fps)
         if paths:
             self._skin_ready(paths)
             if self.skin_build_state != "fallback":
                 self.skin_build_state = "ready"
             return
-        alt = skins.built_gifs_any(skin)
+        alt = build_manager.nearest_ready_cache(skin, height, fps)
         if alt:
             self._skin_ready(alt)
         if self.skin_build_state != "fallback":
             self.skin_build_state = "queued"
         build_manager.request(self.view_id, skin, height, fps)
 
+    def request_skin_rebuild(self, build_manager):
+        """请求重建当前皮肤的 cache（v4.3.1 DP43-R06：Tk 只做 O(1)
+        排队，重建在 skin lane 的 staging 事务中进行）。"""
+        key = self._build_key or self.desired_build_key()
+        build_manager.request_rebuild(self.view_id, *key)
+
     def build_result(self, key, kind, payload, build_manager):
+        if self._closed:
+            return   # 已关闭的 view 不能被迟到的 build 结果复活（DP43-R01）
         if key != self._build_key:
             return
         if kind == "ok":
@@ -412,16 +426,32 @@ class PetView:
         self._pet_image = None
 
     def close(self, build_manager=None):
-        self.release_images()
-        if build_manager is not None and self._build_key is not None:
-            build_manager.forget(self.view_id, self._build_key)
-        self.scheduler.unregister(self.view_id)
-        if build_manager is not None and self._build_key is not None:
-            build_manager.forget(self._build_key)
+        """回收 view（DP43-R01：幂等 + forget 恰好一次）。
+
+        第二次调用直接返回；forget(view_id, key) 只执行一次（旧实现
+        第二次 forget 少传 view_id 参数，active build key 下必抛
+        TypeError）。清理顺序：撤销 build 等待 → 注销 scheduler →
+        释放 PhotoImage → 销毁窗口；任一步失败不阻断后续清理。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        key = self._build_key
+        self._build_key = None
         try:
-            self.window.root.destroy()
-        except Exception:
-            pass
+            if build_manager is not None and key is not None:
+                build_manager.forget(self.view_id, key)
+        finally:
+            try:
+                self.scheduler.unregister(self.view_id)
+            finally:
+                try:
+                    self.release_images()
+                finally:
+                    try:
+                        self.window.root.destroy()
+                    except Exception:
+                        pass
 
     # ------------------------------------------------------------ 几何
     def _ensure_window(self, w: int, h: int):
@@ -871,6 +901,9 @@ class PetViewManager:
     def stop(self):
         self.scheduler.stop()
         self.cancel_deferred_build()
+        # v4.3.1 DP43-R05：封口 skin lane（取消 active converter 树、
+        # 拒绝新 job、有界等待 worker）——退出时不遗留 converter/ffmpeg
+        self.build_manager.stop()
         # 先于 root.destroy() 在主线程释放全部 PhotoImage（防异线程 GC
         # 触碰 Tcl；v4.2.1 CI 崩溃修复），再清缓存帧
         for view in self.views.values():

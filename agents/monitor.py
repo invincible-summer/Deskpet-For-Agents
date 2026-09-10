@@ -72,6 +72,25 @@ class NativeTerminalLease:
     broken_generations: int = 0
 
 
+@dataclass(frozen=True)
+class ActivationRepairRequest:
+    """一次 stale-binding 修复请求（v4.3.1 DP43-R08 §16.5）。
+
+    UI 在 activate_cached 得到 STALE_WINDOW 后提交；同 agent 天然
+    coalesce（dict 键控），pending 上限 = Agent 上限。
+    """
+    request_id: int
+    agent_key: str
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class ActivationRepairResult:
+    request_id: int
+    agent_key: str
+    repaired: bool
+
+
 def _num(value, default=0.0) -> float:
     try:
         return float(value)
@@ -133,6 +152,11 @@ class ProcessProbeWorker:
     def snapshot(self) -> dict[str, SourceProbeSnapshot]:
         with self._lock:
             return dict(self._snapshot)
+
+    def set_wsl_root_metadata_fallback(self, enabled: bool) -> None:
+        """DP43-R03：运行期切换 WSL root metadata 权限。O(1)、无 WSL
+        call、无 Tk、线程安全（Event 承载）。"""
+        self._wsl.set_allow_root_metadata(bool(enabled))
 
     def rescan(self):
         self._last_windows = 0.0
@@ -263,6 +287,14 @@ class Monitor:
         # v4.3 §4.2 UI 语义 revision：signature 不含只影响新鲜度的时间戳
         self._ui_revision = 0
         self._ui_signature: tuple = ()
+        # v4.3.1 DP43-R08 §16.5：stale binding 的异步 repair 队列。
+        # _repair_requests 按 agent_key 键控（同 agent coalesce）；
+        # _repair_results bounded（16），bridge 每 tick 有界收割。
+        self._repair_lock = threading.Lock()
+        self._repair_requests: dict[str, ActivationRepairRequest] = {}
+        self._repair_next_id = 1
+        self._repair_results: "queue.Queue[ActivationRepairResult]" = (
+            queue.Queue(maxsize=16))
 
     # ------------------------------------------------------------ 生命周期
     def start(self):
@@ -398,6 +430,10 @@ class Monitor:
         with self.lock:
             return key in self.instances
 
+    def set_wsl_root_metadata_fallback(self, enabled: bool) -> None:
+        """DP43-R03：UI 隐私开关的运行期撤权/授权入口（透传 probe）。"""
+        self._probe.set_wsl_root_metadata_fallback(bool(enabled))
+
     def rescan(self):
         """重新扫描：只清缓存与运行期绑定，不动 Agent 数据目录（plan §46）。"""
         self._probe.rescan()
@@ -416,14 +452,81 @@ class Monitor:
         """UI 激活 Terminal 窗口的唯一入口（v4.1.1 §9.2）。
 
         UI 只携带 exact agent_key；服务内部重新核验 Agent live、
-        window binding、WindowIdentity，fail-closed。不依赖 UIA。
+        window binding、WindowIdentity，fail-closed。不依赖 UIA、
+        不做 UIA refresh（v4.3.1 DP43-R08：stale 由 request_activation_repair
+        异步修复，Tk 不阻塞）。
         """
         if not key:
             return ActivationResult(ActivationCode.NO_BINDING)
         if not self.is_live_key(key):
             return ActivationResult(ActivationCode.AGENT_GONE)
-        return self._terminal_service.activate(
+        return self._terminal_service.activate_cached(
             key, is_agent_live=self.is_live_key)
+
+    # ------------------------------------------------------------ 异步 repair（DP43-R08 §16.5）
+    def request_activation_repair(self, agent_key: str) -> int:
+        """O(1)、线程安全、同 agent coalesce：UI 在 STALE_WINDOW 后调用。"""
+        key = str(agent_key or "")
+        if not key:
+            return 0
+        with self._repair_lock:
+            existing = self._repair_requests.get(key)
+            if existing is not None:
+                return existing.request_id
+            rid = self._repair_next_id
+            self._repair_next_id += 1
+            self._repair_requests[key] = ActivationRepairRequest(
+                rid, key, time.time() + 10.0)
+            return rid
+
+    def drain_activation_repairs(self, max_items: int = 4):
+        """UI bridge 每 tick 有界收割（<=4）repair 结果。"""
+        out = []
+        for _ in range(max_items):
+            try:
+                out.append(self._repair_results.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def _process_repair_requests(self, now: float) -> None:
+        """Monitor _tick 专属（§16.5）：drain bounded repair 请求 →
+        repair binding → publish bounded result。不新增线程。"""
+        with self._repair_lock:
+            pending = list(self._repair_requests.values())
+            self._repair_requests.clear()
+        for req in pending:
+            if req.expires_at <= now:
+                continue   # 过期：不执行也不发布（用户早已离开该动作）
+            with self.lock:
+                instances = list(self.instances.values())
+                live = req.agent_key in self.instances
+            if not live:
+                self._publish_repair_result(req, False)
+                continue
+            repaired = self._terminal_service.repair_binding(
+                req.agent_key, instances=instances, now=now)
+            self._log(f"终端绑定修复{'成功' if repaired else '失败'}: "
+                      f"{req.agent_key}")
+            self._publish_repair_result(req, repaired)
+
+    def _publish_repair_result(self, req: ActivationRepairRequest,
+                               repaired: bool) -> None:
+        try:
+            self._repair_results.put_nowait(
+                ActivationRepairResult(req.request_id, req.agent_key,
+                                       repaired))
+        except queue.Full:
+            try:
+                self._repair_results.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._repair_results.put_nowait(
+                    ActivationRepairResult(req.request_id, req.agent_key,
+                                           repaired))
+            except queue.Full:
+                pass
 
     def terminal_available(self) -> bool:
         # 不再使用 _terminal_failed 锁存：UIA 首次初始化（typelib 生成）
@@ -726,6 +829,11 @@ class Monitor:
         for key in self._prune_detached_native(instances, probe_snap, now):
             instances.pop(key, None)
             session_obs.pop(key, None)
+
+        # 3.6) stale binding 异步 repair（v4.3.1 DP43-R08 §16.5）：
+        # UI 提交的 repair 请求在本线程执行 UIA refresh + re-resolve
+        # （Tk 绝不同步等待），结果发布到 bounded 队列由 bridge 收割。
+        self._process_repair_requests(now)
 
         # 4) 状态融合
         grace = _num(cfg_m.get("activity_grace_sec", 10.0), 10.0)

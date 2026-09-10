@@ -275,15 +275,27 @@ def convert_skin(src_dir: str, out_dir: str, height: int = 240, fps: int = 12,
 
 
 def _selftest() -> None:
-    """CLI 入口：python -m tools.convert <skin_dir> <out_dir> [height] [fps]
-    在独立子进程中执行转换，numpy/scipy 内存随进程退出释放。"""
+    """CLI 入口：python -m tools.convert [--gated] <skin_dir> <out_dir> [height] [fps]
+    在独立子进程中执行转换，numpy/scipy 内存随进程退出释放。
+
+    --gated（v4.3.1 DP43-R05）：启动后先阻塞读 stdin 的 1 字节 gate
+    再做任何真实工作。父进程先 AssignProcessToJobObject（Windows Job
+    Object，KILL_ON_JOB_CLOSE）再放行 gate——保证 converter 在加入 job
+    前绝不可能 spawn ffmpeg（无 assign race，DeskPet 退出可杀整棵树）。
+    """
     import sys
-    if len(sys.argv) < 3:
-        print("usage: python -m tools.convert <skin_dir> <out_dir> [height] [fps]")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if "--gated" in sys.argv[1:]:
+        try:
+            sys.stdin.buffer.read(1)   # 等 gate 字节
+        except Exception:
+            pass
+    if len(args) < 2:
+        print("usage: python -m tools.convert [--gated] <skin_dir> <out_dir> [height] [fps]")
         raise SystemExit(1)
-    src_dir, out_dir = sys.argv[1], sys.argv[2]
-    height = int(sys.argv[3]) if len(sys.argv) > 3 else 240
-    fps = int(sys.argv[4]) if len(sys.argv) > 4 else 12
+    src_dir, out_dir = args[0], args[1]
+    height = int(args[2]) if len(args) > 2 else 240
+    fps = int(args[3]) if len(args) > 3 else 12
     convert_skin(src_dir, out_dir, height=height, fps=fps,
                  log=print if sys.stdout else None)
 

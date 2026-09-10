@@ -280,7 +280,92 @@ class AttentionTests(unittest.TestCase):
             self.assertEqual(name, "die", msg=str(status))
 
 
-class FleetTests(unittest.TestCase):
+class AttentionScopeTests(unittest.TestCase):
+    """DP43-R07：Aggregate attention 必须属于 selected 集。"""
+
+    def test_excluded_waiting_does_not_steal_attention(self):
+        # A = Claude WAITING（用户 exclude）；B = Codex WORKING（selected）
+        pc = PresentationController(concurrent_cfg())
+        a = inst(AgentKind.CLAUDE, 1)
+        b = inst(AgentKind.CODEX, 2)
+        pc.set_instance_included(a.key, False)
+        state = pc.reconcile(targets(
+            (a, snap(a, Status.WAITING, "需要确认")),
+            (b, snap(b, Status.WORKING))), NOW)
+        card_keys = [c.agent_key for c in state.cards]
+        self.assertNotIn(a.key, card_keys)
+        self.assertIn(b.key, card_keys)
+        # invariant：attention ∈ card keys（不再被 exclude 的 WAITING 抢走）
+        self.assertEqual(state.attention_key, b.key)
+        self.assertIn(state.attention_key, card_keys)
+        # focused 非空且属于 cards（B 的气泡不被清）
+        self.assertEqual(state.focused_key, b.key)
+
+    def test_ineligible_waiting_does_not_steal_attention(self):
+        # eligible_kinds 排除 claude： ineligible WAITING 不抢 attention
+        pc = PresentationController(concurrent_cfg(eligible={
+            "codex": True, "claude": False, "kimi": True, "pi": True}))
+        a = inst(AgentKind.CLAUDE, 1)
+        b = inst(AgentKind.CODEX, 2)
+        state = pc.reconcile(targets(
+            (a, snap(a, Status.WAITING, "需要确认")),
+            (b, snap(b, Status.WORKING))), NOW)
+        card_keys = [c.agent_key for c in state.cards]
+        self.assertNotIn(a.key, card_keys)
+        self.assertEqual(state.attention_key, b.key)
+        self.assertEqual(state.focused_key, b.key)
+
+    def test_max_targets_one_attention_still_in_cards(self):
+        pc = PresentationController(concurrent_cfg(max_targets=1))
+        a = inst(AgentKind.CLAUDE, 1)
+        b = inst(AgentKind.CODEX, 2)
+        state = pc.reconcile(targets(
+            (a, snap(a, Status.WAITING, "A 等待")),
+            (b, snap(b, Status.WORKING))), NOW)
+        self.assertEqual(len(state.cards), 1)
+        card_keys = [c.agent_key for c in state.cards]
+        self.assertIn(state.attention_key, card_keys)
+        self.assertIn(state.focused_key, card_keys)
+
+    def test_focused_and_attention_both_selected_keeps_focus(self):
+        # focused A（WORKING）+ attention B（WAITING）都在 selected：
+        # focused 保持 A、attention 指向 B（focus sticky 不被偷）
+        pc = PresentationController(concurrent_cfg())
+        a = inst(AgentKind.CODEX, 1)
+        b = inst(AgentKind.CLAUDE, 2)
+        pc.set_focus(a.key)
+        state = pc.reconcile(targets(
+            (a, snap(a, Status.WORKING)),
+            (b, snap(b, Status.WAITING, "B 等待"))), NOW)
+        self.assertEqual(state.focused_key, a.key)
+        self.assertEqual(state.attention_key, b.key)
+        for c in state.cards:
+            if c.agent_key == b.key:
+                self.assertTrue(c.attention)
+
+    def test_zero_agents_attention_and_focused_empty(self):
+        pc = PresentationController(concurrent_cfg())
+        state = pc.reconcile({}, NOW)
+        self.assertEqual(state.cards, ())
+        self.assertEqual(state.attention_key, "")
+        self.assertEqual(state.focused_key, "")
+
+    def test_cards_nonempty_focused_always_valid(self):
+        # invariant 总检：非空 cards 时 focused ∈ card keys
+        pc = PresentationController(concurrent_cfg(max_targets=2))
+        agents = [inst(AgentKind.CODEX, i + 1) for i in range(5)]
+        pc.set_instance_included(agents[4].key, False)   # 排除最后一个
+        tg = targets(*[(a, snap(a, Status.WORKING)) for a in agents])
+        for _ in range(3):
+            state = pc.reconcile(tg, NOW)
+            card_keys = {c.agent_key for c in state.cards}
+            self.assertTrue(card_keys)
+            self.assertIn(state.focused_key, card_keys)
+            self.assertTrue(state.attention_key == ""
+                            or state.attention_key in card_keys)
+
+
+
     def _fleet_pc(self, slots):
         pc = PresentationController(concurrent_cfg(
             enabled=True, mode="fleet", slots=slots))

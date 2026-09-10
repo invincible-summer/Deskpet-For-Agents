@@ -437,5 +437,92 @@ class OldTimerRemovalTests(unittest.TestCase):
         self.assertEqual(len(root.timers), 0)
 
 
+# ================================================================ DP43-R02
+class BridgeTierWithSaverTests(unittest.TestCase):
+    """saver active => 125ms；save finished => 空闲回 200/500ms。"""
+
+    class FakeSaver:
+        def __init__(self):
+            self.pending_flag = False
+            self.poll_calls = 0
+
+        def pending(self):
+            return self.pending_flag
+
+        def poll(self):
+            self.poll_calls += 1
+
+    def _tier_coordinator(self, visible=True, tray=False):
+        root = FakeRoot()
+        saver = self.FakeSaver()
+
+        class _VisibleManager(FakePetManager):
+            def any_visible(self):
+                return visible
+
+        pets = _VisibleManager(("pet-1",) if visible else ())
+        pets.build_manager = FakeBuildManager()
+        ui = UiCoordinator(
+            root, monitor=FakeMonitor(), presentation=FakePresentation(),
+            pet_manager=pets, dashboard_provider=lambda: FakeDashboard(),
+            tray_drain=lambda: None, tray_enabled=lambda: tray,
+            config_saver=saver)
+        return ui, root, saver
+
+    def test_saver_active_uses_125ms(self):
+        ui, root, saver = self._tier_coordinator()
+        ui.start()
+        saver.pending_flag = True
+        ui.kick()
+        bridge = [t for t in root.timers.values() if not t.idle]
+        self.assertEqual(len(bridge), 1)
+        self.assertEqual(bridge[0].delay_ms, 125)
+
+    def test_idle_bridge_returns_to_200(self):
+        # DP43-R02 问题 A 回归：save 完成（pending False）后 bridge
+        # 回 200ms（有可见 pet），不再永久卡 125ms
+        ui, root, saver = self._tier_coordinator(visible=True)
+        ui.start()
+        saver.pending_flag = True
+        ui.kick()
+        bridge = [t for t in root.timers.values() if not t.idle][0]
+        self.assertEqual(bridge.delay_ms, 125)
+        saver.pending_flag = False   # harvest 完成
+        root.fire(bridge.token)      # 下一轮 arm 用新档位
+        bridge = [t for t in root.timers.values() if not t.idle][0]
+        self.assertEqual(bridge.delay_ms, 200)
+
+    def test_hidden_idle_bridge_returns_to_500(self):
+        # 全部隐藏 + 无 tray + 无 worker → 500ms
+        ui, root, saver = self._tier_coordinator(visible=False, tray=False)
+        ui.start()
+        saver.pending_flag = True
+        ui.kick()
+        bridge = [t for t in root.timers.values() if not t.idle][0]
+        self.assertEqual(bridge.delay_ms, 125)
+        saver.pending_flag = False
+        root.fire(bridge.token)
+        bridge = [t for t in root.timers.values() if not t.idle][0]
+        self.assertEqual(bridge.delay_ms, 500)
+
+    def test_hidden_with_tray_returns_to_200(self):
+        ui, root, saver = self._tier_coordinator(visible=False, tray=True)
+        ui.start()
+        saver.pending_flag = False
+        bridge = [t for t in root.timers.values() if not t.idle][0]
+        self.assertEqual(bridge.delay_ms, 200)
+
+    def test_bridge_polls_saver_only_when_pending(self):
+        ui, root, saver = self._tier_coordinator()
+        ui.start()
+        bridge = [t for t in root.timers.values() if not t.idle][0]
+        root.fire(bridge.token)
+        self.assertEqual(saver.poll_calls, 0)   # 不 pending 不 poll
+        saver.pending_flag = True
+        bridge = [t for t in root.timers.values() if not t.idle][0]
+        root.fire(bridge.token)
+        self.assertEqual(saver.poll_calls, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

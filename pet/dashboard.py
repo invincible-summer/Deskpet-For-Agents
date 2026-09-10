@@ -899,9 +899,17 @@ class AppearancePage(DashboardPage):
         self.font_var = tk.StringVar(
             value=str(cfg.get("bubble.font_family",
                               "Microsoft YaHei UI")))
-        ttk.Combobox(r._control_cell, textvariable=self.font_var,
-                     values=available, width=22,
-                     state="readonly").pack(side="left")
+        # DP43-R11：字体下拉必须写回 AppearanceController——旧实现只改
+        # UI variable，Config/桌宠/保存全部不动（死选择器）。程序化
+        # font_var.set() 不触发 <<ComboboxSelected>>，sync 无副作用。
+        self.font_combo = ttk.Combobox(
+            r._control_cell, textvariable=self.font_var,
+            values=available, width=22, state="readonly")
+        self.font_combo.pack(side="left")
+        self.font_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: app.appearance.set_global(
+                "bubble.font_family", self.font_var.get()))
         r.reflow("wide")
         r = row(panel_bub.body, "字号")
         self.size_stepper = Stepper(
@@ -1111,11 +1119,24 @@ class MonitorPage(DashboardPage):
         self.root_meta_var = tk.BooleanVar(
             value=bool(cfg.get("privacy.wsl_root_metadata_fallback",
                                False)))
-        ttk.Checkbutton(
+
+        def _set_root_metadata(flag):
+            # DP43-R03：隐私开关运行期必须立即生效——
+            # Config 内存 → runtime 权限（Monitor → probe）→ 异步持久化；
+            # 磁盘保存失败也不回滚运行期隐私意图。
+            cfg.set("privacy.wsl_root_metadata_fallback", bool(flag))
+            try:
+                app.monitor.set_wsl_root_metadata_fallback(bool(flag))
+            except Exception:
+                pass
+            app.config_saver.request_save()
+
+        self.root_meta_check = ttk.Checkbutton(
             erow, text="允许 WSL root metadata fallback（默认关闭）",
             variable=self.root_meta_var,
-            command=lambda: save("privacy.wsl_root_metadata_fallback",
-                                 self.root_meta_var.get())).pack(side="left")
+            command=lambda: _set_root_metadata(
+                self.root_meta_var.get()))
+        self.root_meta_check.pack(side="left")
         InfoButton(erow, "WSL 里 root 用户的 /proc 元数据默认拒绝读取。"
                    "开启后用受控 fallback 读取 root Agent 元数据；关闭时"
                    "这类 Agent 仍被发现，只是详情较少。",
@@ -1391,9 +1412,11 @@ class SettingsPage(DashboardPage):
         self.refresh(UiDirty.NONE)
 
     def _retry_save(self):
-        result = self.dash.app.config.commit()
-        if result.ok:
-            self.dash.app.toast("设置已写入磁盘", 3)
+        # DP43-R02：显式重试不同步写盘——immediate 强制快照 + 单
+        # transient worker；成功/失败 toast 统一走 saver 的 result
+        # callback（on_result），此处只负责触发。
+        self.dash.app.config_saver.request_save(
+            immediate=True, force=True)
         self.refresh(UiDirty.NONE)
 
     def on_show(self):

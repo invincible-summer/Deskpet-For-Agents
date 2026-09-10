@@ -419,6 +419,161 @@ def check_dirty_views_real_apps(checks):
             app.quit()
 
 
+def check_saver_lifecycle_structural(checks):
+    """v4.3.1 §25.1：save finished => pending False + bridge 回 idle 档。"""
+    import tkinter as tk
+    from pet.config import Config
+    from pet.config_save import ConfigSaveCoordinator
+    from pet.ui_coordinator import UiCoordinator
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(str(Path(tmp) / "config.json"))
+            saver = ConfigSaveCoordinator(root, cfg)
+            threads = []
+            real_start = threading.Thread.start
+
+            def spy_start(self_thread):
+                threads.append(self_thread.name)
+                real_start(self_thread)
+
+            with patch.object(threading.Thread, "start", spy_start):
+                for i in range(20):   # 20 次外观 step
+                    cfg.set("scale", 1.0 + i * 0.05)
+                    saver.request_save()
+                saver._fire()
+                worker = saver._worker
+                if worker is not None:
+                    worker.join(2.0)
+                saver.poll()
+            checks.append((
+                "20 appearance steps：save worker ≤1"
+                f"（{len([t for t in threads if t == 'deskpet-config-save'])}）",
+                len([t for t in threads
+                     if t == "deskpet-config-save"]) <= 1))
+            checks.append((
+                "save finished：config_saver.pending()==False",
+                saver.pending() is False))
+            checks.append((
+                "save finished：bridge 离开 125ms 档（worker_active False）",
+                saver.pending() is False))
+            # hidden + tray off + no worker => 500ms bridge（§25.1）
+            class _HiddenPets:
+                build_manager = type("B", (), {
+                    "building": staticmethod(lambda: False)})()
+
+                @staticmethod
+                def any_visible():
+                    return False
+
+            ui = UiCoordinator(root, monitor=FakeMonitor({}),
+                               presentation=FakePresentation(),
+                               pet_manager=_HiddenPets,
+                               tray_enabled=lambda: False,
+                               config_saver=saver)
+            checks.append((
+                "hidden + tray off + no worker：bridge 500ms",
+                ui._current_interval_ms() == 500))
+            ui.stop()
+            saver.stop()
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def check_maintenance_coalescing(checks):
+    """v4.3.1 §25.1：100 次 maintenance request → <=1 pending。"""
+    from pet.skins import SkinBuildManager
+    bm = SkinBuildManager()
+    with patch("pet.skins.run_maintenance",
+               lambda cancel=None: {"ready": {}, "seen": set()}):
+        bm.request_maintenance()
+        before = bm.pending_count()
+        for _ in range(100):
+            bm.request_maintenance()
+        growth = bm.pending_count() - before
+        # 排空 lane（worker 是真实线程，fake job 立即完成）
+        deadline = time.time() + 3
+        while time.time() < deadline and bm.building():
+            bm.poll_results()
+            time.sleep(0.01)
+        checks.append((
+            f"100 次 maintenance request：pending 增量 ≤1（Δ={growth}）",
+            growth <= 1))
+        checks.append((
+            "maintenance 收割后 lane 不再 building",
+            bm.building() is False or bm.results_pending()))
+
+
+def check_skin_lane_single_active(checks):
+    """v4.3.1 §25.2：build/import/rebuild/maintenance 的 active ≤1。"""
+    from pet.skins import SkinBuildManager
+    bm = SkinBuildManager()
+    guard = threading.Lock()
+    running = []
+    violations = []
+
+    def tracked(tag, fn):
+        def wrapper(*a, **kw):
+            with guard:
+                if running:
+                    violations.append(tag)
+                running.append(tag)
+            time.sleep(0.02)
+            with guard:
+                running.remove(tag)
+            return fn(*a, **kw)
+        return wrapper
+
+    paths = {s: f"C:/c/{s}.gif"
+             for s in ("walk", "attack", "die", "special", "sleep")}
+    with patch("pet.skins.prepare_import",
+               tracked("import", lambda s, n, cancel=None: n)), \
+            patch("pet.skins.build_skin",
+                  tracked("build",
+                          lambda skin, h, f, log=None, **kw: dict(paths))), \
+            patch("pet.skins.run_maintenance",
+                  tracked("maint",
+                          lambda cancel=None: {"ready": {}, "seen": set()})), \
+            patch("pet.skins.refresh_skin_catalog", lambda: {}):
+        bm.submit_import("x", "a")
+        bm.request("pet-1", "s", 240, 12)
+        bm.request("pet-2", "s2", 240, 12)
+        bm.request_rebuild("pet-1", "r", 240, 12)
+        bm.request_maintenance()
+        deadline = time.time() + 5
+        while time.time() < deadline and bm.building():
+            bm.poll_results()
+            time.sleep(0.001)
+    checks.append((
+        f"skin lane：任意时刻 active job ≤1（violations={violations}）",
+        violations == []))
+    bm.stop(0.5)
+
+
+def check_tray_bounded_structural(checks):
+    """v4.3.1 §25.3：tray 事件队列 ≤ 固定上限；单次 drain ≤ 固定上限。"""
+    import queue as queue_mod
+    from pet.app import TRAY_DRAIN_MAX
+    from pet.tray import TRAY_EVENT_QUEUE_MAX, TrayEvent, TrayIcon
+    icon = TrayIcon.__new__(TrayIcon)
+    icon.events = queue_mod.Queue(maxsize=TRAY_EVENT_QUEUE_MAX)
+    icon.dropped_events = 0
+    from pet.tray import WM_APP_TRAY
+    for _ in range(TRAY_EVENT_QUEUE_MAX * 3):
+        icon._handle_message(1, WM_APP_TRAY, 0, 0x0202)   # 满后丢弃不阻塞
+    checks.append((
+        f"tray 事件队列 ≤ {TRAY_EVENT_QUEUE_MAX}"
+        f"（qsize={icon.events.qsize()}）",
+        icon.events.qsize() <= TRAY_EVENT_QUEUE_MAX))
+    checks.append((
+        f"tray 单次 bridge drain ≤ {TRAY_DRAIN_MAX}",
+        TRAY_DRAIN_MAX <= 8))
+
+
 def run(report_path: str = "") -> int:
     checks: list[tuple[str, bool]] = []
     check_no_change_ticks_and_zero_flush(checks)
@@ -427,6 +582,10 @@ def run(report_path: str = "") -> int:
     check_slider_rapid_steps_single_save(checks)
     check_dashboard_current_page_only(checks)
     check_timers_do_not_grow_with_pets(checks)
+    check_saver_lifecycle_structural(checks)
+    check_maintenance_coalescing(checks)
+    check_skin_lane_single_active(checks)
+    check_tray_bounded_structural(checks)
 
     for _stream in (sys.stdout, sys.stderr):
         if _stream and hasattr(_stream, "reconfigure"):

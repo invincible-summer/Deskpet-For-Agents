@@ -5,11 +5,14 @@
 TerminalObservationResolver。Monitor 只面对本模块，不再分别管理终端
 生命周期，也不接触 UIA backend 的任何 control 级方法。
 
-window-only 激活事务（plan §6.3，顺序固定、fail-closed、不依赖 UIA）：
+window-only 激活事务（plan §6.3，顺序固定、fail-closed、不依赖 UIA；
+v4.3.1 DP43-R08 拆分为 cached 激活 + 异步 repair）：
   1. 再确认 exact agent_key 仍 live；否则 AGENT_GONE
   2. TerminalWindowBinding 存在且有 window；否则 NO_BINDING
   3. 校验 WindowIdentity（IsWindow + PID + create_time + class）
-  4. 失效时只允许一次 topology refresh + re-resolve；仍失败 STALE_WINDOW
+  4. 失效 → STALE_WINDOW + needs_repair：UI 立即返回，Monitor 线程
+     做恰好一次 repair_binding（invalidate + UIA refresh + re-resolve），
+     绝不在 Tk callback 里同步等待 UIA
   5. restore_window（最小化时恢复）
   6. try_set_foreground；OS 拒绝 → FlashWindowEx + FOREGROUND_DENIED
      （不绕过系统 foreground policy，绝不输入注入）
@@ -20,7 +23,7 @@ Terminal 没有稳定的公开"按 WT_SESSION 激活既有标签页"接口
 """
 from __future__ import annotations
 
-import time
+import threading
 from typing import Callable
 
 from actions import winkeys
@@ -50,10 +53,13 @@ class WindowsTerminalService:
         self.cfg = dict(cfg or {})
         self.failed = observer is None
         self._stopped = False   # stop 终态：异步 boot 晚到的 start 拒绝
-        # 绑定结果缓存（Monitor 线程写入，activate 时读取）
+        # 绑定结果缓存（Monitor 线程写入，UI activate_cached 读取）。
+        # v4.3.1 DP43-R08 §16.8：绑定表读写一律短临界区（swap/read/pop），
+        # 绝不持锁跨越 UIA / enum_windows / foreground。
+        self._binding_lock = threading.Lock()
         self._window_bindings: dict[str, TerminalWindowBinding] = {}
         self._observation_bindings: dict = {}
-        # 最近一次 resolve 的实例集合（activate 内 re-resolve 用）
+        # 最近一次 resolve 的实例集合（repair 内 re-resolve 用）
         self._last_instances: list = []
 
     # ------------------------------------------------------------ 生命周期
@@ -124,6 +130,7 @@ class WindowsTerminalService:
 
         返回 (window_bindings, observation_bindings)；失败返回空表
         （fail-closed，不抛出——Monitor 主循环不能被 UIA/Win32 异常打断）。
+        v4.3.1 DP43-R08 §16.8：先在本地构建全部表，最后短临界区 swap。
         """
         controls = self.observed_controls()
         screens = (self.observer.screen_texts()
@@ -142,16 +149,19 @@ class WindowsTerminalService:
         except Exception:
             observation_bindings = {}
         self._last_instances = list(instances)
-        self._window_bindings = window_bindings
-        self._observation_bindings = observation_bindings
+        with self._binding_lock:
+            self._window_bindings = window_bindings
+            self._observation_bindings = observation_bindings
         return window_bindings, observation_bindings
 
     def current_window_binding(
             self, agent_key: str) -> TerminalWindowBinding | None:
-        return self._window_bindings.get(agent_key)
+        with self._binding_lock:
+            return self._window_bindings.get(agent_key)
 
     def observation_binding(self, agent_key: str):
-        return self._observation_bindings.get(agent_key)
+        with self._binding_lock:
+            return self._observation_bindings.get(agent_key)
 
     # ------------------------------------------------------------ 观察 API
     def waiting_observation(self, control_id: tuple):
@@ -167,9 +177,16 @@ class WindowsTerminalService:
             control_id, now, grace)
 
     # ------------------------------------------------------------ 用户显式 action
-    def activate(self, agent_key: str, *,
-                 is_agent_live: Callable[[str], bool]) -> ActivationResult:
-        """window-only 激活事务（§8.2；refresh 最多一次）。
+    def activate_cached(self, agent_key: str, *,
+                        is_agent_live: Callable[[str], bool]
+                        ) -> ActivationResult:
+        """window-only 激活事务（v4.3.1 DP43-R08 §16.4 拆分后）。
+
+        UI/Tk 线程调用：只走 cached binding + WindowIdentity 校验 +
+        restore + foreground；**不做 UIA refresh、不做 resolver 重建**
+        （旧实现的同步 stale-repair 会把 UIA 等待带进 Tk callback）。
+        stale binding → STALE_WINDOW + needs_repair=True（UI 据此安排
+        Monitor 线程的一次异步 repair）。
 
         不看 confidence：CONFIRMED/HIGH/AMBIGUOUS/NONE 只要
         binding.window 存在，都走同一条 restore + foreground 链
@@ -178,36 +195,18 @@ class WindowsTerminalService:
         if not is_agent_live(agent_key):
             return ActivationResult(ActivationCode.AGENT_GONE)
 
-        binding = self._window_bindings.get(agent_key)
+        binding = self.current_window_binding(agent_key)
         if binding is None or binding.window is None:
             return ActivationResult(
                 ActivationCode.NO_BINDING,
                 detail=binding.reason if binding is not None else "")
 
         if not winkeys.validate_window(binding.window):
-            # 4. 只允许一次 refresh + re-resolve（不循环，§8.3）
-            self.window_resolver.invalidate_window_cache()
-            self.refresh_observed_controls(force=True)
-            self._resolve_once()
-            if not is_agent_live(agent_key):
-                return ActivationResult(ActivationCode.AGENT_GONE)
-            binding = self._window_bindings.get(agent_key)
-            if binding is None or binding.window is None:
-                return ActivationResult(
-                    ActivationCode.NO_BINDING, repaired=True,
-                    detail=binding.reason if binding is not None else "")
-            if not winkeys.validate_window(binding.window):
-                return ActivationResult(ActivationCode.STALE_WINDOW,
-                                        repaired=True)
-            # 5/6. refresh 后成功唤起：携带 repaired（v4.1.1 §19.2-C）
-            hwnd = binding.hwnd
-            winkeys.restore_window(hwnd)
-            if winkeys.try_set_foreground(hwnd):
-                return ActivationResult(ActivationCode.OK, repaired=True)
-            winkeys.flash_window(hwnd)
-            return ActivationResult(ActivationCode.FOREGROUND_DENIED)
+            # stale：UI 立即返回；修复由 Monitor 线程的 repair_binding
+            # 执行（invalidate + UIA refresh + re-resolve），不阻塞 Tk
+            return ActivationResult(ActivationCode.STALE_WINDOW,
+                                    needs_repair=True)
 
-        # 5/6. restore + foreground（OS policy 决定成败，不绕过）
         hwnd = binding.hwnd
         winkeys.restore_window(hwnd)
         if winkeys.try_set_foreground(hwnd):
@@ -215,21 +214,28 @@ class WindowsTerminalService:
         winkeys.flash_window(hwnd)
         return ActivationResult(ActivationCode.FOREGROUND_DENIED)
 
-    def _resolve_once(self):
-        instances = list(self._last_instances)
-        if not instances:
-            return
+    def repair_binding(self, agent_key: str, *, instances: list,
+                       now: float) -> bool:
+        """stale binding 的一次性修复（§16.4；**只允许 Monitor 线程**）。
+
+        invalidate window cache → force UIA topology refresh →
+        resolve once。返回该 key 是否重新获得带 window 的 binding
+        （最终激活前 UI 仍会重新校验 is_agent_live + WindowIdentity）。
+        """
         try:
-            self.resolve(
-                [inst for inst in instances],
-                time.time())
+            self.window_resolver.invalidate_window_cache()
+            self.refresh_observed_controls(force=True)
+            self.resolve([inst for inst in instances], now)
+            binding = self.current_window_binding(agent_key)
+            return binding is not None and binding.window is not None
         except Exception:
-            pass
+            return False
 
     def drop_instance(self, agent_key: str) -> None:
         """Agent 退出级联：清运行期缓存绑定（不再有 manual path）。"""
-        self._window_bindings.pop(agent_key, None)
-        self._observation_bindings.pop(agent_key, None)
+        with self._binding_lock:
+            self._window_bindings.pop(agent_key, None)
+            self._observation_bindings.pop(agent_key, None)
         self._last_instances = [inst for inst in self._last_instances
                                 if getattr(inst, "key", "") != agent_key]
 

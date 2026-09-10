@@ -223,6 +223,296 @@ class ConfigSaveCoordinatorTests(unittest.TestCase):
         self.assertFalse(saver.pending())
 
 
+# ================================================================ DP43-R02
+class SaverStateMachineTests(unittest.TestCase):
+    """v4.3.1 DP43-R02：worker harvest 清引用、failed revision 门、
+    single-writer shutdown、stale snapshot 裁决。"""
+
+    def _coordinator(self, cfg):
+        root = FakeRoot()
+        saver = ConfigSaveCoordinator(root, cfg)
+        return saver, root
+
+    def _debs(self, root):
+        return [t for t in root.timers.values()
+                if t.delay_ms == SAVE_DEBOUNCE_MS]
+
+    def _fail_result(self, error="denied"):
+        return type("R", (), {"ok": False, "path": "", "error": error})()
+
+    def test_worker_reference_is_cleared_after_harvest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _async_config(tmp)
+            saver, root = self._coordinator(cfg)
+            cfg.set("scale", 1.0)
+            saver.request_save()
+            root.fire_timer()
+            saver._worker.join(2.0)
+            self.assertIsNotNone(saver._worker)   # 未收割：引用仍在
+            self.assertFalse(saver._worker_busy())  # 但 dead 不算 busy
+            saver.poll()
+            self.assertIsNone(saver._worker)      # harvest 后清除
+            self.assertIsNone(saver._worker_token)
+
+    def test_pending_false_after_completed_save(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _async_config(tmp)
+            saver, root = self._coordinator(cfg)
+            cfg.set("scale", 1.0)
+            saver.request_save()
+            root.fire_timer()
+            saver._worker.join(2.0)
+            saver.poll()
+            self.assertFalse(saver.pending())   # dead worker 不再让 pending 恒真
+            self.assertFalse(cfg.dirty)
+
+    def test_failed_revision_is_not_retried_forever(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _async_config(tmp)
+            saver, root = self._coordinator(cfg)
+            writes = []
+
+            def fail_write(self_cfg, revision, data, **kw):
+                writes.append(revision)
+                return self._fail_result()
+
+            cfg.set("scale", 1.0)
+            with patch.object(Config, "write_snapshot", fail_write):
+                saver.request_save()
+                root.fire_timer()
+                saver._worker.join(2.0)
+                saver.poll()
+                # 同一失败 revision 的多轮 poll 不再自动重试
+                for _ in range(6):
+                    saver.poll()
+                    root.fire_timer()
+                    if saver._worker is not None:
+                        saver._worker.join(1.0)
+                        saver.poll()
+                self.assertEqual(len(writes), 1)
+            self.assertTrue(cfg.dirty)          # 失败：dirty 保持
+            self.assertEqual(saver._failed_revision, cfg.revision)
+            self.assertFalse(saver.pending())   # bridge 回 idle 档
+
+    def test_new_revision_after_failure_is_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _async_config(tmp)
+            saver, root = self._coordinator(cfg)
+            real_write = Config.write_snapshot
+
+            def fail_once(self_cfg, revision, data, **kw):
+                if len(writes) == 0:
+                    writes.append(revision)
+                    return self._fail_result()
+                return real_write(self_cfg, revision, data)
+
+            writes = []
+            cfg.set("scale", 1.0)
+            with patch.object(Config, "write_snapshot", fail_once):
+                saver.request_save()
+                root.fire_timer()
+                saver._worker.join(2.0)
+                saver.poll()   # 失败收割
+                # 用户新修改 → revision 前进 → 重新有保存资格
+                cfg.set("speed", 2.0)
+                saver.poll()
+                self.assertEqual(len(self._debs(root)), 1)
+                root.fire_timer()
+                saver._worker.join(2.0)
+                saver.poll()
+            self.assertFalse(cfg.dirty)
+            with open(cfg.path, encoding="utf-8") as f:
+                on_disk = json.load(f)
+            self.assertAlmostEqual(on_disk["speed"], 2.0)
+            # plan §6.9：失败门只在"同 revision 成功"时清除；旧失败
+            # revision 已被更新 revision 的成功保存越过（revision 单调
+            # 递增，旧值不会再挡住新保存）。
+            self.assertNotEqual(saver._failed_revision, cfg.revision)
+            self.assertFalse(saver.pending())
+
+    def test_explicit_retry_retries_same_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _async_config(tmp)
+            saver, root = self._coordinator(cfg)
+            real_write = Config.write_snapshot
+
+            state = {"failed": True}
+
+            def fail_then_ok(self_cfg, revision, data, **kw):
+                if state["failed"]:
+                    state["failed"] = False
+                    return self._fail_result()
+                return real_write(self_cfg, revision, data)
+
+            cfg.set("scale", 1.25)
+            revision = cfg.revision
+            with patch.object(Config, "write_snapshot", fail_then_ok):
+                saver.request_save()
+                root.fire_timer()
+                saver._worker.join(2.0)
+                saver.poll()               # 失败；无新 revision
+                saver.poll()               # 自动路径：不重试
+                self.assertTrue(cfg.dirty)
+                # 用户点击"重试保存"：同 revision 立即重新提交（异步 worker）
+                saver.request_save(immediate=True, force=True)
+                self.assertIsNotNone(saver._worker)   # 立即启动（无 debounce）
+                self.assertEqual(self._debs(root), [])
+                saver._worker.join(2.0)
+                saver.poll()
+            self.assertFalse(cfg.dirty)
+            self.assertEqual(saver._worker_revision, None)
+            with open(cfg.path, encoding="utf-8") as f:
+                self.assertAlmostEqual(json.load(f)["scale"], 1.25)
+            self.assertEqual(revision, cfg.revision)  # 同 revision 重试
+
+    def test_only_one_writer_even_with_immediate_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _async_config(tmp)
+            saver, root = self._coordinator(cfg)
+            entered = threading.Event()
+            release = threading.Event()
+            real_write = Config.write_snapshot
+
+            def slow_write(self_cfg, revision, data, **kw):
+                entered.set()
+                release.wait(2.0)
+                return real_write(self_cfg, revision, data)
+
+            threads = []
+            real_start = threading.Thread.start
+
+            def spy_start(self_thread):
+                threads.append(self_thread.name)
+                real_start(self_thread)
+
+            cfg.set("scale", 1.0)
+            with patch.object(Config, "write_snapshot", slow_write), \
+                    patch.object(threading.Thread, "start", spy_start):
+                saver.request_save()
+                root.fire_timer()
+                entered.wait(2.0)
+                first = saver._worker
+                # worker 写盘中：显式 immediate 请求也不创建第二 writer
+                cfg.set("speed", 2.0)
+                saver.request_save(immediate=True, force=True)
+                self.assertIs(saver._worker, first)
+                release.set()
+                first.join(2.0)
+                saver.poll()
+                self.assertEqual(len(threads), 1)
+                # harvest 后 poll 重新安排最新 revision 的保存
+                saver.poll()
+                self.assertEqual(len(self._debs(root)), 1)
+
+    def test_shutdown_timeout_does_not_start_second_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _async_config(tmp)
+            saver, root = self._coordinator(cfg)
+            entered = threading.Event()
+            release = threading.Event()
+            writes = []
+
+            def blocked_write(self_cfg, revision, data, **kw):
+                writes.append(revision)
+                entered.set()
+                release.wait(5.0)   # 模拟磁盘永久阻塞
+                return self._fail_result("io stuck")
+
+            cfg.set("scale", 1.0)
+            with patch.object(Config, "write_snapshot", blocked_write):
+                saver.request_save()
+                root.fire_timer()
+                entered.wait(2.0)
+                first = saver._worker
+                # 写期间又出现新 revision（dirty）
+                cfg.set("speed", 2.0)
+                durable = saver.flush_for_shutdown(0.2)
+                self.assertFalse(durable)          # 明确失败，不假装成功
+                self.assertEqual(len(writes), 1)   # 没有第二个 writer
+                self.assertIs(saver._worker, first)
+                release.set()
+                first.join(2.0)
+                saver._drain_result()
+
+    def test_shutdown_flushes_latest_when_no_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _async_config(tmp)
+            saver, root = self._coordinator(cfg)
+            cfg.set("scale", 1.75)
+            saver.request_save()
+            threads = []
+            real_start = threading.Thread.start
+
+            def spy_start(self_thread):
+                threads.append(self_thread.name)
+                real_start(self_thread)
+
+            with patch.object(threading.Thread, "start", spy_start):
+                durable = saver.flush_for_shutdown(2.0)
+            self.assertTrue(durable)
+            self.assertEqual(threads, ["deskpet-config-save"])   # 恰一个
+            self.assertEqual(self._debs(root), [])
+            with open(cfg.path, encoding="utf-8") as f:
+                self.assertAlmostEqual(json.load(f)["scale"], 1.75)
+
+    def test_shutdown_returns_within_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _async_config(tmp)
+            saver, root = self._coordinator(cfg)
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked_write(self_cfg, revision, data, **kw):
+                entered.set()
+                release.wait(5.0)
+                return self._fail_result("io stuck")
+
+            cfg.set("scale", 1.0)
+            with patch.object(Config, "write_snapshot", blocked_write):
+                saver.request_save()
+                root.fire_timer()
+                entered.wait(2.0)
+                t0 = time.monotonic()
+                saver.flush_for_shutdown(0.15)
+                elapsed = time.monotonic() - t0
+                release.set()
+                saver._worker.join(2.0)
+            self.assertLessEqual(elapsed, 0.6)   # 有界（含 join 调度余量）
+
+    def test_stale_snapshot_cannot_overwrite_newer_revision(self):
+        """写 rev N 期间出现 rev N+1：N 落盘后 dirty 必须保持，随后
+        保存最新快照——最终磁盘一定是最新 revision。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _async_config(tmp)
+            saver, root = self._coordinator(cfg)
+            entered = threading.Event()
+            release = threading.Event()
+            real_write = Config.write_snapshot
+
+            def slow_write(self_cfg, revision, data, **kw):
+                entered.set()
+                release.wait(2.0)
+                return real_write(self_cfg, revision, data)
+
+            cfg.set("scale", 1.0)
+            with patch.object(Config, "write_snapshot", slow_write):
+                saver.request_save()
+                root.fire_timer()
+                entered.wait(2.0)
+                cfg.set("speed", 3.0)   # rev N+1
+                release.set()
+                saver._worker.join(2.0)
+                saver.poll()            # ack 旧 revision → dirty 保持
+                self.assertTrue(cfg.dirty)
+                root.fire_timer()       # 新 debounce → 最新快照
+                saver._worker.join(2.0)
+                saver.poll()
+            with open(cfg.path, encoding="utf-8") as f:
+                on_disk = json.load(f)
+            self.assertAlmostEqual(on_disk["speed"], 3.0)
+            self.assertFalse(cfg.dirty)
+
+
 # ================================================================ SkinCatalog
 class SkinCatalogTests(unittest.TestCase):
     def test_catalog_caches_scan_and_refresh_bumps_revision(self):
@@ -257,8 +547,23 @@ class SkinCatalogTests(unittest.TestCase):
 
 # ================================================================ 导入 lane
 class ImportLaneTests(unittest.TestCase):
+    """v4.3.1 DP43-R04/R05：单 mutation lane（import/build/rebuild/
+    maintenance 共享，worker 只执行 job → bounded 结果队列）。"""
+
     def _manager(self):
         return SkinBuildManager()
+
+    def _wait_result(self, bm, timeout=3.0):
+        """等 active worker 完成并 poll（真实线程；结果很快）。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            out = bm.poll_results()
+            if out:
+                return out
+            if bm._active_job is None and not bm.results_pending():
+                return []
+            time.sleep(0.01)
+        return None
 
     def test_submit_import_runs_in_convert_thread_and_polls_result(self):
         bm = self._manager()
@@ -272,16 +577,16 @@ class ImportLaneTests(unittest.TestCase):
             with patch("pet.skins.PETS_DIR", pets):
                 bm.submit_import(src, "myskin")
                 self.assertTrue(bm.building())   # lane 占用
-                bm._import_thread.join(2.0)
-                self.assertFalse(bm._import_running())
-                self.assertTrue(bm.results_pending())
-                out = bm.poll_results()
+                self.assertEqual(bm._active_thread.name, "deskpet-convert")
+                out = self._wait_result(bm)
+                self.assertIsNotNone(out)
+                self.assertFalse(bm.results_pending())
                 self.assertEqual(len(out), 1)
                 key, kind, payload = out[0]
                 self.assertEqual(key, ("import", "myskin"))
                 self.assertEqual(kind, "import_ok")
                 self.assertEqual(results, [(True, "myskin", "")])
-                # manifest 已写入 + 素材齐全
+                # manifest 已写入 + 素材齐全（整目录事务）
                 self.assertTrue(os.path.isfile(
                     os.path.join(pets, "myskin", "manifest.json")))
 
@@ -293,8 +598,8 @@ class ImportLaneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as src:
             # 空目录 → 缺素材
             bm.submit_import(src, "broken")
-            bm._import_thread.join(2.0)
-            out = bm.poll_results()
+            out = self._wait_result(bm)
+            self.assertIsNotNone(out)
             self.assertEqual(out[0][1], "import_err")
             self.assertIn("缺少素材", str(out[0][2]))
             self.assertFalse(results[0][0])
@@ -305,7 +610,7 @@ class ImportLaneTests(unittest.TestCase):
         release = threading.Event()
         real_prep = "pet.skins.prepare_import"
 
-        def slow_prepare(src, name):
+        def slow_prepare(src, name, cancel=None):
             started.append(name)
             if name == "first":
                 release.wait(2.0)
@@ -315,41 +620,118 @@ class ImportLaneTests(unittest.TestCase):
             bm.submit_import("y", "second")   # 排队
             bm.submit_import("z", "third")    # 覆盖排队项
             release.set()
-            deadline = time.time() + 3
-            while time.time() < deadline and len(started) < 2:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and len(started) < 2:
+                bm.poll_results()   # lane 前进由 poll 驱动（Tk 职责）
                 time.sleep(0.02)
             self.assertEqual(started, ["first", "third"])
 
     def test_build_defers_while_import_running(self):
-        import queue as queue_mod
         bm = self._manager()
         started_builds = []
-
-        class _IdleQueue:
-            def get_nowait(self):
-                raise queue_mod.Empty
-
-        def fake_start_build(*args, **kwargs):
-            started_builds.append(args)
-            return _IdleQueue()
-
         release = threading.Event()
-        with patch("pet.skins.prepare_import",
-                   lambda s, n: release.wait(2.0)), \
-             patch("pet.skins.start_build", fake_start_build):
+
+        def slow_prepare(src, name, cancel=None):
+            release.wait(2.0)
+
+        def fake_build(skin, height, fps, log=None, **kw):
+            started_builds.append((skin, height, fps))
+            return {s: f"C:/cache/{s}.gif" for s in
+                    ("walk", "attack", "die", "special", "sleep")}
+
+        with patch("pet.skins.prepare_import", slow_prepare), \
+             patch("pet.skins.build_skin", fake_build):
             bm.submit_import("x", "myskin")
             # 导入运行中请求 build：只入 pending，不启动 converter
             bm.request("pet-1", "someskin", 240, 12)
-            self.assertTrue(bm._import_running())
+            self.assertIsNotNone(bm._active_job)
+            self.assertEqual(bm._active_job.kind.name, "IMPORT")
             self.assertEqual(started_builds, [])   # 导入期间 0 个 build
             release.set()
-            bm._import_thread.join(2.0)
-            deadline = time.time() + 3
-            while time.time() < deadline and not started_builds:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not started_builds:
+                bm.poll_results()
                 time.sleep(0.02)
             # 导入结束后 build 补位启动（lane 仍互斥）
             self.assertEqual(len(started_builds), 1)
-            self.assertIsNotNone(bm._queue)
+            self._wait_result(bm)
+
+    def test_only_one_active_skin_job(self):
+        # DP43-R05 §25.2：build/import/rebuild/maintenance 任意组合，
+        # 任意时刻 <= 1 个 job 在执行（结构有界）
+        bm = self._manager()
+        guard = threading.Lock()
+        running = []
+        ran = []
+        violations = []
+
+        def tracked(tag, fn):
+            def wrapper(*a, **kw):
+                with guard:
+                    if running:
+                        violations.append(tag)
+                    running.append(tag)
+                    ran.append(tag)
+                time.sleep(0.05)
+                with guard:
+                    running.remove(tag)
+                return fn(*a, **kw)
+            return wrapper
+
+        def fake_prepare(src, name, cancel=None):
+            return name
+
+        def fake_build(skin, height, fps, log=None, **kw):
+            return {s: f"C:/c/{s}.gif" for s in
+                    ("walk", "attack", "die", "special", "sleep")}
+
+        with patch("pet.skins.prepare_import",
+                   tracked("import", fake_prepare)), \
+             patch("pet.skins.build_skin", tracked("build", fake_build)), \
+             patch("pet.skins.run_maintenance",
+                   tracked("maint", lambda cancel=None: {
+                       "ready": {}, "seen": set()})):
+            bm.submit_import("x", "a")
+            bm.request("pet-1", "s", 240, 12)
+            bm.request("pet-2", "s2", 240, 12)
+            bm.request_rebuild("pet-1", "r", 240, 12)
+            bm.request_maintenance()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and bm.building():
+                bm.poll_results()
+                time.sleep(0.001)
+        self.assertEqual(violations, [])   # 任意时刻 <= 1 个 job 执行
+        # import×1 + build×2 + rebuild×1 + maintenance×1
+        self.assertEqual(len(ran), 5)
+        self.assertIn("import", ran)
+        self.assertIn("maint", ran)
+
+    def test_shutdown_cancels_and_rejects_new_jobs(self):
+        # DP43-R05 §13.1：stop 封口 lane；后续 request/submit 拒绝
+        bm = self._manager()
+        release = threading.Event()
+        entered = threading.Event()
+
+        def slow_prepare(src, name, cancel=None):
+            entered.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError("导入已取消")
+                time.sleep(0.01)
+
+        with patch("pet.skins.prepare_import", slow_prepare):
+            bm.submit_import("x", "a")
+            entered.wait(2.0)
+            bm.stop(timeout=1.0)   # 有界等待 + 取消
+            self.assertTrue(bm._stopping)
+            t0 = time.monotonic()
+            bm.request("pet-1", "s", 240, 12)
+            bm.submit_import("y", "b")
+            bm.request_rebuild("pet-1", "s", 240, 12)
+            bm.request_maintenance()
+            self.assertLess(time.monotonic() - t0, 0.2)
+            self.assertIsNone(bm._active_job)   # 不再启动新 job
 
 
 if __name__ == "__main__":

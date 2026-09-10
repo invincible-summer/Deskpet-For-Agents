@@ -67,6 +67,31 @@ class ReleaseLayoutTests(unittest.TestCase):
         # smoke import 检查存在
         self.assertIn("pet.config", text)
 
+    def test_existing_venv_branch_validates_python_312(self):
+        # v4.3.1 DP43-R12：existing .venv 分支也必须验证 Python 3.12
+        # （只检查"脚本里出现 3.12"不够——reusing 分支要真正执行探测）
+        text = (ROOT / "Setup-Desktop.bat").read_text(encoding="utf-8")
+        reusing = text.split("if exist", 1)[1]
+        reusing = reusing.split(":createvenv", 1)[0]
+        self.assertIn("Reusing existing", reusing)
+        self.assertIn("sys.version_info[:2] == (3,12)", reusing)
+        self.assertIn("errorlevel 1", reusing)
+        # 不自动删除用户环境
+        self.assertIn("rename or delete", reusing)
+
+    def test_docs_match_v43_runtime_policy(self):
+        # v4.3.1 DP43-R13：README/toast 与 v4.3 runtime policy 一致
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertNotIn("并发呈现（手动开启）", readme)
+        self.assertIn("并行监听默认开启", readme)
+        self.assertIn("pet-1 idle fallback", readme)
+        app_src = (ROOT / "pet" / "app.py").read_text(encoding="utf-8")
+        self.assertNotIn("并发需手动开启", app_src)
+        self.assertIn("启动默认并行监听 + 单宠聚合", app_src)
+        sourcelink = (ROOT / "SourceLink.md").read_text(encoding="utf-8")
+        self.assertNotIn("v4.2.3 — SourceLink", sourcelink)
+        self.assertIn("39941c2", sourcelink)
+
     def test_constraints_file_pins_verified_set(self):
         path = ROOT / "constraints-v4.3.0.txt"
         self.assertTrue(path.exists())
@@ -78,8 +103,8 @@ class ReleaseLayoutTests(unittest.TestCase):
     def test_version_module_is_single_source(self):
         from pet.version import APP_LABEL, APP_NAME, APP_VERSION
         self.assertEqual(APP_NAME, "DeskPet")
-        self.assertEqual(APP_VERSION, "4.3.0")
-        self.assertEqual(APP_LABEL, "DeskPet V4.3.0")
+        self.assertEqual(APP_VERSION, "4.3.1")
+        self.assertEqual(APP_LABEL, "DeskPet V4.3.1")
         import pet.dashboard as dashboard
         self.assertEqual(dashboard.APP_VERSION, APP_LABEL)
 

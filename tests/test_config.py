@@ -213,6 +213,106 @@ class NormalizeTests(unittest.TestCase):
         self.assertNotIn("gone_grace_sec", data["monitor"])
 
 
+class SchemaHardeningTests(unittest.TestCase):
+    """v4.3.1 DP43-R10 §18.7：malformed-but-valid JSON 不让 Config load
+    崩溃；schema 恢复；config_version==5；runtime keys 仍被清除。"""
+
+    BAD_VALUES = (None, "bad", [], 123, True)
+
+    def _load(self, payload) -> Config:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            return Config(path)
+
+    def test_wrong_container_types_never_crash_and_schema_restored(self):
+        cases = [
+            ("presentation", "bad"),
+            {"presentation": "bad"},
+            {"bubble": []},
+            {"monitor": "x"},
+            {"monitor": {"agents": 12}},
+            {"presentation": {"concurrent": 123}},
+            {"presentation": {"concurrent": {"eligible_kinds": "all"}}},
+            {"privacy": 12},
+            {"convert": True},
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                cfg = self._load(payload)   # 不抛 = 通过
+                data = cfg.data
+                self.assertIsInstance(data["bubble"], dict)
+                self.assertIsInstance(data["monitor"], dict)
+                self.assertIsInstance(data["monitor"]["agents"], dict)
+                self.assertIsInstance(data["presentation"], dict)
+                self.assertIsInstance(
+                    data["presentation"]["concurrent"], dict)
+                self.assertIsInstance(
+                    data["presentation"]["concurrent"]["eligible_kinds"],
+                    dict)
+                self.assertIsInstance(
+                    data["presentation"]["concurrent"]["slots"], list)
+                self.assertIsInstance(data["privacy"], dict)
+                self.assertIsInstance(data["convert"], dict)
+                self.assertEqual(data["config_version"],
+                                 cfgmod.CONFIG_VERSION)
+                # runtime keys 仍被清除（不因异常路径复活）
+                self.assertNotIn("enabled",
+                                 data["presentation"]["concurrent"])
+                self.assertNotIn("mode",
+                                 data["presentation"]["concurrent"])
+                self.assertNotIn("pinned", data["monitor"])
+
+    def test_nested_field_bad_values_clamped_to_bounds(self):
+        for bad in self.BAD_VALUES:
+            with self.subTest(bad=bad):
+                cfg = self._load({
+                    "config_version": 5,
+                    "bubble": {"relative_font": bad, "max_lines": bad,
+                               "autohide_sec": bad, "font_family": bad,
+                               "enabled": bad if bad is not None else None},
+                    "force_state": bad,
+                    "convert": {"fps": bad, "height": bad},
+                    "animated": bad,
+                })
+                b = cfg.data["bubble"]
+                # None/"bad"/[] → 下界；123/True → clamp/强制类型后的
+                # 合法 in-bounds 数值：任何输入都不越界
+                self.assertGreaterEqual(b["relative_font"], 0.5)
+                self.assertLessEqual(b["relative_font"], 2.0)
+                self.assertGreaterEqual(b["max_lines"], 1)
+                self.assertLessEqual(b["max_lines"], 6)
+                self.assertGreaterEqual(b["autohide_sec"], 0)
+                self.assertLessEqual(b["autohide_sec"], 3600)
+                self.assertIsInstance(b["font_family"], str)
+                self.assertTrue(b["font_family"])
+                self.assertIsInstance(b["enabled"], bool)
+                self.assertEqual(cfg.data["force_state"], "")
+                self.assertGreaterEqual(cfg.data["convert"]["fps"], 1)
+                self.assertLessEqual(cfg.data["convert"]["fps"], 30)
+                self.assertGreaterEqual(cfg.data["convert"]["height"], 96)
+                self.assertLessEqual(cfg.data["convert"]["height"], 960)
+                self.assertIsInstance(cfg.data["animated"], bool)
+
+    def test_valid_unknown_future_keys_preserved_in_mappings(self):
+        cfg = self._load({
+            "config_version": 5,
+            "bubble": {"future_bubble_key": {"keep": 1}},
+            "privacy": {"future_priv": "keep"},
+        })
+        self.assertEqual(cfg.data["bubble"]["future_bubble_key"],
+                         {"keep": 1})
+        self.assertEqual(cfg.data["privacy"]["future_priv"], "keep")
+
+    def test_force_state_valid_values_preserved(self):
+        for good in ("", "walk", "attack", "die", "special", "sleep"):
+            cfg = self._load({"config_version": 5, "force_state": good})
+            self.assertEqual(cfg.data["force_state"], good)
+        cfg = self._load({"config_version": 5, "force_state": "hacked"})
+        self.assertEqual(cfg.data["force_state"], "")
+
+
 class CommitTests(unittest.TestCase):
     def _cfg(self, temp) -> Config:
         path = os.path.join(temp, "config.json")

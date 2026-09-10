@@ -414,9 +414,9 @@ class PresentationController:
         self._prune_runtime_keys(set(targets))
         state = PresentationState(mode=self.mode)
         state.focused_key = self._focused_key
-        state.attention_key = self.attention_key(targets)
 
         if state.mode is PresentationMode.SINGLE:
+            state.attention_key = self.attention_key(targets)
             # 单目标兼容：focused 优先，否则 attention
             pick = self._focused_key if self._focused_key in targets else ""
             if not pick:
@@ -424,19 +424,27 @@ class PresentationController:
             state.focused_key = pick
             self._focused_key = pick
         elif state.mode is PresentationMode.AGGREGATE:
+            # DP43-R07：attention 必须属于 selected 集——先 candidate
+            # filter + cap，再在 selected targets 上算 attention；
+            # 否则被 exclude/ineligible 的 WAITING Agent 会抢走 attention，
+            # 而 card 列表里没有它，focused 解析为空、B 的气泡被清。
             candidates = self.candidate_keys(targets)
-            cap = self.max_targets()
-            selected = candidates[:cap]
+            selected = candidates[:self.max_targets()]
             state.overflow_count = max(0, len(candidates) - len(selected))
+            selected_targets = {key: targets[key] for key in selected}
+            attention = self.attention_key(selected_targets)
+            state.attention_key = attention
             state.cards = tuple(
-                self._card(targets[k], state.attention_key) for k in selected)
+                self._card(targets[key], attention) for key in selected)
             # 气泡与单个监听一致：显示 focused（无则 attention）的单卡
             pick = self._focused_key if self._focused_key in selected else ""
             if not pick:
-                pick = (state.attention_key
-                        if state.attention_key in selected else "")
+                pick = attention
+            if not pick and selected:
+                pick = selected[0]
             state.focused_key = pick
         else:   # FLEET
+            state.attention_key = self.attention_key(targets)
             self._reclaim_slots(targets)
             self._auto_bind_slots(targets)
             for slot_id in self.slot_ids():

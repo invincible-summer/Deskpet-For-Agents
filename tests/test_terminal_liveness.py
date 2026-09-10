@@ -463,7 +463,12 @@ class NativeTerminalLeaseTests(unittest.TestCase):
 
 class NoKillInvariantTests(unittest.TestCase):
     def test_agents_never_terminate_or_signal_orphan_processes(self):
-        # AC-PROC-07：DeskPet 观察层绝不 kill/terminate/signal 残余进程
+        # AC-PROC-07：DeskPet 观察层绝不 kill/terminate/signal 残余进程。
+        # v4.3.1 受控例外（plan2 §13.2 / DoD#21）：pet/skins.py 的
+        # ConverterJob 必须能终止 DeskPet 自己 spawn 的 converter/
+        # ffmpeg 子进程树（Windows Job Object + cancel），否则退出时
+        # 遗留孤儿转换进程。该例外只限 ConverterJob 类内部——只管理
+        # 自有子进程，绝不触碰用户 Agent 进程。
         import pathlib
         root = pathlib.Path(__file__).resolve().parent.parent
         banned = ("TerminateProcess", "terminate(", ".kill(", "os.kill",
@@ -471,6 +476,12 @@ class NoKillInvariantTests(unittest.TestCase):
         for module in ("agents", "pet", "actions"):
             for path in (root / module).glob("*.py"):
                 text = path.read_text(encoding="utf-8")
+                if path.name == "skins.py":
+                    _head, sep, tail = text.partition("class ConverterJob:")
+                    self.assertTrue(sep, "skins.py 应包含 ConverterJob")
+                    _block, sep2, rest = tail.partition("\ndef build_skin")
+                    self.assertTrue(sep2, "ConverterJob 后应有 build_skin")
+                    text = _head + rest   # 检查 ConverterJob 之外的全部源码
                 for token in banned:
                     self.assertNotIn(
                         token, text,

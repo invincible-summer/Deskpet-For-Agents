@@ -156,6 +156,20 @@ def _clamp(value, lo, hi):
     return max(lo, min(hi, v))
 
 
+def _ensure_mapping(parent: dict, key: str, default: dict) -> dict:
+    """v4.3.1 DP43-R10 §18.3：嵌套 mapping 的类型保证。
+
+    合法 dict 原样返回（未知 future key 由调用方保留）；错误容器
+    类型（None/str/list/int/bool）用默认 mapping 替换——不为 forward
+    compatibility 保留一个破坏 schema 的 scalar。"""
+    value = parent.get(key)
+    if isinstance(value, dict):
+        return value
+    value = copy.deepcopy(default)
+    parent[key] = value
+    return value
+
+
 def _normalize_slot_appearance(slot: dict) -> None:
     """v4.3 §7.1/§8.1：slot appearance 规范化。
 
@@ -174,74 +188,111 @@ def _normalize_slot_appearance(slot: dict) -> None:
         slot["appearance"] = {"skin": None}
 
 
+_FORCE_STATES = ("", "walk", "attack", "die", "special", "sleep")
+
+
 def normalize(data: dict) -> dict:
-    """加载后 clamp 用户可修改字段（v4plan §9.5）；未知键保留。"""
+    """加载后 clamp 用户可修改字段（v4plan §9.5）；未知键保留。
+
+    v4.3.1 DP43-R10 §18：malformed-but-valid-JSON（错误嵌套容器类型）
+    不再让加载崩溃——所有嵌套 mapping 经 _ensure_mapping 保证类型，
+    字段值按 AppearanceController 运行期 bounds 对齐 clamp/强制类型。
+    """
     data["scale"] = round(_clamp(data.get("scale", 1.0), 0.5, 2.0), 2)
     data["speed"] = round(_clamp(data.get("speed", 1.0), 0.1, 3.0), 2)
     data["animation_cache_mb"] = int(_clamp(
         data.get("animation_cache_mb", 48), 8, 256))
-    bubble = data.get("bubble")
-    if isinstance(bubble, dict):
-        bubble["font_size"] = int(_clamp(bubble.get("font_size", 11), 8, 24))
-        bubble["width"] = int(_clamp(bubble.get("width", 300), 160, 520))
-        bubble["height"] = int(_clamp(bubble.get("height", 132), 112, 220))
-        bubble["relative_width"] = _clamp(
-            bubble.get("relative_width", 1.0), 0.7, 1.6)
-        bubble["relative_height"] = _clamp(
-            bubble.get("relative_height", 1.0), 0.8, 1.6)
-    monitor = data.get("monitor")
-    if isinstance(monitor, dict):
-        agents = monitor.get("agents")
-        if not isinstance(agents, dict):
-            monitor["agents"] = {k: True for k in _KIND_KEYS}
-        else:
-            monitor["agents"] = {k: bool(agents.get(k, True))
-                                 for k in _KIND_KEYS}
-        # 节奏类配置的代码级 clamp（v4.1.1 §11）：配置文件手改异常值
-        # 也不能制造高频 loop / 高频扫描。
-        monitor["windows_scan_sec"] = _clamp(
-            monitor.get("windows_scan_sec", 3.0), 1.0, 60.0)
-        monitor["wsl_scan_sec"] = _clamp(
-            monitor.get("wsl_scan_sec", 3.0), 1.0, 120.0)
-        monitor["file_poll_sec"] = _clamp(
-            monitor.get("file_poll_sec", 0.5), 0.2, 5.0)
-        monitor["session_scan_sec"] = _clamp(
-            monitor.get("session_scan_sec", 3.0), 1.0, 60.0)
-        monitor["activity_grace_sec"] = _clamp(
-            monitor.get("activity_grace_sec", 10.0), 1.0, 60.0)
-        monitor["active_file_window_sec"] = _clamp(
-            monitor.get("active_file_window_sec", 180), 30, 3600)
-    concurrent = ((data.get("presentation") or {}).get("concurrent"))
-    if isinstance(concurrent, dict):
-        # v4.3 §8.1：enabled/mode 不再是持久化字段（runtime session
-        # state 由 PresentationController 每次启动固定初始化）。
-        concurrent.pop("enabled", None)
-        concurrent.pop("mode", None)
-        concurrent["max_targets"] = int(_clamp(
-            concurrent.get("max_targets", 3), 1, 8))
-        eligible = concurrent.get("eligible_kinds")
-        if not isinstance(eligible, dict):
-            concurrent["eligible_kinds"] = {k: True for k in _KIND_KEYS}
-        else:
-            concurrent["eligible_kinds"] = {
-                k: bool(eligible.get(k, True)) for k in _KIND_KEYS}
-        slots = concurrent.get("slots")
-        if not isinstance(slots, list) or not slots:
-            slots = [copy.deepcopy(DEFAULTS["presentation"]["concurrent"]
-                                   ["slots"][0])]
-        seen = set()
-        clean_slots = []
-        for slot in slots:
-            if not isinstance(slot, dict):
-                continue
-            slot_id = str(slot.get("id") or "").strip()
-            if not slot_id or slot_id in seen:
-                continue   # slot id 必须唯一非空
-            seen.add(slot_id)
-            _normalize_slot_appearance(slot)
-            clean_slots.append(slot)
-        concurrent["slots"] = clean_slots or [copy.deepcopy(
-            DEFAULTS["presentation"]["concurrent"]["slots"][0])]
+    skin = data.get("skin")
+    data["skin"] = (skin if isinstance(skin, str) and skin.strip()
+                    else BUILTIN_SKIN)
+    data["animated"] = bool(data.get("animated", True))
+    data["topmost"] = bool(data.get("topmost", True))
+    data["tray_enabled"] = bool(data.get("tray_enabled", True))
+    state = data.get("force_state")
+    data["force_state"] = (state.strip() if isinstance(state, str)
+                           and state.strip() in _FORCE_STATES else "")
+    bubble = _ensure_mapping(data, "bubble", DEFAULTS["bubble"])
+    font = bubble.get("font_family")
+    bubble["font_family"] = (font.strip() if isinstance(font, str)
+                             and font.strip()
+                             else DEFAULTS["bubble"]["font_family"])
+    bubble["enabled"] = bool(bubble.get("enabled", True))
+    bubble["always_visible"] = bool(bubble.get("always_visible", True))
+    bubble["font_size"] = int(_clamp(bubble.get("font_size", 11), 8, 24))
+    bubble["width"] = int(_clamp(bubble.get("width", 300), 160, 520))
+    bubble["height"] = int(_clamp(bubble.get("height", 132), 112, 220))
+    bubble["relative_width"] = _clamp(
+        bubble.get("relative_width", 1.0), 0.7, 1.6)
+    bubble["relative_height"] = _clamp(
+        bubble.get("relative_height", 1.0), 0.8, 1.6)
+    # v4.3.1 §18.5：与 AppearanceController._NUMERIC_BOUNDS 对齐
+    bubble["relative_font"] = _clamp(
+        bubble.get("relative_font", 1.0), 0.5, 2.0)
+    bubble["max_lines"] = int(_clamp(bubble.get("max_lines", 2), 1, 6))
+    bubble["autohide_sec"] = _clamp(
+        bubble.get("autohide_sec", 8), 0, 3600)
+    monitor = _ensure_mapping(data, "monitor", DEFAULTS["monitor"])
+    agents = _ensure_mapping(monitor, "agents",
+                             DEFAULTS["monitor"]["agents"])
+    monitor["agents"] = {k: bool(agents.get(k, True))
+                         for k in _KIND_KEYS}
+    monitor["windows_enabled"] = bool(monitor.get("windows_enabled", True))
+    monitor["wsl_enabled"] = bool(monitor.get("wsl_enabled", True))
+    monitor["terminal_observer"] = bool(
+        monitor.get("terminal_observer", True))
+    # 节奏类配置的代码级 clamp（v4.1.1 §11）：配置文件手改异常值
+    # 也不能制造高频 loop / 高频扫描。
+    monitor["windows_scan_sec"] = _clamp(
+        monitor.get("windows_scan_sec", 3.0), 1.0, 60.0)
+    monitor["wsl_scan_sec"] = _clamp(
+        monitor.get("wsl_scan_sec", 3.0), 1.0, 120.0)
+    monitor["file_poll_sec"] = _clamp(
+        monitor.get("file_poll_sec", 0.5), 0.2, 5.0)
+    monitor["session_scan_sec"] = _clamp(
+        monitor.get("session_scan_sec", 3.0), 1.0, 60.0)
+    monitor["activity_grace_sec"] = _clamp(
+        monitor.get("activity_grace_sec", 10.0), 1.0, 60.0)
+    monitor["active_file_window_sec"] = _clamp(
+        monitor.get("active_file_window_sec", 180), 30, 3600)
+    presentation = _ensure_mapping(
+        data, "presentation", DEFAULTS["presentation"])
+    concurrent = _ensure_mapping(
+        presentation, "concurrent",
+        DEFAULTS["presentation"]["concurrent"])
+    # v4.3 §8.1：enabled/mode 不再是持久化字段（runtime session
+    # state 由 PresentationController 每次启动固定初始化）。
+    concurrent.pop("enabled", None)
+    concurrent.pop("mode", None)
+    concurrent["max_targets"] = int(_clamp(
+        concurrent.get("max_targets", 3), 1, 8))
+    eligible = _ensure_mapping(
+        concurrent, "eligible_kinds",
+        DEFAULTS["presentation"]["concurrent"]["eligible_kinds"])
+    concurrent["eligible_kinds"] = {
+        k: bool(eligible.get(k, True)) for k in _KIND_KEYS}
+    slots = concurrent.get("slots")
+    if not isinstance(slots, list) or not slots:
+        slots = [copy.deepcopy(DEFAULTS["presentation"]["concurrent"]
+                               ["slots"][0])]
+    seen = set()
+    clean_slots = []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        slot_id = str(slot.get("id") or "").strip()
+        if not slot_id or slot_id in seen:
+            continue   # slot id 必须唯一非空
+        seen.add(slot_id)
+        _normalize_slot_appearance(slot)
+        clean_slots.append(slot)
+    concurrent["slots"] = clean_slots or [copy.deepcopy(
+        DEFAULTS["presentation"]["concurrent"]["slots"][0])]
+    _ensure_mapping(data, "privacy", DEFAULTS["privacy"])
+    convert = _ensure_mapping(data, "convert", DEFAULTS["convert"])
+    # §18.5：converter 节奏（legacy 字段；实际高度仍由
+    # PetView.gif_height() 的 DPI-aware 逻辑决定）
+    convert["fps"] = int(_clamp(convert.get("fps", 12), 1, 30))
+    convert["height"] = int(_clamp(convert.get("height", 240), 96, 960))
     return data
 
 
@@ -256,9 +307,17 @@ def migrate(loaded: dict) -> tuple[dict, bool]:
     # 运行期 identity 绝不加载（纵深防御：外部注入的也清掉）
     for banned in ("pinned", "gone_grace_sec"):
         _drop_path(loaded, f"monitor.{banned}")
-    concurrent = ((loaded.get("presentation") or {}).get("concurrent"))
-    if not isinstance(concurrent, dict):
-        concurrent = {}
+    # v4.3.1 DP43-R10：presentation/concurrent 的错误容器类型不再让
+    # migrate 崩溃（(x or {}).get 对 truthy str 抛 AttributeError）
+    raw_presentation = loaded.get("presentation")
+    presentation = raw_presentation if isinstance(raw_presentation, dict) \
+        else {}
+    if presentation is not raw_presentation:
+        migrated = True
+        loaded["presentation"] = presentation
+    raw_concurrent = presentation.get("concurrent")
+    concurrent = raw_concurrent if isinstance(raw_concurrent, dict) else {}
+    if concurrent is not raw_concurrent:
         migrated = True
     # v4.3 §8.1：删除旧 persisted enabled/mode。无论旧值是什么
     # （false/single/fleet/aggregate），都不作为下次启动初始模式依据；
@@ -297,6 +356,10 @@ class Config:
         self._dirty = False
         self._revision = 0   # v4.3 §8.2：每次内存修改 +1（保存协议用）
         self._last_save: ConfigSaveResult | None = None
+        # v4.3.1 DP43-R02：磁盘写入串行化（防御层）——同一时刻最多一个
+        # 磁盘 writer；它不是"UI 同步 commit 安全"的理由，运行期 UI
+        # 保存仍必须走 ConfigSaveCoordinator worker。
+        self._io_lock = threading.Lock()
         self.load()
 
     # ------------------------------------------------------------ 加载
@@ -381,14 +444,16 @@ class Config:
 
     def commit(self, fsync: bool = False) -> ConfigSaveResult:
         """同步原子保存（Tk 线程只允许在退出 flush 兜底时使用；
-        运行期保存走 ConfigSaveCoordinator）。成功才清 dirty。
+        运行期保存走 ConfigSaveCoordinator）。
+
+        v4.3.1 DP43-R02：不再拿 `_lock` 跨越磁盘 I/O——
+        snapshot_for_save（短临界区）→ write_snapshot（io_lock 内
+        写盘）→ acknowledge_save（短临界区裁决新鲜度）。
         """
-        with self._lock:
-            result = self._write_data_to_disk(self.data, fsync)
-            self._last_save = result
-            if result.ok:
-                self._dirty = False
-            return result
+        revision, data = self.snapshot_for_save()
+        result = self.write_snapshot(revision, data, fsync=fsync)
+        self.acknowledge_save(revision, result)
+        return result
 
     # ------------------------------------------------------------ 异步保存协议（v4.3 §8.2）
     @property
@@ -401,11 +466,16 @@ class Config:
         with self._lock:
             return self._revision, copy.deepcopy(self.data)
 
-    def write_snapshot(self, revision: int,
-                       data: dict) -> ConfigSaveResult:
+    def write_snapshot(self, revision: int, data: dict, *,
+                       fsync: bool = False) -> ConfigSaveResult:
         """worker 中执行磁盘写入（temp/backup/replace），不持 Config
-        lock、不改实例状态；新鲜度由 acknowledge_save 裁决。"""
-        return self._write_data_to_disk(data)
+        lock、不改实例状态；新鲜度由 acknowledge_save 裁决。
+
+        v4.3.1 DP43-R02：io_lock 保证同一时刻最多一个磁盘 writer
+        （stale worker / 显式同步 commit 不会交叉 backup/replace）。
+        """
+        with self._io_lock:
+            return self._write_data_to_disk(data, fsync)
 
     def acknowledge_save(self, revision: int,
                          result: ConfigSaveResult) -> None:
@@ -414,7 +484,7 @@ class Config:
         debounce 会保存更新快照）。"""
         with self._lock:
             self._last_save = result
-            if result.ok and revision >= self._revision:
+            if result.ok and revision == self._revision:
                 self._dirty = False
 
     def set_and_commit(self, path, value) -> ConfigSaveResult:

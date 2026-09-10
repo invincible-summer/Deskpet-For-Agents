@@ -59,7 +59,7 @@ class WindowActivationTests(unittest.TestCase):
                           return_value=True) as restore, \
              patch.object(winkeys, "try_set_foreground",
                           return_value=True) as foreground:
-            result = service.activate(KEY, is_agent_live=ALWAYS_LIVE)
+            result = service.activate_cached(KEY, is_agent_live=ALWAYS_LIVE)
         self.assertEqual(result.code, ActivationCode.OK)
         self.assertFalse(result.repaired)
         restore.assert_called_once_with(11)
@@ -73,49 +73,103 @@ class WindowActivationTests(unittest.TestCase):
         with patch.object(winkeys, "validate_window", return_value=True), \
              patch.object(winkeys, "restore_window", return_value=True), \
              patch.object(winkeys, "try_set_foreground", return_value=True):
-            result = service.activate(KEY, is_agent_live=ALWAYS_LIVE)
+            result = service.activate_cached(KEY, is_agent_live=ALWAYS_LIVE)
         self.assertEqual(result.code, ActivationCode.OK)
 
-    # ------------------------------------------------ C. stale → refresh once → OK
-    def test_stale_hwnd_refresh_once_then_ok(self):
+    # ------------------------------------------------ C. stale → async repair → final OK
+    def test_stale_hwnd_returns_immediately_and_repair_on_monitor(self):
+        """v4.3.1 DP43-R08 §16.4：cached activation 遇 stale 立即返回
+        STALE_WINDOW + needs_repair；UIA refresh / re-resolve 只发生在
+        repair_binding（Monitor 线程），Tk 路径零 UIA。"""
         service = self._service()
         self._bind(service, make_binding(make_identity(hwnd=11, pid=100)))
-        new_binding = make_binding(make_identity(hwnd=33, pid=300, created=9.0))
-        calls = {"validate": 0}
-
-        def fake_validate(identity):
-            calls["validate"] += 1
-            if calls["validate"] == 1:
-                # 第一次 stale：模拟重解析拿到新绑定
-                service._window_bindings[KEY] = new_binding
-                return False
-            return True
-
         with patch.object(winkeys, "validate_window",
-                          side_effect=fake_validate), \
+                          return_value=False), \
              patch.object(service, "refresh_observed_controls",
                           return_value=True) as refresh, \
-             patch.object(winkeys, "restore_window", return_value=True), \
-             patch.object(winkeys, "try_set_foreground", return_value=True):
-            result = service.activate(KEY, is_agent_live=ALWAYS_LIVE)
-        self.assertEqual(result.code, ActivationCode.OK)
-        self.assertTrue(result.repaired)
-        refresh.assert_called_once_with(force=True)
-
-    # ------------------------------------------------ D. stale after retry
-    def test_stale_after_refresh_returns_stale_window(self):
-        service = self._service()
-        self._bind(service, make_binding(make_identity(hwnd=11, pid=100)))
-        with patch.object(winkeys, "validate_window", return_value=False), \
-             patch.object(service, "refresh_observed_controls",
-                          return_value=True), \
+             patch.object(service, "resolve") as resolve, \
              patch.object(winkeys, "restore_window", return_value=True) as r, \
              patch.object(winkeys, "try_set_foreground",
                           return_value=True) as fg:
-            result = service.activate(KEY, is_agent_live=ALWAYS_LIVE)
+            result = service.activate_cached(KEY, is_agent_live=ALWAYS_LIVE)
+            self.assertEqual(result.code, ActivationCode.STALE_WINDOW)
+            self.assertTrue(result.needs_repair)
+            refresh.assert_not_called()   # Tk 路径无 UIA refresh
+            resolve.assert_not_called()   # 无 resolver 重建
+            r.assert_not_called()
+            fg.assert_not_called()
+
+    def test_repair_binding_refreshes_once_and_rebuilds_binding(self):
+        """repair_binding（Monitor 线程）：invalidate + force refresh +
+        re-resolve；新 binding 存在 → True；最终激活前 UI 仍重校验。"""
+        service = self._service()
+        self._bind(service, make_binding(make_identity(hwnd=11, pid=100)))
+        new_binding = make_binding(make_identity(hwnd=33, pid=300, created=9.0))
+
+        def fake_resolve(instances, now):
+            service._window_bindings[KEY] = new_binding
+            return {KEY: new_binding}, {}
+
+        with patch.object(winkeys, "validate_window", return_value=True), \
+             patch.object(service, "refresh_observed_controls",
+                          return_value=True) as refresh, \
+             patch.object(service.window_resolver,
+                          "invalidate_window_cache") as invalidate, \
+             patch.object(service, "resolve", side_effect=fake_resolve):
+            repaired = service.repair_binding(
+                KEY, instances=[], now=1.0)
+        self.assertTrue(repaired)
+        refresh.assert_called_once_with(force=True)
+        invalidate.assert_called_once()
+        # repair 后的最终激活（UI 线程）走 cached 路径成功
+        with patch.object(winkeys, "validate_window", return_value=True), \
+             patch.object(winkeys, "restore_window", return_value=True) as r, \
+             patch.object(winkeys, "try_set_foreground",
+                          return_value=True) as fg:
+            result = service.activate_cached(KEY, is_agent_live=ALWAYS_LIVE)
+        self.assertEqual(result.code, ActivationCode.OK)
+        r.assert_called_once_with(33)
+        fg.assert_called_once_with(33)
+
+    def test_repair_binding_false_when_no_new_binding(self):
+        service = self._service()
+        self._bind(service, make_binding(make_identity(hwnd=11, pid=100)))
+
+        def fake_resolve(instances, now):
+            service._window_bindings.pop(KEY, None)
+            return {}, {}
+
+        with patch.object(service, "refresh_observed_controls",
+                          return_value=True), \
+             patch.object(service, "resolve", side_effect=fake_resolve):
+            repaired = service.repair_binding(KEY, instances=[], now=1.0)
+        self.assertFalse(repaired)
+
+    # ------------------------------------------------ D. stale after repair
+    def test_window_changes_again_before_final_is_stale_window(self):
+        """repair 后窗口又失效（validate False）：最终激活 STALE_WINDOW，
+        一次性语义结束，不再触发新 repair。"""
+        service = self._service()
+        self._bind(service, make_binding(make_identity(hwnd=11, pid=100)))
+        new_binding = make_binding(make_identity(hwnd=33, pid=300, created=9.0))
+
+        def fake_resolve(instances, now):
+            service._window_bindings[KEY] = new_binding
+            return {KEY: new_binding}, {}
+
+        with patch.object(service, "refresh_observed_controls",
+                          return_value=True), \
+             patch.object(service, "resolve", side_effect=fake_resolve):
+            self.assertTrue(service.repair_binding(KEY, instances=[], now=1.0))
+        # repair 完成到最终激活之间窗口再次失效
+        with patch.object(winkeys, "validate_window", return_value=False), \
+             patch.object(winkeys, "restore_window", return_value=True) as r, \
+             patch.object(winkeys, "try_set_foreground",
+                          return_value=True) as fg:
+            result = service.activate_cached(KEY, is_agent_live=ALWAYS_LIVE)
         self.assertEqual(result.code, ActivationCode.STALE_WINDOW)
-        self.assertTrue(result.repaired)
-        r.assert_not_called()   # 窗口身份无法证明：绝不动作
+        self.assertTrue(result.needs_repair is True)   # 状态如实上报
+        r.assert_not_called()
         fg.assert_not_called()
 
     # ------------------------------------------------ E. foreground denied
@@ -129,7 +183,7 @@ class WindowActivationTests(unittest.TestCase):
                           return_value=False), \
              patch.object(winkeys, "flash_window",
                           return_value=True) as flash:
-            result = service.activate(KEY, is_agent_live=ALWAYS_LIVE)
+            result = service.activate_cached(KEY, is_agent_live=ALWAYS_LIVE)
         self.assertEqual(result.code, ActivationCode.FOREGROUND_DENIED)
         flash.assert_called_once_with(55)
 
@@ -143,7 +197,7 @@ class WindowActivationTests(unittest.TestCase):
         with patch.object(winkeys, "restore_window", return_value=True) as r, \
              patch.object(winkeys, "try_set_foreground",
                           return_value=True) as fg:
-            result = service.activate(KEY, is_agent_live=ALWAYS_LIVE)
+            result = service.activate_cached(KEY, is_agent_live=ALWAYS_LIVE)
         self.assertEqual(result.code, ActivationCode.NO_BINDING)
         self.assertIn("multiple", result.detail)
         r.assert_not_called()
@@ -156,7 +210,7 @@ class WindowActivationTests(unittest.TestCase):
         with patch.object(winkeys, "restore_window", return_value=True) as r, \
              patch.object(winkeys, "try_set_foreground",
                           return_value=True) as fg:
-            result = service.activate(KEY, is_agent_live=DEAD)
+            result = service.activate_cached(KEY, is_agent_live=DEAD)
         self.assertEqual(result.code, ActivationCode.AGENT_GONE)
         r.assert_not_called()
         fg.assert_not_called()
@@ -170,7 +224,7 @@ class WindowActivationTests(unittest.TestCase):
         with patch.object(winkeys, "validate_window", return_value=True), \
              patch.object(winkeys, "restore_window", return_value=True), \
              patch.object(winkeys, "try_set_foreground", return_value=True):
-            result = service.activate(KEY, is_agent_live=ALWAYS_LIVE)
+            result = service.activate_cached(KEY, is_agent_live=ALWAYS_LIVE)
         self.assertEqual(result.code, ActivationCode.OK)
 
     def test_none_confidence_with_window_activates(self):
@@ -181,7 +235,7 @@ class WindowActivationTests(unittest.TestCase):
         with patch.object(winkeys, "validate_window", return_value=True), \
              patch.object(winkeys, "restore_window", return_value=True), \
              patch.object(winkeys, "try_set_foreground", return_value=True):
-            result = service.activate(KEY, is_agent_live=ALWAYS_LIVE)
+            result = service.activate_cached(KEY, is_agent_live=ALWAYS_LIVE)
         self.assertEqual(result.code, ActivationCode.OK)
 
     def test_drop_instance_clears_cached_bindings(self):
@@ -192,15 +246,108 @@ class WindowActivationTests(unittest.TestCase):
         self.assertNotIn(KEY, service._window_bindings)
         self.assertNotIn(KEY, service._observation_bindings)
 
-    def test_refresh_runs_at_most_once(self):
-        """validate 反复失败也只 refresh 一次（不循环重试）。"""
+    def test_cached_activation_never_refreshes(self):
+        """v4.3.1 DP43-R08：validate 反复失败，cached 路径也绝不 refresh
+        （repair 只属于 Monitor 线程的 repair_binding，Tk 零 UIA）。"""
         service = self._service()
         self._bind(service, make_binding(make_identity()))
         with patch.object(winkeys, "validate_window", return_value=False), \
              patch.object(service, "refresh_observed_controls",
                           return_value=True) as refresh:
-            service.activate(KEY, is_agent_live=ALWAYS_LIVE)
-        refresh.assert_called_once()
+            for _ in range(3):
+                result = service.activate_cached(
+                    KEY, is_agent_live=ALWAYS_LIVE)
+                self.assertEqual(result.code, ActivationCode.STALE_WINDOW)
+                self.assertTrue(result.needs_repair)
+        refresh.assert_not_called()
+
+
+class AsyncRepairQueueTests(unittest.TestCase):
+    """v4.3.1 DP43-R08 §16.5/§16.6：Monitor repair 队列（coalesced、
+    bounded、Monitor 线程执行、结果 bounded 收割）。"""
+
+    KEY = "wsl:Ubuntu|codex|1|t1"
+
+    def _monitor(self):
+        import queue as queue_mod
+        import threading as threading_mod
+        from agents.monitor import Monitor
+        monitor = Monitor.__new__(Monitor)
+        monitor.lock = threading_mod.Lock()
+        monitor.instances = {}
+        monitor.log_q = queue_mod.Queue(maxsize=200)
+        monitor._log_ring = []
+        monitor._repair_lock = threading_mod.Lock()
+        monitor._repair_requests = {}
+        monitor._repair_next_id = 1
+        monitor._repair_results = queue_mod.Queue(maxsize=16)
+
+        class _Svc:
+            def __init__(self):
+                self.repair_calls = []
+
+            def repair_binding(self, agent_key, *, instances, now):
+                self.repair_calls.append((agent_key, now))
+                return True
+
+        monitor._terminal_service = _Svc()
+        return monitor
+
+    def test_repair_requests_coalesce_per_agent(self):
+        monitor = self._monitor()
+        rid1 = monitor.request_activation_repair(self.KEY)
+        rid2 = monitor.request_activation_repair(self.KEY)
+        rid3 = monitor.request_activation_repair(self.KEY)
+        self.assertEqual(rid1, rid2)
+        self.assertEqual(rid2, rid3)
+        self.assertEqual(len(monitor._repair_requests), 1)
+
+    def test_repair_executes_once_on_monitor_thread(self):
+        monitor = self._monitor()
+        monitor.instances = {self.KEY: object()}   # Agent 仍 live
+        monitor.request_activation_repair(self.KEY)
+        monitor.request_activation_repair(self.KEY)   # coalesce
+        monitor._process_repair_requests(now=100.0)
+        self.assertEqual(
+            monitor._terminal_service.repair_calls, [(self.KEY, 100.0)])
+        results = monitor.drain_activation_repairs()
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].repaired)
+        # 队列已空：一次性语义（同一 user request 只 repair 一次）
+        self.assertEqual(monitor.drain_activation_repairs(), [])
+
+    def test_agent_exit_during_repair_reports_not_repaired(self):
+        monitor = self._monitor()
+        monitor.instances = {}   # Agent 已退出
+        monitor.request_activation_repair(self.KEY)
+        monitor._process_repair_requests(now=100.0)
+        self.assertEqual(monitor._terminal_service.repair_calls, [])
+        results = monitor.drain_activation_repairs()
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].repaired)
+
+    def test_expired_request_is_dropped(self):
+        monitor = self._monitor()
+        monitor.instances = {}
+        monitor.request_activation_repair(self.KEY)
+        monitor._repair_requests[self.KEY] = type(
+            monitor._repair_requests[self.KEY])(
+            1, self.KEY, expires_at=50.0)   # 已过期
+        monitor._process_repair_requests(now=100.0)
+        self.assertEqual(monitor._terminal_service.repair_calls, [])
+        self.assertEqual(monitor.drain_activation_repairs(), [])
+
+    def test_repair_result_queue_bounded(self):
+        from agents.monitor import ActivationRepairRequest, Monitor
+        import queue as queue_mod
+        monitor = self._monitor()
+        req = ActivationRepairRequest(1, self.KEY, 1e18)
+        for i in range(40):   # 远超 16：最旧被挤掉，不抛异常
+            monitor._publish_repair_result(req, True)
+        self.assertLessEqual(monitor._repair_results.qsize(), 16)
+        # bridge 单次收割 <= 4
+        self.assertLessEqual(len(monitor.drain_activation_repairs()), 4)
+
 
 
 class ForbiddenApiRegressionTests(unittest.TestCase):

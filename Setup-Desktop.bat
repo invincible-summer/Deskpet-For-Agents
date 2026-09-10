@@ -9,7 +9,18 @@ set "VENV_PY=%ROOT%.venv\Scripts\python.exe"
 echo === DeskPet Setup ===
 
 if exist "%VENV_PY%" (
-    echo Reusing existing environment: .venv
+    rem v4.3.1 DP43-R12: an existing .venv must also pass the Python 3.12
+    rem validation (previously the version check could be bypassed here).
+    rem The user environment will not be automatically deleted; manual handling is required.
+    "%VENV_PY%" -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3,12) else 1)" >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] Existing .venv is not Python 3.12.
+        for /f "delims=" %%v in ('"%VENV_PY%" -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2^>nul') do set "FOUND=%%v"
+        echo Detected version: %FOUND%
+        echo Please rename or delete the .venv directory and run setup again.
+        exit /b 1
+    )
+    echo Reusing existing environment: .venv ^(Python 3.12 verified^)
     goto install
 )
 

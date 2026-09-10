@@ -222,5 +222,88 @@ class DashboardV43Tests(unittest.TestCase):
             self.assertEqual(len(steps), 7)
 
 
+class ControllerWiringTests(unittest.TestCase):
+    """v4.3.1 DP43-R11/R02/R03：Dashboard 控件必须接回 controller/
+    saver/monitor（无死控件），保存全部异步。"""
+
+    def _page(self, name):
+        app = _make_app()
+        app.open_dashboard()
+        app.root.update()
+        dash = app.dashboard
+        dash._show_page(name)
+        app.root.update()
+        return app, dash._pages[name]
+
+    def test_font_selection_calls_set_global_exactly_once(self):
+        # DP43-R11：用户选字体 → set_global("bubble.font_family") 恰一次
+        app, page = self._page(PAGE_LOOK)
+        try:
+            with patch.object(app.appearance, "set_global") as sg:
+                page.font_var.set("SimHei")
+                page.font_combo.event_generate("<<ComboboxSelected>>")
+                app.root.update()
+            sg.assert_called_once_with("bubble.font_family", "SimHei")
+        finally:
+            app.quit()
+
+    def test_font_sync_from_config_no_save_no_apply(self):
+        # DP43-R11：程序化 sync（refresh 路径）不触发 set_global/save
+        app, page = self._page(PAGE_LOOK)
+        try:
+            with patch.object(app.appearance, "set_global") as sg, \
+                 patch.object(app.config_saver, "request_save") as rs:
+                page._sync_from_config(initial=True)
+                app.root.update()
+            sg.assert_not_called()
+            rs.assert_not_called()
+        finally:
+            app.quit()
+
+    def test_font_change_updates_config_and_marks_view_dirty(self):
+        # DP43-R11：真实 controller 路径——Config 更新 + 异步保存请求 +
+        # 受影响 view 进 render 队列（bubble invalidate）
+        app, page = self._page(PAGE_LOOK)
+        try:
+            with patch.object(app.config_saver, "request_save"):
+                app.appearance.set_global("bubble.font_family", "SimHei")
+            self.assertEqual(app.config.get("bubble.font_family"),
+                             "SimHei")
+            # render flush 尚未执行（无 update）：dirty set 仍含 pet-1
+            if not app.ui._dirty_all_views:
+                self.assertIn("pet-1", app.ui._dirty_views)
+        finally:
+            app.quit()
+
+    def test_privacy_toggle_hits_monitor_runtime(self):
+        # DP43-R03：隐私开关 runtime 撤权/授权立即下发 Monitor
+        app, page = self._page(PAGE_MONITOR)
+        try:
+            calls = []
+            with patch.object(
+                    app.monitor, "set_wsl_root_metadata_fallback",
+                    side_effect=lambda f: calls.append(f)):
+                page.root_meta_var.set(False)
+                page.root_meta_check.invoke()   # toggle → True + command
+                app.root.update()
+            self.assertEqual(calls, [True])
+            self.assertTrue(app.config.get(
+                "privacy.wsl_root_metadata_fallback"))
+        finally:
+            app.quit()
+
+    def test_retry_save_is_async(self):
+        # DP43-R02：重试保存走 saver（immediate+force），绝不同步写盘
+        app, page = self._page(PAGE_SETTINGS)
+        try:
+            with patch.object(app.config_saver, "request_save") as rs, \
+                 patch.object(app.config, "save") as save:
+                page._retry_save()
+            rs.assert_called_once_with(immediate=True, force=True)
+            save.assert_not_called()   # 不在 Tk 同步写盘
+        finally:
+            app.quit()
+
+
 if __name__ == "__main__":
     unittest.main()

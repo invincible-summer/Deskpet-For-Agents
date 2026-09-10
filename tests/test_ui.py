@@ -3,8 +3,10 @@ import copy
 import gc
 import os
 from pathlib import Path
+import queue
 import sys
 import threading
+import tkinter as tk
 import unittest
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -611,21 +613,36 @@ class TrayDashboardVisibilityTests(unittest.TestCase):
         旧行为：WNDPROC 挂在 TrayIcon 实例上，首个实例被 GC 后
         ctypes trampoline 释放，而 "DeskPetTrayWnd" 类仍指向它——
         后续实例 CreateWindowExW 即 access violation。共享模块级
-        wndproc 后必须可无限次换代。
+        wndproc 后必须可无限次换代。v4.3.1 DP43-R09：start 立即
+        返回 + request_stop 立即返回 + shutdown-only bounded join。
         """
         import gc
-        from pet.tray import TrayIcon
+        import time as _time
+        from pet.tray import TrayIcon, TrayState
         for i in range(3):
             icon = TrayIcon(f"DeskPet test {i}")
-            icon.start()
-            icon.stop()
+            t0 = _time.monotonic()
+            icon.start()          # 立即返回（不 wait ready）
+            self.assertLess(_time.monotonic() - t0, 0.5)
+            icon._ready.wait(2.0)
+            self.assertEqual(icon.status(), TrayState.READY)
+            t0 = _time.monotonic()
+            icon.request_stop()   # 运行期停止：只投递，不 join
+            self.assertLess(_time.monotonic() - t0, 0.2)
+            self.assertTrue(icon.join_for_shutdown(2.0))
+            self.assertIn(icon.status(), (TrayState.STOPPED,))
             del icon
             gc.collect()
         final = TrayIcon("DeskPet test final")
         final.start()
-        final.stop()
+        final._ready.wait(2.0)
+        final.request_stop()
+        final.join_for_shutdown(2.0)
         self.assertTrue(final.events.empty(),
                         "托盘创建/换代过程中不得产生 error 事件")
+
+
+
 
     def test_explicit_menu_hide_still_works(self):
         """右键菜单的显式隐藏不受 tray 左键修复影响。"""
@@ -721,6 +738,174 @@ class TrayDashboardVisibilityTests(unittest.TestCase):
                     app.root.update()                # pending after 若未取消会触发
             self.assertEqual(err.getvalue(), "")
             self.assertTrue(app.dashboard._closing)
+        finally:
+            app.quit()
+
+
+class TrayLifecycleTests(unittest.TestCase):
+    """v4.3.1 DP43-R09 §17.12：bounded/non-blocking 生命周期。"""
+
+    def test_create_window_failure_reaches_failed_and_recoverable(self):
+        from pet.tray import TrayIcon, TrayState
+        import pet.tray as tray_mod
+        icon = TrayIcon("DeskPet fail-inject")
+        with patch.object(tray_mod.user32, "CreateWindowExW",
+                          return_value=0):
+            icon.start()
+            icon._stopped.wait(2.0)
+        self.assertEqual(icon.status(), TrayState.FAILED)
+        self.assertIn("CreateWindowExW", icon.last_error())
+        # 失败后线程已死：可以创建 replacement（不再有死图标悬挂）
+        self.assertTrue(icon.join_for_shutdown(1.0))
+        ok_icon = TrayIcon("DeskPet recovered")
+        ok_icon.start()
+        ok_icon._ready.wait(2.0)
+        try:
+            self.assertEqual(ok_icon.status(), TrayState.READY)
+        finally:
+            ok_icon.request_stop()
+            ok_icon.join_for_shutdown(2.0)
+
+    def test_event_queue_bounded_and_wndproc_never_blocks(self):
+        from pet.tray import TRAY_EVENT_QUEUE_MAX, WM_APP_TRAY, TrayEvent
+        from pet.tray import TrayIcon
+        icon = TrayIcon.__new__(TrayIcon)   # 不启动线程：只测 wndproc 语义
+        icon.events = queue.Queue(maxsize=TRAY_EVENT_QUEUE_MAX)
+        icon.dropped_events = 0
+        for _ in range(TRAY_EVENT_QUEUE_MAX):
+            icon.events.put_nowait(TrayEvent("left"))
+        with self.assertRaises(queue.Full):
+            icon.events.put_nowait(TrayEvent("left"))
+        # 满队列下 1000 次 wndproc 调用全部立即返回（丢弃计数，不阻塞）
+        for _ in range(1000):
+            self.assertEqual(
+                icon._handle_message(1, WM_APP_TRAY, 0, 0x0202), 0)
+        self.assertEqual(icon.dropped_events, 1000)
+        self.assertEqual(icon.events.qsize(), TRAY_EVENT_QUEUE_MAX)
+
+    def test_app_tray_drain_bounded(self):
+        from pet.app import TRAY_DRAIN_MAX
+        from pet.tray import TrayEvent
+        harness = TrayDashboardVisibilityTests()
+        app = harness._app()
+        try:
+            app.tray = type("T", (), {"events": queue.Queue()})()
+            total = TRAY_DRAIN_MAX * 2 + 4
+            for _ in range(total):
+                app.tray.events.put_nowait(TrayEvent("right"))
+            app._tray_menu = lambda: None   # 右键菜单不真弹
+            app._poll_tray_events()
+            self.assertEqual(app.tray.events.qsize(), total - TRAY_DRAIN_MAX)
+            app.tray = None
+        finally:
+            app.quit()
+
+
+class MenuCommandsAliveTests(unittest.TestCase):
+    """v4.3.1 菜单存活审计：关闭/仪表盘/外观/设置等所有菜单 entry
+    的 command 都是可调用的活按钮（无死按钮、无悬空回调）。
+
+    递归遍历 tray 菜单与桌宠右键菜单（含全部 cascade 子菜单），
+    逐个 invoke 每个 command entry；重侧效入口（退出/托盘启停/自启
+    注册表/重扫描）打桩，其余走真实实现。
+    """
+
+    def _app(self):
+        from pet.app import PetApp
+        from pet.petview import PetView
+        cfg = MemoryConfig()
+        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+             patch.object(PetView, 'load_skin', lambda self, bm: None):
+            return PetApp(cfg)
+
+    def _walk(self, menu, invoked, path="menu"):
+        """递归 invoke 全部 command entry；cascade 递归子菜单。"""
+        end = menu.index("end")
+        if end is None:
+            return
+        for i in range(end + 1):
+            kind = menu.type(i)
+            if kind == "cascade":
+                sub_path = menu.entrycget(i, "menu")
+                if sub_path:
+                    sub = menu.nametowidget(sub_path)
+                    self._walk(sub, invoked, f"{path}/{menu.entrycget(i, 'label')}")
+            elif kind in ("command", "checkbutton", "radiobutton"):
+                label = menu.entrycget(i, "label")
+                menu.invoke(i)   # 死按钮：command 悬空/抛异常会在此失败
+                invoked.append(f"{path}/{label}")
+            # 分隔符跳过
+
+    def test_every_menu_entry_dispatches_without_error(self):
+        from pet import autostart
+        app = self._app()
+        try:
+            with patch.object(app, "quit") as quit_mock, \
+                 patch.object(app, "set_tray_enabled") as tray_mock, \
+                 patch.object(app, "toggle_autostart",
+                              return_value=True) as auto_mock, \
+                 patch.object(app.monitor, "rescan") as rescan_mock, \
+                 patch.object(app, "activate_agent") as act_mock, \
+                 patch.object(app, "_open_agent_picker") as picker_mock, \
+                 patch.object(app, "_rebuild_skin") as rebuild_mock:
+                # Tray 菜单
+                tray_menu = app._build_tray_menu()
+                invoked = []
+                self._walk(tray_menu, invoked, "tray")
+                app._destroy_menu(tray_menu)
+                self.assertGreater(len(invoked), 3)
+                self.assertTrue(quit_mock.called)          # 退出按钮活着
+                # 桌宠右键菜单（非 fleet）
+                pet_menu = tk.Menu(app.root, tearoff=0)
+                app._build_menu(pet_menu)
+                self._walk(pet_menu, invoked, "pet")
+                app._destroy_menu(pet_menu)
+                # 关键按钮逐项确认（label 可能带 emoji/空格）
+                joined = "\n".join(invoked)
+                for needle in ("退出", "仪表盘", "重新扫描", "重建当前皮肤缓存",
+                               "暂时隐藏桌宠", "摸摸头"):
+                    self.assertIn(needle, joined)
+                self.assertTrue(tray_mock.called)          # 设置→托盘图标
+                self.assertTrue(auto_mock.called)          # 设置→开机自启
+                self.assertTrue(rescan_mock.called)
+                self.assertTrue(rebuild_mock.called)       # 重建皮肤缓存
+        finally:
+            app.quit()
+
+    def test_fleet_menu_entries_dispatch(self):
+        from pet.app import PetApp
+        from pet.petview import PetView
+        from pet.presentation import PresentationMode
+        from tests.test_fleet_ui import FleetConfig, _slot, inst, snap
+        from agents.models import AgentKind
+        cfg = FleetConfig([_slot("pet-1", None), _slot("pet-2", None)])
+        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+             patch.object(PetView, 'load_skin', lambda self, bm: None):
+            app = PetApp(cfg)
+        try:
+            from agents.terminal_service import WindowsTerminalService
+            app.monitor._terminal_service = WindowsTerminalService(None)
+            app.presentation.set_concurrent_mode(PresentationMode.FLEET)
+            a = inst(AgentKind.CODEX, 1)
+            app.monitor.instances = {a.key: a}
+            app.monitor.snapshots = {a.key: snap(a)}
+            app._aggregate()
+            app._menu_view = app.pet_manager.views["pet-1"]
+            with patch.object(app, "quit"), \
+                 patch.object(app, "activate_agent"), \
+                 patch.object(app, "_open_agent_picker"), \
+                 patch.object(app, "set_tray_enabled"), \
+                 patch.object(app, "toggle_autostart", return_value=True), \
+                 patch.object(app, "_rebuild_skin"):
+                menu = tk.Menu(app.root, tearoff=0)
+                app._build_menu(menu)
+                invoked = []
+                self._walk(menu, invoked, "fleet")
+                app._destroy_menu(menu)
+            joined = "\n".join(invoked)
+            for needle in ("打开此 Agent 终端", "更换 Agent", "解除绑定",
+                           "隐藏此桌宠", "仪表盘", "退出"):
+                self.assertIn(needle, joined)
         finally:
             app.quit()
 

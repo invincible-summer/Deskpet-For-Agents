@@ -483,3 +483,6 @@ class ActivationResult:
     code: ActivationCode
     repaired: bool = False      # 是否经过一次 refresh/re-resolve 后成功
     detail: str = ""
+    # v4.3.1 DP43-R08：cached activation 遇到 stale binding 时置位——
+    # UI 据此安排一次异步 repair（Monitor 线程做 UIA，Tk 不阻塞）
+    needs_repair: bool = False

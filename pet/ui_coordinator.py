@@ -40,7 +40,8 @@ class UiCoordinator:
     def __init__(self, root, *, monitor=None, presentation=None,
                  pet_manager=None, dashboard_provider=None,
                  tray_drain=None, apply_batch=None, apply_toasts=None,
-                 config_saver=None, tray_enabled=None):
+                 config_saver=None, tray_enabled=None,
+                 activation_repair_drain=None):
         self.root = root
         self.monitor = monitor
         self.presentation = presentation
@@ -51,6 +52,9 @@ class UiCoordinator:
         self.apply_toasts = apply_toasts
         self.config_saver = config_saver
         self.tray_enabled = tray_enabled
+        # v4.3.1 DP43-R08 §16.6：bounded repair 结果收割钩子（app 提供；
+        # 内部有界（<=4），repaired 时 UI 线程做最后一次 activate_cached）
+        self.activation_repair_drain = activation_repair_drain
 
         # 内部状态（§4.3）：只允许这些持久回调槽
         self._bridge_after = None
@@ -199,6 +203,13 @@ class UiCoordinator:
         if self.tray_drain is not None:
             try:
                 self.tray_drain()
+            except Exception:
+                pass
+        # 2b) stale terminal binding 的异步 repair 结果（DP43-R08 §16.6；
+        #     bounded O(1)/bounded-drain，<=4 条/tick）
+        if self.activation_repair_drain is not None:
+            try:
+                self.activation_repair_drain()
             except Exception:
                 pass
         # 3) skin build 结果：仅在 building()/有结果待收割时 poll
