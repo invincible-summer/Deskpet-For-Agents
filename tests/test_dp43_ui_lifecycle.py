@@ -329,20 +329,18 @@ class DashboardFocusRedTests(unittest.TestCase):
     """R16：FocusOut 不得改变 Dashboard 的 open 状态。"""
 
     def test_focusout_does_not_close_dashboard(self):
-        from actions import winkeys as wk
         app = make_app()
         try:
             app.open_dashboard()
             app.root.update()
             dash = app.dashboard
             own = int(dash.winfo_id())
-            # 旧代码曾用 _had_focus 判定"拿到过焦点"；新代码该属性不
-            # 存在（setattr 只是 inert，保证本测试在两种实现下可运行）
+            # 旧代码曾用 _had_focus/GetForegroundWindow 推断关闭意图；
+            # 新代码该整条路径已删除（setattr 只是 inert，保证本测试
+            # 在两种实现下可运行）
             dash._had_focus = True
-            with patch.object(wk, 'foreground_window',
-                              lambda: own + 404):
-                dash.event_generate('<FocusOut>')
-                app.root.update()
+            dash.event_generate('<FocusOut>')
+            app.root.update()
             self.assertTrue(dash.is_open(),
                             "FocusOut 不得自动收起 Dashboard")
             # 二次焦点往返仍稳定

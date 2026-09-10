@@ -7,7 +7,6 @@ build + retained rows（状态变化只 configure，不整页重建）；只有�
 canvas 范围内滚动（无 bind_all）。
 """
 from __future__ import annotations
-import os
 import tkinter as tk
 import time
 from tkinter import filedialog, messagebox, ttk
@@ -923,15 +922,13 @@ class AppearancePage(DashboardPage):
     # ------------------------------------------------------------ actions
     def _confirm_reset(self):
         app = self.dash.app
-        self.dash._native_dialog_open = True
-        try:
-            ok = messagebox.askyesno(
-                "重置全部外观",
-                "恢复默认皮肤（内置猫）与全部视觉参数；不影响监听、隐私、"
-                "slot 绑定与摆放。确定重置？",
-                parent=self.dash)
-        finally:
-            self.dash._native_dialog_open = False
+        # DP43-R16：native dialog 用标准 Tk parent 关系即可——已无
+        # auto-collapse，也就不需要任何 suppress 标志
+        ok = messagebox.askyesno(
+            "重置全部外观",
+            "恢复默认皮肤（内置猫）与全部视觉参数；不影响监听、隐私、"
+            "slot 绑定与摆放。确定重置？",
+            parent=self.dash)
         if ok:
             app.appearance.reset_all()
             self._sync_from_config()
@@ -939,12 +936,8 @@ class AppearancePage(DashboardPage):
 
     def _import_skin(self):
         dash = self.dash
-        dash._native_dialog_open = True
-        try:
-            src = filedialog.askdirectory(
-                title="选择包含 5 个素材文件的文件夹", parent=dash)
-        finally:
-            dash._native_dialog_open = False
+        src = filedialog.askdirectory(
+            title="选择包含 5 个素材文件的文件夹", parent=dash)
         if not src:
             return
         import re
@@ -1516,11 +1509,8 @@ class Dashboard(tk.Toplevel):
         self._closing = False
         # 诊断页 ≥1s 节流时间戳（bridge 规则 5 读取，monotonic）
         self.last_diag_refresh = 0.0
-        # 失焦自动收起（v4.3 用户反馈）
-        self._had_focus = False
-        self._native_dialog_open = False
-        self.bind("<FocusIn>", lambda _e: setattr(self, "_had_focus", True))
-        self.bind("<FocusOut>", self._on_focus_lost)
+        # DP43-R16：retained Toplevel——失焦绝不推断用户关闭意图，
+        # 关闭只来自 X（WM_DELETE_WINDOW）/显式 hide/App shutdown
 
         # ---- shell：左导航 + 右内容
         self._build_shell()
@@ -1663,31 +1653,6 @@ class Dashboard(tk.Toplevel):
 
     def on_diagnostics_page(self) -> bool:
         return self._page == PAGE_DIAG
-
-    # ================================================== 失焦自动收起
-    def _on_focus_lost(self, _ev):
-        if self._closing or self._native_dialog_open:
-            return
-        try:
-            self.after_idle(self._maybe_auto_collapse)
-        except tk.TclError:
-            pass
-
-    def _maybe_auto_collapse(self):
-        if self._closing or self._native_dialog_open or not self._had_focus:
-            return
-        if not self.is_open():
-            return
-        if os.name != "nt":
-            return
-        try:
-            hwnd = int(self.winfo_id())
-        except Exception:
-            return
-        from actions import winkeys
-        fg = winkeys.foreground_window()
-        if fg and fg != hwnd:
-            self.hide_dashboard()
 
     # ================================================== 滚轮 / reflow
     def _on_wheel(self, event):

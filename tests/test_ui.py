@@ -312,81 +312,75 @@ class MenuEphemeralLifecycleTests(unittest.TestCase):
             app.quit()
 
 
-class DashboardAutoCollapseTests(unittest.TestCase):
-    """v4.3 用户反馈：仪表盘失去焦点时自动收起（_maybe_auto_collapse）。
+class DashboardStableToplevelTests(unittest.TestCase):
+    """DP43-R16：Dashboard 是 retained Toplevel——失焦绝不关闭；
+    关闭只来自 X / 显式 hide / App shutdown。
 
-    只有真正拿到过焦点（_had_focus）且前台已离开本窗口才收起；
-    原生对话框期间与从未获焦的窗口（CI/测试）不收起。
+    （替换旧 DashboardAutoCollapseTests 的语义；auto-collapse 整条
+    生命周期已删除。）
     """
 
     def _app(self):
         from pet.app import PetApp
         from pet.petview import PetView
         cfg = MemoryConfig()
-        with patch.object(PetApp, '_reload_skins', lambda self: None), \
-             patch.object(PetView, 'load_skin', lambda self, bm: None):
+        with patch.object(PetApp, '_reload_skins', lambda self: None),              patch.object(PetView, 'load_skin', lambda self, bm: None):
             return PetApp(cfg)
 
-    def test_collapses_when_foreground_left_after_focus(self):
-        from actions import winkeys as wk
+    def test_focusout_never_closes(self):
         app = self._app()
         try:
             app.open_dashboard()
+            app.root.update()
             dash = app.dashboard
-            dash._had_focus = True
-            own = int(dash.winfo_id())
-            with patch.object(wk, 'foreground_window',
-                              lambda: own + 404):
-                dash._maybe_auto_collapse()
+            self.assertTrue(dash.is_open())
+            dash.event_generate('<FocusIn>')
+            dash.event_generate('<FocusOut>')
+            app.root.update()
+            self.assertTrue(dash.is_open())
+        finally:
+            app.quit()
+
+    def test_hide_reopen_keeps_current_page(self):
+        app = self._app()
+        try:
+            app.open_dashboard()
+            app.root.update()
+            dash = app.dashboard
+            # 切到非默认页再 hide/reopen：current page 保留
+            from pet.dashboard import PAGE_PETS
+            dash._show_page(PAGE_PETS)
+            page = dash._page
+            dash.hide_dashboard()
             self.assertFalse(dash.is_open())
+            dash.open()
+            self.assertTrue(dash.is_open())
+            self.assertEqual(dash._page, page)
         finally:
             app.quit()
 
-    def test_stays_open_when_foreground_is_self(self):
-        from actions import winkeys as wk
+    def test_open_100_times_single_dashboard(self):
         app = self._app()
         try:
-            app.open_dashboard()
-            dash = app.dashboard
-            dash._had_focus = True
-            own = int(dash.winfo_id())
-            with patch.object(wk, 'foreground_window', lambda: own):
-                dash._maybe_auto_collapse()
-            self.assertTrue(dash.is_open())
+            first = None
+            for _ in range(100):
+                app.open_dashboard()
+                app.root.update()
+                if first is None:
+                    first = app.dashboard
+            self.assertIs(app.dashboard, first)
+            self.assertTrue(first.winfo_exists())
         finally:
             app.quit()
 
-    def test_never_focused_dashboard_stays_open(self):
-        """CI/测试环境窗口从未获得焦点 → 绝不误收起。"""
-        from actions import winkeys as wk
-        app = self._app()
-        try:
-            app.open_dashboard()
-            dash = app.dashboard
-            dash._had_focus = False
-            own = int(dash.winfo_id())
-            with patch.object(wk, 'foreground_window',
-                              lambda: own + 404):
-                dash._maybe_auto_collapse()
-            self.assertTrue(dash.is_open())
-        finally:
-            app.quit()
-
-    def test_native_dialog_blocks_collapse(self):
-        from actions import winkeys as wk
-        app = self._app()
-        try:
-            app.open_dashboard()
-            dash = app.dashboard
-            dash._had_focus = True
-            dash._native_dialog_open = True
-            own = int(dash.winfo_id())
-            with patch.object(wk, 'foreground_window',
-                              lambda: own + 404):
-                dash._maybe_auto_collapse()
-            self.assertTrue(dash.is_open())
-        finally:
-            app.quit()
+    def test_native_dialog_wrappers_do_not_change_lifecycle(self):
+        """messagebox/filedialog 使用标准 parent；不再依赖 suppress 标志
+        （标志已删除，包装函数直接调用）。"""
+        from pet import dashboard as dash_mod
+        self.assertFalse(hasattr(dash_mod.Dashboard, '_maybe_auto_collapse'))
+        src = open(dash_mod.__file__, encoding='utf-8').read()
+        self.assertNotIn('_native_dialog_open', src)
+        self.assertNotIn('_had_focus', src)
 
 
 class AppTests(unittest.TestCase):

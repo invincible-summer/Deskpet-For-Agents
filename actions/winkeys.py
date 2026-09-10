@@ -172,13 +172,6 @@ def try_set_foreground(hwnd: int) -> bool:
     return int(user32.GetForegroundWindow()) == int(hwnd)
 
 
-def foreground_window() -> int:
-    """当前前台窗口 HWND（0 = 无/不可用）；仅诊断与焦点判断用。"""
-    if not user32:
-        return 0
-    return int(user32.GetForegroundWindow())
-
-
 class FLASHWINFO(ctypes.Structure):
     _fields_ = [('cbSize', wt.UINT), ('hwnd', wt.HWND), ('dwFlags', wt.DWORD),
                 ('dwCount', wt.UINT), ('dwTimeout', wt.DWORD)]
