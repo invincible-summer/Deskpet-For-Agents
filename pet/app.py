@@ -21,7 +21,6 @@ import tkinter as tk
 from agents.models import ActivationCode
 
 from . import autostart, skins
-from .dashboard import Dashboard
 from .labels import status_text
 from .petview import PetView, PetViewManager
 from .presentation import PresentationController, PresentationMode, PresentationState
@@ -45,9 +44,17 @@ SHUTDOWN_BUDGET_SEC = 3.0
 
 
 class PetApp:
-    def __init__(self, config):
+    def __init__(self, config, *, startup_baseline: float | None = None,
+                 config_loaded_at: float | None = None):
         self.config = config
+        # DP43-R18 §9.9：startup 里程碑（纯内存、每个事件只写一次
+        # perf_counter；无 timer）。main.py 提供 process 基准与
+        # config_loaded；其余按发生顺序记录。
+        self._startup_metrics: dict[str, float] = {}
+        self._mark_startup("process_start", startup_baseline)
+        self._mark_startup("config_loaded", config_loaded_at)
         self.root = tk.Tk()
+        self._mark_startup("tk_created")
         self.root.withdraw()   # controller root：不是宠物窗口（v4plan §8.1）
         self.root.configure(bg="#101011")
 
@@ -97,8 +104,20 @@ class PetApp:
             on_moved=self._on_pet_moved,
             on_double_vacant=self._on_vacant_double_click,
         )
-        # 隐式 pet-1 立即创建（single/aggregate 模式也用它）
-        self.pet_manager.ensure_view("pet-1")
+        # DP43-R18 §9.7：first-map 触发后台 runtime 的防御性 one-shot
+        # after fallback（Map 回调触发后取消；两路径只保留一个实现）。
+        # 必须在 _arm_first_map_trigger 之前初始化（arm 会写入 token）。
+        self._first_map_after = None
+        self._first_map_bound = None
+        self._background_started = False
+        # 隐式 pet-1 立即创建（single/aggregate 模式也用它）。
+        # DP43-R18 §9.1：首个可见首帧先于 Monitor scan / UIA boot /
+        # Tray heavy load / Skin catalog maintenance——此处只创建窗口
+        # 与 bootstrap 占位，后台 runtime 由 first-map 回调启动。
+        self.pet_manager.note_startup_event = self._mark_startup
+        first_view = self.pet_manager.ensure_view("pet-1")
+        self._mark_startup("first_pet_created")
+        self._arm_first_map_trigger(first_view)
 
         # v4.3 §4.3：唯一 bridge timer + render-idle slot（替代
         # _poll_monitor/_ui_tick/_poll_build 三个周期 timer）
@@ -120,6 +139,9 @@ class PetApp:
         self._import_switch_name = ""
         self.pet_manager.build_manager.on_import_result = \
             self._on_skin_import_result
+        # DP43-R19 §9.7：bootstrap 结果经现有 bridge 的 poll_results 收割
+        self.pet_manager.build_manager.on_bootstrap_result = \
+            self._on_skin_bootstrap_result
         self.pet_manager.set_render_requester(self.ui.request_view)
 
         self._janitor_after = None
@@ -130,7 +152,9 @@ class PetApp:
         self._toast_deadline = None
         # v4.3：进程内最多一个 agent picker（死弹窗防护）
         self._agent_picker = None
-        self.dashboard: Dashboard | None = None
+        # Dashboard lazy import（§9.8）：约千行级完整设置 UI，普通启动
+        # 不加载；open_dashboard 首次实际需要时局部 import
+        self.dashboard = None
         self.tray = None
         # v4.3.1 DP43-R15 §6.7：FAILED generation 的有界 retry 门——同一
         # desired session 内不自动重建；用户重新切换 intent / hide 恢复
@@ -150,7 +174,80 @@ class PetApp:
         if getattr(config, "migration_notice", False):
             self.toast(f"{APP_LABEL}：被动监听 · 终端窗口唤起 · "
                        "启动默认并行监听 + 单宠聚合", 8)
+
+    # ================= startup（DP43-R18/R19 §9） =================
+    def _mark_startup(self, name: str, value: float | None = None):
+        """里程碑只写一次（无 timer；诊断/验收读取）。"""
+        if name in self._startup_metrics:
+            return
+        self._startup_metrics[name] = (
+            value if value is not None else time.perf_counter())
+
+    def startup_metrics(self) -> dict[str, float]:
+        return dict(self._startup_metrics)
+
+    def _arm_first_map_trigger(self, view: PetView):
+        """§9.7 推荐路径：initial Pet 的 one-shot <Map> 回调启动后台
+        runtime（直接表达"窗口已映射"）；附一个防御性 one-shot after
+        fallback（Map 先到则取消）。"""
+        root = view.window.root
+        self._first_map_bound = root
+
+        def _on_map(_ev=None):
+            self._disarm_first_map_trigger()
+            self._on_first_pet_mapped()
+
+        root.bind("<Map>", _on_map)
+        self._first_map_after = self.root.after(
+            3000, self._on_first_pet_mapped)
+
+    def _disarm_first_map_trigger(self):
+        token = self._first_map_after
+        self._first_map_after = None
+        if token is not None:
+            try:
+                self.root.after_cancel(token)
+            except tk.TclError:
+                pass
+        bound = getattr(self, "_first_map_bound", None)
+        if bound is not None:
+            try:
+                bound.unbind("<Map>")
+            except tk.TclError:
+                pass
+            self._first_map_bound = None
+
+    def _on_first_pet_mapped(self):
+        self._mark_startup("first_pet_mapped")
+        self._start_background_runtime()
+
+    def _start_background_runtime(self):
+        """§9.7：幂等执行——Monitor / skin bootstrap / tray / janitor
+        全部在首个可见首帧之后才启动。"""
+        if self._background_started or self._closing:
+            return
+        self._background_started = True
+        self._mark_startup("background_runtime_started")
+        self.monitor.start()
+        keys = tuple(view.desired_build_key()
+                     for view in self.pet_manager.views.values())
+        self.pet_manager.build_manager.request_bootstrap(keys)
         self._reconcile_tray_runtime()
+        # v4.3.1 DP43-R04：janitor 定期做 ready index reconciliation
+        self._janitor_after = self.root.after(600_000, self._janitor)
+
+    def _on_skin_bootstrap_result(self, payload: dict, error: str):
+        """bootstrap 结果（bridge 的 poll_results 内回调，UI 线程）。
+
+        ready index 已由 poll_results 合入；这里激活 skin runtime
+        （miss 的 view 才在此刻产生 BUILD），再排队 maintenance
+        （低优先级，不阻首屏）。"""
+        self._mark_startup("skin_bootstrap_finished")
+        if error:
+            self.toast("皮肤启动检查失败，使用内置兜底", 5)
+        self.pet_manager.activate_skin_runtime()
+        self.pet_manager.build_manager.request_maintenance()
+        self.ui.kick()   # skin lane 活跃 → bridge 升 125ms 档收割 BUILD
 
     # ================= 交互入口 =================
     def interact(self):
@@ -888,8 +985,12 @@ class PetApp:
     # ================= 仪表盘 =================
     def open_dashboard(self):
         """打开仪表盘：不改桌宠逻辑 hidden 状态，只对原本可见的桌宠做
-       一次 no-activate Z-order 重声明（v4.1.3 §18）。"""
+       一次 no-activate Z-order 重声明（v4.1.3 §18）。
+
+        DP43-R18 §9.8：Dashboard 是约千行级完整设置 UI——首次实际
+        需要时才局部 import（普通启动不加载其页面类）。"""
         if self.dashboard is None or not tk.Toplevel.winfo_exists(self.dashboard):
+            from .dashboard import Dashboard
             self.dashboard = Dashboard(self)
         self.dashboard.open()
         self.ui.kick()   # Dashboard 可见 → bridge 立即升到 125ms 档
@@ -898,15 +999,11 @@ class PetApp:
 
     # ================= 生命周期 =================
     def run(self):
-        self.monitor.start()
-        # v4.3 §4.5：唯一 bridge timer（125/200/500ms 三档）+ 按需
-        # render after_idle；不再有 _poll_monitor/_ui_tick/_poll_build
+        # DP43-R18 §9.7：首帧优先——ui.start 只安排 initial render +
+        # bridge；initial Pet bootstrap 占位已存在（__init__ ensure_view）；
+        # Monitor/UIA/Tray/skin lane 由 first-map <Map> 回调启动。
+        # 绝不 root.update()/nested update 强制首帧。
         self.ui.start()
-        # v4.3.1 DP43-R04：启动时做一次 ready index reconciliation
-        # （校验既有 cache manifest / 清理上次崩溃遗留的 staging 目录），
-        # 全部在 skin lane 后台线程执行
-        self.pet_manager.build_manager.request_maintenance()
-        self._janitor_after = self.root.after(600_000, self._janitor)
         self.root.mainloop()
     def _janitor(self):
         """定时清理入口（v4.3.1 DP43-R06：Tk 线程只做 O(1) 调度）。
@@ -944,6 +1041,7 @@ class PetApp:
             # ---- A. UI 封口（必须快） ----
             self._menu_controller.shutdown()   # Pet 菜单先确定性结束
             self._destroy_agent_picker()
+            self._disarm_first_map_trigger()
             if self.dashboard is not None:
                 try:
                     self.dashboard.shutdown()

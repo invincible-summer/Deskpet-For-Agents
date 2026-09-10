@@ -278,7 +278,10 @@ class MenuEphemeralLifecycleTests(unittest.TestCase):
         cfg = MemoryConfig()
         with patch.object(PetApp, '_reload_skins', lambda self: None), \
              patch.object(PetView, 'load_skin', lambda self, bm: None):
-            return PetApp(cfg)
+            app = PetApp(cfg)
+            app.pet_manager.activate_skin_runtime()
+            app._disarm_first_map_trigger()
+            return app
 
     def test_destroy_menu_idempotent_no_tclerror(self):
         app = self._app()
@@ -325,7 +328,10 @@ class DashboardStableToplevelTests(unittest.TestCase):
         from pet.petview import PetView
         cfg = MemoryConfig()
         with patch.object(PetApp, '_reload_skins', lambda self: None),              patch.object(PetView, 'load_skin', lambda self, bm: None):
-            return PetApp(cfg)
+            app = PetApp(cfg)
+            app.pet_manager.activate_skin_runtime()
+            app._disarm_first_map_trigger()
+            return app
 
     def test_focusout_never_closes(self):
         app = self._app()
@@ -391,6 +397,8 @@ class AppTests(unittest.TestCase):
         from pet.petview import PetView
         with patch.object(PetApp, '_reload_skins', lambda self: None), patch.object(PetView, 'load_skin', lambda self, bm: None):
             app = PetApp(cfg)
+            app.pet_manager.activate_skin_runtime()
+            app._disarm_first_map_trigger()
         try:
             from agents.terminal_service import WindowsTerminalService
             app.monitor._terminal_service = WindowsTerminalService(None)
@@ -445,7 +453,10 @@ class TrayDashboardVisibilityTests(unittest.TestCase):
             cfg = MemoryConfig()
         with patch.object(PetApp, '_reload_skins', lambda self: None), \
              patch.object(PetView, 'load_skin', lambda self, bm: None):
-            return PetApp(cfg)
+            app = PetApp(cfg)
+            app.pet_manager.activate_skin_runtime()
+            app._disarm_first_map_trigger()
+            return app
 
     def test_tray_left_never_hides_visible_pet(self):
         app = self._app()
@@ -689,8 +700,12 @@ class MenuCommandsAliveTests(unittest.TestCase):
     def _app(self, cfg=None):
         from pet.app import PetApp
         from pet.petview import PetView
-        with patch.object(PetApp, '_reload_skins', lambda self: None),              patch.object(PetView, 'load_skin', lambda self, bm: None):
-            return PetApp(cfg or MemoryConfig())
+        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+             patch.object(PetView, 'load_skin', lambda self, bm: None):
+            app = PetApp(cfg or MemoryConfig())
+        app.pet_manager.activate_skin_runtime()
+        app._disarm_first_map_trigger()
+        return app
 
     def _walk(self, menu, invoked, path="menu"):
         """递归 invoke 全部 command entry；cascade 递归子菜单。"""
@@ -802,7 +817,10 @@ class QuitImageReleaseTests(unittest.TestCase):
         from pet.petview import PetView
         with patch.object(PetApp, '_reload_skins', lambda self: None), \
              patch.object(PetView, 'load_skin', lambda self, bm: None):
-            return PetApp(MemoryConfig())
+            app = PetApp(MemoryConfig())
+            app.pet_manager.activate_skin_runtime()
+            app._disarm_first_map_trigger()
+            return app
 
     def test_quit_releases_photoimages_before_destroy(self):
         import tkinter as tk

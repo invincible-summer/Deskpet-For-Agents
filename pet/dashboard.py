@@ -1305,6 +1305,17 @@ class DiagnosticsPage(DashboardPage):
             f" · config_saves={saver.save_count}"
             f" · exit_watched={stats.get('exit_watched', 0)}"
             f" · detached过滤={stats.get('detached_filtered_count', 0)}")
+        # DP43-R18 §9.9：startup 里程碑（相对 process 基准的毫秒）
+        sm = app.startup_metrics()
+        base = sm.get("process_start")
+        if base is not None:
+            order = ("config_loaded", "tk_created", "first_pet_created",
+                     "first_pet_mapped", "background_runtime_started",
+                     "skin_bootstrap_finished", "first_real_skin_frame")
+            parts = [f"{k}={int((sm[k] - base) * 1000)}ms"
+                     for k in order if k in sm]
+            if parts:
+                perf += "\nstartup " + " → ".join(parts)
         self.diag_perf.configure(text=perf)
 
         logs = "\n".join(monitor.recent_logs())

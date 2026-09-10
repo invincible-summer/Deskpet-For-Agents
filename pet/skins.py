@@ -142,30 +142,41 @@ def _scan_skins() -> dict[str, dict]:
 
 
 class SkinCatalog:
-    """进程内皮肤目录快照（v4.3 §9）。
+    """进程内皮肤目录快照（v4.3 §9；DP43-R19 §9.4 纯内存化）。
 
-    右键菜单 / Dashboard / load_skin 只读内存 snapshot，不再每次
-    os.listdir + open(manifest)。revision 在每次 refresh_from_disk
-    时 +1（UI 据此刷新 combobox values）。
+    初始化即包含 builtin-cat metadata；snapshot() 只做短锁读取，
+    **永不**触发磁盘扫描。磁盘扫描（_scan_skins）是 worker-only 的
+    纯 I/O helper：worker 锁外扫描得普通 dict → result 回 Tk/manager
+    → replace() 在极短临界区 swap + revision++。任何 lock 都不跨
+    磁盘 I/O——Tk 读内存不等后台扫描。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self.revision = 0
-        self._snapshot: dict[str, dict] = {}
+        self._snapshot: dict[str, dict] = {
+            BUILTIN_SKIN: {
+                "name": BUILTIN_SKIN,
+                "title": "DeskPet 原创小猫（内置）",
+                "builtin": True,
+            },
+        }
 
     def snapshot(self) -> dict[str, dict]:
-        """只读快照（调用方不得修改；空快照自动首次扫描）。"""
+        """只读快照（调用方不得修改；纯内存，无 I/O）。"""
         with self._lock:
-            if not self._snapshot:
-                self._snapshot = _scan_skins()
-                self.revision += 1
             return self._snapshot
 
-    def refresh_from_disk(self) -> dict[str, dict]:
-        """重新扫描（导入完成/外部变更后；非 Tk 线程调用）。"""
+    def replace(self, snapshot: dict) -> dict[str, dict]:
+        """worker 结果的短临界区 swap（revision++；不复制大对象）。"""
         with self._lock:
-            self._snapshot = _scan_skins()
+            self._snapshot = dict(snapshot) if snapshot else {
+                BUILTIN_SKIN: {
+                    "name": BUILTIN_SKIN,
+                    "title": "DeskPet 原创小猫（内置）",
+                    "builtin": True,
+                },
+            }
             self.revision += 1
             return self._snapshot
 
@@ -179,8 +190,13 @@ def list_skins() -> dict[str, dict]:
 
 
 def refresh_skin_catalog() -> dict[str, dict]:
-    """强制重扫磁盘（v4.3 §9 导入完成后调用）。"""
-    return _catalog.refresh_from_disk()
+    """重扫磁盘（worker/测试入口；DP43-R19：扫描在锁外，swap 在短锁）。
+
+    生产路径的 catalog 更新优先经 lane job result → poll_results 的
+    replace；本函数保留给需要同步刷新的 worker/测试场景。
+    """
+    fresh = _scan_skins()   # 锁外纯 I/O
+    return _catalog.replace(fresh)
 
 
 def catalog_revision() -> int:
@@ -721,7 +737,86 @@ def _write_import_manifest(dst: str, name: str) -> None:
         }, f, ensure_ascii=False, indent=2)
 
 
-# ================================================================ 维护任务（§14.4）
+# ================================================================ startup bootstrap（§9.5）
+def _nearest_cache_for(skin: str, height: int,
+                       fps: int) -> dict[str, str] | None:
+    """同 skin+fps 的就近高度有效 cache（worker-only 纯 I/O）。
+
+    扫 CACHE_DIR 下 `skin@H` 目录，取与 height 差最小且
+    ready_cache_paths 完整通过的条目；无可用返回 None。
+    """
+    best: tuple[int, dict[str, str]] | None = None
+    try:
+        entries = os.listdir(CACHE_DIR)
+    except OSError:
+        return None
+    for name in entries:
+        if "@" not in name:
+            continue
+        s, _, h_s = name.partition("@")
+        if s != skin:
+            continue
+        try:
+            h = int(h_s)
+        except ValueError:
+            continue
+        if h == height:
+            continue   # 精确高度已在主路径判定过
+        paths = ready_cache_paths(skin, h, fps)
+        if paths is None:
+            continue
+        delta = abs(h - height)
+        if best is None or delta < best[0]:
+            best = (delta, paths)
+    return best[1] if best is not None else None
+
+
+def run_bootstrap(keys, cancel=None) -> dict:
+    """skin lane 的 BOOTSTRAP job（后台线程；DP43-R19 §9.5）。
+
+    read-mostly/read-only：锁外扫描 skin catalog + 验证 keys 所需
+    build key 的可用 cache（manifest/签名/文件全过；含 legacy 升级
+    判定与同 skin+fps 就近高度回退）。不 rmtree、不做旧 staging
+    cleanup、不转换、不发布 live cache。可 cancellation。
+
+    返回 {"catalog": {...}, "ready": {BuildKey: paths},
+    "fallback_keys": [BuildKey]}——ready/fallback 由 Tk 侧
+    poll_results 合入 ready index；App 据此激活 skin runtime。
+    """
+    catalog = _scan_skins()   # 锁外纯 I/O
+    ready: dict[tuple, dict[str, str]] = {}
+    fallback_keys: list[tuple] = []
+    for raw in keys or ():
+        key = tuple(raw)
+        if len(key) != 3:
+            continue
+        if cancel is not None and cancel.is_set():
+            break
+        skin, height, fps = key
+        if skin not in catalog:
+            fallback_keys.append(key)
+            continue
+        paths = ready_cache_paths(skin, height, fps)
+        if paths is None:
+            paths = legacy_ready_paths(skin, height, fps)
+            if paths is not None:
+                # legacy ready：后台补写 manifest 升级为正式 ready
+                try:
+                    write_cache_manifest(cache_dir(skin, height), skin,
+                                         height, fps,
+                                         source_signature_for(skin))
+                except OSError:
+                    pass
+        if paths is None:
+            paths = _nearest_cache_for(skin, height, fps)
+        if paths is not None:
+            ready[key] = paths
+        else:
+            fallback_keys.append(key)
+    return {"catalog": catalog, "ready": ready,
+            "fallback_keys": fallback_keys}
+
+
 def run_maintenance(cancel=None) -> dict:
     """skin lane 的 maintenance job（后台线程）：
 
@@ -834,6 +929,7 @@ class SkinJobKind(enum.Enum):
     BUILD = "build"
     REBUILD = "rebuild"
     IMPORT = "import"
+    BOOTSTRAP = "bootstrap"       # DP43-R19 §9.5：startup 只读扫描/校验
     MAINTENANCE = "maintenance"
 
 
@@ -845,6 +941,7 @@ class SkinJobRequest:
     view_ids: tuple[str, ...] = ()
     src_dir: str = ""
     skin_name: str = ""
+    keys: tuple = ()   # BOOTSTRAP：待校验的 BuildKey 集合
 
 
 @dataclass(frozen=True)
@@ -855,6 +952,9 @@ class SkinJobResult:
     key: BuildKey | None = None
     payload: object = None
     error: str = ""
+    # DP43-R19 §9.4：import 成功时携带锁外扫描的 catalog snapshot，
+    # 由 Tk 侧 poll_results 短临界区 swap（worker 不碰共享 lock 做 I/O）
+    extra: object = None
 
 
 class _JobCancellation:
@@ -911,6 +1011,9 @@ class SkinBuildManager:
         # v4.3 §9 导入 lane（与 build 互斥；最多 1 运行 + 1 排队）
         self._pending_import: tuple[str, str] | None = None
         self._maintenance_pending = False
+        # DP43-R19 §9.5：startup BOOTSTRAP job（去重：最多 1 pending）
+        self._bootstrap_pending: tuple[BuildKey, ...] | None = None
+        self.on_bootstrap_result = None   # UI 回调：(catalog, ready, error)
         # active job（worker 只读 request）
         self._active_job: SkinJobRequest | None = None
         self._active_thread: threading.Thread | None = None
@@ -1039,6 +1142,20 @@ class SkinBuildManager:
         self._maintenance_pending = True
         self._start_next_job()
 
+    def request_bootstrap(self, keys) -> None:
+        """提交 startup BOOTSTRAP job（DP43-R19 §9.5；去重合并 keys）。
+
+        只读 job：锁外扫描 catalog + 验证 keys 的可用 cache（含同
+        skin+fps 就近高度回退）。不 rmtree、不转换、不发布 live cache。
+        """
+        if self._stopping:
+            return
+        merged = tuple(dict.fromkeys(
+            (tuple(k) for k in (list(self._bootstrap_pending or ())
+                                + list(keys or ())))))
+        self._bootstrap_pending = merged or ((),)
+        self._start_next_job()
+
     # ------------------------------------------------------------ 结果收割（Tk）
     def poll_results(self) -> list[tuple[BuildKey | tuple, str, object]]:
         """非阻塞收割 lane 结果；完成后启动下一个 job。
@@ -1078,6 +1195,10 @@ class SkinBuildManager:
                 # payload 恒为皮肤名（ok=已导入名；err=请求名）
                 name = str(res.payload)
                 if res.ok:
+                    # §9.4：worker 锁外扫描的 catalog 经 result 携带，
+                    # Tk 侧短临界区 swap（worker 不持共享 lock 做 I/O）
+                    if isinstance(res.extra, dict) and res.extra:
+                        _catalog.replace(res.extra)
                     # §10.5：同名 import 成功 → 该皮肤全部 ready 代次失效
                     for k in [k for k in self._ready_index if k[0] == name]:
                         self._ready_index.pop(k, None)
@@ -1085,6 +1206,25 @@ class SkinBuildManager:
                     out.append((("import", name), "import_ok", name))
                 else:
                     out.append((("import", name), "import_err", res.error))
+            elif res.kind is SkinJobKind.BOOTSTRAP:
+                self._bootstrap_pending = None
+                if res.ok and isinstance(res.payload, dict):
+                    catalog = res.payload.get("catalog")
+                    if isinstance(catalog, dict) and catalog:
+                        _catalog.replace(catalog)
+                    ready = res.payload.get("ready") or {}
+                    for k, paths in ready.items():
+                        key = tuple(k)
+                        self._ready_index[key] = dict(paths)
+                        self._ready_stamps[key] = res.job_id
+                    if self.on_bootstrap_result is not None:
+                        try:
+                            self.on_bootstrap_result(res.payload,
+                                                     str(res.error or ""))
+                        except Exception:
+                            pass
+                    out.append((("bootstrap",), "bootstrap_ok",
+                                dict(res.payload)))
             elif res.kind is SkinJobKind.MAINTENANCE:
                 if res.ok and isinstance(res.payload, dict):
                     self._reconcile_ready_index(res.payload, res.job_id)
@@ -1135,6 +1275,7 @@ class SkinBuildManager:
                 or bool(self._pending_builds)
                 or bool(self._pending_rebuilds)
                 or self._pending_import is not None
+                or self._bootstrap_pending is not None
                 or self._maintenance_pending
                 or self.results_pending())
 
@@ -1146,16 +1287,18 @@ class SkinBuildManager:
         return (len(self._pending_builds) + len(self._pending_rebuilds)
                 + (1 if self._active_job is not None else 0)
                 + (1 if self._pending_import is not None else 0)
+                + (1 if self._bootstrap_pending is not None else 0)
                 + (1 if self._maintenance_pending else 0))
 
     # ------------------------------------------------------------ shutdown（§13.1；DP43-R17）
     def request_stop(self) -> None:
-        """只发停止信号（不 join）：封口 lane、清空 pending、取消
-        active converter（Job Object 终止整棵转换树）。"""
+        """只发停止信号（不 join）：封口 lane、清空 pending（含
+        bootstrap）、取消 active converter（Job Object 终止整棵树）。"""
         self._stopping = True
         self._pending_builds.clear()
         self._pending_rebuilds.clear()
         self._pending_import = None
+        self._bootstrap_pending = None
         self._maintenance_pending = False
         ctx = self._active_cancel
         if ctx is not None:
@@ -1205,8 +1348,10 @@ class SkinBuildManager:
     def _start_next_job(self) -> None:
         """lane 空闲时的补位（只允许 Tk 线程调用）。
 
-        优先级：import（用户显式动作）> rebuild（用户显式动作）>
-        build（view 等待画面）> maintenance（后台整理）。
+        优先级（DP43-R19 §9.6）：import（用户显式动作）> rebuild（用户
+        显式动作）> build（view 等待画面）> bootstrap（仅 startup）>
+        maintenance（后台整理）。启动顺序本身不靠优先级猜——App 在
+        bootstrap 完成前不提交 BUILD（PetViewManager skin gate）。
         """
         if self._stopping or self._active_job is not None:
             return
@@ -1226,6 +1371,13 @@ class SkinBuildManager:
             key = self._pending_builds.pop(0)
             self._spawn(SkinJobRequest(
                 self._next_job_id, SkinJobKind.BUILD, key=key))
+            return
+        if self._bootstrap_pending is not None:
+            keys = self._bootstrap_pending
+            self._bootstrap_pending = None
+            self._spawn(SkinJobRequest(
+                self._next_job_id, SkinJobKind.BOOTSTRAP,
+                keys=keys))
             return
         if self._maintenance_pending:
             self._maintenance_pending = False
@@ -1248,25 +1400,31 @@ class SkinBuildManager:
         绝不：start next / clear active / 调 Tk callback / 改 waiters。
         """
         try:
-            ok, payload, error = self._execute_job(req, ctx)
+            ok, payload, error, extra = self._execute_job(req, ctx)
         except Exception as exc:
-            ok, payload, error = False, None, str(exc)[:200]
+            ok, payload, error, extra = False, None, str(exc)[:200], None
         self._put_result(SkinJobResult(
-            req.job_id, req.kind, ok, req.key, payload, error))
+            req.job_id, req.kind, ok, req.key, payload, error, extra))
 
     def _execute_job(self, req: SkinJobRequest,
-                     ctx: _JobCancellation) -> tuple[bool, object, str]:
+                     ctx: _JobCancellation) -> tuple[bool, object, str, object]:
         if req.kind is SkinJobKind.IMPORT:
             try:
                 name = prepare_import(req.src_dir, req.skin_name,
                                       cancel=ctx.event)
             except Exception as exc:
                 # payload 携带皮肤名：UI 错误回调需要它
-                return False, req.skin_name, str(exc)[:200]
-            refresh_skin_catalog()
-            return True, name, ""
+                return False, req.skin_name, str(exc)[:200], None
+            # §9.4：锁外扫描 catalog，经 result 携带回 Tk 短 swap
+            try:
+                catalog = _scan_skins()
+            except Exception:
+                catalog = None
+            return True, name, "", catalog
+        if req.kind is SkinJobKind.BOOTSTRAP:
+            return True, run_bootstrap(req.keys, cancel=ctx.event), "", None
         if req.kind is SkinJobKind.MAINTENANCE:
-            return True, run_maintenance(cancel=ctx.event), ""
+            return True, run_maintenance(cancel=ctx.event), "", None
         # BUILD / REBUILD
         skin, height, fps = req.key
         converter = ConverterJob()
@@ -1274,5 +1432,5 @@ class SkinBuildManager:
         paths = build_skin(skin, height, fps, force=(
             req.kind is SkinJobKind.REBUILD), converter=converter)
         if converter.cancelled:
-            return False, None, "cancelled"
-        return True, paths, ""
+            return False, None, "cancelled", None
+        return True, paths, "", None

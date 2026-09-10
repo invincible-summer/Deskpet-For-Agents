@@ -19,6 +19,7 @@ Phase 0 红测试集：本文件先于实现提交，覆盖 plan §14 Phase 0 �
 实现完成后同一批测试转为常驻回归（不允许删除或放宽断言）。
 """
 import copy
+import os
 import queue
 import subprocess
 import sys
@@ -62,12 +63,18 @@ class MemoryConfig:
 
 
 def make_app(cfg=None):
-    """构造 PetApp：皮肤加载打桩（测试聚焦菜单/生命周期合同）。"""
+    """构造 PetApp：皮肤加载打桩（测试聚焦菜单/生命周期合同）。
+
+    默认 disarm first-map 触发器（避免 update() 误启真实
+    monitor/WSL 探测）；startup 专项测试用 arm_map=True 走真实链路。
+    """
     from pet.app import PetApp
     from pet.petview import PetView
     with patch.object(PetApp, '_reload_skins', lambda self: None), \
          patch.object(PetView, 'load_skin', lambda self, bm: None):
-        return PetApp(cfg or MemoryConfig())
+        app = PetApp(cfg or MemoryConfig())
+    app._disarm_first_map_trigger()
+    return app
 
 
 # ================================================================ R14
@@ -517,8 +524,13 @@ class SkinCatalogLockRedTests(unittest.TestCase):
             release.wait(5.0)
             return orig_scan()
 
+        def worker_refresh():
+            # DP43-R19 新合同：worker 锁外扫描 → 短临界区 swap
+            fresh = slow_scan()
+            cat.replace(fresh)
+
         with patch.object(skins_mod, '_scan_skins', slow_scan):
-            worker = threading.Thread(target=cat.refresh_from_disk)
+            worker = threading.Thread(target=worker_refresh)
             worker.start()
             self.assertTrue(entered.wait(2.0))
             t0 = time.perf_counter()
@@ -582,11 +594,16 @@ class StartupOrderingRedTests(unittest.TestCase):
             app.quit()
 
     def test_dashboard_import_is_lazy(self):
-        """import pet.app 不得连带加载 dashboard（千行级 UI 模块）。"""
+        """import pet.app 不得连带加载 dashboard（千行级 UI 模块）、
+        Pillow 或 comtypes（§12.6：first map 前不 import）。"""
         code = ("import sys; sys.path.insert(0, r'%s'); "
                 "import pet.app; "
-                "assert 'pet.dashboard' not in sys.modules, "
-                "'dashboard must be lazy-imported'; print('OK')") % _REPO
+                "mods = sys.modules; "
+                "assert 'pet.dashboard' not in mods, "
+                "'dashboard must be lazy-imported'; "
+                "assert 'PIL' not in mods, 'Pillow must stay lazy'; "
+                "assert 'comtypes' not in mods, 'comtypes must stay lazy'; "
+                "print('OK')") % _REPO
         result = subprocess.run(
             [sys.executable, '-c', code], capture_output=True,
             text=True, timeout=60, cwd=_REPO)
@@ -737,6 +754,214 @@ class PetContextMenuControllerTests(unittest.TestCase):
             self.assertEqual(len(afters), 0)
         finally:
             app.quit()
+
+
+# ================================================================ R18 §12.6
+class StartupFlowTests(unittest.TestCase):
+    """first-map 优先 / bootstrap 顺序 / warm-cold cache 行为。"""
+
+    @staticmethod
+    def _fake_monitor_module():
+        import agents.monitor as monitor_mod
+
+        class FakeTerminalService:
+            observer = None
+
+            def request_stop(self):
+                pass
+
+            def join_for_shutdown(self, timeout):
+                return True
+
+            def stop(self):
+                pass
+
+        class FakeMonitor:
+            terminal_available = staticmethod(lambda: False)
+
+            def __init__(self, config):
+                self.events = []
+                self._terminal_service = FakeTerminalService()
+
+            def start(self):
+                self.events.append(("monitor_start", time.perf_counter()))
+
+            def get_targets(self):
+                return {}
+
+            def get_target(self, key):
+                return None
+
+            def get_targets_if_changed(self, revision):
+                return revision, None
+
+            def rescan(self):
+                pass
+
+            def trim(self):
+                pass
+
+            def request_stop(self):
+                pass
+
+            def join_for_shutdown(self, timeout):
+                return True
+
+            def stop(self):
+                pass
+
+        return monitor_mod, FakeMonitor
+
+    def _make_armed_app(self):
+        from pet.app import PetApp
+        from pet.petview import PetView
+        monitor_mod, FakeMonitor = self._fake_monitor_module()
+        with patch.object(monitor_mod, "Monitor", FakeMonitor), \
+             patch.object(PetApp, '_reload_skins', lambda self: None), \
+             patch.object(PetView, 'load_skin', lambda self, bm: None):
+            app = PetApp(MemoryConfig())
+        return app
+
+    def test_first_map_precedes_background_runtime(self):
+        app = self._make_armed_app()
+        try:
+            monitor = app.monitor
+            bm = app.pet_manager.build_manager
+            # 未 map：后台 runtime 未启动，无任何 skin job
+            self.assertEqual(monitor.events, [])
+            self.assertFalse(app._background_started)
+            self.assertFalse(bm.building())
+            # 模拟窗口映射（production 路径：<Map> 一次性回调）
+            view = app.pet_manager.views["pet-1"]
+            view.window.root.event_generate("<Map>")
+            app.root.update()
+            self.assertTrue(monitor.events, "map 后必须启动 Monitor")
+            metrics = app.startup_metrics()
+            self.assertIn("first_pet_mapped", metrics)
+            self.assertIn("background_runtime_started", metrics)
+            self.assertLess(metrics["first_pet_mapped"],
+                            metrics["background_runtime_started"])
+            # bootstrap 已提交；Map 期间不产生 BUILD
+            self.assertTrue(
+                bm._bootstrap_pending is not None
+                or (bm._active_job is not None
+                    and bm._active_job.kind.value == "bootstrap")
+                or bm.results_pending(),
+                "map 后应提交 BOOTSTRAP job")
+            self.assertEqual(bm._pending_builds, [])
+        finally:
+            app.quit()
+
+    def test_bootstrap_result_activates_runtime_and_queues_maintenance(self):
+        app = self._make_armed_app()
+        try:
+            bm = app.pet_manager.build_manager
+            activated = []
+            app.pet_manager.activate_skin_runtime = (
+                lambda: activated.append(1))
+            # 直接以 worker 结果驱动 poll（跳过真实磁盘扫描）
+            from pet.skins import SkinJobKind, SkinJobResult
+            bm._put_result(SkinJobResult(
+                1, SkinJobKind.BOOTSTRAP, True, None,
+                {"catalog": {"builtin-cat": {"name": "builtin-cat"}},
+                 "ready": {}, "fallback_keys": []}, ""))
+            bm._active_job = None   # 模拟 worker 已结束
+            bm.poll_results()
+            # on_bootstrap_result（app 回调）→ activate skin runtime
+            self.assertEqual(activated, [1])
+            metrics = app.startup_metrics()
+            self.assertIn("skin_bootstrap_finished", metrics)
+        finally:
+            app.quit()
+
+    def test_bootstrap_no_converter_warm_cache_and_build_after_cold(self):
+        """BOOTSTRAP 只读校验（warm cache 命中不转换）；真正 miss 的
+        BUILD 只在 activate 之后才产生。"""
+        import json as json_mod
+        import tempfile
+        from pathlib import Path
+        import pet.skins as skins_mod
+        from pet.skins import (SkinBuildManager, cache_dir, cache_files_ok,
+                               write_cache_manifest)
+
+        with tempfile.TemporaryDirectory() as root:
+            cache = Path(root, "cache")
+            cache.mkdir()
+            with patch.object(skins_mod, "CACHE_DIR", str(cache)):
+                bm = SkinBuildManager()
+                key = (skins_mod.BUILTIN_SKIN, 240, 12)
+                # cold：无 cache → bootstrap 全 miss
+                bm.request_bootstrap([key])
+                self._wait_lane(bm)
+                out = bm.poll_results()
+                payload = out[0][2]
+                self.assertEqual(payload["fallback_keys"], [key])
+                self.assertEqual(payload["ready"], {})
+                self.assertFalse(bm._pending_builds,
+                                 "bootstrap 本身绝不提交 BUILD/转换")
+                # 手工构造合法 warm cache（builtin 固定签名；不跑 Pillow）
+                d = cache_dir(key[0], key[1])
+                os.makedirs(d, exist_ok=True)
+                for s in skins_mod.STATES:
+                    Path(d, s + ".gif").write_bytes(b"GIF89a")
+                    Path(d, s + ".gif.json").write_text(
+                        json_mod.dumps({"frames": 1, "width": 4,
+                                        "height": 4, "delay_ms": 1000,
+                                        "loop": True}))
+                write_cache_manifest(d, key[0], key[1], key[2],
+                                     skins_mod.source_signature_for(key[0]))
+                # warm：bootstrap 命中 ready，不产生任何 BUILD/转换
+                bm.request_bootstrap([key])
+                self._wait_lane(bm)
+                out = bm.poll_results()
+                payload = out[0][2]
+                self.assertEqual(list(payload["ready"].keys()), [key])
+                self.assertEqual(payload["fallback_keys"], [])
+                self.assertFalse(bm._pending_builds)
+                self.assertTrue(bm.ready_paths(*key))
+                # ready index 命中：request 立即入队 ok 结果（无 worker）
+                bm.request("pet-1", *key)
+                self.assertFalse(bm._pending_builds)
+                results = bm.poll_results()
+                self.assertEqual(results[0][1], "ok")
+
+    @staticmethod
+    def _wait_lane(bm, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if bm.results_pending():
+                return True
+            if bm._active_job is None and bm._bootstrap_pending is None:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_import_result_carries_catalog_swap(self):
+        """import 成功：worker 锁外扫描的 catalog 经 result 携带，
+        Tk 侧 poll 短临界区 swap（§12.6）。"""
+        import tempfile
+        from pathlib import Path
+        import pet.skins as skins_mod
+        from pet.skins import SkinBuildManager
+        with tempfile.TemporaryDirectory() as src, \
+                tempfile.TemporaryDirectory() as pets:
+            for state in skins_mod.STATES:
+                Path(src, state + ".gif").write_bytes(b"GIF89a")
+            with patch.object(skins_mod, "PETS_DIR", pets):
+                bm = SkinBuildManager()
+                bm.submit_import(src, "catalogswap")
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    if bm.poll_results():
+                        break
+                    time.sleep(0.01)
+                self.assertIn("catalogswap", skins_mod.list_skins())
+        # 清理：恢复真实 catalog（模块单例）
+        with patch.object(skins_mod, "_scan_skins",
+                          lambda: {skins_mod.BUILTIN_SKIN:
+                                   {"name": skins_mod.BUILTIN_SKIN,
+                                    "builtin": True}}):
+            skins_mod.refresh_skin_catalog()
 
 
 if __name__ == '__main__':

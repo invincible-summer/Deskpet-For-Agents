@@ -122,6 +122,12 @@ class PetView:
         self._win_size: tuple[int, int] | None = None
         self._pet_item = None
         self._pet_image = None
+        # v4.3.1 DP43-R18 §9.2：startup bootstrap 占位（纯 Tk Canvas
+        # primitive；不 import Pillow、不读 skin 文件、不进
+        # SharedAnimationCache、不持久化）。真实 skin first frame ready
+        # 后一次性删除。
+        self._bootstrap_items: list[int] | None = None
+        self._bootstrap_size: tuple[int, int] | None = None
         # v4.3 §6.3：当前显示帧的 FrameKey（与 _pet_image 对应）；
         # 与 cursor 请求 key 相同 → 沿用当前图，不再次向 cache 请求
         self._pet_frame_key = None
@@ -232,10 +238,88 @@ class PetView:
 
     def _skin_ready(self, paths: dict[str, str]):
         self._skin_paths = dict(paths)
+        # §9.2：真实 skin 首次就绪 → 一次性删除 bootstrap 占位
+        self.clear_bootstrap_visual()
         self.cursor.speed = float(self.view_config.get("speed", 1.0) or 1.0)
         self.cursor.static = not bool(self.view_config.get("animated", True))
         state = self._state if self._state in self._skin_paths else "sleep"
         self._play(state, force=True)
+
+    # ------------------------------------------------------------ bootstrap 占位
+    def show_bootstrap_visual(self):
+        """纯 Tk 占位 Pet + "DeskPet 正在启动…"（DP43-R18 §9.2）。
+
+        只用 Canvas primitive（oval/ polygon/ text）；不 import
+        Pillow、不读任何 skin 文件、不写文件、不启动 converter、不
+        创建第二个窗口。这不是一种新"皮肤"，只是 startup placeholder。
+        """
+        if self._bootstrap_items is not None:
+            return
+        h = max(96, min(240, int(self.gif_height() * 0.6)))
+        w = int(h * 0.9)
+        self._ensure_window(w, h)
+        self._draw_bootstrap(w, h)
+
+    def _draw_bootstrap(self, w: int, h: int):
+        c = self.window.canvas
+        items: list[int] = []
+        # 极轻小猫：身体 + 两只耳朵 + 眼睛 + 启动文案
+        body_top, body_bot = h * 0.34, h * 0.96
+        body_w = w * 0.62
+        cx = w / 2
+        items.append(c.create_oval(
+            cx - body_w / 2, body_top, cx + body_w / 2, body_bot,
+            fill="#3d4a44", outline="#232b27", width=2))
+        ear_w, ear_h = w * 0.16, h * 0.14
+        for dx in (-body_w / 2 + ear_w * 0.2, body_w / 2 - ear_w * 1.2):
+            items.append(c.create_polygon(
+                cx + dx, body_top + 4,
+                cx + dx + ear_w, body_top + 4,
+                cx + dx + ear_w * 0.5, body_top - ear_h,
+                fill="#3d4a44", outline="#232b27", width=2))
+        eye_dy = (body_top + body_bot) * 0.42
+        for dx in (-body_w * 0.18, body_w * 0.18):
+            items.append(c.create_oval(
+                cx + dx - 3, eye_dy - 3, cx + dx + 3, eye_dy + 3,
+                fill="#e8f0ea", outline=""))
+        items.append(c.create_text(
+            cx, max(10, h * 0.09), text="DeskPet 正在启动…",
+            fill="#d7e2da", font=("Microsoft YaHei UI", 9)))
+        self._bootstrap_items = items
+        self._bootstrap_size = (w, h)
+
+    def clear_bootstrap_visual(self):
+        """一次性删除 bootstrap 占位（幂等；不删正常皮肤条目）。"""
+        items = self._bootstrap_items
+        self._bootstrap_items = None
+        self._bootstrap_size = None
+        if items is None:
+            return
+        c = self.window.canvas
+        for item in items:
+            try:
+                c.delete(item)
+            except Exception:
+                pass
+
+    def _redraw_bootstrap(self):
+        """bootstrap 占位期间的 redraw：只维护窗口几何与占位条目。"""
+        h = max(96, min(240, int(self.gif_height() * 0.6)))
+        w = int(h * 0.9)
+        self._ensure_window(w, h)
+        if self._bootstrap_size != (w, h):
+            self._clear_items_quietly()
+            self._draw_bootstrap(w, h)
+
+    def _clear_items_quietly(self):
+        items, self._bootstrap_items = self._bootstrap_items, None
+        if items:
+            c = self.window.canvas
+            for item in items:
+                try:
+                    c.delete(item)
+                except Exception:
+                    pass
 
     def _anim_meta(self, state: str):
         path = self._skin_paths.get(state) or ""
@@ -472,6 +556,10 @@ class PetView:
     def redraw(self):
         if self.hidden or self.window.dragging:
             return
+        # §9.2：bootstrap 占位期间不进正常皮肤/气泡绘制路径
+        if self._bootstrap_items is not None:
+            self._redraw_bootstrap()
+            return
         c = self.window.canvas
         pw, ph = self.cursor.size
         bw, bh = self.bubble.layout()
@@ -560,6 +648,12 @@ class PetViewManager:
             __import__("pet.skins", fromlist=["SkinBuildManager"]).SkinBuildManager())
         self.views: dict[str, PetView] = {}
         self._hooks = None   # app 提供 activate/menu/interact/moved 回调
+        # DP43-R18 §9.3：skin bootstrap gate——ready 前 ensure_view 只
+        # 显示纯 Tk 占位，不提交任何 BUILD；activate_skin_runtime 后
+        # 才用最新 config/slot 解析结果 load_skin。
+        self._skin_bootstrap_ready = False
+        # startup 里程碑回调（app 注入；first_real_skin_frame 等）
+        self.note_startup_event = None
         # v4.3 §5.1：PetView.mark_dirty → UiCoordinator.request_view 的
         # 注入点（None 时 mark_dirty 只设置 bool，供测试直接 redraw）
         self._render_request = None
@@ -622,11 +716,45 @@ class PetViewManager:
             view.anchor = (sw - 300 - 40 * len(self.views),
                            sh - 240)
         self.views[slot_id] = view
-        view.load_skin(self.build_manager)
+        if self._skin_bootstrap_ready:
+            view.load_skin(self.build_manager)
+        else:
+            # §9.3：bootstrap 未就绪 → 只显示极轻占位（无 BUILD、无 I/O）
+            view.show_bootstrap_visual()
         if self.user_hidden:
             # v4.3 §18.2：显式隐藏期间新 view 也保持隐藏
             view.hide()
         return view
+
+    def activate_skin_runtime(self):
+        """bootstrap 完成 → 幂等激活 skin runtime（DP43-R18 §9.3）。
+
+        对当前存在的所有 view 用**最新 config/slot resolved config**
+        重新 load_skin（bootstrap 期间用户改 skin/scale 只使用最终值，
+        不排中间 build）；清除 bootstrap 占位由各 view 在首个真实
+        frame ready 时一次性完成。
+        """
+        if self._skin_bootstrap_ready:
+            return
+        self._skin_bootstrap_ready = True
+        self.refresh_all_slot_configs()
+        for slot_id in sorted(self.views):
+            view = self.views.get(slot_id)
+            if view is None:
+                continue
+            view.clear_bootstrap_visual()
+            view.load_skin(self.build_manager)
+            if view._skin_paths:
+                self._note_first_skin_frame()
+
+    def _note_first_skin_frame(self):
+        cb = self.note_startup_event
+        if cb is not None:
+            try:
+                cb("first_real_skin_frame")
+            except Exception:
+                pass
+            self.note_startup_event = None   # 只记一次
 
     def remove_view(self, slot_id: str):
         view = self.views.pop(slot_id, None)
@@ -887,8 +1015,12 @@ class PetViewManager:
         """收割 build 结果并应用到等待的 view；返回 [(key,kind,payload)]。"""
         results = self.build_manager.poll_results()
         for key, kind, payload in results:
+            if isinstance(key, tuple) and key and key[0] == "bootstrap":
+                continue   # bootstrap 结果由 app 回调处理，不 fan-out 到 view
             for view in self.views.values():
                 view.build_result(key, kind, payload, self.build_manager)
+                if kind == "ok" and view._skin_paths:
+                    self._note_first_skin_frame()
         return results
 
     def stats(self) -> dict:

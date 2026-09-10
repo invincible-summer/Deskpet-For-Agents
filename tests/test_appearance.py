@@ -92,6 +92,8 @@ class AppHarness:
         with patch.object(PetApp, "_reload_skins", lambda self: None), \
              patch.object(PetView, "load_skin", lambda self, bm: None):
             self.app = PetApp(cfg)
+            self.app.pet_manager.activate_skin_runtime()
+            self.app._disarm_first_map_trigger()
         from agents.terminal_service import WindowsTerminalService
         self.app.monitor._terminal_service = WindowsTerminalService(None)
         if fleet:

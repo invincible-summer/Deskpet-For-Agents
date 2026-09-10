@@ -336,6 +336,8 @@ class DirtyViewProtocolTests(unittest.TestCase):
         with patch.object(PetApp, "_reload_skins", lambda self: None), \
              patch.object(PetView, "load_skin", lambda self, bm: None):
             app = PetApp(cfg)
+            app.pet_manager.activate_skin_runtime()
+            app._disarm_first_map_trigger()
         app.presentation.set_concurrent_mode(PresentationMode.FLEET)
         return app
 
@@ -369,6 +371,8 @@ class DirtyViewProtocolTests(unittest.TestCase):
         with patch.object(PetApp, "_reload_skins", lambda self: None), \
              patch.object(PetView, "load_skin", lambda self, bm: None):
             app = PetApp(cfg)
+            app.pet_manager.activate_skin_runtime()
+            app._disarm_first_map_trigger()
         try:
             app.presentation.set_concurrent_enabled(True)
             app.presentation.set_concurrent_mode(

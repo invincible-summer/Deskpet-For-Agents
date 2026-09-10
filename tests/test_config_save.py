@@ -515,33 +515,34 @@ class SaverStateMachineTests(unittest.TestCase):
 
 # ================================================================ SkinCatalog
 class SkinCatalogTests(unittest.TestCase):
-    def test_catalog_caches_scan_and_refresh_bumps_revision(self):
+    """DP43-R19 §9.4：snapshot 纯内存（永不触发磁盘扫描）；worker
+    锁外扫描 → replace() 短临界区 swap + revision++。"""
+
+    def test_snapshot_never_scans_and_replace_bumps_revision(self):
         catalog = SkinCatalog()
-        calls = []
 
-        def fake_scan():
-            calls.append(1)
-            return {"a": {"name": "a"}}
+        def forbidden():
+            raise AssertionError("snapshot() 不得触发磁盘扫描")
 
-        with patch("pet.skins._scan_skins", fake_scan):
+        with patch("pet.skins._scan_skins", forbidden):
             first = catalog.snapshot()
             second = catalog.snapshot()
         self.assertIs(first, second)
-        self.assertEqual(len(calls), 1)   # 只扫一次磁盘
+        self.assertIn("builtin-cat", first)   # 纯内存初始化含 builtin
         rev = catalog.revision
-        with patch("pet.skins._scan_skins", lambda: {"b": {"name": "b"}}):
-            refreshed = catalog.refresh_from_disk()
-        self.assertEqual(refreshed, {"b": {"name": "b"}})
+        catalog.replace({"b": {"name": "b"}})
+        self.assertEqual(catalog.snapshot(), {"b": {"name": "b"}})
         self.assertEqual(catalog.revision, rev + 1)
 
     def test_list_skins_uses_singleton_snapshot(self):
         import pet.skins as skins
         catalog = SkinCatalog()
         with patch("pet.skins._catalog", catalog), \
-             patch("pet.skins._scan_skins", lambda: {"x": {"name": "x"}}):
+             patch("pet.skins._scan_skins",
+                   side_effect=AssertionError("不得扫描")):
             one = skins.list_skins()
             two = skins.list_skins()
-        self.assertIn("x", one)
+        self.assertIn("builtin-cat", one)
         self.assertIs(one, two)
 
 

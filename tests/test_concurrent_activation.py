@@ -97,6 +97,8 @@ def make_app(slots):
     with patch.object(PetApp, "_reload_skins", lambda self: None), \
          patch.object(PetView, "load_skin", lambda self, bm: None):
         app = PetApp(cfg)
+        app.pet_manager.activate_skin_runtime()
+        app._disarm_first_map_trigger()
     # v4.3：mode 是运行期 session state（config 旧 mode=fleet 被启动
     # 策略忽略），本测试矩阵显式切到 fleet
     app.presentation.set_concurrent_mode(PresentationMode.FLEET)

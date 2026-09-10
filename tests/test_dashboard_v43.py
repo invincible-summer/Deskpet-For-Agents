@@ -37,7 +37,10 @@ def _make_app():
     from tests.test_ui import MemoryConfig
     with patch.object(PetApp, "_reload_skins", lambda self: None), \
          patch.object(PetView, "load_skin", lambda self, bm: None):
-        return PetApp(MemoryConfig())
+        app = PetApp(MemoryConfig())
+        app.pet_manager.activate_skin_runtime()
+        app._disarm_first_map_trigger()
+        return app
 
 
 def _inject_agents(app, n=2):

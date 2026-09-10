@@ -1,6 +1,7 @@
 """DeskPet 入口：DPI 感知、单实例保护、启动桌宠。"""
 import ctypes
 import sys
+import time
 
 
 def _dpi_aware():
@@ -32,8 +33,10 @@ def main():
     from pet.config import Config
     from pet.app import PetApp
 
+    startup_t0 = time.perf_counter()   # DP43-R18 §9.9：startup 基准
     config = Config()
-    app = PetApp(config)
+    app = PetApp(config, startup_baseline=startup_t0,
+                 config_loaded_at=time.perf_counter())
     app.run()
     return 0
 

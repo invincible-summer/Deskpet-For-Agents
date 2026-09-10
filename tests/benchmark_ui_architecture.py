@@ -322,6 +322,8 @@ def check_dashboard_current_page_only(checks):
     with patch.object(PetApp, "_reload_skins", lambda self: None), \
             patch.object(PetView, "load_skin", lambda self, bm: None):
         app = PetApp(MemoryConfig())
+        app.pet_manager.activate_skin_runtime()
+        app._disarm_first_map_trigger()
     try:
         app.open_dashboard()
         app.root.update()
@@ -405,6 +407,8 @@ def check_dirty_views_real_apps(checks):
         with patch.object(PetApp, "_reload_skins", lambda self: None), \
                 patch.object(PetView, "load_skin", lambda self, bm: None):
             app = PetApp(cfg)
+            app.pet_manager.activate_skin_runtime()
+            app._disarm_first_map_trigger()
         app.presentation.set_concurrent_mode(
             PresentationMode.FLEET if mode == "fleet"
             else PresentationMode.AGGREGATE)

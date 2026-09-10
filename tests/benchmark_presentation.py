@@ -87,6 +87,8 @@ def run(pets_max: int = 8, report_path: str = "") -> int:
     with patch.object(PetApp, "_reload_skins", lambda self: None), \
          patch.object(PetView, "load_skin", lambda self, bm: None):
         app = PetApp(BenchConfig(slots))
+        app.pet_manager.activate_skin_runtime()
+        app._disarm_first_map_trigger()
     from agents.terminal_service import WindowsTerminalService
     app.monitor._terminal_service = WindowsTerminalService(None)
     # v4.3：mode 是运行期 session state（config 旧 fleet 被启动策略忽略）
