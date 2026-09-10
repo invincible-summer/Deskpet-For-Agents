@@ -82,9 +82,13 @@ class PetApp:
             config, self.pet_manager,
             request_save=self.config_saver.request_save,
             request_render=_appearance_render)
+        # DP43-R14：单一 Tk Pet context menu owner（deferred 语义发布）
+        from .context_menu import TkContextMenuController
+        self._menu_controller = TkContextMenuController(
+            self.root, is_closing=lambda: self._closing)
         self.pet_manager.set_hooks(
             on_activate=self.activate_agent,
-            on_menu=self._build_menu,
+            on_context_menu=self._show_pet_menu,
             on_interact=self._on_interact,
             on_moved=self._on_pet_moved,
             on_double_vacant=self._on_vacant_double_click,
@@ -718,11 +722,13 @@ class PetApp:
             pass
 
     def _agents_submenu(self, menu):
-        """Agents 子菜单：每项捕获 exact key（§8.4/§8.5）。
+        """Agents 子菜单：每项捕获 exact key（§8.4/§8.5）；command
+        一律 deferred。
 
         托盘 Agent 项只激活对应 Terminal 窗口，不改 presentation 的
         focused 状态。
         """
+        d = self._menu_controller.deferred
         targets = self.monitor.get_targets()
         m = tk.Menu(menu, tearoff=0)
         if not targets:
@@ -733,31 +739,40 @@ class PetApp:
                 label=f"{s.kind.label} · "
                       f"{t.instance.project or t.instance.source} · "
                       f"{status_text(s)}",
-                command=lambda k=key: self.activate_agent(k))
+                command=d(self.activate_agent, key))
         menu.add_cascade(label="Agents", menu=m)
 
-    # ================= 右键菜单（每只桌宠） =================
-    def _build_menu(self, menu: tk.Menu):
+    # ================= 右键菜单（每只桌宠；DP43-R14） =================
+    def _show_pet_menu(self, view: PetView, x_root: int, y_root: int):
+        """Pet context request 入口：单一 controller 拥有 popup。"""
+        self._menu_controller.show(
+            view, x_root, y_root,
+            lambda menu: self._build_pet_menu(menu, view))
+
+    def _build_pet_menu(self, menu: tk.Menu, view: PetView | None):
+        """构建桌宠右键菜单（所有 command 一律 deferred 发布）。"""
         state = self._presentation_state
         mode = state.mode if state is not None else PresentationMode.SINGLE
-        view = getattr(self, "_menu_view", None)
         if mode is PresentationMode.FLEET and view is not None:
             self._fleet_menu(menu, view)
             return
-        menu.add_command(label="🤚 摸摸头（互动）", command=self.interact)
+        d = self._menu_controller.deferred
+        menu.add_command(label="🤚 摸摸头（互动）", command=d(self.interact))
         self._agents_submenu(menu)
-        menu.add_command(label="📊 打开仪表盘", command=self.open_dashboard)
+        menu.add_command(label="📊 打开仪表盘", command=d(self.open_dashboard))
         menu.add_command(
-            label="🙈 暂时隐藏桌宠（托盘可恢复）", command=self.hide_pet)
+            label="🙈 暂时隐藏桌宠（托盘可恢复）", command=d(self.hide_pet))
         menu.add_separator()
         self._appearance_menu(menu)
         self._system_menu(menu)
         menu.add_separator()
-        menu.add_command(label="🔄 重建当前皮肤缓存", command=self._rebuild_skin)
-        menu.add_command(label="❌ 退出", command=self.quit)
+        menu.add_command(label="🔄 重建当前皮肤缓存", command=d(self._rebuild_skin))
+        menu.add_command(label="❌ 退出",
+                         command=d(self.quit, allow_when_closing=True))
 
     def _fleet_menu(self, menu: tk.Menu, view: PetView):
-        """Fleet 每只 Pet 的菜单（v4plan §14）。"""
+        """Fleet 每只 Pet 的菜单（v4plan §14；builder 显式 view）。"""
+        d = self._menu_controller.deferred
         target = self.monitor.get_target(view.agent_key) if view.agent_key else None
         if target is not None:
             s = target.snapshot
@@ -765,25 +780,26 @@ class PetApp:
                 label=f"{s.kind.label} · {target.instance.project or ''}")
             menu.add_command(
                 label="打开此 Agent 终端",
-                command=lambda k=view.agent_key: self.activate_agent(k))
+                command=d(self.activate_agent, view.agent_key))
             menu.add_command(label="更换 Agent",
-                             command=lambda v=view: self._open_agent_picker(
-                                 v.view_id))
+                             command=d(self._open_agent_picker,
+                                       view.view_id))
             menu.add_command(label="解除绑定",
-                             command=lambda v=view: self._unbind_view(v))
+                             command=d(self._unbind_view, view))
         else:
             menu.add_command(label="（未绑定 Agent）", state="disabled")
             menu.add_command(label="绑定 Agent",
-                             command=lambda v=view: self._open_agent_picker(
-                                 v.view_id))
+                             command=d(self._open_agent_picker,
+                                       view.view_id))
         menu.add_separator()
-        menu.add_command(label="隐藏此桌宠", command=lambda v=view: v.hide())
-        menu.add_command(label="仪表盘", command=self.open_dashboard)
+        menu.add_command(label="隐藏此桌宠", command=d(view.hide))
+        menu.add_command(label="仪表盘", command=d(self.open_dashboard))
         menu.add_separator()
         self._appearance_menu(menu)
         self._system_menu(menu)
         menu.add_separator()
-        menu.add_command(label="❌ 退出", command=self.quit)
+        menu.add_command(label="❌ 退出",
+                         command=d(self.quit, allow_when_closing=True))
 
     def _unbind_view(self, view: PetView):
         """解除绑定：slot 释放 + 该 Agent 移出并发展示（否则下一轮自动
@@ -797,40 +813,41 @@ class PetApp:
         self.toast("已解除绑定并移出并发展示", 3)
 
     def _appearance_menu(self, menu: tk.Menu):
+        d = self._menu_controller.deferred
         m_look = tk.Menu(menu, tearoff=0)
         bubble_on = tk.BooleanVar(value=bool(self.config.get("bubble.enabled", True)))
         m_look.add_checkbutton(label="显示气泡（取消=只留桌宠）", variable=bubble_on,
-                               command=lambda: self._toggle_bubble(bubble_on.get()))
+                               command=d(lambda: self._toggle_bubble(bubble_on.get())))
         animated = tk.BooleanVar(value=bool(self.config.get("animated", True)))
         m_look.add_checkbutton(label="动态模式（取消=静态）", variable=animated,
-                               command=lambda: self._set_animated(animated.get()))
+                               command=d(lambda: self._set_animated(animated.get())))
         m_lock = tk.Menu(m_look, tearoff=0)
         m_lock.add_radiobutton(label="自动（按监听状态）", value="",
-                               command=lambda: self._set_force_state(""))
+                               command=d(self._set_force_state, ""))
         for st_name, label in (("walk", "walk 工作中"), ("attack", "attack 下达指令"),
                                ("die", "die 等待批复"), ("special", "special 完成"),
                                ("sleep", "sleep 睡觉")):
             m_lock.add_radiobutton(label=label, value=st_name,
-                                   command=lambda v=st_name: self._set_force_state(v))
+                                   command=d(self._set_force_state, st_name))
         m_look.add_cascade(label="锁定动画", menu=m_lock)
         m_speed = tk.Menu(m_look, tearoff=0)
         for sp in (0.5, 0.75, 1.0, 1.5, 2.0, 3.0):
             m_speed.add_radiobutton(label=f"{sp:g}x", value=sp,
-                                    command=lambda v=sp: self._set_speed(v))
+                                    command=d(self._set_speed, sp))
         m_look.add_cascade(label="播放速度", menu=m_speed)
         m_scale = tk.Menu(m_look, tearoff=0)
         for sc in (0.5, 0.75, 1.0, 1.25, 1.5, 2.0):
             m_scale.add_radiobutton(label=f"{sc:g}x", value=sc,
-                                    command=lambda v=sc: self.set_scale(v))
+                                    command=d(self.set_scale, sc))
         m_look.add_cascade(label="大小", menu=m_scale)
         topmost = tk.BooleanVar(value=bool(self.config.get("topmost", True)))
         m_look.add_checkbutton(label="窗口置顶", variable=topmost,
-                               command=lambda: self._set_topmost(topmost.get()))
+                               command=d(lambda: self._set_topmost(topmost.get())))
         m_skins = tk.Menu(m_look, tearoff=0)
         for name, mf in skins.list_skins().items():
             label = mf.get("title") or name
             m_skins.add_radiobutton(label=f"{label} ({name})", value=name,
-                                    command=lambda n=name: self._switch_skin(n))
+                                    command=d(self._switch_skin, name))
         m_look.add_cascade(label="皮肤", menu=m_skins)
         menu.add_cascade(label="🎨 外观", menu=m_look)
 
@@ -841,19 +858,20 @@ class PetApp:
             view.window.set_topmost(flag)
 
     def _system_menu(self, menu: tk.Menu):
+        d = self._menu_controller.deferred
         m_sys = tk.Menu(menu, tearoff=0)
         from .autostart import status as autostart_status
         st = autostart_status()
         label = {"healthy": "开机自启动 ✔", "missing": "开机自启动",
                  "stale": "开机自启动（需要修复）"}.get(st.state, "开机自启动")
         m_sys.add_checkbutton(label=label,
-                              command=self._toggle_autostart)
+                              command=d(self._toggle_autostart))
         tray_on = tk.BooleanVar(value=bool(self.config.get("tray_enabled", True)))
         m_sys.add_checkbutton(label="托盘图标", variable=tray_on,
-                              command=lambda: self._toggle_tray(tray_on.get()))
+                              command=d(lambda: self._toggle_tray(tray_on.get())))
         terminal_on = tk.BooleanVar(value=bool(self.config.get("monitor.terminal_observer", True)))
         m_sys.add_checkbutton(label="终端交互观察（UIA）", variable=terminal_on,
-                              command=lambda: self._toggle_terminal_observer(terminal_on.get()))
+                              command=d(lambda: self._toggle_terminal_observer(terminal_on.get())))
         menu.add_cascade(label="⚙ 设置", menu=m_sys)
 
     def _toggle_autostart(self):
@@ -906,6 +924,7 @@ class PetApp:
     def quit(self):
         self._closing = True
         try:
+            self._menu_controller.shutdown()   # DP43-R14：先确定性结束菜单
             self.ui.stop()
             self.monitor.stop()
             self.pet_manager.stop()

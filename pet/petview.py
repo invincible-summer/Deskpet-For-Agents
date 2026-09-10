@@ -85,7 +85,7 @@ class PetView:
 
     def __init__(self, view_id: str, master, view_config,
                  scheduler: AnimationScheduler,
-                 on_activate, on_menu, on_interact, on_moved,
+                 on_activate, on_context_menu, on_interact, on_moved,
                  on_double_vacant=None):
         self.view_id = view_id
         self.view_config = view_config
@@ -105,7 +105,10 @@ class PetView:
         self.window.bind_hit(self._hit)
         self.window.on_bubble_double = self._on_hit_tag
         self.window.on_body_double = self._on_body_double
-        self.window.on_menu = on_menu
+        # DP43-R14：context request 显式闭包携带本 view——生产路径
+        # 永远知道是哪只桌宠右键，不依赖任何隐式当前菜单上下文
+        self.window.on_context_menu = (
+            lambda x_root, y_root: on_context_menu(self, x_root, y_root))
         self.window.on_moved = lambda: on_moved(self)
         self.scheduler.register(self.cursor, self._on_frame)
         self._on_interact_cb = on_interact
@@ -569,10 +572,10 @@ class PetViewManager:
         # 不持久化；进程重启固定 False（下次启动至少一宠重新可见）。
         self.user_hidden = False
 
-    def set_hooks(self, on_activate, on_menu, on_interact, on_moved,
-                  on_double_vacant=None):
-        self._hooks = (on_activate, on_menu, on_interact, on_moved,
-                       on_double_vacant)
+    def set_hooks(self, on_activate, on_context_menu, on_interact,
+                  on_moved, on_double_vacant=None):
+        self._hooks = (on_activate, on_context_menu, on_interact,
+                       on_moved, on_double_vacant)
 
     def set_render_requester(self, cb) -> None:
         """注入 mark_dirty → coordinator.request_view 通路（v4.3 §5.1）。
@@ -604,12 +607,13 @@ class PetViewManager:
         if slot_id in self.views:
             return self.views[slot_id]
         view_config = self._slot_config(slot_id)
-        on_activate, on_menu, on_interact, on_moved, on_double_vacant = \
-            self._hooks or (lambda k: None, lambda m: None, lambda: None,
-                            lambda v: None, None)
+        (on_activate, on_context_menu, on_interact, on_moved,
+         on_double_vacant) = \
+            self._hooks or (lambda k: None, lambda v, x, y: None,
+                            lambda: None, lambda v: None, None)
         view = PetView(slot_id, self.root, view_config, self.scheduler,
-                       on_activate, on_menu, on_interact, on_moved,
-                       on_double_vacant)
+                       on_activate, on_context_menu, on_interact,
+                       on_moved, on_double_vacant)
         if self._render_request is not None:
             view._request_render = self._render_request
         if view.anchor is None:

@@ -46,7 +46,9 @@ class PetWindow:
 
         self.on_bubble_double = None  # cb(tag)  气泡双击（激活）
         self.on_body_double = None    # cb()     body 双击（互动/激活）
-        self.on_menu = None           # cb(menu) 右键菜单构建
+        # DP43-R14：右键只上报 context request（x_root, y_root）——
+        # 菜单的创建/销毁属于 TkContextMenuController，不属于窗口层
+        self.on_context_menu = None   # cb(x_root, y_root)
         self.on_moved = None          # cb()     拖动结束
 
     @property
@@ -198,34 +200,13 @@ class PetWindow:
         return "break"
 
     def _on_menu(self, ev):
-        menu = tk.Menu(self.root, tearoff=0)
-        if self.on_menu:
-            self.on_menu(menu)
-        # v4.3：桌宠窗口是 no-activate topmost，天然没有前台状态；
-        # 不做前台准备的 TrackPopupMenu 点击菜单外不收起（与托盘
-        # 菜单同一 Win32 缺陷）。
-        hwnd = 0
-        try:
-            hwnd = int(self.root.winfo_id())
-        except Exception:
-            pass
-        try:
-            if hwnd:
-                winkeys.prepare_menu_popup(hwnd)
-            menu.tk_popup(ev.x_root, ev.y_root)
-        finally:
-            if hwnd:
-                winkeys.finish_menu_popup(hwnd)
-            # v4.2.3 §9：finally 显式销毁，不依赖 Python GC 决定
-            # Tk menu widget 生命周期。
-            try:
-                menu.grab_release()
-            except tk.TclError:
-                pass
-            try:
-                menu.destroy()
-            except tk.TclError:
-                pass
+        """Button-3：只上报 (x_root, y_root)（DP43-R14）。
+
+        不创建 menu、不调用 Win32 popup helper——菜单生命周期由
+        TkContextMenuController 单一拥有。
+        """
+        if self.on_context_menu:
+            self.on_context_menu(ev.x_root, ev.y_root)
 
     def hit_button(self, x: int, y: int):
         if self._hit_cb:

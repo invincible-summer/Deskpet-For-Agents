@@ -265,10 +265,11 @@ class TkTests(unittest.TestCase):
 
 
 class MenuEphemeralLifecycleTests(unittest.TestCase):
-    """v4.2.3 §9 / DP43-R15：popup menu 的确定性销毁与 churn 上限。
+    """v4.2.3 §9 / DP43-R14/R15：popup menu 的确定性销毁与 churn 上限。
 
-    Tray 菜单已原生化（worker 线程内 HMENU，无 Tk widget）；本类只
-    保留通用 Tk menu 销毁原语 _destroy_menu 的合同。
+    Tray 菜单已原生化（worker 线程内 HMENU）；Pet 菜单由
+    TkContextMenuController 拥有（test_dp43_ui_lifecycle 覆盖）。
+    本类保留通用 Tk menu 销毁原语 _destroy_menu 的合同。
     """
 
     def _app(self):
@@ -307,46 +308,6 @@ class MenuEphemeralLifecycleTests(unittest.TestCase):
                      if app.root.tk.call('winfo', 'exists', p)]
             self.assertEqual(alive, [])
             # 无新增 after timer（菜单生命周期不靠定时器）
-        finally:
-            app.quit()
-
-
-class MenuForegroundPrepTests(unittest.TestCase):
-    """v4.3：Tk pet 菜单 tk_popup 前的 Win32 前台准备（Phase 2 将由
-    ContextMenuController 接管并移除该 helper；Tray 菜单已原生化）。
-    """
-
-    def _app(self):
-        from pet.app import PetApp
-        from pet.petview import PetView
-        cfg = MemoryConfig()
-        with patch.object(PetApp, '_reload_skins', lambda self: None), \
-             patch.object(PetView, 'load_skin', lambda self, bm: None):
-            return PetApp(cfg)
-
-    def test_pet_menu_prepares_foreground_before_popup(self):
-        from actions import winkeys as wk
-        app = self._app()
-        try:
-            view = app.pet_manager.views["pet-1"]
-            view.window.on_menu = lambda menu: None
-            calls = []
-
-            class _Ev:
-                x_root, y_root = 10, 20
-
-            with patch.object(wk, 'prepare_menu_popup',
-                              lambda h: calls.append(("prepare", h))
-                              or True), \
-                 patch.object(wk, 'finish_menu_popup',
-                              lambda h: calls.append(("finish", h))), \
-                 patch('tkinter.Menu.tk_popup',
-                       lambda self, x, y, entry="":
-                       calls.append("popup")):
-                view.window._on_menu(_Ev())
-            kinds = [c if isinstance(c, str) else c[0]
-                     for c in calls]
-            self.assertEqual(kinds, ["prepare", "popup", "finish"])
         finally:
             app.quit()
 
@@ -723,21 +684,19 @@ class TrayLifecycleTests(unittest.TestCase):
 
 
 class MenuCommandsAliveTests(unittest.TestCase):
-    """v4.3.1 菜单存活审计：关闭/仪表盘/外观/设置等所有菜单 entry
-    的 command 都是可调用的活按钮（无死按钮、无悬空回调）。
+    """v4.3.1 DP43-R14 菜单存活审计：桌宠右键菜单（含全部 cascade 子
+    菜单）的每个 command entry 都是活按钮——invoke 后业务 action 不
+    同步执行，menu teardown + idle 后 exactly once。
 
-    递归遍历 tray 菜单与桌宠右键菜单（含全部 cascade 子菜单），
-    逐个 invoke 每个 command entry；重侧效入口（退出/托盘启停/自启
-    注册表/重扫描）打桩，其余走真实实现。
+    Tray 菜单已原生化（worker 内 HMENU），语义映射由
+    test_tray_native 覆盖；本类只审计 Pet Tk 菜单 wiring。
     """
 
-    def _app(self):
+    def _app(self, cfg=None):
         from pet.app import PetApp
         from pet.petview import PetView
-        cfg = MemoryConfig()
-        with patch.object(PetApp, '_reload_skins', lambda self: None), \
-             patch.object(PetView, 'load_skin', lambda self, bm: None):
-            return PetApp(cfg)
+        with patch.object(PetApp, '_reload_skins', lambda self: None),              patch.object(PetView, 'load_skin', lambda self, bm: None):
+            return PetApp(cfg or MemoryConfig())
 
     def _walk(self, menu, invoked, path="menu"):
         """递归 invoke 全部 command entry；cascade 递归子菜单。"""
@@ -750,81 +709,85 @@ class MenuCommandsAliveTests(unittest.TestCase):
                 sub_path = menu.entrycget(i, "menu")
                 if sub_path:
                     sub = menu.nametowidget(sub_path)
-                    self._walk(sub, invoked, f"{path}/{menu.entrycget(i, 'label')}")
+                    self._walk(sub, invoked,
+                               f"{path}/{menu.entrycget(i, 'label')}")
             elif kind in ("command", "checkbutton", "radiobutton"):
                 label = menu.entrycget(i, "label")
-                menu.invoke(i)   # 死按钮：command 悬空/抛异常会在此失败
+                menu.invoke(i)   # 死按钮：command 悬空/抛异常在此失败
                 invoked.append(f"{path}/{label}")
-            # 分隔符跳过
 
-    def test_every_menu_entry_dispatches_without_error(self):
+    def test_every_menu_entry_dispatches_after_teardown_exactly_once(self):
         from pet import autostart
         app = self._app()
         try:
-            with patch.object(app, "quit") as quit_mock, \
-                 patch.object(app, "set_tray_enabled") as tray_mock, \
-                 patch.object(app, "toggle_autostart",
-                              return_value=True) as auto_mock, \
-                 patch.object(app.monitor, "rescan") as rescan_mock, \
-                 patch.object(app, "activate_agent") as act_mock, \
-                 patch.object(app, "_open_agent_picker") as picker_mock, \
-                 patch.object(app, "_rebuild_skin") as rebuild_mock:
-                # 桌宠右键菜单（非 fleet）；Tray 菜单已原生化（worker
-                # 内 HMENU，由 test_tray_native 覆盖语义映射）
+            counts = {}
+
+            def _spy(name, impl=lambda *a, **k: None):
+                def _fn(*a, **k):
+                    counts[name] = counts.get(name, 0) + 1
+                return _fn
+
+            with patch.object(app, "quit", _spy("quit")),                  patch.object(app, "set_tray_enabled",
+                              _spy("tray")),                  patch.object(app, "toggle_autostart",
+                              _spy("autostart")),                  patch.object(app.monitor, "rescan", _spy("rescan")),                  patch.object(app, "activate_agent", _spy("activate")),                  patch.object(app, "_open_agent_picker", _spy("picker")),                  patch.object(app, "_rebuild_skin", _spy("rebuild")):
                 pet_menu = tk.Menu(app.root, tearoff=0)
-                app._build_menu(pet_menu)
+                view = app.pet_manager.views["pet-1"]
+                app._build_pet_menu(pet_menu, view)
                 invoked = []
                 self._walk(pet_menu, invoked, "pet")
+                # deferred：invoke 后业务 action 尚未同步执行
+                self.assertEqual(counts, {},
+                                 "menu command 不得同步执行业务 action")
                 app._destroy_menu(pet_menu)
-                # 关键按钮逐项确认（label 可能带 emoji/空格）；"重新扫描"
-                # 是 tray 原生菜单项（test_tray_native 覆盖其语义映射）
+                app.root.update()   # teardown + idle 后 exactly once
                 joined = "\n".join(invoked)
                 for needle in ("退出", "仪表盘", "重建当前皮肤缓存",
                                "暂时隐藏桌宠", "摸摸头"):
                     self.assertIn(needle, joined)
-                self.assertTrue(quit_mock.called)          # 退出按钮活着
-                self.assertTrue(tray_mock.called)          # 设置→托盘图标
-                self.assertTrue(auto_mock.called)          # 设置→开机自启
-                self.assertTrue(rebuild_mock.called)       # 重建皮肤缓存
-                # rescan/activate 是 tray 原生菜单与 Agents 子菜单的
-                # 语义（无 Agent 会话下 pet 菜单不含激活项）
+                for name in ("quit", "tray", "autostart", "rebuild"):
+                    self.assertEqual(counts.get(name), 1,
+                                     f"{name} 必须 exactly once")
         finally:
             app.quit()
 
-    def test_fleet_menu_entries_dispatch(self):
-        from pet.app import PetApp
-        from pet.petview import PetView
+    def test_fleet_menu_entries_dispatch_with_explicit_view(self):
+        """Fleet：builder 显式 view（production 回调携带），不再手工
+        _menu_view。"""
         from pet.presentation import PresentationMode
         from tests.test_fleet_ui import FleetConfig, _slot, inst, snap
         from agents.models import AgentKind
         cfg = FleetConfig([_slot("pet-1", None), _slot("pet-2", None)])
-        with patch.object(PetApp, '_reload_skins', lambda self: None), \
-             patch.object(PetView, 'load_skin', lambda self, bm: None):
-            app = PetApp(cfg)
+        app = self._app(cfg)
         try:
-            from agents.terminal_service import WindowsTerminalService
-            app.monitor._terminal_service = WindowsTerminalService(None)
             app.presentation.set_concurrent_mode(PresentationMode.FLEET)
             a = inst(AgentKind.CODEX, 1)
-            app.monitor.instances = {a.key: a}
-            app.monitor.snapshots = {a.key: snap(a)}
+            b = inst(AgentKind.CLAUDE, 2, cwd="/w/q")
+            app.monitor.instances = {a.key: a, b.key: b}
+            app.monitor.snapshots = {a.key: snap(a), b.key: snap(b)}
             app._aggregate()
-            app._menu_view = app.pet_manager.views["pet-1"]
+            view = app.pet_manager.views["pet-1"]
+            self.assertTrue(view.agent_key)
             with patch.object(app, "quit"), \
-                 patch.object(app, "activate_agent"), \
+                 patch.object(app, "activate_agent") as act_mock, \
                  patch.object(app, "_open_agent_picker"), \
+                 patch.object(app, "_unbind_view"), \
                  patch.object(app, "set_tray_enabled"), \
                  patch.object(app, "toggle_autostart", return_value=True), \
                  patch.object(app, "_rebuild_skin"):
                 menu = tk.Menu(app.root, tearoff=0)
-                app._build_menu(menu)
+                app._build_pet_menu(menu, view)
                 invoked = []
                 self._walk(menu, invoked, "fleet")
                 app._destroy_menu(menu)
+                app.root.update()
             joined = "\n".join(invoked)
             for needle in ("打开此 Agent 终端", "更换 Agent", "解除绑定",
                            "隐藏此桌宠", "仪表盘", "退出"):
                 self.assertIn(needle, joined)
+            # fleet 激活作用于 exact view 的 agent
+            self.assertTrue(act_mock.called)
+            for call in act_mock.call_args_list:
+                self.assertEqual(call.args[0], view.agent_key)
         finally:
             app.quit()
 

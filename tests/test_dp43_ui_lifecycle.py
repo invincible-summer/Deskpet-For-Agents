@@ -522,5 +522,150 @@ class StartupOrderingRedTests(unittest.TestCase):
         self.assertIn('OK', result.stdout)
 
 
+# ================================================================ R14 §12.3
+class PetContextMenuControllerTests(unittest.TestCase):
+    """DP43-R14 §12.3：TkContextMenuController 生命周期/deferred 合同。"""
+
+    class _Ev:
+        x_root, y_root = 10, 20
+
+    def test_repeated_show_destroys_previous_single_active(self):
+        from pet.context_menu import TkContextMenuController
+        app = make_app()
+        try:
+            ctrl = app._menu_controller
+            menus = []
+            active_flags = []
+
+            def build(menu):
+                active_flags.append(ctrl.active)   # build 阶段必然 active
+                menus.append(menu)
+                menu.add_command(label="x")
+
+            with patch('tkinter.Menu.tk_popup',
+                       lambda self, x, y, entry="": None):
+                ctrl.show("owner", 1, 2, build)
+                self.assertEqual(active_flags, [True])
+                path = menus[0]._w
+                # show 返回 = popup 已确定性销毁
+                self.assertFalse(ctrl.active)
+                ctrl.show("owner2", 3, 4, build)
+            # 旧 popup 不因第二次 show 复活/残留
+            self.assertEqual(app.root.tk.call('winfo', 'exists', path), 0)
+            self.assertEqual(len(menus), 2)
+            ctrl.dismiss()
+            self.assertFalse(ctrl.active)
+            ctrl.dismiss()   # 幂等
+        finally:
+            app.quit()
+
+    def test_builder_exception_still_destroys(self):
+        from pet.context_menu import TkContextMenuController
+        app = make_app()
+        try:
+            ctrl = app._menu_controller
+
+            def bad_builder(menu):
+                menu.add_command(label="x")
+                raise RuntimeError("builder boom")
+
+            with patch('tkinter.Menu.tk_popup',
+                       lambda self, x, y, entry="": None):
+                ctrl.show("owner", 1, 2, bad_builder)   # 不向外抛
+            self.assertFalse(ctrl.active)
+        finally:
+            app.quit()
+
+    def test_deferred_waits_for_teardown_and_runs_once(self):
+        from pet.context_menu import TkContextMenuController
+        app = make_app()
+        try:
+            ctrl = app._menu_controller
+            calls = []
+
+            def build(menu):
+                menu.add_command(label="go",
+                                 command=ctrl.deferred(calls.append, "ran"))
+                # 菜单 active（native/Tk 交互阶段）时 invoke：
+                # 只发布 idle，不同步执行业务
+                menu.invoke(0)
+                self.assertEqual(calls, [])
+                self.assertTrue(ctrl.active)
+
+            with patch('tkinter.Menu.tk_popup',
+                       lambda self, x, y, entry="": None):
+                ctrl.show("owner", 1, 2, build)
+            # show 返回 = teardown 完成；idle 后 exactly once
+            app.root.update()
+            self.assertEqual(calls, ["ran"])
+            app.root.update()
+            self.assertEqual(calls, ["ran"])   # 不重复
+        finally:
+            app.quit()
+
+    def test_deferred_discarded_when_closing_except_quit(self):
+        from pet.context_menu import TkContextMenuController
+        app = make_app()
+        try:
+            ctrl = app._menu_controller
+            calls = []
+            app._closing = True
+            ctrl.deferred(calls.append, "normal")()
+            ctrl.deferred(calls.append, "quit", allow_when_closing=True)()
+            app.root.update()
+            self.assertEqual(calls, ["quit"])   # closing 只放行 quit
+            app._closing = False
+        finally:
+            app.quit()
+
+    def test_fleet_context_request_carries_own_view(self):
+        """Fleet pet-1/pet-2 各自右键 → builder 收到 exact view。"""
+        from pet.presentation import PresentationMode
+        from tests.test_fleet_ui import FleetConfig, _slot, inst, snap
+        from agents.models import AgentKind
+        cfg = FleetConfig([_slot("pet-1"), _slot("pet-2")])
+        app = make_app(cfg)
+        try:
+            app.presentation.set_concurrent_mode(PresentationMode.FLEET)
+            a = inst(AgentKind.CODEX, 1)
+            b = inst(AgentKind.CLAUDE, 2, cwd="/w/q")
+            app.monitor.instances = {a.key: a, b.key: b}
+            app.monitor.snapshots = {a.key: snap(a), b.key: snap(b)}
+            app._aggregate()
+            v1 = app.pet_manager.views["pet-1"]
+            v2 = app.pet_manager.views["pet-2"]
+            seen = []
+            with patch.object(app, "_build_pet_menu",
+                              side_effect=lambda menu, view:
+                              seen.append(view)), \
+                 patch('tkinter.Menu.tk_popup',
+                       lambda self, x, y, entry="": None):
+                v1.window._on_menu(self._Ev())
+                app.root.update()
+                v2.window._on_menu(self._Ev())
+                app.root.update()
+            self.assertEqual(seen, [v1, v2])   # 各自携带 exact view
+        finally:
+            app.quit()
+
+    def test_controller_churn_leaves_no_after_timers(self):
+        app = make_app()
+        try:
+            ctrl = app._menu_controller
+            with patch('tkinter.Menu.tk_popup',
+                       lambda self, x, y, entry="": None):
+                for i in range(100):
+                    ctrl.show("owner", 1, 2,
+                              lambda m: m.add_command(label=str(i)))
+            ctrl.dismiss()
+            app.root.update()
+            # Tk after 队列为空（菜单生命周期不靠定时器）
+            afters = app.root.tk.splitlist(
+                app.root.tk.call('after', 'info'))
+            self.assertEqual(len(afters), 0)
+        finally:
+            app.quit()
+
+
 if __name__ == '__main__':
     unittest.main()
