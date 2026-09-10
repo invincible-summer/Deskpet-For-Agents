@@ -35,7 +35,7 @@ def _make_app():
     from pet.app import PetApp
     from pet.petview import PetView
     from tests.test_ui import MemoryConfig
-    with patch.object(PetApp, "_reload_skins", lambda self: None), \
+    with\
          patch.object(PetView, "load_skin", lambda self, bm: None):
         app = PetApp(MemoryConfig())
         app.pet_manager.activate_skin_runtime()

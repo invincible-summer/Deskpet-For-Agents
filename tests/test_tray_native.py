@@ -45,7 +45,7 @@ class MemoryConfig:
 def make_app(cfg=None):
     from pet.app import PetApp
     from pet.petview import PetView
-    with patch.object(PetApp, '_reload_skins', lambda self: None), \
+    with\
          patch.object(PetView, 'load_skin', lambda self, bm: None):
         return PetApp(cfg or MemoryConfig())
 

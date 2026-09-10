@@ -145,7 +145,6 @@ class PetApp:
         self.pet_manager.set_render_requester(self.ui.request_view)
 
         self._janitor_after = None
-        self._skin_after = None
         self._reassert_after = None
         # v4.3 §4.5：toast 过期用"最近 expiry 的单次 deadline"
         self._toast_after = None
@@ -571,11 +570,6 @@ class PetApp:
         # 350ms 最终尺寸 build debounce + 保存策略回调）
         self.appearance.set_global("scale", scale)
 
-    def _reload_skins(self):
-        self._skin_after = None
-        for view in self.pet_manager.views.values():
-            view.load_skin(self.pet_manager.build_manager)
-
     def _switch_skin(self, name: str):
         self.appearance.set_global("skin", name)
 
@@ -804,23 +798,10 @@ class PetApp:
             elif command == "quit":
                 self.quit()
 
-    # ================= ephemeral 菜单生命周期（v4.2.3 §9） =================
-    def _destroy_menu(self, menu):
-        """幂等销毁一个 popup menu；任何阶段失败都不抛 TclError。"""
-        if menu is None:
-            return
-        try:
-            menu.grab_release()
-        except tk.TclError:
-            pass
-        try:
-            menu.unpost()
-        except tk.TclError:
-            pass
-        try:
-            menu.destroy()
-        except tk.TclError:
-            pass
+    # ================= ephemeral 菜单生命周期 =================
+    # DP43-R20：_destroy_menu/_active_menu/_dismiss_active_menu 已删除——
+    # Pet 菜单销毁由 TkContextMenuController._destroy 单一拥有；Tray
+    # 菜单为原生 HMENU（worker 内销毁）。
 
     def _agents_submenu(self, menu):
         """Agents 子菜单：每项捕获 exact key（§8.4/§8.5）；command

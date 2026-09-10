@@ -81,7 +81,7 @@ class FleetUiTests(unittest.TestCase):
         from pet.app import PetApp
         from pet.petview import PetView
         cfg = FleetConfig(slots)
-        with patch.object(PetApp, "_reload_skins", lambda self: None), \
+        with\
              patch.object(PetView, "load_skin", lambda self, bm: None):
             app = PetApp(cfg)
             app.pet_manager.activate_skin_runtime()

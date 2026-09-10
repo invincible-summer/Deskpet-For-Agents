@@ -319,7 +319,7 @@ def check_dashboard_current_page_only(checks):
     from pet.app import PetApp
     from pet.petview import PetView
     from tests.test_ui import MemoryConfig
-    with patch.object(PetApp, "_reload_skins", lambda self: None), \
+    with\
             patch.object(PetView, "load_skin", lambda self, bm: None):
         app = PetApp(MemoryConfig())
         app.pet_manager.activate_skin_runtime()
@@ -404,7 +404,7 @@ def check_dirty_views_real_apps(checks):
         slots = [_slot("pet-1"), _slot("pet-2")] if mode == "fleet" \
             else [_slot("pet-1")]
         cfg = FleetConfig(slots)
-        with patch.object(PetApp, "_reload_skins", lambda self: None), \
+        with\
                 patch.object(PetView, "load_skin", lambda self, bm: None):
             app = PetApp(cfg)
             app.pet_manager.activate_skin_runtime()
@@ -567,8 +567,10 @@ def check_tray_bounded_structural(checks):
     icon.events = queue_mod.Queue(maxsize=TRAY_EVENT_QUEUE_MAX)
     icon.dropped_events = 0
     from pet.tray import WM_APP_TRAY
+    v4 = TrayIcon._ICON_ID << 16   # VERSION_4：HIWORD=icon id
     for _ in range(TRAY_EVENT_QUEUE_MAX * 3):
-        icon._handle_message(1, WM_APP_TRAY, 0, 0x0202)   # 满后丢弃不阻塞
+        icon._handle_message(1, WM_APP_TRAY, 0,
+                             v4 | 0x0202)   # 满后丢弃不阻塞
     checks.append((
         f"tray 事件队列 ≤ {TRAY_EVENT_QUEUE_MAX}"
         f"（qsize={icon.events.qsize()}）",
@@ -576,6 +578,80 @@ def check_tray_bounded_structural(checks):
     checks.append((
         f"tray 单次 bridge drain ≤ {TRAY_DRAIN_MAX}",
         TRAY_DRAIN_MAX <= 8))
+
+
+def check_dp43_reliability_structural(checks):
+    """DP43-R14..R22（plan §12.7）结构合同：
+
+    - context menu 无常驻 timer（churn 后 after 队列空）；
+    - Tray restart timer 已不存在（旧 symbol 归零）；
+    - bootstrap job 复用现有 skin lane（不新增线程）；
+    - SkinCatalog UI 读不做 I/O（scan 打桩为 raise 仍可读）；
+    - shutdown timeout 是单一全局 deadline（不是局部累加）；
+    - 常驻线程预算不增（context_menu/dashboard 无新线程）。
+    """
+    import tkinter as tk
+    from pet.context_menu import TkContextMenuController
+    root = tk.Tk()
+    root.withdraw()
+    ctrl = TkContextMenuController(root)
+    from unittest.mock import patch as _patch
+    with _patch('tkinter.Menu.tk_popup', lambda self, x, y, entry="": None):
+        for i in range(100):
+            ctrl.show("owner", 1, 2, lambda m: m.add_command(label=str(i)))
+    ctrl.dismiss()
+    root.update()
+    afters = root.tk.splitlist(root.tk.call('after', 'info'))
+    checks.append(("context menu churn 后无 after timer",
+                   len(afters) == 0))
+    root.destroy()
+
+    repo = Path(__file__).resolve().parents[1]
+    app_src = (repo / "pet" / "app.py").read_text(encoding="utf-8")
+    checks.append(("tray restart timer 不存在（_tray_restart_after 归零）",
+                   "_tray_restart_after" not in app_src))
+    checks.append(("app 无 _reload_skins/_skin_after 旧路径",
+                   "_reload_skins" not in app_src
+                   and "_skin_after" not in app_src))
+
+    import pet.skins as skins_mod
+    cat = skins_mod.SkinCatalog()
+    with _patch.object(skins_mod, "_scan_skins",
+                       side_effect=AssertionError("no I/O")):
+        snap = cat.snapshot()
+    checks.append(("SkinCatalog UI 读纯内存（scan 打桩仍可读）",
+                   skins_mod.BUILTIN_SKIN in snap))
+
+    from pet.app import SHUTDOWN_BUDGET_SEC
+    monitor_src = (repo / "agents" / "monitor.py").read_text(encoding="utf-8")
+    checks.append((
+        "shutdown 为单一全局 deadline（无 6/3/2s 局部累加）",
+        SHUTDOWN_BUDGET_SEC == 3.0
+        and "timeout=6.0" not in monitor_src
+        and "timeout=3.0" not in monitor_src
+        and "timeout=2.0" not in monitor_src
+        and "_remaining()" in monitor_src))
+
+    for mod, label in (("pet/context_menu.py", "context_menu"),
+                       ("pet/dashboard.py", "dashboard")):
+        src = (repo / mod).read_text(encoding="utf-8")
+        checks.append((f"{label} 无常驻线程", "threading.Thread" not in src))
+
+    from pet.skins import SkinBuildManager
+    bm = SkinBuildManager()
+    started = []
+    real_spawn = bm._spawn
+
+    def spy_spawn(req):
+        started.append(req.kind.value)
+        real_spawn(req)
+
+    bm._spawn = spy_spawn
+    bm.request_bootstrap([("builtin-cat", 240, 12)])   # 直接起在同一 lane
+    lane_name = bm._active_thread.name if bm._active_thread else ""
+    checks.append(("bootstrap 复用现有 skin lane（deskpet-convert）",
+                   started == ["bootstrap"] and lane_name == "deskpet-convert"))
+    bm.stop()
 
 
 def run(report_path: str = "") -> int:
@@ -590,6 +666,7 @@ def run(report_path: str = "") -> int:
     check_maintenance_coalescing(checks)
     check_skin_lane_single_active(checks)
     check_tray_bounded_structural(checks)
+    check_dp43_reliability_structural(checks)
 
     for _stream in (sys.stdout, sys.stderr):
         if _stream and hasattr(_stream, "reconfigure"):

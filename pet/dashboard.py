@@ -20,7 +20,6 @@ from .theme import LIGHT, STATUS_COLOR, pick_font
 from .ui_coordinator import UiDirty
 from .version import APP_LABEL as APP_VERSION
 from .widgets import (
-    Card,
     DashboardMetrics,
     DiscreteSlider,
     Expander,

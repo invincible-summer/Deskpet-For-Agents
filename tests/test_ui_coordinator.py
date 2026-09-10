@@ -333,7 +333,7 @@ class DirtyViewProtocolTests(unittest.TestCase):
         from pet.petview import PetView
         from pet.presentation import PresentationMode
         cfg = FleetConfig([_slot(s) for s in slots])
-        with patch.object(PetApp, "_reload_skins", lambda self: None), \
+        with\
              patch.object(PetView, "load_skin", lambda self, bm: None):
             app = PetApp(cfg)
             app.pet_manager.activate_skin_runtime()
@@ -368,7 +368,7 @@ class DirtyViewProtocolTests(unittest.TestCase):
         from pet.petview import PetView
         from pet.presentation import PresentationMode
         cfg = FleetConfig([_slot("pet-1")])
-        with patch.object(PetApp, "_reload_skins", lambda self: None), \
+        with\
              patch.object(PetView, "load_skin", lambda self, bm: None):
             app = PetApp(cfg)
             app.pet_manager.activate_skin_runtime()

@@ -89,7 +89,7 @@ class AppHarness:
         from pet.petview import PetView
         self._real_load_skin = PetView.load_skin
         cfg = FleetConfig(slots)
-        with patch.object(PetApp, "_reload_skins", lambda self: None), \
+        with\
              patch.object(PetView, "load_skin", lambda self, bm: None):
             self.app = PetApp(cfg)
             self.app.pet_manager.activate_skin_runtime()

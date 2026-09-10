@@ -36,7 +36,7 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 - 并发 AGGREGATE（单宠聚合）：每张候选卡在**同一桌宠上叠成一摞气泡**（V4.1.4——最底一张带指向桌宠的倒三角尾巴，上方卡片无尾巴、卡片间只留小间隔）；**双击对应气泡 → 唤起该气泡对应 Agent 的 Terminal**；双击桌宠 → 只互动。唤起结果（如"已打开终端"）**只显示在被双击的那张气泡上**，其他气泡不受影响、叠层不收起（V4.1.4）
 - 并发 FLEET（多宠分离）：双击各自的桌宠或气泡 → 唤起各自 Agent 的 Terminal
 
-气泡/桌宠单击不激活。仪表盘卡片"打开终端"按钮与托盘 Agents 子菜单同样按 exact agent_key 唤起。托盘左键 = 显示/恢复桌宠（绝不隐藏已可见的桌宠），右键 = 完整菜单。
+气泡/桌宠单击不激活。仪表盘卡片"打开终端"按钮与托盘 Agents 子菜单同样按 exact agent_key 唤起。托盘左键 = 显示/恢复桌宠（绝不隐藏已可见的桌宠），右键/键盘菜单键 = native context menu。
 
 ## 功能
 
@@ -44,10 +44,13 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 - **语义化状态气泡**：`Agent · Mode · Phase` + Goal（≤120 字）+ 当前活动摘要（≤160 字，本地规则压缩，不调用 LLM）
 - **等待审批检测**：Kimi 来自 wire durable `interaction.request(kind=approval)`（EXACT；legacy `ApprovalRequest`/`approval.request` 兼容兜底），`question`/`user_tool` 归类为 INPUT 而非 WAITING；Codex/Claude 来自 Windows Terminal UIA 当前可见审批 UI（高置信 + 1.5s TTL 复检）——**静默永远不被推断为等待审批**
 - **多 Agent**：自动跟随（WAITING > INPUT > ERROR > WORKING …，工作中粘性），或并发模式（单宠聚合/多宠分离）
-- **仪表盘 V4.3**：左侧导航七页（概览/Agents/桌宠/外观/监听与隐私/诊断/设置），页面懒构建 + retained 行（状态变化只 configure 不重建）、只有当前页刷新；失去焦点自动收起；PID/HWND 等运行期细节收在“高级诊断”折叠区
-- **每只桌宠独立皮肤（V4.3）**：Fleet 每个槽位可单独选皮肤（同一皮肤可被多只重复选择），“跟随全局”继承；换皮先请求构建、完成前保持当前画面，失败保持旧画面绝不空白
+- **仪表盘 V4.3**：左侧导航七页（概览/Agents/桌宠/外观/监听与隐私/诊断/设置），页面懒构建 + retained 行（状态变化只 configure 不重建）、只有当前页刷新；**retained Toplevel——失去焦点绝不自动收起**（V4.3.1：关闭只来自 X / 显式隐藏 / 退出）；PID/HWND 等运行期细节收在"高级诊断"折叠区
+- **每只桌宠独立皮肤（V4.3）**：Fleet 每个槽位可单独选皮肤（同一皮肤可被多只重复选择），"跟随全局"继承；换皮先请求构建、完成前保持当前画面，失败保持旧画面绝不空白
 - **外观即时生效（V4.3）**：整体大小/速度/气泡宽高/文字缩放全部为离散值滑块，每跨一档立即应用；无 Apply 按钮，配置经 650ms debounce 原子落盘
 - **非阻塞 UI（V4.3）**：单一 UiCoordinator bridge timer（125/200/500ms 三档自适应）+ 合并式 render flush；Monitor 语义 revision 不变则零 reconcile；冷动画帧每 idle slice 最多解码 1 帧、frame 级全局 LRU 保护正在显示的帧；配置保存在独立 transient 线程写盘；皮肤导入（复制/校验/manifest）在后台单 job lane 进行
+- **原生托盘菜单（V4.3.1）**：托盘右键/键盘菜单键 = **标准 Windows native context menu**（`NOTIFYICON_VERSION_4` + `WM_CONTEXTMENU` + `TrackPopupMenuEx`，一次手势恰一个菜单，菜单在托盘线程内确定性销毁）；托盘左键/键盘激活 = 显示/恢复桌宠
+- **首帧优先启动（V4.3.1）**：首个桌宠窗口的可见首帧（纯 Tk 启动占位）先于 Monitor 扫描 / UIA 引导 / 托盘加载 / 皮肤缓存维护；皮肤 catalog 纯内存快照，磁盘扫描全部在锁外的后台 lane
+- **确定性退出（V4.3.1）**：hide-first + 单一 3s 绝对 deadline——菜单先结束、可见窗口立即隐藏，所有后台子系统只用全局剩余预算回收，无局部超时叠加、不留孤儿 converter
 - **双击桌宠/气泡/卡片按钮**：唤起该 Agent 所在的 Windows Terminal 窗口（公共 Win32 API 恢复并前置；foreground 被拒时闪烁任务栏；AGGREGATE 下双击桌宠只互动）
 - **系统集成**：托盘图标（程序内绘制的原创小猫，**不使用桌宠形象素材**）、开机自启、隐藏、换肤、缩放、锁定动画
 - **隐私**：`/proc/<pid>/environ` 只在 WSL 内部按 allowlist（`WT_SESSION`/`CODEX_HOME` 等 9 项）过滤后才进入 Python；终端文本只在内存、绝不落盘
@@ -118,7 +121,9 @@ Windows Terminal 没有 `WT_SESSION → tab/pane` 公开接口，DeskPet 只做 
 
 ```
 main.py                 入口（DPI 感知、单实例互斥）
-pet/                    UI：app/dashboard/bubble/labels/petwindow/animator/skins/tray/config
+pet/                    UI：app/dashboard/bubble/labels/petwindow/context_menu/
+                        animator/skins/tray/config（context_menu = 单一
+                        Tk 右键菜单 owner + deferred 语义发布）
 agents/
   models.py             Status/Phase/Mode/Observation/AgentInstance/TerminalWindowBinding/
                         TerminalObservationBinding/AgentTarget/ActivationCode

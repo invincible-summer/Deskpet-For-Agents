@@ -16,6 +16,19 @@
 - [pet/autostart.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/pet/autostart.py) — HKCU Run 健康校验与当前解释器路径生成。
 - [tests/benchmark_monitor.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/tests/benchmark_monitor.py) — Monitor/UIA 有界队列和资源预算基准。
 
+## v4.3.1 reliability closure（DP43-R14..R22）上游依据
+
+- [Notifications and the Notification Area](https://learn.microsoft.com/en-us/windows/win32/shell/notification-area) — 任务栏通知区 context menu 的官方交互模型（TrackPopupMenu 前的前台准备、菜单结束后 NIM_SETFOCUS）。
+- [Shell_NotifyIconW](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyiconw) — NIM_ADD/NIM_MODIFY/NIM_DELETE/NIM_SETFOCUS/NIM_SETVERSION 消息语义与返回值合同；NIM_SETVERSION 必须在每次 NIM_ADD 后调用。
+- [NOTIFYICONDATAW](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-notifyicondataw) — NOTIFYICON_VERSION_4 回调组成：LOWORD(lParam)=通知事件（WM_CONTEXTMENU/NIN_SELECT/NIN_KEYSELECT/鼠标消息）、HIWORD(lParam)=icon id、wParam=锚点坐标；NIF_SHOWTIP 保留标准 tooltip。
+- [TrackPopupMenuEx](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-trackpopupmenuex) — TPM_RETURNCMD 返回所选 command id（0=取消）；native HMENU 生命周期。
+- [DestroyMenu](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-destroymenu) — root menu 销毁递归释放 submenus；菜单资源不依赖 GC。
+- [DestroyIcon](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-destroyicon) — 文件加载（非 shared）icon 由调用方释放；shared icon（LoadIconW 所得）不得 Destroy。
+- [WM_CONTEXTMENU](https://learn.microsoft.com/en-us/windows/win32/menurc/wm-contextmenu) — v4 Shell 对鼠标右键与键盘 context selection 统一发送 WM_CONTEXTMENU（替代 legacy WM_RBUTTONDOWN/UP 组合）的依据。
+- [CreateWindowExW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createwindowexw) / [GetModuleHandleW](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandlew) / [LoadImageW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadimagew) — tray worker 隐藏窗口与 HICON 的 64 位 ABI 原型声明依据（handle 返回值不得依赖 ctypes 默认 C int restype）。
+- [Python 3.12 ctypes](https://docs.python.org/3.12/library/ctypes.html) — 未声明 restype 的 foreign function 默认按 C int 处理（指针截断风险）。
+- [Tk `tk_popup`](https://www.tcl-lang.org/man/tcl9.1/TkCmd/popup.html) — Tk popup menu 的 traversal/lifecycle 入口；DP43-R14 的 deferred-after-teardown 菜单语义基础。
+
 ## Historical baselines
 
 - [DeskPet v4.2.2 audit baseline commit](https://github.com/invincible-summer/Deskpet-For-Agents/commit/3d0ab8e515cd79fa703ee62138789b00f3c8f474) — v4.2.3 计划所依据的固定代码基线（历史追溯）。

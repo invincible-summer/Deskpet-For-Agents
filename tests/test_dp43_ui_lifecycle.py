@@ -70,7 +70,7 @@ def make_app(cfg=None):
     """
     from pet.app import PetApp
     from pet.petview import PetView
-    with patch.object(PetApp, '_reload_skins', lambda self: None), \
+    with\
          patch.object(PetView, 'load_skin', lambda self, bm: None):
         app = PetApp(cfg or MemoryConfig())
     app._disarm_first_map_trigger()
@@ -577,7 +577,7 @@ class StartupOrderingRedTests(unittest.TestCase):
             scans.append(1)
             return orig_scan()
 
-        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+        with\
              patch.object(SkinBuildManager, 'request', spy_request), \
              patch.object(skins_mod, '_scan_skins', spy_scan), \
              patch.object(PetView, 'redraw', lambda self: None):
@@ -817,7 +817,7 @@ class StartupFlowTests(unittest.TestCase):
         from pet.petview import PetView
         monitor_mod, FakeMonitor = self._fake_monitor_module()
         with patch.object(monitor_mod, "Monitor", FakeMonitor), \
-             patch.object(PetApp, '_reload_skins', lambda self: None), \
+\
              patch.object(PetView, 'load_skin', lambda self, bm: None):
             app = PetApp(MemoryConfig())
         return app

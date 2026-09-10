@@ -483,7 +483,7 @@ class AggregateUiSmokeTests(unittest.TestCase):
                 pass
 
         from pet.petview import PetView
-        with patch.object(PetApp, "_reload_skins", lambda self: None),              patch.object(PetView, "load_skin", lambda self, bm: None):
+        with patch.object(PetView, "load_skin", lambda self, bm: None):
             app = PetApp(UiConfig())
             app.pet_manager.activate_skin_runtime()
             app._disarm_first_map_trigger()

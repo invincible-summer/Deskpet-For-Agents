@@ -99,76 +99,6 @@ class AnimatorUnitsTests(unittest.TestCase):
         self.assertEqual(cursor.frame_index, 0)
 
 
-class CardWidgetTests(unittest.TestCase):
-    """Card 必须由内容撑起高度，且 canvas 窗口项不可被删除。"""
-
-    def setUp(self):
-        try:
-            import tkinter as tk
-        except Exception:
-            raise unittest.SkipTest("no display")
-        self.root = tk.Tk()
-        self.root.withdraw()
-
-    def tearDown(self):
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-
-    def _card_with_content(self, padding=12):
-        from pet.widgets import Card
-        card = Card(self.root, padding=padding)
-        card.pack(fill="x")
-        inner = card.body
-        import tkinter as tk
-        tk.Label(inner, text="Codex · D:/work/deskpet").pack(anchor="w")
-        tk.Label(inner, text="Live 2   Waiting 1").pack(anchor="w")
-        import tkinter.ttk as ttk
-        ttk.Button(inner, text="打开终端").pack(anchor="e")
-        return card
-
-    def test_card_grows_to_content_height(self):
-        card = self._card_with_content()
-        self.root.update_idletasks()
-        want = card.body.winfo_reqheight() + 2 * 12
-        # 请求尺寸即可证明"内容撑起卡片"（withdrawn root 下 actual 恒 1）
-        self.assertGreaterEqual(card.winfo_reqheight(), want - 1)
-        self.assertGreater(card.winfo_reqheight(), 30)   # 回归：修复前恒为 1
-        self.root.deiconify()
-        self.root.update()
-        self.assertGreaterEqual(card.winfo_height(), want - 1)
-
-    def test_card_window_item_survives_resize(self):
-        card = self._card_with_content()
-        self.root.update_idletasks()
-        self.root.update()
-        # 触发一次 canvas resize（宽度变化）
-        card.configure(width=600)
-        card._canvas.configure(width=600)
-        self.root.update_idletasks()
-        self.root.update()
-        self.assertEqual(card._canvas.type(card._window), "window")
-        # body 必须仍挂在 canvas 上（回归：delete("all") 曾把它删掉）
-        self.assertEqual(card.body.winfo_parent(), str(card._canvas))
-        self.assertGreaterEqual(card.body.winfo_reqheight(), 1)
-
-    def test_expander_toggle_grows_card(self):
-        from pet.widgets import Card, Expander
-        card = Card(self.root, padding=12)
-        card.pack(fill="x")
-        import tkinter as tk
-        exp = Expander(card.body, "高级")
-        exp.pack(fill="x")
-        tk.Label(exp.body, text="间隔 3.0 秒").pack(anchor="w")
-        self.root.update_idletasks()
-        h_closed = card.winfo_height()
-        exp.toggle()
-        self.root.update_idletasks()
-        self.root.update()
-        self.assertGreater(card.winfo_height(), h_closed)
-
-
 class BubbleTailTests(unittest.TestCase):
     """尾巴尖端必须落在 pet_top（桌宠顶部），不得伸到窗口底。"""
 
@@ -227,51 +157,6 @@ class BubbleTailTests(unittest.TestCase):
         import pet.bubble as bubble
         self.assertFalse(hasattr(bubble, "AgentStackBubbleRenderer"))
 
-
-class HelpDotTests(unittest.TestCase):
-    """？帮助图标：悬浮提示显示/隐藏（注释不写进界面正文）。"""
-
-    def setUp(self):
-        try:
-            import tkinter as tk
-        except Exception:
-            raise unittest.SkipTest("no display")
-        import tkinter as tk
-        self.root = tk.Tk()
-        self.root.withdraw()
-
-    def tearDown(self):
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-
-    def test_show_creates_tooltip_and_hide_destroys(self):
-        from pet.widgets import HelpDot
-        dot = HelpDot(self.root, "这是说明文字", bg="#F7F8F6")
-        dot.pack()
-        self.root.update_idletasks()
-        self.root.update()
-        self.assertIsNone(dot._tip)
-        dot._show()
-        self.assertIsNotNone(dot._tip)
-        self.assertTrue(dot._tip.winfo_exists())
-        # 提示窗内有完整文字
-        texts = [w for w in dot._tip.winfo_children()
-                 if isinstance(w, __import__("tkinter").Label)]
-        self.assertEqual(texts[0].cget("text"), "这是说明文字")
-        dot._hide()
-        self.assertIsNone(dot._tip)
-
-    def test_empty_text_never_shows(self):
-        from pet.widgets import HelpDot
-        dot = HelpDot(self.root, "")
-        dot._show()
-        self.assertIsNone(dot._tip)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class UiContractTests(unittest.TestCase):
@@ -337,6 +222,7 @@ class UiContractTests(unittest.TestCase):
         src = self._source("pet", "dashboard.py")
         for required in ("更换 Agent", "解除绑定"):
             self.assertIn(required, src)
+
 
 
 class ScrollableFrameAdaptiveTests(unittest.TestCase):

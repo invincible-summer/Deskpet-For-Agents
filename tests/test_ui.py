@@ -269,14 +269,14 @@ class MenuEphemeralLifecycleTests(unittest.TestCase):
 
     Tray 菜单已原生化（worker 线程内 HMENU）；Pet 菜单由
     TkContextMenuController 拥有（test_dp43_ui_lifecycle 覆盖）。
-    本类保留通用 Tk menu 销毁原语 _destroy_menu 的合同。
+    本类保留通用 Tk menu 销毁原语（controller._destroy）的合同。
     """
 
     def _app(self):
         from pet.app import PetApp
         from pet.petview import PetView
         cfg = MemoryConfig()
-        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+        with\
              patch.object(PetView, 'load_skin', lambda self, bm: None):
             app = PetApp(cfg)
             app.pet_manager.activate_skin_runtime()
@@ -289,11 +289,12 @@ class MenuEphemeralLifecycleTests(unittest.TestCase):
             import tkinter as tkmod
             menu = tkmod.Menu(app.root, tearoff=0)
             path = menu._w
-            app._destroy_menu(menu)
+            destroy = app._menu_controller._destroy
+            destroy(menu)
             self.assertEqual(app.root.tk.call('winfo', 'exists', path), 0)
             # 幂等：重复 destroy / None 不抛
-            app._destroy_menu(menu)
-            app._destroy_menu(None)
+            destroy(menu)
+            destroy(None)
         finally:
             app.quit()
 
@@ -305,7 +306,7 @@ class MenuEphemeralLifecycleTests(unittest.TestCase):
             for _ in range(1000):
                 menu = tkmod.Menu(app.root, tearoff=0)
                 paths.append(menu._w)
-                app._destroy_menu(menu)
+                app._menu_controller._destroy(menu)
             # 所有历史 menu widget 均已销毁（无线性增长）
             alive = [p for p in paths
                      if app.root.tk.call('winfo', 'exists', p)]
@@ -327,7 +328,7 @@ class DashboardStableToplevelTests(unittest.TestCase):
         from pet.app import PetApp
         from pet.petview import PetView
         cfg = MemoryConfig()
-        with patch.object(PetApp, '_reload_skins', lambda self: None),              patch.object(PetView, 'load_skin', lambda self, bm: None):
+        with patch.object(PetView, 'load_skin', lambda self, bm: None):
             app = PetApp(cfg)
             app.pet_manager.activate_skin_runtime()
             app._disarm_first_map_trigger()
@@ -395,7 +396,7 @@ class AppTests(unittest.TestCase):
         from agents.models import AgentInstance, AgentKind, Snapshot, Status, Phase, Mode
         cfg = MemoryConfig()
         from pet.petview import PetView
-        with patch.object(PetApp, '_reload_skins', lambda self: None), patch.object(PetView, 'load_skin', lambda self, bm: None):
+        with patch.object(PetView, 'load_skin', lambda self, bm: None):
             app = PetApp(cfg)
             app.pet_manager.activate_skin_runtime()
             app._disarm_first_map_trigger()
@@ -451,7 +452,7 @@ class TrayDashboardVisibilityTests(unittest.TestCase):
             cfg = ConcurrentConfig(slots)
         else:
             cfg = MemoryConfig()
-        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+        with\
              patch.object(PetView, 'load_skin', lambda self, bm: None):
             app = PetApp(cfg)
             app.pet_manager.activate_skin_runtime()
@@ -700,7 +701,7 @@ class MenuCommandsAliveTests(unittest.TestCase):
     def _app(self, cfg=None):
         from pet.app import PetApp
         from pet.petview import PetView
-        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+        with\
              patch.object(PetView, 'load_skin', lambda self, bm: None):
             app = PetApp(cfg or MemoryConfig())
         app.pet_manager.activate_skin_runtime()
@@ -747,7 +748,7 @@ class MenuCommandsAliveTests(unittest.TestCase):
                 # deferred：invoke 后业务 action 尚未同步执行
                 self.assertEqual(counts, {},
                                  "menu command 不得同步执行业务 action")
-                app._destroy_menu(pet_menu)
+                app._menu_controller._destroy(pet_menu)
                 app.root.update()   # teardown + idle 后 exactly once
                 joined = "\n".join(invoked)
                 for needle in ("退出", "仪表盘", "重建当前皮肤缓存",
@@ -787,7 +788,7 @@ class MenuCommandsAliveTests(unittest.TestCase):
                 app._build_pet_menu(menu, view)
                 invoked = []
                 self._walk(menu, invoked, "fleet")
-                app._destroy_menu(menu)
+                app._menu_controller._destroy(menu)
                 app.root.update()
             joined = "\n".join(invoked)
             for needle in ("打开此 Agent 终端", "更换 Agent", "解除绑定",
@@ -815,7 +816,7 @@ class QuitImageReleaseTests(unittest.TestCase):
     def _app(self):
         from pet.app import PetApp
         from pet.petview import PetView
-        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+        with\
              patch.object(PetView, 'load_skin', lambda self, bm: None):
             app = PetApp(MemoryConfig())
             app.pet_manager.activate_skin_runtime()

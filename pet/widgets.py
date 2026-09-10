@@ -1,7 +1,8 @@
 """轻量自定义 ttk/tk 控件（v4plan §2/§13）：只依赖 Tk/ttk。
 
-NavButton / Card / StatusChip / SegmentedControl / SettingCard /
-Expander / ScrollableFrame —— 不引入 Qt/CustomTkinter/ttkbootstrap。
+NavButton / StatusChip / SegmentedControl / Expander / ScrollableFrame
+（v4.3.1 DP43-R20：无 production caller 的旧 HelpDot / Card /
+SettingCard 已删除）—— 不引入 Qt/CustomTkinter/ttkbootstrap。
 """
 from __future__ import annotations
 
@@ -9,73 +10,6 @@ import tkinter as tk
 import tkinter.ttk as ttk
 
 from .theme import LIGHT, pick_font
-
-
-class HelpDot(tk.Label):
-    """？帮助图标：鼠标靠近自动悬浮提示（注释不写进界面正文）。
-
-    无边框小圆点样式；hover ~300ms 后在图标下方弹出说明气泡，
-    移开即消失。不抢焦点、不阻塞输入。
-    """
-
-    def __init__(self, master, text: str, bg: str = LIGHT.surface):
-        self._text = str(text or "")
-        super().__init__(master, text=" ?", padx=1,
-                         bg=bg, fg=LIGHT.accent,
-                         disabledforeground=LIGHT.accent,
-                         font=pick_font(master, 9, True),
-                         cursor="arrow")
-        self._tip: tk.Toplevel | None = None
-        self._show_after = None
-        self.bind("<Enter>", self._schedule)
-        self.bind("<Leave>", self._hide)
-
-    def _schedule(self, _event=None):
-        self._cancel_show()
-        self._show_after = self.after(300, self._show)
-
-    def _cancel_show(self):
-        if self._show_after is not None:
-            try:
-                self.after_cancel(self._show_after)
-            except Exception:
-                pass
-            self._show_after = None
-
-    def _show(self):
-        self._show_after = None
-        if self._tip is not None or not self._text:
-            return
-        tip = tk.Toplevel(self)
-        tip.overrideredirect(True)
-        tip.attributes("-topmost", True)
-        try:
-            tip.attributes("-toolwindow", True)
-        except tk.TclError:
-            pass
-        label = tk.Label(tip, text=self._text, justify="left",
-                         wraplength=320, padx=10, pady=7,
-                         bg="#202522", fg="#F7F8F6",
-                         font=pick_font(self, 9))
-        label.pack(fill="both", expand=True)
-        self._tip = tip
-        self.update_idletasks()
-        x = self.winfo_rootx()
-        y = self.winfo_rooty() + self.winfo_height() + 6
-        sw = self.winfo_screenwidth()
-        w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
-        x = min(max(8, x), max(8, sw - w - 8))
-        tip.geometry(f"+{x}+{y}")
-        tip.deiconify()
-
-    def _hide(self, _event=None):
-        self._cancel_show()
-        tip, self._tip = self._tip, None
-        if tip is not None:
-            try:
-                tip.destroy()
-            except tk.TclError:
-                pass
 
 
 class NavButton(tk.Frame):
@@ -103,48 +37,6 @@ class NavButton(tk.Frame):
         self._label.configure(bg=bg,
                               fg=LIGHT.text if active else fg,
                               font=pick_font(self, 10, bold=active))
-
-
-class Card(tk.Frame):
-    """卡片：内容（body）的请求尺寸决定高度，宽度随容器。
-
-    修复：旧实现构造时立即把 canvas configure 成 winfo 尺寸（布局前为
-    1×1），而 canvas 窗口项内的内容不会贡献 canvas 的请求尺寸 → 卡片
-    永远塌成 1px 高。现在由 body 的 <Configure> 反向驱动 canvas 的请求
-    尺寸，再由 pack 自然传播给卡片。
-    """
-
-    def __init__(self, master, padding: int = 16):
-        super().__init__(master, bg=LIGHT.border, bd=0,
-                         highlightthickness=0)
-        self._pad = padding
-        self._body_bg = LIGHT.surface
-        self._canvas = tk.Canvas(self, bg=LIGHT.border, highlightthickness=0,
-                                 height=2)
-        self._canvas.pack(fill="both", expand=True)
-        self.body = tk.Frame(self._canvas, bg=self._body_bg)
-        # 两个 item 只创建一次（禁止 delete("all")：会连带删掉挂 body 的
-        # window item，卡片内容会整个消失）
-        self._rect = self._canvas.create_rectangle(
-            0, 0, 2, 2, fill=self._body_bg, outline=LIGHT.border)
-        self._window = self._canvas.create_window(0, 0, anchor="nw",
-                                                  window=self.body)
-        self.body.bind("<Configure>", lambda _e: self._sync_request())
-        self._canvas.bind("<Configure>", self._on_canvas_resize)
-
-    def _sync_request(self):
-        """body 请求尺寸变化 → 更新 canvas 请求尺寸（含内边距）。"""
-        w = self.body.winfo_reqwidth() + 2 * self._pad
-        h = self.body.winfo_reqheight() + 2 * self._pad
-        if (w, h) != (int(self._canvas["width"]), int(self._canvas["height"])):
-            self._canvas.configure(width=w, height=h)
-
-    def _on_canvas_resize(self, event):
-        w, h = max(2, event.width), max(2, event.height)
-        c = self._canvas
-        c.coords(self._rect, 0, 0, w - 1, h - 1)
-        c.coords(self._window, self._pad, self._pad)
-        c.itemconfigure(self._window, width=max(10, w - 2 * self._pad))
 
 
 class StatusChip(tk.Label):
@@ -197,23 +89,6 @@ class SegmentedControl(tk.Frame):
 
     def selected(self) -> int:
         return self._selected
-
-
-class SettingCard(tk.Frame):
-    """一行设置：左标签 + 右控件（对齐网格）。"""
-
-    def __init__(self, master, label: str, widget, hint: str = ""):
-        super().__init__(master, bg=LIGHT.surface)
-        tk.Label(self, text=label, bg=LIGHT.surface, fg=LIGHT.text,
-                 font=pick_font(master, 10)).pack(side="left")
-        if hint:
-            tk.Label(self, text=hint, bg=LIGHT.surface,
-                     fg=LIGHT.text_secondary,
-                     font=pick_font(master, 9)).pack(side="left", padx=8)
-        widget.pack(side="right")
-
-    def set_hint(self, hint: str):
-        pass
 
 
 class Expander(tk.Frame):
