@@ -277,3 +277,5 @@ When uncertain, choose the solution that is simpler, more conservative, more mea
 ## Attention
 
 If the test runs overtime continuously, **please check the test logic to see if there is a waiting person trigger or an infinite loop vulnerability**.
+
+**Be careful when writing a test that the native menu is blocked interactively.**
