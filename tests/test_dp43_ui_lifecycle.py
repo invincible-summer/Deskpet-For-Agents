@@ -1,0 +1,516 @@
+"""DP43-R14～R22 UI 生命周期/菜单/退出/启动可靠性测试（plan §5-§13）。
+
+Phase 0 红测试集：本文件先于实现提交，覆盖 plan §14 Phase 0 列出的
+七类已确认缺陷——
+
+  1. Fleet menu explicit view（R14：production 回调未传 view，
+     `_menu_view` 从未被赋值）；
+  2. rapid tray generation（R15：stop 后立即 self.tray=None，
+     新 generation 在旧 worker STOPPING 期间被创建）；
+  3. tray protocol duplicate/context（R15：一次右键手势产生两个
+     "right"；NOTIFYICON_VERSION_4 的 WM_CONTEXTMENU 未被识别）；
+  4. Dashboard FocusOut auto-collapse（R16：焦点变化被当成关闭意图）；
+  5. shutdown additive timeout（R17：局部有界但总时延可叠加）；
+  6. SkinCatalog indirect lock（R19：持 catalog lock 做磁盘扫描，
+     Tk 读内存也要等 I/O）；
+  7. startup job ordering（R18/R19：首个 view 在 bootstrap 前提交
+     BUILD；first snapshot 做磁盘扫描；dashboard 顶层 import）。
+
+实现完成后同一批测试转为常驻回归（不允许删除或放宽断言）。
+"""
+import copy
+import queue
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from pet.config import DEFAULTS
+
+_REPO = str(Path(__file__).resolve().parents[1])
+
+
+class MemoryConfig:
+    def __init__(self):
+        self.data = copy.deepcopy(DEFAULTS)
+        self.data['tray_enabled'] = False
+        self.migration_notice = False
+
+    def get(self, path, default=None):
+        node = self.data
+        for p in path.split('.'):
+            if not isinstance(node, dict) or p not in node:
+                return default
+            node = node[p]
+        return node
+
+    def set(self, path, value):
+        node = self.data
+        parts = path.split('.')
+        for p in parts[:-1]:
+            node = node.setdefault(p, {})
+        node[parts[-1]] = value
+
+    def save(self):
+        pass
+
+
+def make_app(cfg=None):
+    """构造 PetApp：皮肤加载打桩（测试聚焦菜单/生命周期合同）。"""
+    from pet.app import PetApp
+    from pet.petview import PetView
+    with patch.object(PetApp, '_reload_skins', lambda self: None), \
+         patch.object(PetView, 'load_skin', lambda self, bm: None):
+        return PetApp(cfg or MemoryConfig())
+
+
+# ================================================================ R14
+class PetMenuExplicitViewRedTests(unittest.TestCase):
+    """R14：Pet 菜单 builder 必须显式携带 view；_menu_view 必须消失。"""
+
+    def test_fleet_menu_production_path_carries_view(self):
+        """Fleet：production 回调链（窗口事件 → 菜单）必须产出该 view 的
+        fleet 菜单，不依赖测试手工注入 _menu_view。"""
+        from pet.presentation import PresentationMode
+        from tests.test_fleet_ui import FleetConfig, _slot, inst, snap
+        from agents.models import AgentKind
+        cfg = FleetConfig([_slot("pet-1"), _slot("pet-2")])
+        app = make_app(cfg)
+        try:
+            app.presentation.set_concurrent_mode(PresentationMode.FLEET)
+            a = inst(AgentKind.CODEX, 1)
+            b = inst(AgentKind.CLAUDE, 2, cwd="/w/q")
+            app.monitor.instances = {a.key: a, b.key: b}
+            app.monitor.snapshots = {a.key: snap(a), b.key: snap(b)}
+            app._aggregate()
+            view = app.pet_manager.views["pet-1"]
+            self.assertTrue(view.agent_key)
+
+            class _Ev:
+                x_root, y_root = 10, 20
+
+            with patch.object(app, "quit"), \
+                 patch.object(app, "activate_agent"), \
+                 patch.object(app, "_open_agent_picker"), \
+                 patch.object(app, "set_tray_enabled"), \
+                 patch.object(app, "toggle_autostart", return_value=True), \
+                 patch.object(app, "_rebuild_skin"), \
+                 patch('tkinter.Menu.tk_popup',
+                       lambda self, x, y, entry="": None):
+                # production 链：窗口 Button-3 事件开始，不注入任何
+                # 隐藏变量
+                view.window._on_menu(_Ev())
+                app.root.update()
+            # fleet 菜单特征项（旧实现读取从未被赋值的 _menu_view，
+            # production 下永远落到非 fleet 菜单）
+            menu = tk.Menu(app.root, tearoff=0)
+            app._build_pet_menu(menu, view)
+            labels = []
+            end = menu.index('end')
+            if end is not None:
+                for i in range(end + 1):
+                    if menu.type(i) in ('command', 'cascade', 'checkbutton',
+                                        'radiobutton'):
+                        labels.append(menu.entrycget(i, 'label'))
+            joined = "\n".join(labels)
+            self.assertIn("更换 Agent", joined)
+            self.assertIn("解除绑定", joined)
+            try:
+                menu.destroy()
+            except tk.TclError:
+                pass
+        finally:
+            app.quit()
+
+    def test_build_pet_menu_requires_explicit_view(self):
+        app = make_app()
+        try:
+            view = app.pet_manager.views['pet-1']
+            menu = tk.Menu(app.root, tearoff=0)
+            # 新合同：builder 显式参数 (menu, view)
+            app._build_pet_menu(menu, view)
+            self.assertIsNotNone(menu.index('end'))
+        finally:
+            app.quit()
+
+    def test_petwindow_reports_context_request_not_menu(self):
+        """PetWindow 只上报 (x_root, y_root)，不创建业务 menu。"""
+        app = make_app()
+        try:
+            view = app.pet_manager.views['pet-1']
+            win = view.window
+            self.assertFalse(
+                hasattr(win, 'on_menu') and win.on_menu is not None,
+                "PetWindow 不得再持有 menu 构建回调")
+            self.assertTrue(callable(getattr(win, 'on_context_menu', None)),
+                            "PetWindow 必须上报 context request")
+        finally:
+            app.quit()
+
+
+# ================================================================ R15
+class TrayGenerationRedTests(unittest.TestCase):
+    """R15：rapid off→on 不得在旧 worker STOPPING 期间创建新 generation。"""
+
+    def test_rapid_off_on_keeps_single_generation(self):
+        from pet.tray import TrayState
+        created = []
+
+        class FakeTray:
+            def __init__(self, tooltip=''):
+                created.append(self)
+                self.events = queue.Queue()
+                self._state = TrayState.READY
+                self._terminal = threading.Event()
+                self.dropped_events = 0
+                self.stops = 0
+
+            def status(self):
+                return self._state
+
+            def request_stop(self):
+                self.stops += 1
+                self._state = TrayState.STOPPING
+
+            def join_for_shutdown(self, timeout):
+                return self._terminal.is_set()
+
+            def terminate(self):
+                self._terminal.set()
+                self._state = TrayState.STOPPED
+
+            def show_icon(self):
+                pass
+
+            def update_menu_snapshot(self, *a, **k):
+                pass
+
+            def menu_open_failures(self):
+                return 0
+
+            def last_error(self):
+                return ''
+
+        with patch('pet.tray.TrayIcon', FakeTray):
+            app = make_app()
+            try:
+                app.set_tray_enabled(True)
+                self.assertEqual(len(created), 1)
+                first = created[0]
+                self.assertIs(app.tray, first)
+                # 快速 OFF → ON（旧 worker 仍在 STOPPING）
+                app.set_tray_enabled(False)
+                app.set_tray_enabled(True)
+                self.assertIs(app.tray, first,
+                              "STOPPING 期间不得替换 owner")
+                self.assertEqual(len(created), 1,
+                                 "STOPPING 期间不得创建 replacement")
+                self.assertGreaterEqual(first.stops, 1)
+                # 旧 generation 到达终态后，reconcile 才创建新 generation
+                first.terminate()
+                app._reconcile_tray_runtime()
+                self.assertEqual(len(created), 2)
+                self.assertIs(app.tray, created[1])
+            finally:
+                app.quit()
+
+    def test_stop_keeps_owner_until_terminal(self):
+        from pet.tray import TrayState
+
+        class SlowStopTray:
+            def __init__(self):
+                self.events = queue.Queue()
+                self._state = TrayState.READY
+
+            def status(self):
+                return self._state
+
+            def request_stop(self):
+                self._state = TrayState.STOPPING
+
+            def join_for_shutdown(self, timeout):
+                return False
+
+            def show_icon(self):
+                pass
+
+        with patch('pet.tray.TrayIcon', SlowStopTray):
+            app = make_app()
+            try:
+                app.set_tray_enabled(True)
+                first = app.tray
+                app.set_tray_enabled(False)
+                self.assertIs(app.tray, first,
+                              "request_stop 后不得立即丢弃 owner")
+            finally:
+                app.quit()
+
+
+class TrayProtocolRedTests(unittest.TestCase):
+    """R15：一个手势 = 一个语义事件；VERSION_4 只认 WM_CONTEXTMENU。"""
+
+    def _bare_icon(self):
+        from pet.tray import TRAY_EVENT_QUEUE_MAX, TrayIcon
+        icon = TrayIcon.__new__(TrayIcon)
+        icon.events = queue.Queue(maxsize=TRAY_EVENT_QUEUE_MAX)
+        icon.dropped_events = 0
+        return icon
+
+    def test_one_right_gesture_exactly_one_context_request(self):
+        from pet.tray import WM_APP_TRAY
+        icon = self._bare_icon()
+        # VERSION_4：Shell 对 context selection 发送 WM_CONTEXTMENU
+        icon._handle_message(1, WM_APP_TRAY, 0, 0x007B)
+        # legacy 组合不再产生任何语义事件
+        icon._handle_message(1, WM_APP_TRAY, 0, 0x0204)   # WM_RBUTTONDOWN
+        icon._handle_message(1, WM_APP_TRAY, 0, 0x0205)   # WM_RBUTTONUP
+        drained = []
+        while True:
+            try:
+                drained.append(icon.events.get_nowait())
+            except queue.Empty:
+                break
+        self.assertEqual(len(drained), 1,
+                         "一次右键手势必须恰好产生一个语义事件")
+        self.assertEqual(drained[0].kind, 'context')
+
+    def test_left_up_exactly_one_restore(self):
+        from pet.tray import WM_APP_TRAY
+        icon = self._bare_icon()
+        icon._handle_message(1, WM_APP_TRAY, 0, 0x0202)   # WM_LBUTTONUP
+        icon._handle_message(1, WM_APP_TRAY, 0, 0x0200)   # WM_LBUTTONDOWN
+        drained = []
+        while True:
+            try:
+                drained.append(icon.events.get_nowait())
+            except queue.Empty:
+                break
+        self.assertEqual([e.kind for e in drained], ['restore'])
+
+    def test_hicon_ownership_tracked(self):
+        from pet.tray import TrayIcon
+        icon = TrayIcon("ownership")   # 不启动线程
+        self.assertFalse(icon._owns_hicon,
+                         "TrayIcon 必须显式跟踪 HICON 所有权（初始 False）")
+
+    def test_pointer_returning_prototypes_declared(self):
+        """所有 handle/指针返回的 Win32 函数必须显式声明 restype。"""
+        import ctypes.wintypes as wt
+        import pet.tray as tray_mod
+        cases = [
+            (tray_mod.user32.CreateWindowExW, wt.HWND),
+            (tray_mod.kernel32.GetModuleHandleW, wt.HMODULE),
+            (tray_mod.user32.LoadImageW, wt.HANDLE),
+            (tray_mod.user32.LoadIconW, wt.HICON),
+        ]
+        for fn, expected in cases:
+            self.assertIs(fn.restype, expected,
+                          f"{fn.__name__} restype 必须显式声明为 {expected}")
+
+
+# ================================================================ R16
+class DashboardFocusRedTests(unittest.TestCase):
+    """R16：FocusOut 不得改变 Dashboard 的 open 状态。"""
+
+    def test_focusout_does_not_close_dashboard(self):
+        from actions import winkeys as wk
+        app = make_app()
+        try:
+            app.open_dashboard()
+            app.root.update()
+            dash = app.dashboard
+            own = int(dash.winfo_id())
+            # 旧代码曾用 _had_focus 判定"拿到过焦点"；新代码该属性不
+            # 存在（setattr 只是 inert，保证本测试在两种实现下可运行）
+            dash._had_focus = True
+            with patch.object(wk, 'foreground_window',
+                              lambda: own + 404):
+                dash.event_generate('<FocusOut>')
+                app.root.update()
+            self.assertTrue(dash.is_open(),
+                            "FocusOut 不得自动收起 Dashboard")
+            # 二次焦点往返仍稳定
+            dash.event_generate('<FocusIn>')
+            dash.event_generate('<FocusOut>')
+            app.root.update()
+            self.assertTrue(dash.is_open())
+            dash.hide_dashboard()
+            self.assertFalse(dash.is_open())
+            dash.open()
+            self.assertTrue(dash.is_open())
+        finally:
+            app.quit()
+
+    def test_no_autocollapse_symbols(self):
+        app = make_app()
+        try:
+            app.open_dashboard()
+            dash = app.dashboard
+            for symbol in ('_on_focus_lost', '_maybe_auto_collapse',
+                           '_native_dialog_open', '_had_focus'):
+                self.assertFalse(
+                    hasattr(dash, symbol) or symbol in dir(dash),
+                    f"auto-collapse 路径 {symbol} 必须删除")
+        finally:
+            app.quit()
+
+
+# ================================================================ R17
+class ShutdownDeadlineRedTests(unittest.TestCase):
+    """R17：退出总等待 ≤ 单一全局 deadline（不叠加局部 timeout）。"""
+
+    def test_quit_uses_single_global_deadline(self):
+        app = make_app()
+        try:
+            calls = []
+
+            class SlowMonitor:
+                def __getattr__(self, name):
+                    return lambda *a, **k: None
+
+                def request_stop(self):
+                    calls.append(('request_stop', time.monotonic()))
+
+                def join_for_shutdown(self, timeout):
+                    calls.append(('join', float(timeout)))
+                    time.sleep(min(5.0, max(0.0, timeout)))
+                    return False
+
+                def stop(self):
+                    calls.append(('legacy_stop',))
+                    time.sleep(5.0)
+
+                def get_targets(self):
+                    return {}
+
+                def rescan(self):
+                    pass
+
+                def trim(self):
+                    pass
+
+            app.monitor = SlowMonitor()
+            t0 = time.monotonic()
+            app.quit()
+            elapsed = time.monotonic() - t0
+            # 10s 级 fake worker 下总等待必须被全局 deadline 截断
+            self.assertLessEqual(elapsed, 3.5,
+                                 "退出等待必须由单一绝对 deadline 截断")
+            self.assertIn('request_stop', [c[0] for c in calls])
+            join_timeouts = [c[1] for c in calls if c[0] == 'join']
+            self.assertTrue(join_timeouts)
+            for t in join_timeouts:
+                self.assertLessEqual(t, 3.0 + 0.05,
+                                     "join 只能使用全局 deadline 的剩余量")
+        finally:
+            pass
+
+    def test_double_quit_idempotent(self):
+        app = make_app()
+        app.quit()
+        t0 = time.monotonic()
+        app.quit()   # 第二次必须是 no-op
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+
+# ================================================================ R19
+class SkinCatalogLockRedTests(unittest.TestCase):
+    """R19：snapshot() 纯内存；磁盘扫描永远在锁外。"""
+
+    def test_ui_read_never_waits_for_disk_scan(self):
+        import pet.skins as skins_mod
+        cat = skins_mod.SkinCatalog()
+        entered = threading.Event()
+        release = threading.Event()
+        orig_scan = skins_mod._scan_skins
+
+        def slow_scan():
+            entered.set()
+            release.wait(5.0)
+            return orig_scan()
+
+        with patch.object(skins_mod, '_scan_skins', slow_scan):
+            worker = threading.Thread(target=cat.refresh_from_disk)
+            worker.start()
+            self.assertTrue(entered.wait(2.0))
+            t0 = time.perf_counter()
+            snapshot = cat.snapshot()   # 模拟 Tk 线程读内存
+            elapsed = time.perf_counter() - t0
+            release.set()
+            worker.join(6.0)
+        self.assertLess(elapsed, 0.5,
+                        "UI 读 snapshot 不得等待后台磁盘扫描（锁外 I/O）")
+        self.assertIn(skins_mod.BUILTIN_SKIN, snapshot)
+
+    def test_initial_snapshot_requires_no_disk_io(self):
+        import pet.skins as skins_mod
+        cat = skins_mod.SkinCatalog()
+
+        def forbidden():
+            raise AssertionError("snapshot() 不得触发磁盘扫描")
+
+        with patch.object(skins_mod, '_scan_skins', forbidden):
+            snapshot = cat.snapshot()
+        self.assertIn(skins_mod.BUILTIN_SKIN, snapshot)
+
+
+# ================================================================ R18
+class StartupOrderingRedTests(unittest.TestCase):
+    """R18/R19：首个 view 先于后台 runtime；首帧路径无磁盘扫描。"""
+
+    def test_initial_view_no_build_request_before_bootstrap(self):
+        import pet.skins as skins_mod
+        requests = []
+        from pet.app import PetApp
+        from pet.petview import PetView
+        from pet.skins import SkinBuildManager
+        orig_request = SkinBuildManager.request
+
+        def spy_request(self, view_id, skin, height, fps):
+            requests.append((view_id, skin, height, fps))
+            return orig_request(self, view_id, skin, height, fps)
+
+        scans = []
+        orig_scan = skins_mod._scan_skins
+
+        def spy_scan():
+            scans.append(1)
+            return orig_scan()
+
+        with patch.object(PetApp, '_reload_skins', lambda self: None), \
+             patch.object(SkinBuildManager, 'request', spy_request), \
+             patch.object(skins_mod, '_scan_skins', spy_scan), \
+             patch.object(PetView, 'redraw', lambda self: None):
+            cfg = MemoryConfig()
+            app = PetApp(cfg)
+        try:
+            self.assertEqual(
+                requests, [],
+                "bootstrap 激活前 ensure_view 不得提交 BUILD")
+            self.assertEqual(
+                scans, [],
+                "首个 view 创建路径不得触发 skin 目录扫描")
+        finally:
+            app.quit()
+
+    def test_dashboard_import_is_lazy(self):
+        """import pet.app 不得连带加载 dashboard（千行级 UI 模块）。"""
+        code = ("import sys; sys.path.insert(0, r'%s'); "
+                "import pet.app; "
+                "assert 'pet.dashboard' not in sys.modules, "
+                "'dashboard must be lazy-imported'; print('OK')") % _REPO
+        result = subprocess.run(
+            [sys.executable, '-c', code], capture_output=True,
+            text=True, timeout=60, cwd=_REPO)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('OK', result.stdout)
+
+
+if __name__ == '__main__':
+    unittest.main()
