@@ -902,14 +902,37 @@ class PetViewManager:
         })
         return out
 
-    def stop(self):
+    def hide_all_for_shutdown(self):
+        """退出路径的视觉封口（DP43-R17 §8.2 A）：只 withdraw，不写
+        user preference/配置（user_hidden 不变）。"""
+        for view in self.views.values():
+            try:
+                view.window.root.withdraw()
+            except Exception:
+                pass
+
+    def request_stop(self) -> None:
+        """只发停止信号（DP43-R17 §8.2 B）：scheduler 停止 + skin lane
+        封口（取消 active converter）+ 撤销 debounce。"""
         self.scheduler.stop()
         self.cancel_deferred_build()
-        # v4.3.1 DP43-R05：封口 skin lane（取消 active converter 树、
-        # 拒绝新 job、有界等待 worker）——退出时不遗留 converter/ffmpeg
-        self.build_manager.stop()
-        # 先于 root.destroy() 在主线程释放全部 PhotoImage（防异线程 GC
-        # 触碰 Tcl；v4.2.1 CI 崩溃修复），再清缓存帧
+        self.build_manager.request_stop()
+
+    def join_for_shutdown(self, timeout: float) -> bool:
+        """有界回收 skin lane worker（timeout = 全局 deadline 剩余量）。"""
+        return self.build_manager.join_for_shutdown(timeout)
+
+    def finalize_tk_resources(self):
+        """Tk 最终清理（DP43-R17 §8.2 D）：先于 root.destroy() 在主线程
+        释放全部 PhotoImage（防异线程 GC 触碰 Tcl；v4.2.1 CI 崩溃
+        修复），再清缓存帧。"""
         for view in self.views.values():
             view.release_images()
         self.cache.free_all()
+
+    def stop(self):
+        """兼容薄 wrapper（测试/旧入口）。"""
+        self.request_stop()
+        self.join_for_shutdown(0.75)
+        # 先于 root.destroy() 在主线程释放全部 PhotoImage
+        self.finalize_tk_resources()

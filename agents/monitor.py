@@ -326,34 +326,82 @@ class Monitor:
         except Exception:
             pass
 
-    def stop(self):
-        """有界停机（plan §18）：所有 join 都有超时，且绝不 join 自己。"""
+    def request_stop(self):
+        """只发停止信号（DP43-R17 §8.3）：stop event、probe stop、
+        terminal service request stop、exit watcher request stop。
+
+        全部 O(1)/bounded native 调用，绝不 join——join 职责归
+        join_for_shutdown(timeout)。
+        """
         self._stop.set()
         self._probe.stop()
         if self._exit_watcher is not None:
             try:
-                self._exit_watcher.stop()
+                self._exit_watcher.request_stop()
             except Exception:
                 pass
         # 先置终态（service/backend 拒绝晚到的 start），再等 boot 线程
         try:
-            self._terminal_service.stop()
+            self._terminal_service.request_stop()
         except Exception:
             pass
+
+    def join_for_shutdown(self, timeout: float) -> bool:
+        """有界回收（timeout = App 全局 deadline 的剩余量）。
+
+        顺序 join boot/core/probe/uia/exit watcher，每段只使用剩余
+        预算（绝不自建 6s/3s timeout 累加）；watcher 的 handle 释放
+        只在剩余时间允许且线程已退出时完成。timeout 后返回 False，
+        不清除仍 live thread 的 ownership reference。
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+
+        def _remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        exited = True
         boot = self._terminal_boot
         if boot is not None and boot is not threading.current_thread():
-            # typelib 首次生成可能数秒：有界等待，不让 Tk 线程无限挂起
-            boot.join(timeout=6.0)
-            self._terminal_boot = None
+            # typelib 首次生成可能数秒：只等剩余预算
+            boot.join(timeout=_remaining())
+            if boot.is_alive():
+                exited = False
+            else:
+                self._terminal_boot = None
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=3.0)
-        self._probe.join(timeout=2.0)
+            thread.join(timeout=_remaining())
+            if thread.is_alive():
+                exited = False
+        self._probe.join(timeout=_remaining())
+        if self._probe._thread is not None and self._probe._thread.is_alive():
+            exited = False
+        if self._exit_watcher is not None:
+            try:
+                if not self._exit_watcher.join_for_shutdown(_remaining()):
+                    exited = False
+            except Exception:
+                pass
+        try:
+            if not self._terminal_service.join_for_shutdown(_remaining()):
+                exited = False
+        except Exception:
+            pass
         for watcher in self._watchers.values():
             try:
                 watcher.release()
             except Exception:
                 pass
+        return exited
+
+    def stop(self):
+        """兼容薄 wrapper（测试/旧入口）：signal + 固定 8s 预算 join。
+
+        生产主路径（PetApp.request_quit）只允许调用 request_stop +
+        join_for_shutdown(全局 deadline 剩余量)。
+        """
+        self.request_stop()
+        self.join_for_shutdown(8.0)
 
     # ------------------------------------------------------------ UI API
     def get_targets(self) -> dict[str, AgentTarget]:

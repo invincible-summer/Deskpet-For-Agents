@@ -39,6 +39,10 @@ INTERACT_LINES = [
 # v4.3.1 DP43-R09 §17.9：单次 bridge drain 的托盘事件上限
 TRAY_DRAIN_MAX = 8
 
+# v4.3.1 DP43-R17 §8.2：全局退出预算（秒）——所有子系统 join 只能
+# 使用该 deadline 的剩余量，不允许局部 timeout 累加
+SHUTDOWN_BUDGET_SEC = 3.0
+
 
 class PetApp:
     def __init__(self, config):
@@ -904,7 +908,6 @@ class PetApp:
         self.pet_manager.build_manager.request_maintenance()
         self._janitor_after = self.root.after(600_000, self._janitor)
         self.root.mainloop()
-
     def _janitor(self):
         """定时清理入口（v4.3.1 DP43-R06：Tk 线程只做 O(1) 调度）。
 
@@ -921,30 +924,34 @@ class PetApp:
             pass
         self._janitor_after = self.root.after(600_000, self._janitor)
 
-    def quit(self):
+    def request_quit(self):
+        """唯一退出实现（DP43-R17 §8）：hide-first + 单一绝对 deadline。
+
+        固定顺序：
+          A. UI 封口（快）——菜单/picker/dashboard 确定性结束，全部
+             visible Toplevel withdraw，bridge/after 取消；
+          B. 只发 stop signal（不 join）——monitor/skin lane/tray/
+             config writer；
+          C. 全局 deadline 回收——deadline = monotonic()+3.0s，所有
+             join 只用剩余量，到期不再等待；
+          D. Tk 最终清理——PhotoImage/动画缓存释放，root.destroy。
+        第二次调用直接 no-op（幂等）。
+        """
+        if self._closing:
+            return
         self._closing = True
         try:
-            self._menu_controller.shutdown()   # DP43-R14：先确定性结束菜单
-            self.ui.stop()
-            self.monitor.stop()
-            self.pet_manager.stop()
-            if self.tray is not None:
-                # DP43-R15：request_stop 先发 WM_CANCELMODE 结束可能
-                # active 的 native menu；最终退出允许 bounded join
-                self.tray.request_stop()
-                self.tray.join_for_shutdown(1.0)
-                self.tray = None
+            # ---- A. UI 封口（必须快） ----
+            self._menu_controller.shutdown()   # Pet 菜单先确定性结束
+            self._destroy_agent_picker()
             if self.dashboard is not None:
                 try:
                     self.dashboard.shutdown()
                 except tk.TclError:
                     pass
-            # v4.3 §8.2：退出时有界 flush（绝对 deadline；deadline 内
-            # 恰一个 worker，不再在 Tk 同步写盘/双 writer）
-            self.config_saver.flush_for_shutdown()
-        finally:
-            self._destroy_agent_picker()  # v4.3：不留死弹窗
-            for attr in ("_janitor_after", "_skin_after", "_reassert_after",
+            self.pet_manager.hide_all_for_shutdown()   # 只 withdraw
+            self.ui.stop()
+            for attr in ("_janitor_after", "_reassert_after",
                          "_toast_after"):
                 callback = getattr(self, attr, None)
                 if callback is not None:
@@ -953,11 +960,39 @@ class PetApp:
                     except tk.TclError:
                         pass
                     setattr(self, attr, None)
+            # ---- B. stop signal（不得 join） ----
+            self.monitor.request_stop()
+            self.pet_manager.request_stop()   # scheduler + skin lane
+            if self.tray is not None:
+                # request_stop 先发 WM_CANCELMODE 结束可能 active 的
+                # native menu
+                self.tray.request_stop()
+            # ---- C. 全局 deadline 回收 ----
+            deadline = time.monotonic() + SHUTDOWN_BUDGET_SEC
+
+            def _remaining() -> float:
+                return max(0.0, deadline - time.monotonic())
+
+            self.monitor.join_for_shutdown(_remaining())
+            self.pet_manager.join_for_shutdown(_remaining())
+            if self.tray is not None:
+                self.tray.join_for_shutdown(_remaining())
+                self.tray = None
+            # deadline 内恰一个最新快照 writer；到期不再启动第二个、
+            # 绝不双 writer
+            self.config_saver.flush_for_shutdown(_remaining())
+            # ---- D. Tk 资源最终清理 ----
+            self.pet_manager.finalize_tk_resources()
+        finally:
             try:
                 self.root.quit()
             finally:
                 self.root.destroy()
         # 主线程立即回收残余引用环（v4.2.1）：PhotoImage 已在
-        # pet_manager.stop() 里释放，这里兜底保证之后任何工作线程
+        # finalize_tk_resources 里释放，这里兜底保证之后任何工作线程
         # 触发 GC 都不会再碰到 Tcl 对象
         gc.collect()
+
+    def quit(self):
+        """极薄 alias（DP43-R17 §8.1：兼容已有测试/外部入口）。"""
+        self.request_quit()

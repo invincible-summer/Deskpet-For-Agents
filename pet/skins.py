@@ -1148,10 +1148,10 @@ class SkinBuildManager:
                 + (1 if self._pending_import is not None else 0)
                 + (1 if self._maintenance_pending else 0))
 
-    # ------------------------------------------------------------ shutdown（§13.1）
-    def stop(self, timeout: float = 0.75) -> None:
-        """封口 lane：不再接受/启动新 job、清空 pending、取消 active、
-        有界等待 worker（converter 树随 job 取消被 Job Object 终止）。"""
+    # ------------------------------------------------------------ shutdown（§13.1；DP43-R17）
+    def request_stop(self) -> None:
+        """只发停止信号（不 join）：封口 lane、清空 pending、取消
+        active converter（Job Object 终止整棵转换树）。"""
         self._stopping = True
         self._pending_builds.clear()
         self._pending_rebuilds.clear()
@@ -1160,12 +1160,27 @@ class SkinBuildManager:
         ctx = self._active_cancel
         if ctx is not None:
             ctx.cancel()
+
+    def join_for_shutdown(self, timeout: float) -> bool:
+        """有界等待 active worker（timeout = 全局 deadline 剩余量）。
+
+        timeout 后不假装 worker 已不存在（保留 ownership 引用）。
+        """
         thread = self._active_thread
+        exited = True
         if thread is not None and thread.is_alive():
             thread.join(timeout=max(0.0, timeout))
-        self._active_thread = None
-        self._active_job = None
-        self._active_cancel = None
+            exited = not thread.is_alive()
+        if exited:
+            self._active_thread = None
+            self._active_job = None
+            self._active_cancel = None
+        return exited
+
+    def stop(self, timeout: float = 0.75) -> None:
+        """兼容薄 wrapper（测试/旧入口）：request_stop + bounded join。"""
+        self.request_stop()
+        self.join_for_shutdown(timeout)
 
     # ------------------------------------------------------------ 内部（Tk 线程）
     def _enqueue_import(self, src_dir: str, name: str) -> None:

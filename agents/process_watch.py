@@ -130,25 +130,37 @@ class WindowsExitWatcher:
         self.started = True
         return True
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        """只发停止信号（O(1)）：stop event + SetEvent(control) 唤醒等待。
+
+        DP43-R17：signal 与 join 分离——运行期任何线程可以调用；
+        不做任何 join/handle 操作。
+        """
         self._stop.set()
         control = self._control
         if control:
             kernel32.SetEvent(control)
+
+    def join_for_shutdown(self, timeout: float = 3.0) -> bool:
+        """有界回收 watcher 线程（timeout 来自 App 全局 deadline 的
+        剩余量）；返回线程是否退出。
+
+        线程退出（不再有任何 pending wait）后才由本调用线程关闭
+        register/stop 竞态中未及处理的残留 pending handle；超时绝不
+        跨线程 CloseHandle 可能仍在 WaitForMultipleObjects 中的
+        process/control handle（UB）——daemon 线程 + handle 由 OS 在
+        进程退出时回收。
+        """
         thread = self._thread
         exited = True
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=3.0)
+            thread.join(timeout=max(0.0, timeout))
             exited = not thread.is_alive()
         self._thread = None
         if not exited:
-            # join 超时：绝不从调用线程关闭可能仍在 pending wait 中的
-            # process/control handle（UB）；daemon 线程 + handle 由 OS
-            # 在进程退出时回收。
             self.started = False
-            return
-        # watcher 线程已退出（不再有任何 pending wait）：调用线程关闭
-        # register/stop 竞态中未及处理的残留 pending handle 是安全的。
+            return False
+        # watcher 线程已退出：关闭残留 pending handle 是安全的
         with self._lock:
             leftovers = list(self._pending_add.values())
             self._pending_add.clear()
@@ -158,10 +170,17 @@ class WindowsExitWatcher:
             if entry.handle:
                 kernel32.CloseHandle(entry.handle)
         self._entries = {}
+        control = self._control
         if control:
             kernel32.CloseHandle(control)
             self._control = 0
         self.started = False
+        return True
+
+    def stop(self, timeout: float = 3.0) -> None:
+        """兼容薄 wrapper：request_stop + bounded join（测试/旧入口）。"""
+        self.request_stop()
+        self.join_for_shutdown(timeout)
 
     # ------------------------------------------------------------ 注册
     def register(self, instance) -> bool:

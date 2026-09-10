@@ -76,13 +76,28 @@ class WindowsTerminalService:
         self.failed = not ok
         return ok
 
-    def stop(self):
+    def request_stop(self):
+        """只发停止信号（DP43-R17）：置终态 + observer request_stop。"""
         self._stopped = True
         if self.observer is not None:
             try:
-                self.observer.stop()
+                self.observer.request_stop()
             except Exception:
                 pass
+
+    def join_for_shutdown(self, timeout: float = 3.0) -> bool:
+        """有界回收 observer/MTA 线程（外部预算）。"""
+        if self.observer is not None:
+            try:
+                return self.observer.join_for_shutdown(timeout)
+            except Exception:
+                return True
+        return True
+
+    def stop(self):
+        """兼容薄 wrapper（测试/旧入口）。"""
+        self.request_stop()
+        self.join_for_shutdown()
 
     @property
     def backend(self):

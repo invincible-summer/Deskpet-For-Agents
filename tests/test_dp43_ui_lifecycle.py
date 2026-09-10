@@ -427,6 +427,80 @@ class ShutdownDeadlineRedTests(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 0.5)
 
 
+# ================================================================ R17 §12.5
+class ShutdownFaultInjectionTests(unittest.TestCase):
+    """DP43-R17 §12.5：全局 deadline / 顺序 / 幂等。"""
+
+    def test_quit_deadline_bounds_all_waits(self):
+        from pet.app import SHUTDOWN_BUDGET_SEC
+        app = make_app()
+        timeouts = []
+
+        def slow_join(timeout):
+            timeouts.append(float(timeout))
+            time.sleep(min(5.0, max(0.0, timeout)))
+            return False
+
+        class SlowMonitor:
+            def __getattr__(self, name):
+                return lambda *a, **k: None
+
+            def request_stop(self):
+                pass
+
+            def join_for_shutdown(self, timeout):
+                slow_join(timeout)
+                return False
+
+        app.monitor = SlowMonitor()
+        with patch.object(app.pet_manager.build_manager,
+                          'request_stop', lambda: None), \
+             patch.object(app.pet_manager.build_manager,
+                          'join_for_shutdown', side_effect=slow_join), \
+             patch.object(app.config_saver, 'flush_for_shutdown',
+                          side_effect=slow_join):
+            t0 = time.monotonic()
+            app.request_quit()
+            elapsed = time.monotonic() - t0
+        # 10s 级 fake worker：总等待被全局 deadline 截断
+        self.assertLessEqual(elapsed, SHUTDOWN_BUDGET_SEC + 0.25)
+        self.assertTrue(timeouts)
+        for t in timeouts:
+            self.assertLessEqual(t, SHUTDOWN_BUDGET_SEC + 0.05,
+                                 "join 只能使用全局 deadline 剩余量")
+        self.assertEqual(timeouts, sorted(timeouts, reverse=True),
+                         "剩余量必须单调不增（同一绝对 deadline）")
+
+    def test_hide_and_menu_teardown_before_stop_signals(self):
+        app = make_app()
+        order = []
+        orig_hide = app.pet_manager.hide_all_for_shutdown
+        app.pet_manager.hide_all_for_shutdown = (
+            lambda: (order.append("hide"), orig_hide())[1])
+        orig_menu = app._menu_controller.shutdown
+        app._menu_controller.shutdown = (
+            lambda: (order.append("menu"), orig_menu())[1])
+
+        class OrderMonitor:
+            def __getattr__(self, name):
+                return lambda *a, **k: None
+
+            def request_stop(self):
+                order.append("monitor_stop")
+
+            def join_for_shutdown(self, timeout):
+                return True
+
+        app.monitor = OrderMonitor()
+        orig_lane = app.pet_manager.build_manager.request_stop
+        app.pet_manager.build_manager.request_stop = (
+            lambda: (order.append("lane_stop"), orig_lane())[1])
+        app.request_quit()
+        self.assertLess(order.index("menu"), order.index("hide"))
+        self.assertLess(order.index("hide"), order.index("monitor_stop"))
+        self.assertLess(order.index("monitor_stop"), order.index("lane_stop"))
+
+
 # ================================================================ R19
 class SkinCatalogLockRedTests(unittest.TestCase):
     """R19：snapshot() 纯内存；磁盘扫描永远在锁外。"""

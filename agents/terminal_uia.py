@@ -413,13 +413,31 @@ class UiaBackend(TerminalBackend):
         # 初始化失败时 _run 也会 set _ready，不会反复硬等 8s
         return self.available
 
-    def stop(self):
-        self._stopped = True   # 终态：后续 start() 直接拒绝
+    def request_stop(self) -> None:
+        """只发停止信号：置终态 + stop event（DP43-R17：不 join）。
+
+        _stopped 是终态标记：后续 start() 直接拒绝（plan §18）。
+        """
+        self._stopped = True
         self._stop.set()
+
+    def join_for_shutdown(self, timeout: float = 3.0) -> bool:
+        """有界回收 MTA 线程（timeout 来自 App 全局 deadline 的剩余量）。
+
+        COM handler teardown 发生在 MTA owner 线程内（_run 的收尾），
+        本方法只等待线程退出。
+        """
         thread = self._thread
         self._thread = None
         if thread is not None:
-            thread.join(timeout=3.0)
+            thread.join(timeout=max(0.0, timeout))
+            return not thread.is_alive()
+        return True
+
+    def stop(self, timeout: float = 3.0) -> bool:
+        """兼容薄 wrapper：request_stop + bounded join（测试/旧入口）。"""
+        self.request_stop()
+        return self.join_for_shutdown(timeout)
 
     def _submit(self, fn, timeout: float = 2.0):
         if not self.available:
@@ -892,12 +910,25 @@ class TerminalObserver:
             self.refresh_controls(force=True)
         return ok
 
-    def stop(self):
+    def request_stop(self):
+        """只发停止信号（DP43-R17：signal/join 分离）。"""
         try:
-            self.backend.stop()
+            self.backend.request_stop()
         except Exception:
             pass
         self._started = False
+
+    def join_for_shutdown(self, timeout: float = 3.0) -> bool:
+        """有界回收 backend MTA 线程（外部预算）。"""
+        try:
+            return self.backend.join_for_shutdown(timeout)
+        except Exception:
+            return True
+
+    def stop(self):
+        """兼容薄 wrapper（测试/旧入口）。"""
+        self.request_stop()
+        self.join_for_shutdown()
 
     # ---- control 发现 ----
     def refresh_controls(self, force: bool = False):
