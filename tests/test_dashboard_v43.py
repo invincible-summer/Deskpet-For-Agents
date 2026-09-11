@@ -6,9 +6,14 @@
   * Agent retained rows：同 key 只 configure 不 recreate；
   * 无 bind_all("<MouseWheel>")（滚轮只在页面 canvas 内）；
   * §13.2 离散值组齐备且默认 1.00。
+
+v4.3.1 交互收口新增（plan §18）：七页真实 geometry gate（compact/wide
+双尺寸）、scrollregion/滚动条合同、滚轮 bounds、hide/reopen 几何健康。
+该组直接抓"built=True 但 height≈1px 右侧空白"的旧盲点。
 """
 from __future__ import annotations
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -29,6 +34,9 @@ from pet.dashboard import (
     PAGE_PETS,
     PAGE_SETTINGS,
 )
+
+_ALL_PAGES = (PAGE_OVERVIEW, PAGE_AGENTS, PAGE_PETS, PAGE_LOOK,
+              PAGE_MONITOR, PAGE_DIAG, PAGE_SETTINGS)
 
 
 def _make_app():
@@ -52,6 +60,76 @@ def _inject_agents(app, n=2):
     app.monitor.instances = {a.key: a for a in agents}
     app.monitor.snapshots = {a.key: snap(a) for a in agents}
     return agents
+
+
+def _set_logical_size(app, w: int, h: int):
+    """按 DPI 换算设置 Dashboard 逻辑尺寸并驱动一次重排。"""
+    dash = app.dashboard
+    s = dash.metrics.scale
+    dash.geometry(f"{int(w * s)}x{int(h * s)}")
+    app.root.update()
+    dash._reflow_debounced()
+    app.root.update()
+    app.root.update_idletasks()
+
+
+def _screen_box(widget):
+    x, y = widget.winfo_rootx(), widget.winfo_rooty()
+    return (x, y, x + widget.winfo_width(), y + widget.winfo_height())
+
+
+def _boxes_intersect(a, b):
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+
+def assert_page_has_visible_geometry(testcase, app, page_name):
+    """§18.1/§18.2 geometry gate：切页 → update → update_idletasks →
+    读实际几何。避免 pixel-perfect，只抓空白/坍塌/未映射。"""
+    dash = app.dashboard
+    dash._show_page(page_name)
+    app.root.update()
+    app.root.update_idletasks()
+    testcase.assertTrue(dash.winfo_viewable(), f"{page_name} 窗口不可见")
+    canvas = dash.content._canvas
+    testcase.assertGreater(canvas.winfo_width(), 200,
+                           f"{page_name} canvas 宽度坍塌")
+    testcase.assertGreater(canvas.winfo_height(), 200,
+                           f"{page_name} canvas 高度坍塌")
+    center = dash._center
+    testcase.assertGreater(center.winfo_width(), 200,
+                           f"{page_name} 正文容器宽度坍塌")
+    testcase.assertGreater(center.winfo_height(), 100,
+                           f"{page_name} 正文容器高度坍塌（右侧空白根因）")
+    page = dash._pages[page_name]
+    holder = page.holder
+    testcase.assertIsNotNone(holder)
+    testcase.assertTrue(holder.winfo_ismapped(), f"{page_name} holder 未映射")
+    testcase.assertGreater(holder.winfo_height(), 100,
+                           f"{page_name} holder 高度坍塌")
+    testcase.assertGreater(holder.winfo_reqheight(), 0)
+    bbox = canvas.bbox("all")
+    testcase.assertIsNotNone(bbox, f"{page_name} scrollregion 内容为空")
+    region = canvas["scrollregion"] or ""
+    parts = [int(v) for v in str(region).split()]
+    testcase.assertEqual(len(parts), 4)
+    testcase.assertEqual((parts[2] - parts[0], parts[3] - parts[1]),
+                         (bbox[2] - bbox[0], bbox[3] - bbox[1]),
+                         f"{page_name} scrollregion 必须等于内容 bbox")
+    # 至少一个 meaningful 子控件与 viewport 有交集（不是只 built 不显示）
+    viewport = _screen_box(canvas)
+    meaningful = []
+    stack = [holder]
+    while stack and not meaningful:
+        widget = stack.pop()
+        for child in widget.winfo_children():
+            if child.winfo_ismapped() and child.winfo_width() > 5 \
+                    and child.winfo_height() > 5:
+                meaningful.append(child)
+            stack.append(child)
+    testcase.assertTrue(meaningful, f"{page_name} 无可见子控件")
+    testcase.assertTrue(any(_boxes_intersect(_screen_box(w), viewport)
+                            for w in meaningful),
+                        f"{page_name} 子控件与 viewport 无交集")
 
 
 class DiscreteSliderTests(unittest.TestCase):
@@ -223,6 +301,113 @@ class DashboardV43Tests(unittest.TestCase):
             self.assertIn(1.0, steps)
             self.assertEqual(steps, tuple(sorted(steps)))
             self.assertEqual(len(steps), 7)
+
+
+class DashboardGeometryTests(unittest.TestCase):
+    """v4.3.1 plan §18：七页真实 geometry gate（compact/wide）、
+    scrollregion/滚动条、滚轮 bounds、hide/reopen 几何健康。"""
+
+    def setUp(self):
+        self.app = _make_app()
+        self.app.open_dashboard()
+        self.app.root.update()
+
+    def tearDown(self):
+        self.app.quit()
+
+    def test_seven_pages_geometry_wide_and_compact(self):
+        """§18.3/§18.4：全部七页（不是抽两页）× wide(1120x720) 与
+        compact(860x560) 都通过 geometry gate。"""
+        for logical_w, logical_h in ((1120, 720), (860, 560)):
+            _set_logical_size(self.app, logical_w, logical_h)
+            for page_name in _ALL_PAGES:
+                assert_page_has_visible_geometry(
+                    self, self.app, page_name)
+                holder = self.app.dashboard._pages[page_name].holder
+                self.assertGreater(holder.winfo_height(), 100,
+                                   f"{page_name}@{logical_w} holder 高度")
+
+    def test_long_content_shows_scrollbar(self):
+        """§18.5：长内容（多 Agent）→ 滚动条出现且 scrollregion 高于
+        canvas 可视高度。"""
+        _inject_agents(self.app, 20)
+        self.app._aggregate()
+        _set_logical_size(self.app, 860, 560)
+        self.app.dashboard._show_page(PAGE_OVERVIEW)
+        self.app.dashboard.refresh_current_page()   # 生产刷新路径
+        self.app.root.update()
+        self.app.root.update_idletasks()
+        canvas = self.app.dashboard.content._canvas
+        self.assertGreater(len(self.app.dashboard._pages[PAGE_OVERVIEW]._rows),
+                           0, "fixture Agent 行必须真实进入页面")
+        self.assertTrue(self.app.dashboard.content._bar_visible,
+                        "长内容必须显示滚动条")
+        region = [int(v) for v in str(canvas["scrollregion"]).split()]
+        self.assertGreater(region[3] - region[1],
+                           canvas.winfo_height(),
+                           "scrollregion 高度必须超过可视高度")
+
+    def test_short_page_hides_scrollbar(self):
+        _set_logical_size(self.app, 1120, 720)
+        self.app.dashboard._show_page(PAGE_SETTINGS)
+        self.app.root.update()
+        self.app.root.update_idletasks()
+        self.app.dashboard._reflow_debounced()
+        self.app.root.update()
+        self.app.root.update_idletasks()
+        self.assertFalse(self.app.dashboard.content._bar_visible,
+                         "短内容页不得显示滚动条")
+
+    def test_wheel_scroll_bounds(self):
+        """§18.6：nav 点不滚；canvas 内点滚（长内容）；短内容不滚。"""
+        _inject_agents(self.app, 20)
+        self.app._aggregate()
+        _set_logical_size(self.app, 860, 560)
+        dash = self.app.dashboard
+        dash._show_page(PAGE_OVERVIEW)
+        dash.refresh_current_page()   # 生产刷新路径：fixture 行进入页面
+        self.app.root.update()
+        self.app.root.update_idletasks()
+        canvas = dash.content._canvas
+        self.assertTrue(dash.content._bar_visible)
+        cx = canvas.winfo_rootx()
+        cy = canvas.winfo_rooty()
+        before = canvas.yview()
+        # 指针在 canvas 左侧（nav 区域）→ 不滚
+        self.assertFalse(dash.content.wheel_scroll(120, cx - 40, cy + 40))
+        self.assertEqual(canvas.yview(), before)
+        # 指针在 canvas 内 → 滚动
+        self.assertTrue(dash.content.wheel_scroll(
+            -120, cx + canvas.winfo_width() // 2,
+            cy + canvas.winfo_height() // 2))
+        self.assertNotEqual(canvas.yview(), before)
+        # 短内容（无滚动条）→ False
+        _set_logical_size(self.app, 1120, 720)
+        dash._show_page(PAGE_SETTINGS)
+        self.app.root.update()
+        self.app.root.update_idletasks()
+        dash._reflow_debounced()
+        self.app.root.update()
+        self.app.root.update_idletasks()
+        self.assertFalse(dash.content._bar_visible)
+        self.assertFalse(dash.content.wheel_scroll(
+            -120, canvas.winfo_rootx() + 40, canvas.winfo_rooty() + 40))
+
+    def test_hide_reopen_100_cycles_keeps_geometry(self):
+        """§18.7：100 轮 hide/reopen——Toplevel 身份不变、当前页保留、
+        重开后几何健康、无 reflow timer 残留。"""
+        dash = self.app.dashboard
+        dash._show_page(PAGE_PETS)
+        first = dash
+        for _ in range(100):
+            dash.hide_dashboard()
+            dash.open()
+            self.app.root.update()
+        self.assertIs(self.app.dashboard, first)
+        self.assertEqual(dash._page, PAGE_PETS)
+        self.assertTrue(dash.is_open())
+        self.assertIsNone(dash._reflow_after, "无周期 reflow timer")
+        assert_page_has_visible_geometry(self, self.app, PAGE_PETS)
 
 
 class ControllerWiringTests(unittest.TestCase):

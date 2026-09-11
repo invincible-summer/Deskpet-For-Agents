@@ -140,8 +140,16 @@ class ScrollableFrame(tk.Frame):
         self._canvas.bind("<Configure>", self._on_canvas_configure)
 
     def wheel_scroll(self, delta: int, x: int, y: int) -> bool:
-        """Dashboard 滚轮分发入口；指针在本 canvas 内才滚动。"""
-        if not self.winfo_ismapped() or not self._bar_visible:
+        """Dashboard 滚轮分发入口；指针在本 canvas 内才滚动。
+
+        边界合同（v4.3.1 §9）：未映射 / 指针不在 canvas 范围 / 内容
+        不足一页（无滚动条）→ False，不产生任何滚动。
+        """
+        if not self.winfo_ismapped():
+            return False
+        if not self.contains_point(x, y):
+            return False
+        if not self._bar_visible:
             return False
         try:
             self._canvas.yview_scroll(int(-1 * (delta / 120)), "units")

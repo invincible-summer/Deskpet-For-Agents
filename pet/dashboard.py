@@ -1588,17 +1588,41 @@ class Dashboard(tk.Toplevel):
     def _make_scroller(self):
         from .widgets import ScrollableFrame
         scroller = ScrollableFrame(self)
-        # 页面居中容器：最大 960 逻辑像素
+        # 页面居中容器：横向跟 viewport（_sync_center_geometry 用 padx
+        # 居中并限制最大 960 逻辑像素）；纵向高度由页面内容 propagate
+        # ——不关闭 propagation，否则 _center 只配 width 时纵向 requested
+        # size 可能坍塌成接近 1px（右侧正文空白的根因）。
         self._center = tk.Frame(scroller.inner, bg=LIGHT.page)
-        self._center.pack(fill="both", expand=True)
+        self._center.pack(fill="x")
+        # add="+"：ScrollableFrame 自己的 <Configure>（scrollregion/
+        # scrollbar）是唯一 scroll owner；Dashboard 只追加几何回调，
+        # 绝不覆盖已有 binding。
         scroller.inner.bind(
             "<Configure>",
-            lambda e: self._center.configure(
-                width=max(120, min(int(PAGE_CONTENT_MAX_WIDTH
-                                        * self.metrics.scale),
-                                   e.width))))
-        self._center.pack_propagate(False)
+            lambda e: self._sync_center_geometry(e.width),
+            add="+")
         return scroller
+
+    def _sync_center_geometry(self, viewport_width: int | None = None) -> None:
+        """横向几何同步：正文宽度 = min(viewport, 960 逻辑像素)，超出
+        部分左右对称留白。高度从不在此设置——由页面内容 propagate。"""
+        if self._closing or not self.winfo_exists():
+            return
+        if viewport_width is None:
+            try:
+                viewport_width = self.content._canvas.winfo_width()
+            except tk.TclError:
+                return
+        try:
+            viewport_width = int(viewport_width)
+        except (TypeError, ValueError):
+            return
+        if viewport_width <= 1:
+            return
+        max_content = self.metrics.px(PAGE_CONTENT_MAX_WIDTH)
+        content_width = min(viewport_width, max_content)
+        pad = max(0, (viewport_width - content_width) // 2)
+        self._center.pack_configure(padx=(pad, pad))
 
     def _add_nav_item(self, nav, page: str):
         btn = NavButton(nav, page, command=lambda p=page: self._show_page(p))
@@ -1714,6 +1738,9 @@ class Dashboard(tk.Toplevel):
         if dpi_changed:
             self.metrics = new_metrics
             self._last_reflow_dpi = new_metrics.dpi
+            # §8.6：DPI 变化后 960px 上限/padding 换算全部失效，先同步
+            # 横向几何再重排当前页
+            self._sync_center_geometry(self.content.winfo_width())
         width = max(0, self.content.winfo_width()
                     - 2 * self.metrics.px(PAGE_PAD_X))
         crossed = (width >= SettingRow.COMPACT_BREAK) != (
