@@ -47,6 +47,25 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
+
+def _dpi_aware():
+    """与 main.py 相同的 per-monitor DPI awareness。
+
+    验收进程必须与 production 启动方式一致：否则 DPI 虚拟化会把按
+    物理像素保存的 pet_pos/窗口几何解释到缩放后的逻辑桌面（窗口被
+    放到屏幕外），坐标证据与截图 DPI 也全部失真。
+    """
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+_dpi_aware()
+
 CHECKS: list[dict] = []
 VISUAL_METRICS: list[dict] = []
 INTERACTIVE_EVENTS: list[dict] = []
@@ -1452,7 +1471,11 @@ def _drain_all(tray):
 
 def _console_confirm(prompt: str, timeout: float = 30) -> bool:
     """控制台 y/n 确认（native 菜单无法进程内观察时的诚实替代）。
-    等待期间不注入任何输入。"""
+
+    交互式控制台：等待操作者输入 y/n。stdin 不可用（后台运行）时，
+    必须由操作者在仓库根写入 confirm 文件（内容含 y）才算确认——
+    绝不因 EOF 静默通过。
+    """
     import threading as _th
     print(f"  [需要人工确认] {prompt}", flush=True)
     answer = {}
@@ -1461,11 +1484,25 @@ def _console_confirm(prompt: str, timeout: float = 30) -> bool:
         try:
             answer["v"] = input().strip().lower()
         except Exception:
-            answer["v"] = ""
+            answer["v"] = "<eof>"
     reader = _th.Thread(target=_reader, daemon=True)
     reader.start()
     reader.join(timeout)
-    return answer.get("v", "") in ("y", "yes", "")
+    value = answer.get("v", "")
+    if value == "<eof>":
+        flag = REPO / "deskpet-accept-confirm.txt"
+        deadline = time.monotonic() + timeout
+        print(f"  [stdin 不可用] 确认文件：{flag}（写入 y 确认 / n 拒绝）",
+              flush=True)
+        while time.monotonic() < deadline:
+            if flag.is_file():
+                content = flag.read_text(encoding="utf-8").strip().lower()
+                flag.unlink()
+                print(f"  [confirm-file] {content}", flush=True)
+                return content in ("y", "yes")
+            time.sleep(0.2)
+        return False
+    return value in ("y", "yes")
 
 
 def suite_tk_menu_interactive():
