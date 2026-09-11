@@ -367,6 +367,9 @@ class CodexWatcherTests(unittest.TestCase):
         self.assertEqual(state.phase, Phase.TESTING)
 
     def test_error_and_abort_lifecycle(self):
+        # AC-CODEX-01（plan1 §5）：ERROR → task_started → WORKING，
+        # 作为四 watcher 跨 turn transient 合同的对照回归；Codex 生产
+        # 代码本就正确，不为形式统一修改（plan1 R05）。
         state = CodexFile("rollout-x.jsonl")
         base = time.time()
         state.feed(json.dumps({"type": "event_msg", "timestamp": base, "payload": {
@@ -490,6 +493,53 @@ class ClaudeWatcherTests(unittest.TestCase):
         self.assertIn(obs.status, (Status.WORKING, Status.UNKNOWN))
         self.assertIsNot(obs.status, Status.WAITING)
 
+    # -------------------------------------------- plan1 跨 turn 瞬态失效矩阵
+
+    def test_new_user_text_invalidates_stale_error(self):
+        # AC-CLAUDE-01：error 后新普通 user text → 立即 WORKING
+        state = ClaudeFile("claude.jsonl")
+        base = time.time()
+        state.feed(json.dumps({"type": "error", "timestamp": base,
+                               "message": "boom"}))
+        self.assertEqual(state.observation(base + 1, {}).status, Status.ERROR)
+        state.feed(json.dumps({
+            "type": "user", "timestamp": base + 5,
+            "message": {"content": [{"type": "text", "text": "继续修复"}]},
+        }))
+        obs = state.observation(base + 5.5, {})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertFalse(state.error_ts)
+
+    def test_new_assistant_activity_invalidates_stale_error(self):
+        # AC-CLAUDE-02：更新的 assistant 活动不被旧 ERROR TTL 压住
+        state = ClaudeFile("claude.jsonl")
+        base = time.time()
+        state.feed(json.dumps({"type": "error", "timestamp": base,
+                               "message": "boom"}))
+        self.assertEqual(state.observation(base + 1, {}).status, Status.ERROR)
+        state.feed(json.dumps({
+            "type": "assistant", "timestamp": base + 5,
+            "message": {"content": [{"type": "text", "text": "已恢复"}]},
+        }))
+        obs = state.observation(base + 5.5, {})
+        self.assertEqual(obs.status, Status.WORKING)
+
+    def test_tool_result_only_user_record_keeps_stale_error(self):
+        # plan1 §5（AC-CLAUDE-02 附带）：纯 tool_result user record 不是
+        # 新用户 Goal/新 turn，不清旧 ERROR 瞬态
+        state = ClaudeFile("claude.jsonl")
+        base = time.time()
+        state.feed(json.dumps({"type": "error", "timestamp": base,
+                               "message": "boom"}))
+        state.feed(json.dumps({
+            "type": "user", "timestamp": base + 2,
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                     "content": "noise"}]},
+        }))
+        obs = state.observation(base + 3, {})
+        self.assertEqual(obs.status, Status.ERROR)
+        self.assertEqual(state.goal, "")
+
 
 class PiSessionV3Tests(unittest.TestCase):
     """v4.2.3 §8：pi v3 stopReason / 独立 toolResult / WSL canonical root。"""
@@ -594,6 +644,94 @@ class PiSessionV3Tests(unittest.TestCase):
             "stopReason": ""}}))
         obs = state.observation(base + 0.1, {})
         self.assertEqual(obs.status, Status.WORKING)   # 不凭空宣布完成
+
+    # -------------------------------------------- plan1 跨 turn 瞬态失效矩阵
+
+    def test_error_ttl_expiry_falls_to_idle_never_working(self):
+        # AC-PI-01：active → error → ERROR TTL 结束后 IDLE，绝不反弹 WORKING
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message", "timestamp": base,
+                               "message": {"role": "user",
+                                           "content": "重构解析器"}}))
+        state.feed(json.dumps({"type": "message", "timestamp": base + 1,
+                               "message": {"role": "assistant", "content": [],
+                                           "stopReason": "error",
+                                           "errorMessage": "boom"}}))
+        obs = state.observation(base + 1.5, {})
+        self.assertEqual(obs.status, Status.ERROR)
+        self.assertFalse(state.turn_active)
+        obs = state.observation(base + 31, {})
+        self.assertEqual(obs.status, Status.IDLE)
+        obs = state.observation(base + 120, {})
+        self.assertIsNot(obs.status, Status.WORKING)
+
+    def test_new_user_turn_invalidates_stale_error(self):
+        # AC-PI-02：ERROR TTL 内新 user turn → 立即 WORKING/THINKING，Goal=B
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message", "timestamp": base,
+                               "message": {"role": "user",
+                                           "content": "任务 A"}}))
+        state.feed(json.dumps({"type": "message", "timestamp": base + 1,
+                               "message": {"role": "assistant", "content": [],
+                                           "stopReason": "error",
+                                           "errorMessage": "boom"}}))
+        self.assertEqual(state.observation(base + 1.5, {}).status, Status.ERROR)
+        state.feed(json.dumps({"type": "message", "timestamp": base + 5,
+                               "message": {"role": "user",
+                                           "content": "任务 B"}}))
+        obs = state.observation(base + 5.5, {})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertEqual(obs.phase, Phase.THINKING)
+        self.assertEqual(obs.goal, "任务 B")
+        self.assertFalse(state.error_ts)
+
+    def test_new_user_turn_invalidates_stale_done(self):
+        # AC-PI-03：DONE 8s 窗口内新 user turn → 立即 WORKING，不显示旧 DONE
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message", "timestamp": base,
+                               "message": {"role": "user",
+                                           "content": "任务 A"}}))
+        state.feed(json.dumps({"type": "message", "timestamp": base + 1,
+                               "message": {"role": "assistant",
+                                           "content": [{"type": "text",
+                                                        "text": "完成"}],
+                                           "stopReason": "stop"}}))
+        self.assertEqual(state.observation(base + 1.5, {}).status, Status.DONE)
+        state.feed(json.dumps({"type": "message", "timestamp": base + 3,
+                               "message": {"role": "user",
+                                           "content": "任务 B"}}))
+        obs = state.observation(base + 3.5, {})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertEqual(obs.phase, Phase.THINKING)
+
+    def test_image_only_user_message_starts_turn(self):
+        # AC-PI-04：无文本/仅图片 user message 也建立 turn，不伪造 Goal
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message", "timestamp": base,
+                               "message": {"role": "user",
+                                           "content": [{"type": "image",
+                                                        "url": "pic.png"}]}}))
+        self.assertTrue(state.turn_active)
+        obs = state.observation(base + 0.5, {})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertEqual(obs.goal, "")
+
+    def test_toplevel_error_same_lifecycle_as_assistant_error(self):
+        # AC-PI-05：top-level error 与 assistant stopReason=error 同语义
+        state = self._state()
+        base = time.time()
+        state.feed(json.dumps({"type": "message", "timestamp": base,
+                               "message": {"role": "user",
+                                           "content": "任务 A"}}))
+        state.feed(json.dumps({"type": "error", "timestamp": base + 1,
+                               "message": "boom"}))
+        self.assertEqual(state.observation(base + 1.5, {}).status, Status.ERROR)
+        self.assertFalse(state.turn_active)
+        self.assertEqual(state.observation(base + 31, {}).status, Status.IDLE)
 
     def test_pi_session_roots_windows_and_wsl(self):
         # AC-PI-03：Windows/WSL 默认 pi session path 都指向
@@ -861,6 +999,68 @@ class KimiWatcherTests(unittest.TestCase):
         state.feed(json.dumps({"type": "TurnEnd", "timestamp": base + 1}))
         self.assertEqual(state.observation(base + 2, {}).status, Status.DONE)
         self.assertEqual(state.observation(base + 20, {}).status, Status.IDLE)
+
+    # -------------------------------------------- plan1 跨 turn 瞬态失效矩阵
+
+    def test_prompt_accepted_invalidates_stale_error(self):
+        # AC-KIMI-01：真实 wire 序列无 turn.begin 时，prompt.accepted
+        # 即用户输入证据，旧 ERROR 失效并进入 WORKING
+        state = KimiFile("wire.jsonl")
+        base = time.time()
+        state.feed(json.dumps({"type": "prompt.accepted",
+                               "time": int(base * 1000),
+                               "content": [{"type": "text", "text": "任务 A"}]}))
+        state.feed(json.dumps({"type": "error", "time": int((base + 1) * 1000),
+                               "message": "boom"}))
+        self.assertEqual(state.observation(base + 1.5, {}).status, Status.ERROR)
+        state.feed(json.dumps({"type": "prompt.accepted",
+                               "time": int((base + 5) * 1000),
+                               "content": [{"type": "text", "text": "重试"}]}))
+        obs = state.observation(base + 5.5, {})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertEqual(obs.goal, "重试")
+        self.assertFalse(state.error_ts)
+
+    def test_step_begin_invalidates_stale_error(self):
+        # AC-KIMI-02：context.append_loop_event -> step.begin 的真实路径
+        # 不被旧 ERROR TTL 压住
+        state = KimiFile("wire.jsonl")
+        base = time.time()
+        state.feed(json.dumps({"type": "prompt.accepted",
+                               "time": int(base * 1000),
+                               "content": [{"type": "text", "text": "任务 A"}]}))
+        state.feed(json.dumps({"type": "error", "time": int((base + 1) * 1000),
+                               "message": "boom"}))
+        self.assertEqual(state.observation(base + 1.5, {}).status, Status.ERROR)
+        state.feed(json.dumps({"type": "context.append_loop_event",
+                               "event": {"type": "step.begin", "step": 1},
+                               "time": int((base + 5) * 1000)}))
+        obs = state.observation(base + 5.5, {})
+        self.assertEqual(obs.status, Status.WORKING)
+        self.assertFalse(state.error_ts)
+
+    def test_unresolved_approval_survives_ordinary_activity(self):
+        # AC-KIMI-03：未 resolve 的显式 approval 不因普通活动被清掉
+        state = KimiFile("wire.jsonl")
+        base = time.time()
+        state.feed(json.dumps({"type": "prompt.accepted",
+                               "time": int(base * 1000),
+                               "content": [{"type": "text", "text": "跑测试"}]}))
+        state.feed(json.dumps({
+            "type": "interaction.request", "time": int((base + 1) * 1000),
+            "agentId": "main", "id": "it-9", "kind": "approval",
+            "request": {"title": "Bash: rm -rf build"}}))
+        self.assertEqual(state.observation(base + 1.5, {}).status, Status.WAITING)
+        # 无关且不 resolve 的普通活动不得清审批
+        state.feed(json.dumps({"type": "context.append_loop_event",
+                               "event": {"type": "step.begin", "step": 2},
+                               "time": int((base + 2) * 1000)}))
+        state.feed(json.dumps({"type": "prompt.accepted",
+                               "time": int((base + 3) * 1000),
+                               "content": [{"type": "text", "text": "别的"}]}))
+        obs = state.observation(base + 3.5, {})
+        self.assertEqual(obs.status, Status.WAITING)
+        self.assertEqual(obs.phase, Phase.APPROVAL)
 
 
 # ============================================================ 绑定

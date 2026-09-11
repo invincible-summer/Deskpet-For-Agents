@@ -200,13 +200,14 @@ class KimiFile(FileState):
 
         # ---- 真实 CLI 顶层事件 ----
         if t == "prompt.accepted":
+            # 用户输入证据本身开始新 turn（R04）：文本缺失（如仅图片）
+            # 不影响 turn 生命周期，也不保留旧 ERROR/DONE 瞬态
             text = _text(obj.get("content"))
             if text:
                 self.goal = shorten(text, GOAL_MAX)
-                self.turn_active = True
-                self.turn_known_over = False
-                self.done_ts = 0.0
-                self.phase = Phase.THINKING
+            self._mark_turn_active()
+            self.done_ts = 0.0
+            self.phase = Phase.THINKING
         elif t == "plan_mode.enter":
             self.mode, self.mode_raw = parse_mode("plan")
         elif t in ("plan_mode.exit", "plan_mode.cancel"):
@@ -304,11 +305,24 @@ class KimiFile(FileState):
         self.error_ts = 0.0
         self.phase = Phase.THINKING
 
+    def _mark_turn_active(self):
+        """真实 start/activity 路径共用的 stale-error 清理（plan1 R04）。
+
+        与 _turn_begin 的差异：不清 pending/input——显式 approval/
+        question 仍由 interaction.request/resolved 事件闭合，普通
+        activity 不得误伤未 resolve 的审批。
+        """
+        self.turn_active = True
+        self.turn_known_over = False
+        self.error_text = ""
+        self.error_ts = 0.0
+
     def _feed_loop_event(self, event: dict, ts: float):
         et = str(event.get("type") or "")
         if et == "step.begin":
-            self.turn_active = True
-            self.turn_known_over = False
+            # R04：step.begin 是真实权威 start/activity 证据，
+            # 同样失效旧 ERROR 瞬态
+            self._mark_turn_active()
             self.phase = Phase.THINKING
         elif et == "step.end":
             pass   # 活动证据已记录

@@ -68,12 +68,31 @@ class PiFile(FileState):
             self.goal = shorten(str(goal), GOAL_MAX)
         return ts
 
+    def _begin_turn(self):
+        """新 user turn 的唯一初始化路径（plan1 R01）。
+
+        合法 user message 本身就是新 turn 证据：文本 Goal 解析失败
+        （image-only 等）也必须建立 turn 生命周期，并使上一轮
+        ERROR/DONE 展示瞬态与内部 phase 立即失效。
+        """
+        self.turn_active = True
+        self.turn_known_over = False
+        self.input_pending = False
+        self.done_ts = 0.0
+        self.error_text = ""
+        self.error_ts = 0.0
+        self.phase = Phase.THINKING
+
     def _set_error(self, obj: dict, ts: float):
         message = obj.get("message") or obj.get("error") or obj.get("reason")
         self.error_text = shorten(str(message or "pi 报告错误"), SUMMARY_MAX)
         self.error_ts = ts
+        # R02：error 真正结束 active turn，ERROR TTL 结束后落 IDLE，
+        # 不允许反弹回 WORKING
+        self.turn_active = False
         self.turn_known_over = True
         self.input_pending = False
+        self.done_ts = 0.0
         self.phase = Phase.NONE
 
     def _set_input(self, obj: dict):
@@ -115,7 +134,9 @@ class PiFile(FileState):
         msg = obj.get("message") or {}
         role = msg.get("role")
         if role == "user":
-            self.input_pending = False
+            # R01：先建立 turn 生命周期，再尝试提取文本 Goal；
+            # image-only 等无文本 user message 同样开始新 turn
+            self._begin_turn()
         content = msg.get("content")
         blocks = content if isinstance(content, list) else (
             [{"type": "text", "text": content}] if isinstance(content, str) else [])
@@ -138,8 +159,6 @@ class PiFile(FileState):
                 value = _text(block.get("text") or block.get("content"))
                 if value.strip():
                     self.goal = shorten(value, GOAL_MAX)
-                    self.turn_active = True
-                    self.turn_known_over = False
             elif btype in {"thinking", "ThinkingContent", "thinking_content"}:
                 self.phase = Phase.THINKING
             elif btype in {"toolCall", "tool_call"}:

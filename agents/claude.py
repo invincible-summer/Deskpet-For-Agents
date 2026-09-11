@@ -130,6 +130,11 @@ class ClaudeFile(FileState):
         self.done_ts = 0.0
         self.phase = Phase.NONE
 
+    def _clear_error_transient(self):
+        """比旧 error 更新的明确 session 活动使旧 ERROR 展示瞬态失效（plan1 R03）。"""
+        self.error_text = ""
+        self.error_ts = 0.0
+
     def _set_input(self, obj: dict):
         value = _first_present(obj, "question", "prompt", "message")
         self.input_pending = True
@@ -148,6 +153,7 @@ class ClaudeFile(FileState):
             self.turn_active = True
             self.turn_known_over = False
             self.done_ts = 0.0
+            self._clear_error_transient()
             msg = obj.get("message") or {}
             for block in msg.get("content") or []:
                 if not isinstance(block, dict):
@@ -186,12 +192,15 @@ class ClaudeFile(FileState):
                 elif isinstance(block, str):
                     plain.append(block)
             # 普通用户文本 → Goal（最新一次真实输入；plan §12）。
+            # 新 turn 开始时同时失效旧 ERROR 瞬态（plan1 R03）；
+            # 纯 tool_result block 不构成"新用户 Goal"，不清瞬态。
             text = shorten(" ".join(x for x in plain if x.strip()), GOAL_MAX)
             if text:
                 self.goal = text
                 self.turn_active = True
                 self.turn_known_over = False
                 self.done_ts = 0.0
+                self._clear_error_transient()
             return
 
         if t == "ai-title":
