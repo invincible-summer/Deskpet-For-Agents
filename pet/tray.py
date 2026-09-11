@@ -590,7 +590,10 @@ class TrayIcon:
         ver.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         ver.hWnd = self._hwnd
         ver.uID = self._ICON_ID
-        ver.uVersion = NOTIFYICON_VERSION_4
+        # 写 native union storage（_anonymous_ 让 uVersion 别名指向同一
+        # descriptor；显式经 union 访问使这一行在 _anonymous_ 被移除时
+        # 立即 AttributeError，而不是静默退化为普通 Python attribute）。
+        ver.union.uVersion = NOTIFYICON_VERSION_4
         if not shell32.Shell_NotifyIconW(NIM_SETVERSION,
                                          ctypes.byref(ver)):
             error = (f"Shell_NotifyIconW(NIM_SETVERSION=4) failed "

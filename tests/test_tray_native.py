@@ -142,6 +142,83 @@ class TrayShellApiTests(unittest.TestCase):
         self.assertIn("NIM_SETVERSION", icon.last_error())
         self.assertIsNone(icon._nid)   # 回滚：不留语义模糊的 icon
 
+    def test_setversion_writes_version4_to_native_union_bytes(self):
+        """regression for Python attribute vs native struct bytes。
+
+        必须从 Shell_NotifyIconW 收到的指针复制 raw bytes 再解析——
+        `ver.uVersion == 4` 只证明 Python 属性被写，不能证明传给
+        Win32 的结构体内存正确（历史上 union 字段曾被误写成普通
+        attribute，native 字节保持 0）。
+        """
+        import ctypes
+        import pet.tray as tray_mod
+        from pet.tray import TrayState
+        icon = self._icon()
+        icon._state = TrayState.STARTING
+        versions = []
+
+        def notify(msg, data):
+            if msg == tray_mod.NIM_SETVERSION:
+                raw = ctypes.string_at(
+                    data, ctypes.sizeof(tray_mod.NOTIFYICONDATAW))
+                native = tray_mod.NOTIFYICONDATAW.from_buffer_copy(raw)
+                versions.append(native.union.uVersion)
+            return True
+
+        with patch.object(icon, '_load_icon', return_value=(None, False)), \
+             patch.object(tray_mod.shell32, 'Shell_NotifyIconW',
+                          side_effect=notify):
+            self.assertTrue(icon._add_icon())
+        self.assertEqual(versions, [4],
+                         "Shell must receive v4 bytes, not a Python attribute")
+
+    def test_add_failure_skips_setversion_and_frees_owned_icon(self):
+        """NIM_ADD 失败：不调 SETVERSION；owned HICON 释放；无残留 nid。"""
+        import pet.tray as tray_mod
+        from pet.tray import TrayState
+        icon = self._icon()
+        icon._state = TrayState.STARTING
+        calls = []
+
+        def fake_notify(msg, _data):
+            calls.append(msg)
+            return False
+
+        with patch.object(icon, '_load_icon', return_value=(0x55, True)), \
+             patch.object(tray_mod.user32, 'DestroyIcon',
+                          return_value=True) as destroy, \
+             patch.object(tray_mod.shell32, 'Shell_NotifyIconW',
+                          side_effect=fake_notify):
+            ok = icon._add_icon()
+        self.assertFalse(ok)
+        self.assertEqual(calls, [tray_mod.NIM_ADD],
+                         "ADD 失败绝不能留下 legacy-protocol icon")
+        self.assertEqual(icon._state, TrayState.FAILED)
+        destroy.assert_called_once_with(0x55)   # owned icon 必须释放
+        self.assertIsNone(icon._nid)
+
+    def test_every_readd_sets_version_again(self):
+        """版本不是持久 Shell 属性：每次 NIM_ADD 后都要重新 SETVERSION。"""
+        import pet.tray as tray_mod
+        from pet.tray import TrayState
+        icon = self._icon()
+        icon._state = TrayState.STARTING
+        calls = []
+
+        def fake_notify(msg, _data):
+            calls.append(msg)
+            return True
+
+        with patch.object(icon, '_load_icon', return_value=(0x55, False)), \
+             patch.object(tray_mod.shell32, 'Shell_NotifyIconW',
+                          side_effect=fake_notify):
+            self.assertTrue(icon._add_icon())
+            icon._remove()          # icon 被移除（如 reconcile/Explorer 重启）
+            self.assertTrue(icon._add_icon())   # show_icon 重新挂载路径
+        self.assertEqual(calls, [tray_mod.NIM_ADD, tray_mod.NIM_SETVERSION,
+                                 tray_mod.NIM_DELETE,
+                                 tray_mod.NIM_ADD, tray_mod.NIM_SETVERSION])
+
 
 class TrayVersion4CallbackTests(unittest.TestCase):
     """VERSION_4 语义输入映射（§6.2）。"""
@@ -152,14 +229,35 @@ class TrayVersion4CallbackTests(unittest.TestCase):
         icon.events = queue.Queue(maxsize=TRAY_EVENT_QUEUE_MAX)
         return icon
 
-    def test_keyboard_select_maps_to_restore(self):
-        from pet.tray import WM_APP_TRAY, TrayIcon
+    def test_mouse_left_up_exactly_one_restore(self):
+        from pet.tray import WM_APP_TRAY, WM_LBUTTONUP, TrayIcon
         icon = self._icon()
         v4 = TrayIcon._ICON_ID << 16
-        icon._handle_message(1, WM_APP_TRAY, 0, v4 | 0x0401)  # NIN_KEYSELECT
-        icon._handle_message(1, WM_APP_TRAY, 0, v4 | 0x0400)  # NIN_SELECT
+        for _ in range(3):
+            icon._handle_message(1, WM_APP_TRAY, 0, v4 | WM_LBUTTONUP)
+        self.assertEqual([e.command for e in drain(icon)],
+                         ["restore", "restore", "restore"])
+
+    def test_keyboard_select_maps_to_restore(self):
+        from pet.tray import WM_APP_TRAY, NIN_SELECT, NIN_KEYSELECT, TrayIcon
+        icon = self._icon()
+        v4 = TrayIcon._ICON_ID << 16
+        icon._handle_message(1, WM_APP_TRAY, 0, v4 | NIN_KEYSELECT)
+        icon._handle_message(1, WM_APP_TRAY, 0, v4 | NIN_SELECT)
         self.assertEqual([e.command for e in drain(icon)],
                          ["restore", "restore"])
+
+    def test_keyboard_context_notification_opens_menu_once(self):
+        """键盘 context selection 同样发 WM_CONTEXTMENU：一次手势一个菜单。"""
+        from pet.tray import WM_APP_TRAY, WM_CONTEXTMENU, TrayIcon
+        icon = self._icon()
+        v4 = TrayIcon._ICON_ID << 16
+        attempts = []
+        with patch.object(icon, '_open_native_menu',
+                          lambda: attempts.append(1)):
+            icon._handle_message(1, WM_APP_TRAY, 0, v4 | WM_CONTEXTMENU)
+        self.assertEqual(attempts, [1])
+        self.assertTrue(icon.events.empty())   # 开菜单本身不是语义事件
 
     def test_foreign_icon_id_ignored(self):
         from pet.tray import WM_APP_TRAY, TrayIcon
@@ -337,6 +435,40 @@ class TrayNativeMenuTests(unittest.TestCase):
         self.assertEqual(posted[0], (0x1234, tray_mod.WM_CANCELMODE))
         self.assertEqual(posted[1], (0x1234, WM_APP_QUIT))
         self.assertEqual(posted[2], ("tid", 0x0012))
+
+
+# ================================================================ §6.3 queue
+class TrayEventQueueTests(unittest.TestCase):
+    """语义事件队列：有界、满不阻塞 wndproc、quit 语义不可丢。"""
+
+    def test_bounded_queue_drops_and_counts(self):
+        from pet.tray import (TRAY_EVENT_QUEUE_MAX, WM_APP_TRAY, TrayEvent,
+                              TrayIcon)
+        icon = TrayIcon.__new__(TrayIcon)   # 不启动线程：只测 wndproc 语义
+        icon.events = queue.Queue(maxsize=TRAY_EVENT_QUEUE_MAX)
+        icon.dropped_events = 0
+        icon.quit_requested = threading.Event()
+        for _ in range(TRAY_EVENT_QUEUE_MAX):
+            icon.events.put_nowait(TrayEvent("restore"))
+        with self.assertRaises(queue.Full):
+            icon.events.put_nowait(TrayEvent("restore"))
+        # 满队列下 1000 次 wndproc 调用全部立即返回（丢弃计数，不阻塞）。
+        v4 = TrayIcon._ICON_ID << 16
+        for _ in range(1000):
+            self.assertEqual(
+                icon._handle_message(1, WM_APP_TRAY, 0, v4 | 0x0202), 0)
+        self.assertEqual(icon.dropped_events, 1000)
+        self.assertEqual(icon.events.qsize(), TRAY_EVENT_QUEUE_MAX)
+
+    def test_quit_latch_cannot_be_lost_behind_full_queue(self):
+        from pet.tray import TrayEvent, TrayIcon
+        icon = TrayIcon()
+        for _ in range(icon.events.maxsize):
+            icon._enqueue(TrayEvent("restore"))
+        icon._enqueue(TrayEvent("quit"))
+        self.assertTrue(icon.quit_requested.is_set())
+        self.assertEqual(icon.dropped_events, 1)
+        self.assertEqual(icon.events.qsize(), icon.events.maxsize)
 
 
 class TrayHiconOwnershipTests(unittest.TestCase):

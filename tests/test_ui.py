@@ -644,25 +644,6 @@ class TrayLifecycleTests(unittest.TestCase):
             ok_icon.request_stop()
             ok_icon.join_for_shutdown(2.0)
 
-    def test_event_queue_bounded_and_wndproc_never_blocks(self):
-        from pet.tray import TRAY_EVENT_QUEUE_MAX, WM_APP_TRAY, TrayEvent
-        from pet.tray import TrayIcon
-        icon = TrayIcon.__new__(TrayIcon)   # 不启动线程：只测 wndproc 语义
-        icon.events = queue.Queue(maxsize=TRAY_EVENT_QUEUE_MAX)
-        icon.dropped_events = 0
-        for _ in range(TRAY_EVENT_QUEUE_MAX):
-            icon.events.put_nowait(TrayEvent("restore"))
-        with self.assertRaises(queue.Full):
-            icon.events.put_nowait(TrayEvent("restore"))
-        # 满队列下 1000 次 wndproc 调用全部立即返回（丢弃计数，不阻塞）。
-        # VERSION_4：HIWORD(lParam)=icon id，LOWORD=通知事件
-        lparam = (TrayIcon._ICON_ID << 16) | 0x0202   # WM_LBUTTONUP
-        for _ in range(1000):
-            self.assertEqual(
-                icon._handle_message(1, WM_APP_TRAY, 0, lparam), 0)
-        self.assertEqual(icon.dropped_events, 1000)
-        self.assertEqual(icon.events.qsize(), TRAY_EVENT_QUEUE_MAX)
-
     def test_app_tray_drain_bounded(self):
         from pet.app import TRAY_DRAIN_MAX
         from pet.tray import TrayEvent, TrayState

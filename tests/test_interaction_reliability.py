@@ -190,34 +190,6 @@ class TrayReliabilityTests(unittest.TestCase):
         self.assertEqual(icon.menu_open_failures(), 1)
         self.assertFalse(icon._menu_active)
 
-    def test_shell_version_is_written_to_native_union_bytes(self):
-        import ctypes
-        import pet.tray as mod
-        icon = mod.TrayIcon()
-        icon._hwnd = 123
-        versions = []
-        def notify(msg, data):
-            if msg == mod.NIM_SETVERSION:
-                raw = ctypes.string_at(data, ctypes.sizeof(mod.NOTIFYICONDATAW))
-                native = mod.NOTIFYICONDATAW.from_buffer_copy(raw)
-                versions.append(native.union.uVersion)
-            return True
-        with patch.object(icon, "_load_icon", return_value=(None, False)), \
-                patch.object(mod.shell32, "Shell_NotifyIconW", side_effect=notify):
-            self.assertTrue(icon._add_icon())
-        self.assertEqual(versions, [4], "Shell must receive v4 bytes, not a Python attribute")
-
-    def test_queue_overflow_does_not_lose_exit(self):
-        from pet.tray import TrayEvent, TrayIcon
-        icon = TrayIcon()
-        for _ in range(icon.events.maxsize):
-            icon._enqueue(TrayEvent("restore"))
-        icon._enqueue(TrayEvent("quit"))
-        self.assertTrue(icon.quit_requested.is_set())
-        self.assertEqual(icon.dropped_events, 1)
-        self.assertEqual(icon.events.qsize(), icon.events.maxsize)
-
-
 class AppReliabilityTests(unittest.TestCase):
     def test_bad_cleanup_cannot_skip_other_stop_signals(self):
         app = make_app()
