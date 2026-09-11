@@ -372,6 +372,19 @@ class CommitTests(unittest.TestCase):
             cfg.commit()
             self.assertEqual(len(saves), 1)
 
+    def test_setting_same_value_is_zero_work(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = self._cfg(temp)
+            current = cfg.get("scale")
+            revision = cfg.revision
+            self.assertFalse(cfg.set("scale", current))
+            self.assertFalse(cfg.update_many({
+                "scale": current,
+                "speed": cfg.get("speed"),
+            }))
+            self.assertEqual(cfg.revision, revision)
+            self.assertFalse(cfg.dirty)
+
 
 class GitIgnoreTests(unittest.TestCase):
     def test_local_artifacts_are_git_ignored(self):

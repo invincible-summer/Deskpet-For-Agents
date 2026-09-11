@@ -23,8 +23,10 @@ v4.3.1 DP43-R15 生命周期与协议合同（plan §6）：
     非零 command id 映射成 TrayEvent 入队。前台准备失败不开菜单
     （menu_open_failures++），绝不留下无法 click-away 的菜单；
   * request_stop：先 PostMessage(WM_CANCELMODE) 结束可能 active 的
-    native menu（EndMenu 只作用于调用线程，不得跨线程调用），再投
-    递 WM_APP_QUIT / 线程 WM_QUIT；
+    native menu（EndMenu 只作用于调用线程，不得跨线程调用——worker
+    在 wndproc 收到 WM_CANCELMODE/WM_APP_QUIT 时自己调用 EndMenu，
+    实际结束 TrackPopupMenuEx 跟踪），再投递 WM_APP_QUIT / 线程
+    WM_QUIT；
   * HWND 路由：module-level WNDPROC（与窗口类同生命周期）+ hwnd →
     TrayIcon registry；未登记 HWND 一律 DefWindowProc。App 保证同
     一时刻最多一个 live generation（plan §6.6）；
@@ -97,6 +99,8 @@ user32.DestroyMenu.restype = wt.BOOL
 user32.TrackPopupMenuEx.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int,
                                     ctypes.c_int, wt.HWND, wt.LPVOID]
 user32.TrackPopupMenuEx.restype = ctypes.c_int   # TPM_RETURNCMD 时为 cmd id
+user32.EndMenu.argtypes = []
+user32.EndMenu.restype = wt.BOOL
 user32.SetForegroundWindow.argtypes = [wt.HWND]
 user32.SetForegroundWindow.restype = wt.BOOL
 user32.GetForegroundWindow.argtypes = []
@@ -111,8 +115,9 @@ shell32.Shell_NotifyIconW.restype = wt.BOOL
 WM_APP_TRAY = 0x8100            # 托盘回调消息（uCallbackMessage）
 WM_APP_QUIT = 0x8101
 WM_QUIT = 0x0012
-WM_CANCELMODE = 0x001B          # 结束 active menu 的标准路径（EndMenu
-                                # 只作用于调用线程，不能跨线程用）
+WM_CANCELMODE = 0x001B          # 请求结束 active menu：worker 收到后在
+                                # 自己线程调用 EndMenu（EndMenu 只作用于
+                                # 调用线程，不能跨线程用）
 
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIM_SETFOCUS, NIM_SETVERSION = 3, 4
@@ -422,7 +427,19 @@ class TrayIcon:
                 self._enqueue(TrayEvent("restore"))
             # 其他鼠标 down/move/up 不转成业务语义（plan §6.2）
             return 0
+        if msg == WM_CANCELMODE and self._menu_active:
+            # request_stop 的取消路径落到 worker 自己的线程执行：
+            # EndMenu 是“结束调用线程活动菜单”的一级 API（Microsoft
+            # Learn / EndMenu；文档注明 WM_CANCELMODE 只是回退手段，
+            # posted WM_CANCELMODE 经 DefWindowProc 实测不能可靠结束
+            # 正在跟踪的真实菜单——桌面空闲被授予前台时由自动验收暴露）。
+            user32.EndMenu()
+            return 0
         if msg == WM_APP_QUIT:
+            if self._menu_active:
+                # 菜单模态循环内收到 quit：先结束跟踪再退出消息循环，
+                # 保证全局 shutdown deadline 不被 TrackPopupMenuEx 卡住。
+                user32.EndMenu()
             self._remove()
             user32.PostQuitMessage(0)
             return 0

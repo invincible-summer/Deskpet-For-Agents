@@ -118,6 +118,7 @@ class ProcessProbeWorker:
     def __init__(self, config):
         self.config = config
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._snapshot: dict[str, SourceProbeSnapshot] = {}
@@ -136,12 +137,14 @@ class ProcessProbeWorker:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(
             target=self._loop, name="deskpet-probe", daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
+        self._wake.set()
 
     def join(self, timeout: float = 2.0):
         """有界回收探测线程（plan §18）；绝不 join 调用线程自己。"""
@@ -159,18 +162,21 @@ class ProcessProbeWorker:
         self._wsl.set_allow_root_metadata(bool(enabled))
 
     def rescan(self):
+        """Request an immediate probe pass without doing probe work here."""
         self._last_windows = 0.0
         self._last_wsl = 0.0
+        self._wake.set()
 
     def _loop(self):
         while not self._stop.is_set():
+            self._wake.clear()
             t0 = time.time()
             try:
                 self._tick()
             except Exception:
                 pass
             elapsed = time.time() - t0
-            self._stop.wait(max(0.3, 1.0 - elapsed))
+            self._wake.wait(max(0.3, 1.0 - elapsed))
 
     def _tick(self):
         cfg_m = self.config.get("monitor") or {}
@@ -271,6 +277,11 @@ class Monitor:
         self._terminal_service = WindowsTerminalService(
             observer, cfg=monitor_cfg)
         self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._rescan_requested = threading.Event()
+        self._rescan_lock = threading.Lock()
+        self._rescan_request_count = 0
+        self._rescan_complete_count = 0
         self._thread: threading.Thread | None = None
         self._terminal_boot: threading.Thread | None = None
         self._exit_watcher = None
@@ -301,6 +312,8 @@ class Monitor:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._wake.clear()
+        self._rescan_requested.clear()
         self._probe.start()
         # UIA 后端初始化（comtypes/typelib/control 发现）可能耗时数秒，
         # 绝不能阻塞 UI 线程：放独立引导线程异步启动（plan §15/§32）。
@@ -334,6 +347,7 @@ class Monitor:
         join_for_shutdown(timeout)。
         """
         self._stop.set()
+        self._wake.set()
         self._probe.stop()
         if self._exit_watcher is not None:
             try:
@@ -483,8 +497,26 @@ class Monitor:
         self._probe.set_wsl_root_metadata_fallback(bool(enabled))
 
     def rescan(self):
-        """重新扫描：只清缓存与运行期绑定，不动 Agent 数据目录（plan §46）。"""
+        """提交一次合并式重新扫描请求并立即返回。
+
+        本方法可由 Tk callback 调用。它只设置 Event；watcher cache reset、
+        UIA topology refresh 和重新绑定全部由现有 Monitor worker 执行。
+        重复点击在 worker 消费前天然合并，不增加线程或队列。
+        """
+        with self._rescan_lock:
+            if self._stop.is_set() or self._rescan_requested.is_set():
+                return False
+            self._rescan_requested.set()
+            self._rescan_request_count += 1
         self._probe.rescan()
+        self._wake.set()
+        return True
+
+    def _consume_rescan_request(self) -> None:
+        with self._rescan_lock:
+            if not self._rescan_requested.is_set():
+                return
+            self._rescan_requested.clear()
         for watcher in self._watchers.values():
             try:
                 watcher.reset_scan_cache()
@@ -494,6 +526,10 @@ class Monitor:
             self._terminal_service.refresh_observed_controls(force=True)
         except Exception:
             pass
+        self._instance_sig = ()
+        self._last_resolve = 0.0
+        with self._rescan_lock:
+            self._rescan_complete_count += 1
         self._log("已请求重新扫描（清 Process/Session/Terminal 运行期缓存）")
 
     def activate_target(self, key: str) -> ActivationResult:
@@ -587,11 +623,8 @@ class Monitor:
         return self._terminal_service.startup_error()
 
     def rediscover_terminal(self):
-        """HWND 失效等场景下的终端重发现（只刷新运行期观察拓扑缓存）。"""
-        try:
-            self._terminal_service.refresh_observed_controls(force=True)
-        except Exception:
-            pass
+        """兼容入口：终端重发现同样不得在调用线程同步等待 UIA。"""
+        self.rescan()
 
     def stats(self) -> dict:
         wsl = self._probe._wsl
@@ -606,6 +639,8 @@ class Monitor:
             "exit_watched": (self._exit_watcher.watched_count()
                              if self._exit_watcher is not None else 0),
             "native_terminal_leases": len(self._native_terminal_leases),
+            "rescan_requests": self._rescan_request_count,
+            "rescan_completed": self._rescan_complete_count,
         }
         out.update(self._terminal_service.stats())
         return out
@@ -647,13 +682,14 @@ class Monitor:
 
     def _loop(self):
         while not self._stop.is_set():
+            self._wake.clear()
             t0 = time.time()
             try:
                 self._tick()
             except Exception as exc:
                 self._log(f"监控异常: {exc!r}")
             elapsed = time.time() - t0
-            self._stop.wait(max(0.15, self._poll_sec() - elapsed))
+            self._wake.wait(max(0.15, self._poll_sec() - elapsed))
 
     def _enabled_kinds(self, cfg_m: dict) -> set:
         out = set()
@@ -821,6 +857,7 @@ class Monitor:
     def _tick(self):
         cfg_m = dict(self.config.get("monitor") or {})
         now = time.time()
+        self._consume_rescan_request()
         self._merge_instances(now)
         probe_snap = self._probe.snapshot()
 

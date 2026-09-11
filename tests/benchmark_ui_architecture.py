@@ -1,6 +1,6 @@
 """UI 架构合成基准（v4.3 §19.2）。
 
-八条断言：
+十条断言：
   1. 8 Agent target 连续 500 个 semantic-no-change bridge tick，
      Presentation reconcile 不随 tick 等量增长；
   2. 无变化时 render flush = 0；
@@ -13,7 +13,11 @@
      save worker、0 次同步 commit；
   7. Dashboard 只 refresh 当前页，隐藏页 refresh 计数 = 0；
   8. 1→8 Pet 后 bridge timer 数不增长、animation scheduler after 槽
-     仍 ≤1。
+     仍 ≤1；
+  9. v4.3.1：导航/重扫描/外观按钮回调耗时有界（<50ms，重扫描
+     O(1) 提交）；
+  10. v4.3.1：200 次 Configure 合并为一个 idle 并收敛，同宽零重复
+     写入。
 
 用法：python tests/benchmark_ui_architecture.py [--report PATH]
 """
@@ -347,6 +351,86 @@ def check_dashboard_current_page_only(checks):
         app.quit()
 
 
+def check_button_latency_and_configure_convergence(checks):
+    """断言（v4.3.1 稳定性 §4）：按钮回调耗时有界（重扫描 O(1)）；
+    Configure 风暴合并为一个 idle 并有限收敛，不残留 callback。"""
+    from pet.app import PetApp
+    from pet.dashboard import PAGE_AGENTS, PAGE_OVERVIEW, SCALE_STEPS
+    from pet.petview import PetView
+    from tests.test_ui import MemoryConfig
+    with\
+            patch.object(PetView, "load_skin", lambda self, bm: None):
+        app = PetApp(MemoryConfig())
+        app.pet_manager.activate_skin_runtime()
+        app._disarm_first_map_trigger()
+    try:
+        app.open_dashboard()
+        app.root.update()
+        dash = app.dashboard
+        app.toast = lambda *a, **k: None   # 隔离提示 UI，只测调度合同
+        # 预热：懒构建是一次性成本（v4.3 既有合同），计时只测稳态回调。
+        for page in list(dash._pages):
+            dash._show_page(page)
+        app.root.update()
+
+        def timed(label, fn, limit_ms=50.0, rounds=20):
+            worst = 0.0
+            for _ in range(rounds):
+                t0 = time.perf_counter()
+                fn()
+                worst = max(worst, (time.perf_counter() - t0) * 1000.0)
+            app.root.update_idletasks()
+            checks.append((
+                f"按钮回调有界：{label} 最差 {worst:.1f}ms "
+                f"< {limit_ms:.0f}ms",
+                worst < limit_ms))
+
+        timed("重复点击当前导航（零布局）",
+              lambda: dash._show_page(dash._page))
+        timed("切页提交",
+              lambda: dash._show_page(
+                  PAGE_AGENTS if dash._page != PAGE_AGENTS
+                  else PAGE_OVERVIEW))
+        timed("重新扫描提交（O(1) Event）", dash.request_rescan)
+        steps = SCALE_STEPS
+        counter = {"i": 0}
+
+        def change_scale():
+            app.appearance.set_global(
+                "scale", steps[counter["i"] % len(steps)])
+            counter["i"] += 1
+
+        timed("外观 step 提交", change_scale)
+
+        # Configure 风暴：200 次同宽事件 → 恰一个 pending idle、
+        # drain 后零残留，同宽不重复写窗口宽。
+        scroller = dash.content
+        event = type("ConfigureEvent", (), {"width": 900})()
+        itemconfigure_calls = []
+        real_itemconfigure = scroller._canvas.itemconfigure
+
+        def spy_itemconfigure(*a, **k):
+            itemconfigure_calls.append(1)
+            return real_itemconfigure(*a, **k)
+
+        with patch.object(scroller._canvas, "itemconfigure",
+                          spy_itemconfigure):
+            for _ in range(200):
+                scroller._on_canvas_configure(event)
+                scroller._on_inner_configure(event)
+            pending_single = scroller._layout_after is not None
+            app.root.update_idletasks()
+            converged = pending_single and scroller._layout_after is None
+        checks.append(("200 次 Configure 合并为一个 idle 并收敛"
+                       "（无残留 callback）", converged))
+        checks.append((
+            f"同宽 Configure 只写一次窗口宽"
+            f"（itemconfigure={len(itemconfigure_calls)}）",
+            len(itemconfigure_calls) <= 1))
+    finally:
+        app.quit()
+
+
 def check_timers_do_not_grow_with_pets(checks):
     """断言 8：1→8 Pet bridge timer 不增长；scheduler after 槽 ≤1。"""
     from pet.ui_coordinator import UiCoordinator
@@ -670,10 +754,23 @@ def check_dp43_reliability_structural(checks):
         and "timeout=2.0" not in monitor_src
         and "_remaining()" in monitor_src))
 
-    for mod, label in (("pet/context_menu.py", "context_menu"),
-                       ("pet/dashboard.py", "dashboard")):
-        src = (repo / mod).read_text(encoding="utf-8")
-        checks.append((f"{label} 无常驻线程", "threading.Thread" not in src))
+    context_src = (repo / "pet" / "context_menu.py").read_text(
+        encoding="utf-8")
+    checks.append(("context_menu 无常驻线程",
+                   "threading.Thread" not in context_src))
+    action_body = dashboard_src.split("    def submit_action(", 1)[-1].split(
+        "    def actions_pending", 1)[0]
+    checks.append((
+        "Dashboard 仅允许一个按需 transient action worker",
+        dashboard_src.count("threading.Thread(") == 1
+        and "deskpet-dashboard-action" in dashboard_src
+        and "while True" not in action_body))
+    rescan_body = monitor_src.split("    def rescan(self):", 2)[-1].split(
+        "    def ", 1)[0]
+    checks.append((
+        "Monitor.rescan 只提交 Event，不同步刷新 UIA",
+        "refresh_observed_controls" not in rescan_body
+        and "_rescan_requested.set()" in rescan_body))
 
     from pet.skins import SkinBuildManager
     bm = SkinBuildManager()
@@ -699,6 +796,7 @@ def run(report_path: str = "") -> int:
     check_decode_slice_and_shared_key(checks)
     check_slider_rapid_steps_single_save(checks)
     check_dashboard_current_page_only(checks)
+    check_button_latency_and_configure_convergence(checks)
     check_timers_do_not_grow_with_pets(checks)
     check_saver_lifecycle_structural(checks)
     check_maintenance_coalescing(checks)

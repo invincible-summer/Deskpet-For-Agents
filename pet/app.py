@@ -75,6 +75,7 @@ class PetApp:
             if result is not None and getattr(result, "ok", True) is False:
                 self.toast(f"配置保存失败：{getattr(result, 'error', '')}",
                            5)
+            self.ui.request(UiDirty.DASHBOARD)
 
         self.config_saver = ConfigSaveCoordinator(
             self.root, config, on_result=_on_config_saved)
@@ -1096,6 +1097,8 @@ class PetApp:
             clean(self.config_saver.begin_shutdown)
             clean(self.monitor.join_for_shutdown, remaining())
             clean(self.pet_manager.join_for_shutdown, remaining())
+            if self.dashboard is not None:
+                clean(self.dashboard.join_actions, remaining())
             if self.tray is not None:
                 clean(self.tray.join_for_shutdown, remaining())
                 self.tray = None

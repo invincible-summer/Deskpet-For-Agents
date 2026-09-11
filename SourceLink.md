@@ -22,6 +22,7 @@
 - [Shell_NotifyIconW](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyiconw) — NIM_ADD/NIM_MODIFY/NIM_DELETE/NIM_SETFOCUS/NIM_SETVERSION 消息语义与返回值合同；NIM_SETVERSION 必须在每次 NIM_ADD 后调用。
 - [NOTIFYICONDATAW](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-notifyicondataw) — NOTIFYICON_VERSION_4 回调组成：LOWORD(lParam)=通知事件（WM_CONTEXTMENU/NIN_SELECT/NIN_KEYSELECT/鼠标消息）、HIWORD(lParam)=icon id、wParam=锚点坐标；NIF_SHOWTIP 保留标准 tooltip。
 - [TrackPopupMenuEx](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-trackpopupmenuex) — TPM_RETURNCMD 返回所选 command id（0=取消）；native HMENU 生命周期。
+- [EndMenu](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-endmenu) — 结束“调用线程”的活动菜单（WM_CANCELMODE 仅为文档回退路径）；托盘 worker 在 wndproc 收到 WM_CANCELMODE/WM_APP_QUIT 时自行调用，保证菜单真实跟踪被授予前台时 request_stop 仍在 shutdown 预算内到达 STOPPED。
 - [DestroyMenu](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-destroymenu) — root menu 销毁递归释放 submenus；菜单资源不依赖 GC。
 - [DestroyIcon](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-destroyicon) — 文件加载（非 shared）icon 由调用方释放；shared icon（LoadIconW 所得）不得 Destroy。
 - [WM_CONTEXTMENU](https://learn.microsoft.com/en-us/windows/win32/menurc/wm-contextmenu) — v4 Shell 对鼠标右键与键盘 context selection 统一发送 WM_CONTEXTMENU（替代 legacy WM_RBUTTONDOWN/UP 组合）的依据。

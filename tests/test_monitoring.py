@@ -4,10 +4,12 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from unittest.mock import Mock
 
 from agents.base import parse_ts
 from agents.claude import ClaudeFile, ClaudeWatcher
@@ -98,6 +100,69 @@ class MemoryConfig:
 
     def save(self):
         pass
+
+
+class AsyncRescanTests(unittest.TestCase):
+    """Dashboard rescan must never carry UIA work into the Tk caller."""
+
+    def test_rescan_is_o1_coalesced_and_worker_owned(self):
+        monitor = Monitor(MemoryConfig())
+        monitor._probe.rescan = Mock()
+        for watcher in monitor._watchers.values():
+            watcher.reset_scan_cache = Mock()
+        entered = threading.Event()
+        release = threading.Event()
+        worker_ids = []
+
+        def slow_refresh(force=False):
+            worker_ids.append(threading.get_ident())
+            entered.set()
+            release.wait(2.0)
+
+        monitor._terminal_service.refresh_observed_controls = slow_refresh
+        caller = threading.get_ident()
+        started = time.perf_counter()
+        self.assertTrue(monitor.rescan())
+        for _ in range(19):
+            self.assertFalse(monitor.rescan())
+        self.assertLess(time.perf_counter() - started, 0.05)
+        monitor._probe.rescan.assert_called_once_with()
+        self.assertEqual(monitor._rescan_request_count, 1)
+        self.assertEqual(monitor._rescan_complete_count, 0)
+
+        worker = threading.Thread(target=monitor._consume_rescan_request)
+        worker.start()
+        self.assertTrue(entered.wait(1.0))
+        self.assertTrue(worker.is_alive())
+        release.set()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(monitor._rescan_complete_count, 1)
+        self.assertEqual(worker_ids, [worker.ident])
+        self.assertNotEqual(worker_ids[0], caller)
+
+    def test_shutdown_seals_rescan_requests(self):
+        monitor = Monitor(MemoryConfig())
+        monitor._probe.stop = Mock()
+        monitor.request_stop()
+        self.assertFalse(monitor.rescan())
+        self.assertFalse(monitor._rescan_requested.is_set())
+
+    def test_rescan_survives_refresh_exception(self):
+        monitor = Monitor(MemoryConfig())
+        monitor._probe.rescan = Mock()
+        for watcher in monitor._watchers.values():
+            watcher.reset_scan_cache = Mock()
+        monitor._terminal_service.refresh_observed_controls = Mock(
+            side_effect=RuntimeError("uia boom"))
+        self.assertTrue(monitor.rescan())
+        monitor._consume_rescan_request()
+        self.assertEqual(monitor._rescan_complete_count, 1)
+        # 异常不杀 worker、不留下 pending 请求：后续新请求照常接受消费
+        self.assertTrue(monitor.rescan())
+        monitor._consume_rescan_request()
+        self.assertEqual(monitor._rescan_complete_count, 2)
+        self.assertFalse(monitor._rescan_requested.is_set())
 
 
 def _line(path: Path, obj: dict):

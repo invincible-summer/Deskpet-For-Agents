@@ -122,7 +122,7 @@ class ConfigSaveCoordinatorTests(unittest.TestCase):
             cfg = _async_config(tmp)
             saver, root = self._coordinator(cfg)
             for _ in range(20):
-                cfg.set("scale", 1.0)
+                cfg.set("scale", 1.25)
                 saver.request_save()
             self.assertEqual(len(self._debs(root)), 1)   # 恰一个 timer
 
@@ -156,7 +156,7 @@ class ConfigSaveCoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _async_config(tmp)
             saver, root = self._coordinator(cfg)
-            cfg.set("scale", 1.0)
+            cfg.set("scale", 1.25)
             saver.request_save()
             entered = threading.Event()
             release = threading.Event()
@@ -244,7 +244,7 @@ class SaverStateMachineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _async_config(tmp)
             saver, root = self._coordinator(cfg)
-            cfg.set("scale", 1.0)
+            cfg.set("scale", 1.25)
             saver.request_save()
             root.fire_timer()
             saver._worker.join(2.0)
@@ -258,7 +258,7 @@ class SaverStateMachineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _async_config(tmp)
             saver, root = self._coordinator(cfg)
-            cfg.set("scale", 1.0)
+            cfg.set("scale", 1.25)
             saver.request_save()
             root.fire_timer()
             saver._worker.join(2.0)
@@ -276,7 +276,7 @@ class SaverStateMachineTests(unittest.TestCase):
                 writes.append(revision)
                 return self._fail_result()
 
-            cfg.set("scale", 1.0)
+            cfg.set("scale", 1.25)
             with patch.object(Config, "write_snapshot", fail_write):
                 saver.request_save()
                 root.fire_timer()
@@ -307,7 +307,7 @@ class SaverStateMachineTests(unittest.TestCase):
                 return real_write(self_cfg, revision, data)
 
             writes = []
-            cfg.set("scale", 1.0)
+            cfg.set("scale", 1.25)
             with patch.object(Config, "write_snapshot", fail_once):
                 saver.request_save()
                 root.fire_timer()
@@ -385,7 +385,7 @@ class SaverStateMachineTests(unittest.TestCase):
                 threads.append(self_thread.name)
                 real_start(self_thread)
 
-            cfg.set("scale", 1.0)
+            cfg.set("scale", 1.25)
             with patch.object(Config, "write_snapshot", slow_write), \
                     patch.object(threading.Thread, "start", spy_start):
                 saver.request_save()
@@ -418,7 +418,7 @@ class SaverStateMachineTests(unittest.TestCase):
                 release.wait(5.0)   # 模拟磁盘永久阻塞
                 return self._fail_result("io stuck")
 
-            cfg.set("scale", 1.0)
+            cfg.set("scale", 1.25)
             with patch.object(Config, "write_snapshot", blocked_write):
                 saver.request_save()
                 root.fire_timer()
@@ -467,7 +467,7 @@ class SaverStateMachineTests(unittest.TestCase):
                 release.wait(5.0)
                 return self._fail_result("io stuck")
 
-            cfg.set("scale", 1.0)
+            cfg.set("scale", 1.25)
             with patch.object(Config, "write_snapshot", blocked_write):
                 saver.request_save()
                 root.fire_timer()
@@ -494,7 +494,7 @@ class SaverStateMachineTests(unittest.TestCase):
                 release.wait(2.0)
                 return real_write(self_cfg, revision, data)
 
-            cfg.set("scale", 1.0)
+            cfg.set("scale", 1.25)
             with patch.object(Config, "write_snapshot", slow_write):
                 saver.request_save()
                 root.fire_timer()

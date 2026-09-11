@@ -13,6 +13,7 @@ v4.3.1 交互收口新增（plan §18）：七页真实 geometry gate（compact/
 """
 from __future__ import annotations
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -34,6 +35,7 @@ from pet.dashboard import (
     PAGE_PETS,
     PAGE_SETTINGS,
 )
+from pet.ui_coordinator import UiDirty
 
 _ALL_PAGES = (PAGE_OVERVIEW, PAGE_AGENTS, PAGE_PETS, PAGE_LOOK,
               PAGE_MONITOR, PAGE_DIAG, PAGE_SETTINGS)
@@ -89,6 +91,12 @@ def assert_page_has_visible_geometry(testcase, app, page_name):
     dash._show_page(page_name)
     app.root.update()
     app.root.update_idletasks()
+    # 全量套件高负载下 WM 的 MapNotify 可能晚于一次 update；在有限窗口内
+    # 等待映射完成。门槛不变：必须 viewable 且几何健康。
+    deadline = time.monotonic() + 2.0
+    while not dash.winfo_viewable() and time.monotonic() < deadline:
+        app.root.update()
+        time.sleep(0.01)
     testcase.assertTrue(dash.winfo_viewable(), f"{page_name} 窗口不可见")
     canvas = dash.content._canvas
     testcase.assertGreater(canvas.winfo_width(), 200,
@@ -546,6 +554,194 @@ class ControllerWiringTests(unittest.TestCase):
             save.assert_not_called()   # 不在 Tk 同步写盘
         finally:
             app.quit()
+
+
+class DashboardInteractionStabilityTests(unittest.TestCase):
+    """v4.3.1：按钮、刷新与 Configure 必须在一个 idle batch 收敛。"""
+
+    def setUp(self):
+        self.app = _make_app()
+        _inject_agents(self.app, 2)
+        self.app._aggregate()
+        self.app.open_dashboard()
+        self.app.root.update()
+        self.dash = self.app.dashboard
+
+    def tearDown(self):
+        self.app.quit()
+
+    def test_active_nav_is_idempotent(self):
+        current = self.dash._page
+        with patch.object(self.app.ui, "request") as request, \
+                patch.object(self.dash._current, "reflow") as reflow:
+            self.dash._show_page(current)
+        request.assert_not_called()
+        reflow.assert_not_called()
+
+    def test_presentation_action_uses_only_coalesced_render_path(self):
+        self.dash._show_page(PAGE_AGENTS)
+        self.app.root.update()
+        page = self.dash._pages[PAGE_AGENTS]
+        page._detail_key = sorted(self.app.monitor.instances)[0]
+        with patch.object(self.app, "_aggregate") as aggregate, \
+                patch.object(page, "refresh") as refresh, \
+                patch.object(self.app.ui, "request",
+                             wraps=self.app.ui.request) as request:
+            page._toggle_include()
+        aggregate.assert_not_called()
+        refresh.assert_not_called()
+        self.assertEqual(request.call_count, 1)
+
+    def test_duplicate_rescan_is_zero_ui_work(self):
+        with patch.object(self.app.monitor, "rescan", return_value=False), \
+                patch.object(self.app, "toast") as toast, \
+                patch.object(self.app.ui, "kick") as kick:
+            self.assertFalse(self.dash.request_rescan())
+        toast.assert_not_called()
+        kick.assert_not_called()
+
+    def test_same_geometry_does_not_reconfigure_center(self):
+        width = max(400, self.dash.content._canvas.winfo_width())
+        self.dash._sync_center_geometry(width)
+        with patch.object(self.dash._center, "pack_configure") as configure:
+            for _ in range(100):
+                self.dash._sync_center_geometry(width)
+        configure.assert_not_called()
+
+    def test_configure_storm_coalesces_and_drains(self):
+        scroller = self.dash.content
+        event = type("Event", (), {"width": 800})()
+        for _ in range(100):
+            scroller._on_canvas_configure(event)
+            scroller._on_inner_configure(event)
+        self.assertIsNotNone(scroller._layout_after)
+        self.app.root.update_idletasks()
+        self.assertIsNone(scroller._layout_after)
+
+    def test_same_appearance_value_is_zero_work(self):
+        current = self.app.config.get("scale")
+        with patch.object(self.app.config, "set", return_value=False) as set_, \
+                patch.object(self.app.pet_manager,
+                          "apply_appearance_change") as apply, \
+                patch.object(self.app.config_saver, "request_save") as save, \
+                patch.object(self.app.ui, "request") as render:
+            self.app.appearance.set_global("scale", current)
+        set_.assert_called_once_with("scale", current)
+        apply.assert_not_called()
+        save.assert_not_called()
+        render.assert_not_called()
+
+    def test_same_batch_refreshes_current_page_once(self):
+        page = self.dash._current
+        with patch.object(page, "refresh") as refresh:
+            self.app.ui.request(UiDirty.DASHBOARD)
+            self.app.ui.request(UiDirty.DASHBOARD)
+            self.app.root.update_idletasks()
+        refresh.assert_called_once()
+
+    def test_rapid_appearance_changes_coalesce_save_render_build(self):
+        """20 次快速外观变化：最多一个保存请求、一个 render idle、
+        一次最终尺寸 build；Dashboard 页面身份保持不重建。"""
+        from tests.test_ui import MemoryConfig
+        from pet.petview import PetView
+        self.dash._show_page(PAGE_LOOK)
+        self.app.root.update()
+        self.app.root.update_idletasks()
+        holder_id = id(self.dash._pages[PAGE_LOOK].holder)
+        saves = []
+        loads = []
+        saver = self.app.config_saver
+        with patch.object(MemoryConfig, "save",
+                          side_effect=lambda *a, **k: saves.append(1)), \
+                patch.object(PetView, "load_skin", autospec=True,
+                             side_effect=lambda view, bm:
+                                 loads.append(view.view_id)):
+            render_before = self.app.ui.render_count
+            steps = SCALE_STEPS
+            for i in range(20):
+                self.app.appearance.set_global("scale", steps[i % len(steps)])
+            self.app.root.update_idletasks()
+            render_delta = self.app.ui.render_count - render_before
+            # 20 次 request_save 合并为恰一个 debounce 排程
+            self.assertIsNotNone(saver._timer)
+            # 最终尺寸 build：单一 debounce token，flush 每个 view 恰一次
+            self.assertIsNotNone(self.app.pet_manager._build_debounce_after)
+            self.app.pet_manager._flush_deferred_build()
+            self.assertTrue(saver.pending())
+            saver.request_save(immediate=True, force=True)
+        self.assertEqual(render_delta, 1)
+        self.assertEqual(len(saves), 1)          # 20 次请求 → 一次保存
+        self.assertEqual(len(loads), len(self.app.pet_manager.views))
+        self.assertEqual(self.app.config.get("scale"),
+                         steps[(20 - 1) % len(steps)])
+        self.assertFalse(saver.pending())
+        self.assertEqual(id(self.dash._pages[PAGE_LOOK].holder), holder_id)
+
+    def test_external_action_is_single_worker_and_tk_harvested(self):
+        caller = threading.get_ident()
+        entered = threading.Event()
+        release = threading.Event()
+        worker_ids = []
+        callbacks = []
+
+        def work():
+            worker_ids.append(threading.get_ident())
+            entered.set()
+            release.wait(2.0)
+            return "done"
+
+        def done(ok, payload):
+            callbacks.append((threading.get_ident(), ok, payload))
+
+        self.assertTrue(self.dash.submit_action("one", work, done))
+        self.assertTrue(entered.wait(1.0))
+        self.assertFalse(self.dash.submit_action("duplicate", work, done))
+        release.set()
+        deadline = time.time() + 2.0
+        while self.dash.actions_pending() and time.time() < deadline:
+            self.app.ui._bridge_tick()
+            self.app.root.update_idletasks()
+            time.sleep(0.01)
+        self.assertEqual(worker_ids, [worker_ids[0]])
+        self.assertNotEqual(worker_ids[0], caller)
+        self.assertEqual(callbacks, [(caller, True, "done")])
+        self.assertFalse(self.dash.actions_pending())
+
+    def test_autostart_status_failure_does_not_retry_loop(self):
+        self.dash._show_page(PAGE_SETTINGS)
+        self.app.root.update()
+        page = self.dash._pages[PAGE_SETTINGS]
+        page._autostart_status_done(False, "registry unavailable")
+        self.assertIsNotNone(page._autostart_status)
+        with patch.object(self.dash, "submit_action") as submit:
+            page.refresh(UiDirty.DASHBOARD)
+        submit.assert_not_called()
+
+    def test_shutdown_discards_late_action_result(self):
+        entered = threading.Event()
+        release = threading.Event()
+        callbacks = []
+
+        def work():
+            entered.set()
+            release.wait(2.0)
+            return "late"
+
+        self.assertTrue(self.dash.submit_action(
+            "late", work, lambda *result: callbacks.append(result)))
+        self.assertTrue(entered.wait(1.0))
+        self.dash.request_action_stop()
+        release.set()
+        self.assertTrue(self.dash.join_actions(1.0))
+        self.assertFalse(self.dash.poll_actions())
+        self.assertEqual(callbacks, [])
+
+    def test_action_thread_start_failure_is_recoverable(self):
+        with patch.object(threading.Thread, "start",
+                          side_effect=RuntimeError("no thread")):
+            self.assertFalse(self.dash.submit_action(
+                "failed", lambda: None, lambda *_: None))
+        self.assertFalse(self.dash.actions_pending())
 
 
 if __name__ == "__main__":

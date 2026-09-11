@@ -436,6 +436,107 @@ class TrayNativeMenuTests(unittest.TestCase):
         self.assertEqual(posted[1], (0x1234, WM_APP_QUIT))
         self.assertEqual(posted[2], ("tid", 0x0012))
 
+    def test_cancelmode_with_active_menu_ends_tracking_on_worker(self):
+        """posted WM_CANCELMODE 必须经 worker 侧 EndMenu 实际结束菜单。
+
+        Microsoft Learn / EndMenu：EndMenu 结束“调用线程”的活动菜单，
+        WM_CANCELMODE 只是文档回退路径。桌面空闲时 Windows 可能把前台
+        授予托盘窗口，TrackPopupMenuEx 真实进入模态跟踪并阻塞 worker；
+        自动验收（tray-native-synthetic）在该条件下暴露 request_stop
+        永远无法到达 STOPPED 的停止卡死。worker 收到 WM_CANCELMODE /
+        WM_APP_QUIT 时必须自己调用 EndMenu（调用线程语义成立）。
+        """
+        import pet.tray as tray_mod
+        from pet.tray import WM_APP_QUIT
+        endmenu_calls = []
+
+        def fake_endmenu():
+            endmenu_calls.append(1)
+            return 1
+
+        icon = self._icon()
+        icon._menu_active = True
+        with patch.object(tray_mod.user32, 'EndMenu',
+                          side_effect=fake_endmenu), \
+             patch.object(tray_mod.user32, 'PostQuitMessage',
+                          lambda n: None), \
+             patch.object(tray_mod.shell32, 'Shell_NotifyIconW',
+                          return_value=1):
+            result = icon._handle_message(0x1234,
+                                          tray_mod.WM_CANCELMODE, 0, 0)
+            self.assertEqual(result, 0)
+            result = icon._handle_message(0x1234, WM_APP_QUIT, 0, 0)
+            self.assertEqual(result, 0)
+        self.assertEqual(endmenu_calls, [1, 1])   # 两条路径都必须解除跟踪
+
+    def test_cancelmode_without_active_menu_keeps_defwindowproc(self):
+        import pet.tray as tray_mod
+        icon = self._icon()   # _menu_active 为 False
+        endmenu_calls = []
+
+        def fake_endmenu():
+            endmenu_calls.append(1)
+            return 1
+
+        with patch.object(tray_mod.user32, 'EndMenu',
+                          side_effect=fake_endmenu), \
+             patch.object(tray_mod.user32, 'DefWindowProcW',
+                          return_value=7):
+            result = icon._handle_message(0x1234,
+                                          tray_mod.WM_CANCELMODE, 0, 0)
+        self.assertEqual(endmenu_calls, [])
+        self.assertEqual(result, 7)
+
+    def test_stop_releases_blocked_real_menu_tracking(self):
+        """停止解除阻塞中的菜单跟踪：blocking TrackPopupMenuEx 模拟
+        真实模态循环，WM_CANCELMODE 经 wndproc 在 worker 线程调
+        EndMenu 后跟踪结束、资源确定性回收、无语义事件。"""
+        import threading
+        import pet.tray as tray_mod
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_track(hmenu, flags, x, y, hwnd, params):
+            entered.set()
+            release.wait(3.0)   # 真实菜单：模态循环直到被 EndMenu 结束
+            return 0
+
+        def fake_endmenu():
+            release.set()
+            return 1
+
+        icon = self._icon()
+        ctx = [
+            patch.object(tray_mod.user32, 'CreatePopupMenu',
+                         return_value=0xAAA1),
+            patch.object(tray_mod.user32, 'AppendMenuW', return_value=True),
+            patch.object(tray_mod.user32, 'TrackPopupMenuEx',
+                         side_effect=blocking_track),
+            patch.object(tray_mod.user32, 'DestroyMenu', return_value=True),
+            patch.object(tray_mod.shell32, 'Shell_NotifyIconW',
+                         return_value=1),
+            patch.object(tray_mod.user32, 'SetForegroundWindow',
+                         return_value=True),
+            patch.object(tray_mod.user32, 'GetForegroundWindow',
+                         return_value=0x1234),
+            patch.object(tray_mod.user32, 'EndMenu',
+                         side_effect=fake_endmenu),
+        ]
+        for c in ctx:
+            c.start()
+        try:
+            tracker = threading.Thread(target=icon._open_native_menu)
+            tracker.start()
+            self.assertTrue(entered.wait(1.0))
+            icon._handle_message(0x1234, tray_mod.WM_CANCELMODE, 0, 0)
+            tracker.join(2.0)
+        finally:
+            for c in reversed(ctx):
+                c.stop()
+        self.assertFalse(tracker.is_alive())
+        self.assertFalse(icon._menu_active)
+        self.assertTrue(icon.events.empty())
+
 
 # ================================================================ §6.3 queue
 class TrayEventQueueTests(unittest.TestCase):

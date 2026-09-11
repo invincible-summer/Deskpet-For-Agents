@@ -8,6 +8,7 @@ canvas 范围内滚动（无 bind_all）。
 """
 from __future__ import annotations
 import tkinter as tk
+import threading
 import time
 from tkinter import filedialog, messagebox, ttk
 
@@ -73,6 +74,29 @@ def _section_title(parent, text: str):
         fill="x", pady=(0, ROW_GAP))
 
 
+def _pack_once(widget, **options):
+    if not widget.winfo_manager():
+        widget.pack(**options)
+
+
+def _pack_forget_once(widget):
+    if widget.winfo_manager():
+        widget.pack_forget()
+
+
+def _configure_changed(widget, **options):
+    changed = {}
+    for key, value in options.items():
+        try:
+            current = widget.cget(key)
+        except tk.TclError:
+            current = object()
+        if str(current) != str(value):
+            changed[key] = value
+    if changed:
+        widget.configure(**changed)
+
+
 class DashboardPage:
     """统一页面接口（plan2 §15）：lazy build + retained 复用。"""
 
@@ -105,7 +129,7 @@ class OverviewPage(DashboardPage):
 
     def build(self, parent):
         header = self.dash.page_header(parent, PAGE_OVERVIEW)
-        header.add_action("重新扫描", self.dash.app.monitor.rescan,
+        header.add_action("重新扫描", self.dash.request_rescan,
                           primary=False)
         body = self.dash.page_body(parent)
         # SummaryGrid：4 个轻量 metric panel（wide 4 列 / compact 2×2）
@@ -164,7 +188,7 @@ class OverviewPage(DashboardPage):
         values = {"live": len(targets), "working": working,
                   "waiting": waiting + error, "terminal": wakeable}
         for key, (_panel, label) in self._metric_cells.items():
-            label.configure(text=str(values[key]))
+            _configure_changed(label, text=str(values[key]))
         # 需要注意：WAITING/INPUT/ERROR 首要 Agent
         priority = None
         for status_order in (Status.WAITING, Status.INPUT, Status.ERROR):
@@ -176,13 +200,14 @@ class OverviewPage(DashboardPage):
                 break
         if priority is not None:
             self._attn_key = priority.key
-            self._attn_label.configure(
+            _configure_changed(self._attn_label,
                 text=f"{priority.snapshot.kind.label} · "
                      f"{priority.instance.project or '?'} · "
                      f"{status_text(priority.snapshot)}")
         else:
             self._attn_key = ""
-            self._attn_label.configure(text="当前没有需要处理的请求")
+            _configure_changed(self._attn_label,
+                               text="当前没有需要处理的请求")
         self._refresh_rows(targets)
 
     def _refresh_rows(self, targets):
@@ -255,7 +280,7 @@ class AgentsPage(DashboardPage):
 
     def build(self, parent):
         header = self.dash.page_header(parent, PAGE_AGENTS)
-        header.add_action("重新扫描", self.dash.app.monitor.rescan)
+        header.add_action("重新扫描", self.dash.request_rescan)
         body = self.dash.page_body(parent)
         self._split = tk.Frame(body, bg=LIGHT.page)
         self._split.pack(fill="both", expand=True)
@@ -290,7 +315,7 @@ class AgentsPage(DashboardPage):
                                        command=self._toggle_include)
         self._include_btn.pack(side="left", padx=8)
         ttk.Button(actions, text="重新扫描", width=10,
-                   command=self.dash.app.monitor.rescan).pack(side="left")
+                   command=self.dash.request_rescan).pack(side="left")
         self._fields_frame = tk.Frame(self._detail_panel.body,
                                       bg=LIGHT.surface)
         self._fields_frame.pack(fill="x", pady=(8, 0))
@@ -318,13 +343,13 @@ class AgentsPage(DashboardPage):
         current = app.presentation.instance_included(self._detail_key)
         app.presentation.set_instance_included(
             self._detail_key, current is False)
-        app._aggregate()
         app.ui.request(UiDirty.PRESENTATION)
-        self.refresh(UiDirty.PRESENTATION)
 
     def select(self, key: str):
+        if key == self._detail_key:
+            return
         self._detail_key = key
-        self.refresh(UiDirty.MONITOR)
+        self.dash.app.ui.request(UiDirty.DASHBOARD)
 
     def refresh(self, reason: UiDirty):
         targets = self.dash.app.monitor.get_targets()
@@ -378,8 +403,10 @@ class AgentsPage(DashboardPage):
         target = targets.get(self._detail_key)
         if target is None:
             if self._rows and self._detail_key == "":
-                self.select(ordered[0])
-                return
+                self._detail_key = ordered[0]
+                target = targets.get(self._detail_key)
+                if target is None:
+                    return
             self._detail_title.configure(text="未选择 Agent")
             self._detail_chip.set("—")
             return
@@ -437,11 +464,11 @@ class AgentsPage(DashboardPage):
         adv.append(f"parser={snap.parser_health or 'UNKNOWN'}"
                    + (f"（{snap.parser_detail}）" if snap.parser_detail
                       else ""))
-        self._advanced_label.configure(text="\n".join(adv))
+        _configure_changed(self._advanced_label, text="\n".join(adv))
         # include 状态 → 按钮文案（None = 未显式设置，按默认参与展示）
         included = self.dash.app.presentation.instance_included(
             self._detail_key)
-        self._include_btn.configure(
+        _configure_changed(self._include_btn,
             text="移出并发" if included is not False else "加入并发")
 
     def reflow(self, width: int):
@@ -560,7 +587,6 @@ class PetsPage(DashboardPage):
         app.presentation.set_concurrent_enabled(enabled)
         app.toast("并发监听已" + ("开启" if enabled else "关闭")
                   + "（仅本次运行有效）", 4)
-        app._aggregate()
         app.ui.request(UiDirty.PRESENTATION)
 
     def _on_mode_segment(self, index: int):
@@ -578,17 +604,20 @@ class PetsPage(DashboardPage):
 
     def _save_max_targets(self, value: int):
         app = self.dash.app
-        app.config.ensure_fleet_slots(value)
-        app.config.set("presentation.concurrent.max_targets", value)
-        app.config_saver.request_save()
+        slots_changed = app.config.ensure_fleet_slots(value)
+        value_changed = app.config.set(
+            "presentation.concurrent.max_targets", value)
+        if slots_changed or value_changed is not False:
+            app.config_saver.request_save()
         app.ui.request(UiDirty.PRESENTATION)
 
     def _save_eligible(self, kind: str):
         app = self.dash.app
-        app.config.set(
+        changed = app.config.set(
             f"presentation.concurrent.eligible_kinds.{kind}",
             bool(self.eligible_vars[kind].get()))
-        app.config_saver.request_save()
+        if changed is not False:
+            app.config_saver.request_save()
         app.ui.request(UiDirty.PRESENTATION)
 
     def _unbind_slot(self, slot_id: str):
@@ -597,7 +626,6 @@ class PetsPage(DashboardPage):
         app.presentation.unbind_slot(slot_id)
         if key:
             app.presentation.set_instance_included(key, False)
-        app._aggregate()
         app.ui.request(UiDirty.PRESENTATION)
 
     # ------------------------------------------------------------ refresh
@@ -628,14 +656,15 @@ class PetsPage(DashboardPage):
             overflow = max(0, len(state.cards) - max_targets)
             if overflow:
                 summary += f" · overflow {overflow}"
-            self.summary_label.configure(text=summary)
+            _configure_changed(self.summary_label, text=summary)
             if not state.slot_keys:
-                self.fallback_label.configure(
+                _configure_changed(self.fallback_label,
                     text="1 只 idle fallback 桌宠（pet-1）：不占用 Agent "
                          "slot，Agent 出现后自动复用/替换。")
-                self.fallback_label.pack(fill="x", pady=(0, ROW_GAP))
+                _pack_once(self.fallback_label, fill="x",
+                           pady=(0, ROW_GAP))
             else:
-                self.fallback_label.pack_forget()
+                _pack_forget_once(self.fallback_label)
             self._refresh_slot_cards(state, max_targets)
         else:
             if (app.presentation.concurrent_enabled
@@ -649,8 +678,8 @@ class PetsPage(DashboardPage):
                 text = "1 只桌宠 · 单目标模式"
             else:
                 text = "1 只桌宠"
-            self.summary_label.configure(text=text)
-            self.fallback_label.pack_forget()
+            _configure_changed(self.summary_label, text=text)
+            _pack_forget_once(self.fallback_label)
             self._clear_slot_cards()
 
     def _clear_slot_cards(self):
@@ -939,8 +968,6 @@ class AppearancePage(DashboardPage):
             parent=self.dash)
         if ok:
             app.appearance.reset_all()
-            self._sync_from_config()
-            self.refresh(UiDirty.APPEARANCE)
 
     def _import_skin(self):
         dash = self.dash
@@ -971,7 +998,7 @@ class AppearancePage(DashboardPage):
                 text, color = "保存失败（设置页可重试）", LIGHT.error
             else:
                 text, color = "已自动保存", LIGHT.text_secondary
-        self.save_status.configure(text=text, fg=color)
+        _configure_changed(self.save_status, text=text, fg=color)
 
     def _refresh_skin_state(self):
         revision = skins.catalog_revision()
@@ -1030,8 +1057,8 @@ class MonitorPage(DashboardPage):
         cfg = app.config
 
         def save(path, value):
-            cfg.set(path, value)
-            app.config_saver.request_save()
+            if cfg.set(path, value) is not False:
+                app.config_saver.request_save()
 
         # A 监听来源
         panel = SurfacePanel(body)
@@ -1125,7 +1152,10 @@ class MonitorPage(DashboardPage):
             # DP43-R03：隐私开关运行期必须立即生效——
             # Config 内存 → runtime 权限（Monitor → probe）→ 异步持久化；
             # 磁盘保存失败也不回滚运行期隐私意图。
-            cfg.set("privacy.wsl_root_metadata_fallback", bool(flag))
+            changed = cfg.set(
+                "privacy.wsl_root_metadata_fallback", bool(flag))
+            if changed is False:
+                return
             try:
                 app.monitor.set_wsl_root_metadata_fallback(bool(flag))
             except Exception:
@@ -1172,7 +1202,7 @@ class MonitorPage(DashboardPage):
 
     def refresh(self, reason: UiDirty):
         available = self.dash.app.monitor.terminal_available()
-        self.uia_state.configure(
+        _configure_changed(self.uia_state,
             text=f"当前状态：{'可用' if available else '不可用'}"
                  f"（开关更改在重启 DeskPet 后生效）")
 
@@ -1227,7 +1257,7 @@ class DiagnosticsPage(DashboardPage):
         except Exception:
             pass
         self._logs_signature = None
-        self.refresh(UiDirty.DASHBOARD)
+        self.dash.app.ui.request(UiDirty.DASHBOARD)
 
     def refresh(self, reason: UiDirty):
         # ≥1s 节流时间戳（bridge 规则 5 读取）
@@ -1324,7 +1354,7 @@ class DiagnosticsPage(DashboardPage):
                      for k in order if k in sm]
             if parts:
                 perf += "\nstartup " + " → ".join(parts)
-        self.diag_perf.configure(text=perf)
+        _configure_changed(self.diag_perf, text=perf)
 
         logs = "\n".join(monitor.recent_logs())
         if logs != self._logs_signature:
@@ -1362,6 +1392,8 @@ class SettingsPage(DashboardPage):
         arow = tk.Frame(auto.body, bg=LIGHT.surface)
         arow.pack(fill="x", pady=(6, 0))
         self._autostart_row = arow
+        self._autostart_status = None
+        self._autostart_loading = False
         self.autostart_btn = ttk.Button(arow, text="开启",
                                         command=self._toggle_autostart)
         self.autostart_btn.pack(side="left")
@@ -1421,19 +1453,56 @@ class SettingsPage(DashboardPage):
                  fg=LIGHT.text, font=pick_font(abt, 10)).pack(anchor="w")
 
     def _toggle_autostart(self):
-        result = autostart.toggle()
-        self.dash.app.toast(
-            "开机自启动已" + ("开启" if result.enabled else "关闭")
-            + ("" if result.ok else f"（{result.reason}）"), 4)
-        self.refresh(UiDirty.NONE)
+        self._submit_autostart("autostart-toggle", autostart.toggle)
 
     def _repair(self):
-        result = autostart.repair()
-        if result.ok:
-            self.dash.app.toast("开机自启动已修复", 3)
+        self._submit_autostart("autostart-repair", autostart.repair)
+
+    def _submit_autostart(self, key, operation):
+        if self._autostart_loading:
+            return
+        self._autostart_loading = True
+        self.dash.app.ui.request(UiDirty.DASHBOARD)
+
+        def work():
+            result = operation()
+            return result, autostart.status()
+
+        if not self.dash.submit_action(key, work, self._autostart_done):
+            self._autostart_loading = False
+
+    def _request_autostart_status(self):
+        if self._autostart_loading or self._autostart_status is not None:
+            return
+        self._autostart_loading = True
+        if not self.dash.submit_action(
+                "autostart-status", autostart.status,
+                self._autostart_status_done):
+            self._autostart_loading = False
+
+    def _autostart_status_done(self, ok, payload):
+        self._autostart_loading = False
+        if ok:
+            self._autostart_status = payload
         else:
-            self.dash.app.toast("修复失败：" + result.reason, 5)
-        self.refresh(UiDirty.NONE)
+            from .autostart import AutostartState, AutostartStatus
+            self._autostart_status = AutostartStatus(
+                state=AutostartState.UNAVAILABLE, registered=False,
+                healthy=False, expected_command="", registered_command="",
+                reason=str(payload))
+        self.dash.app.ui.request(UiDirty.DASHBOARD)
+
+    def _autostart_done(self, ok, payload):
+        self._autostart_loading = False
+        if not ok:
+            self.dash.app.toast(f"开机自启动操作失败：{payload}", 5)
+        else:
+            result, status = payload
+            self._autostart_status = status
+            self.dash.app.toast(
+                "开机自启动已" + ("开启" if result.enabled else "关闭")
+                + ("" if result.ok else f"（{result.reason}）"), 4)
+        self.dash.app.ui.request(UiDirty.DASHBOARD)
 
     def _retry_save(self):
         # DP43-R02：显式重试不同步写盘——immediate 强制快照 + 单
@@ -1441,50 +1510,70 @@ class SettingsPage(DashboardPage):
         # callback（on_result），此处只负责触发。
         self.dash.app.config_saver.request_save(
             immediate=True, force=True)
-        self.refresh(UiDirty.NONE)
+        self.dash.app.ui.request(UiDirty.DASHBOARD)
 
     def on_show(self):
-        self.refresh(UiDirty.NONE)
+        self._request_autostart_status()
 
     def refresh(self, reason: UiDirty):
         from .autostart import AutostartState
-        st = autostart.status()
-        if st.state == AutostartState.HEALTHY:
-            self.autostart_state.configure(text="已开启", fg=LIGHT.done)
-            self.autostart_detail.configure(text="")
-            self.autostart_repair_btn.pack_forget()
+        st = self._autostart_status
+        if st is None:
+            _configure_changed(self.autostart_state, text="正在读取…",
+                               fg=LIGHT.text_secondary)
+            _configure_changed(self.autostart_detail, text="")
+            _configure_changed(self.autostart_btn, state="disabled")
+            _pack_forget_once(self.autostart_repair_btn)
+            self._request_autostart_status()
+        else:
+            _configure_changed(self.autostart_btn,
+                state="disabled" if self._autostart_loading else "normal")
+        if st is None:
+            pass
+        elif st.state == AutostartState.HEALTHY:
+            _configure_changed(self.autostart_state, text="已开启",
+                               fg=LIGHT.done)
+            _configure_changed(self.autostart_detail, text="")
+            _pack_forget_once(self.autostart_repair_btn)
         elif st.state == AutostartState.MISSING:
-            self.autostart_state.configure(text="未开启",
-                                           fg=LIGHT.text_secondary)
-            self.autostart_detail.configure(text="")
-            self.autostart_repair_btn.pack_forget()
+            _configure_changed(self.autostart_state, text="未开启",
+                               fg=LIGHT.text_secondary)
+            _configure_changed(self.autostart_detail, text="")
+            _pack_forget_once(self.autostart_repair_btn)
         elif st.state == AutostartState.STALE:
-            self.autostart_state.configure(text="需要修复",
-                                           fg=LIGHT.waiting)
-            self.autostart_detail.configure(
+            _configure_changed(self.autostart_state, text="需要修复",
+                               fg=LIGHT.waiting)
+            _configure_changed(self.autostart_detail,
                 text=f"注册路径与当前 DeskPet 路径不一致：\n"
                      f"{st.registered_command}")
-            self.autostart_repair_btn.pack(in_=self._autostart_row,
-                                           side="left", padx=6)
-        else:
-            self.autostart_state.configure(text="不可用",
-                                           fg=LIGHT.text_secondary)
-            self.autostart_repair_btn.pack_forget()
-        self.autostart_btn.configure(
-            text="关闭" if st.state == AutostartState.HEALTHY else "开启")
+            _pack_once(self.autostart_repair_btn,
+                       in_=self._autostart_row, side="left", padx=6)
+            _configure_changed(
+                self.autostart_repair_btn,
+                state="disabled" if self._autostart_loading else "normal")
+        elif st is not None:
+            _configure_changed(self.autostart_state, text="不可用",
+                               fg=LIGHT.text_secondary)
+            _configure_changed(self.autostart_detail,
+                               text=getattr(st, "reason", ""))
+            _pack_forget_once(self.autostart_repair_btn)
+        if st is not None:
+            _configure_changed(self.autostart_btn,
+                text="关闭" if st.state == AutostartState.HEALTHY else "开启")
         saver = self.dash.app.config_saver
         last = saver.last_result or getattr(
             self.dash.app.config, "last_save_result", None)
         if saver.pending():
-            self.save_state.configure(text="正在保存…", fg=LIGHT.waiting)
+            _configure_changed(self.save_state, text="正在保存…",
+                               fg=LIGHT.waiting)
         elif last is not None and getattr(last, "ok", True) is False:
-            self.save_state.configure(
+            _configure_changed(self.save_state,
                 text=f"上次保存失败：{getattr(last, 'error', '')}",
                 fg=LIGHT.error)
-            self._retry_btn.pack(side="left")
+            _pack_once(self._retry_btn, side="left")
         else:
-            self.save_state.configure(text="已保存", fg=LIGHT.done)
-            self._retry_btn.pack_forget()
+            _configure_changed(self.save_state, text="已保存", fg=LIGHT.done)
+            _pack_forget_once(self._retry_btn)
 
     def reflow(self, width: int): ...
 
@@ -1528,6 +1617,16 @@ class Dashboard(tk.Toplevel):
         self._closing = False
         self._dialog_active = False
         self._visibility_epoch = 0
+        # 一个 Dashboard 只有一个 transient external-action worker。
+        # worker 只执行注册表/路径类阻塞工作；结果由 UiCoordinator bridge
+        # 在 Tk 线程收割，绝不从 worker 触碰 widget。
+        self._action_lock = threading.Lock()
+        self._action_worker = None
+        self._action_result = None
+        self._action_token = 0
+        self._actions_accepting = True
+        # Configure/Canvas 几何变化合并到短期 idle pass；无周期 timer。
+        self._last_center_geometry = None
         # 诊断页 ≥1s 节流时间戳（bridge 规则 5 读取，monotonic）
         self.last_diag_refresh = 0.0
         # DP43-R16：retained Toplevel——失焦绝不推断用户关闭意图，
@@ -1631,6 +1730,10 @@ class Dashboard(tk.Toplevel):
         max_content = self.metrics.px(PAGE_CONTENT_MAX_WIDTH)
         content_width = min(viewport_width, max_content)
         pad = max(0, (viewport_width - content_width) // 2)
+        geometry = (viewport_width, content_width, pad)
+        if geometry == self._last_center_geometry:
+            return
+        self._last_center_geometry = geometry
         self._center.pack_configure(padx=(pad, pad))
 
     def _add_nav_item(self, nav, page: str):
@@ -1665,6 +1768,8 @@ class Dashboard(tk.Toplevel):
         target = self._pages.get(page)
         if target is None:
             return
+        if self._current is target and target.built:
+            return
         if self._current is not None and self._current is not target:
             if self._current.built:
                 self._current.holder.pack_forget()
@@ -1681,18 +1786,91 @@ class Dashboard(tk.Toplevel):
         if width > 1:
             target.reflow(width)
         self._last_reflow_width = width
+        self.app.ui.request(UiDirty.DASHBOARD)
 
     # ================================================== 刷新（§4.4 E 步）
-    def refresh_current_page(self):
+    def refresh_current_page(self, reason: UiDirty = UiDirty.NONE):
         if self._closing or not self.winfo_exists():
             return
         if self.state() == "withdrawn":
             return
         if self._current is not None:
-            self._current.refresh(UiDirty.NONE)
+            self._current.refresh(reason)
 
     def refresh(self):
-        self.refresh_current_page()
+        self.refresh_current_page(UiDirty.DASHBOARD)
+
+    # ================================================== 合并式用户动作
+    def request_rescan(self):
+        """Dashboard 扫描按钮：O(1) 提交，不在 Tk callback 等 UIA。"""
+        accepted = self.app.monitor.rescan()
+        if accepted is False:
+            return False
+        self.app.toast("已请求重新扫描", 3)
+        self.app.ui.kick()
+        return True
+
+    def submit_action(self, key: str, work, on_done) -> bool:
+        """提交一个 transient 阻塞动作；busy 时拒绝重复提交。"""
+        with self._action_lock:
+            if (not self._actions_accepting or self._action_result is not None
+                    or (self._action_worker is not None
+                        and self._action_worker.is_alive())):
+                return False
+            self._action_token += 1
+            token = self._action_token
+            worker = threading.Thread(
+                target=self._run_action,
+                args=(token, str(key), work, on_done),
+                name="deskpet-dashboard-action", daemon=True)
+            self._action_worker = worker
+            try:
+                worker.start()
+            except Exception:
+                self._action_worker = None
+                return False
+        self.app.ui.kick()
+        return True
+
+    def _run_action(self, token, key, work, on_done):
+        try:
+            payload = work()
+            ok = True
+        except Exception as exc:
+            payload = str(exc)
+            ok = False
+        with self._action_lock:
+            if self._actions_accepting and token == self._action_token:
+                self._action_result = (token, key, on_done, ok, payload)
+
+    def actions_pending(self) -> bool:
+        with self._action_lock:
+            return (self._action_result is not None
+                    or (self._action_worker is not None
+                        and self._action_worker.is_alive()))
+
+    def poll_actions(self) -> bool:
+        with self._action_lock:
+            item, self._action_result = self._action_result, None
+            if item is not None:
+                self._action_worker = None
+        if item is None or self._closing:
+            return False
+        _token, _key, on_done, ok, payload = item
+        on_done(ok, payload)
+        return True
+
+    def request_action_stop(self):
+        with self._action_lock:
+            self._actions_accepting = False
+            self._action_result = None
+
+    def join_actions(self, timeout: float) -> bool:
+        worker = self._action_worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=max(0.0, timeout))
+            return not worker.is_alive()
+        return True
 
     def is_open(self) -> bool:
         if self._closing or not self.winfo_exists():
@@ -1774,7 +1952,6 @@ class Dashboard(tk.Toplevel):
             self._show_page(PAGE_OVERVIEW)
         elif was_hidden:
             self._current.on_show()
-        self.refresh_current_page()
 
     def run_dialog(self, dialog, *args, **kwargs):
         """Native dialogs run nested event loops; allow only one at a time.
@@ -1813,8 +1990,13 @@ class Dashboard(tk.Toplevel):
             pass
 
     def shutdown(self):
+        self.request_action_stop()
         self._closing = True
         self.tooltip.hide()
+        try:
+            self.content.cancel_layout()
+        except Exception:
+            pass
         if self._reflow_after is not None:
             try:
                 self.after_cancel(self._reflow_after)

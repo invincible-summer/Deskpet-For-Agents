@@ -44,10 +44,10 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 - **语义化状态气泡**：`Agent · Mode · Phase` + Goal（≤120 字）+ 当前活动摘要（≤160 字，本地规则压缩，不调用 LLM）
 - **等待审批检测**：Kimi 来自 wire durable `interaction.request(kind=approval)`（EXACT；legacy `ApprovalRequest`/`approval.request` 兼容兜底），`question`/`user_tool` 归类为 INPUT 而非 WAITING；Codex/Claude 来自 Windows Terminal UIA 当前可见审批 UI（高置信 + 1.5s TTL 复检）——**静默永远不被推断为等待审批**
 - **多 Agent**：自动跟随（WAITING > INPUT > ERROR > WORKING …，工作中粘性），或并发模式（单宠聚合/多宠分离）
-- **仪表盘 V4.3**：左侧导航七页（概览/Agents/桌宠/外观/监听与隐私/诊断/设置），页面懒构建 + retained 行（状态变化只 configure 不重建）、只有当前页刷新；**retained Toplevel——失去焦点绝不自动收起**（V4.3.1：关闭只来自 X / 显式隐藏 / 退出）；PID/HWND 等运行期细节收在"高级诊断"折叠区
+- **仪表盘 V4.3**：左侧导航七页（概览/Agents/桌宠/外观/监听与隐私/诊断/设置），页面懒构建 + retained 行（状态变化只 configure 不重建）、只有当前页刷新；V4.3.1 将按钮动作、render 与 Configure 合并到单一事件批次，重复点击和相同配置值为零工作；重新扫描只提交后台请求，不在 Tk 线程等待 UIA；**retained Toplevel——失去焦点绝不自动收起**（关闭只来自 X / 显式隐藏 / 退出）；PID/HWND 等运行期细节收在"高级诊断"折叠区
 - **每只桌宠独立皮肤（V4.3）**：Fleet 每个槽位可单独选皮肤（同一皮肤可被多只重复选择），"跟随全局"继承；换皮先请求构建、完成前保持当前画面，失败保持旧画面绝不空白
 - **外观即时生效（V4.3）**：整体大小/速度/气泡宽高/文字缩放全部为离散值滑块，每跨一档立即应用；无 Apply 按钮，配置经 650ms debounce 原子落盘
-- **非阻塞 UI（V4.3）**：单一 UiCoordinator bridge timer（125/200/500ms 三档自适应）+ 合并式 render flush；Monitor 语义 revision 不变则零 reconcile；冷动画帧每 idle slice 最多解码 1 帧、frame 级全局 LRU 保护正在显示的帧；配置保存在独立 transient 线程写盘；皮肤导入（复制/校验/manifest）在后台单 job lane 进行
+- **非阻塞 UI（V4.3）**：单一 UiCoordinator bridge timer（125/200/500ms 三档自适应）+ 合并式 render flush；Monitor 语义 revision 不变则零 reconcile；冷动画帧每 idle slice 最多解码 1 帧、frame 级全局 LRU 保护正在显示的帧；配置保存、开机启动注册表操作使用有界 transient worker；皮肤导入（复制/校验/manifest）在后台单 job lane 进行
 - **原生托盘菜单（V4.3.1）**：托盘右键/键盘菜单键 = **标准 Windows native context menu**（`NOTIFYICON_VERSION_4` + `WM_CONTEXTMENU` + `TrackPopupMenuEx`，一次手势恰一个菜单，菜单在托盘线程内确定性销毁）；托盘左键/键盘激活 = 显示/恢复桌宠
 - **首帧优先启动（V4.3.1）**：首个桌宠窗口的可见首帧（纯 Tk 启动占位）先于 Monitor 扫描 / UIA 引导 / 托盘加载 / 皮肤缓存维护；皮肤 catalog 纯内存快照，磁盘扫描全部在锁外的后台 lane
 - **确定性退出（V4.3.1）**：hide-first + 单一 3s 绝对 deadline——菜单先结束、可见窗口立即隐藏，所有后台子系统只用全局剩余预算回收，无局部超时叠加、不留孤儿 converter

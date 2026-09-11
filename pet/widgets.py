@@ -30,6 +30,9 @@ class NavButton(tk.Frame):
             widget.bind("<Button-1>", lambda _e: self._command())
 
     def set_active(self, active: bool):
+        active = bool(active)
+        if active == self._active:
+            return
         self._active = active
         bg = LIGHT.nav_active_bg if active else LIGHT.page
         fg = LIGHT.nav_active_fg if active else LIGHT.text_secondary
@@ -49,7 +52,10 @@ class StatusChip(tk.Label):
                          padx=8, pady=2)
 
     def set(self, text: str, color: str = ""):
-        self.configure(text=text, fg=color or self._color)
+        target_color = color or self._color
+        if self["text"] == text and self["fg"] == target_color:
+            return
+        self.configure(text=text, fg=target_color)
 
 
 class SegmentedControl(tk.Frame):
@@ -136,6 +142,10 @@ class ScrollableFrame(tk.Frame):
         self._canvas.pack(side="left", fill="both", expand=True)
         # 滚动条初始不 pack：_sync_bar 按内容高度决定显隐
         self._bar_visible = False
+        self._layout_after = None
+        self._pending_canvas_width = None
+        self._last_window_width = None
+        self._last_scrollregion = None
         self.inner.bind("<Configure>", self._on_inner_configure)
         self._canvas.bind("<Configure>", self._on_canvas_configure)
 
@@ -159,7 +169,6 @@ class ScrollableFrame(tk.Frame):
 
     def contains_point(self, x: int, y: int) -> bool:
         try:
-            self._canvas.update_idletasks()
             left = self._canvas.winfo_rootx()
             top = self._canvas.winfo_rooty()
             return (left <= x <= left + self._canvas.winfo_width()
@@ -167,18 +176,49 @@ class ScrollableFrame(tk.Frame):
         except tk.TclError:
             return False
 
+    def _schedule_layout(self):
+        if self._layout_after is None:
+            self._layout_after = self.after_idle(self._layout_pass)
+
     def _on_inner_configure(self, _event):
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
-        self._sync_bar()
+        self._schedule_layout()
 
     def _on_canvas_configure(self, event):
-        self._canvas.itemconfigure(self._window, width=event.width)
-        self._sync_bar()
+        self._pending_canvas_width = int(event.width)
+        self._schedule_layout()
 
-    def _sync_bar(self):
+    def _layout_pass(self):
+        """Coalesce nested Canvas/Frame Configure events into one idle pass."""
+        self._layout_after = None
+        try:
+            width = self._pending_canvas_width
+            self._pending_canvas_width = None
+            if width is not None and width != self._last_window_width:
+                self._canvas.itemconfigure(self._window, width=width)
+                self._last_window_width = width
+            region = self._canvas.bbox("all")
+            region_value = tuple(region) if region else ()
+            if region_value != self._last_scrollregion:
+                self._canvas.configure(scrollregion=region or ())
+                self._last_scrollregion = region_value
+            self._sync_bar(region)
+        except tk.TclError:
+            return
+
+    def cancel_layout(self):
+        token = self._layout_after
+        self._layout_after = None
+        if token is not None:
+            try:
+                self.after_cancel(token)
+            except tk.TclError:
+                pass
+
+    def _sync_bar(self, region=None):
         """内容高于可视区才显示滚动条；否则隐藏（不占宽度）。"""
         try:
-            region = self._canvas.bbox("all")
+            if region is None:
+                region = self._canvas.bbox("all")
             canvas_h = int(self._canvas.winfo_height())
         except tk.TclError:
             return
@@ -193,8 +233,7 @@ class ScrollableFrame(tk.Frame):
 
     def _yview_changed(self, first, last):
         self._bar.set(first, last)
-        # 滚动到边界之外没有任何意义；内容不足一页时同步一次条状态
-        self._sync_bar()
+        self._schedule_layout()
 
 
 def bind_wraplength(widget, min_width: int = 160, pad: int = 8):
@@ -205,7 +244,9 @@ def bind_wraplength(widget, min_width: int = 160, pad: int = 8):
     """
     def _on_configure(event):
         try:
-            widget.configure(wraplength=max(min_width, event.width - pad))
+            target = max(min_width, event.width - pad)
+            if int(widget["wraplength"]) != target:
+                widget.configure(wraplength=target)
         except tk.TclError:
             pass
     widget.bind("<Configure>", _on_configure)

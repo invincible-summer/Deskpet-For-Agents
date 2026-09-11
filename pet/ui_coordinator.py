@@ -168,6 +168,13 @@ class UiCoordinator:
         if (self.config_saver is not None
                 and self.config_saver.pending()):
             return True
+        if self.dashboard_provider is not None:
+            try:
+                dash = self.dashboard_provider()
+                if dash is not None and dash.actions_pending():
+                    return True
+            except Exception:
+                pass
         return False
 
     def _bridge(self):
@@ -237,6 +244,16 @@ class UiCoordinator:
                 self.config_saver.poll()
             except Exception:
                 pass
+        # 4b) Dashboard 外部动作结果：同一 bridge 有界收割；worker
+        #     永不直接触碰 Tk。
+        if self.dashboard_provider is not None:
+            try:
+                dash = self.dashboard_provider()
+                if dash is not None and dash.actions_pending():
+                    if dash.poll_actions():
+                        self.request(UiDirty.DASHBOARD)
+            except Exception:
+                pass
         # 5) Dashboard 诊断页 ≥1000ms 自动刷新（非诊断页不周期刷）
         if self._dashboard_is_open():
             dash = self.dashboard_provider()
@@ -291,7 +308,7 @@ class UiCoordinator:
                         | UiDirty.SKIN):
                 dash = self.dashboard_provider()
                 try:
-                    dash.refresh_current_page()
+                    dash.refresh_current_page(flags)
                 except Exception:
                     pass
         # F. batch 已在开头取走清零；flush 期间新到的请求已自行安排

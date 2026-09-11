@@ -1,39 +1,26 @@
-# 桌宠交互可靠性修复记录
+# DeskPet 4.3.1 仪表盘稳定性修复记录
 
-仪表盘原有七页导航、控件排布和样式保持不变。本次改动集中在菜单、窗口和后台任务的生命周期，未增加依赖、常驻线程或轮询定时器。
+本次修复针对仪表盘操作后的闪烁、重复刷新和卡死。七页导航、retained 页面、Monitor 归属规则、终端激活安全语义和桌宠动画架构保持原有合同。
 
-## 使用行为
+## 修复内容
 
-- 桌宠菜单和仪表盘菜单共用一个控制器；同一时刻只有一个 Tk 弹出菜单。重复右键不会嵌套弹出，已选操作不会被随后到来的右键取消。
-- 仪表盘右键（文本输入控件除外）、菜单键或 Shift+F10 可打开菜单：刷新当前页、显示桌宠、关闭仪表盘、退出 DeskPet。
-- 仪表盘的窗口关闭按钮和“关闭仪表盘”只隐藏仪表盘。再次唤起复用原窗口并保留页面。“退出 DeskPet”退出整个应用。
-- 隐藏最后一只 Fleet 桌宠时保留托盘恢复入口，即使配置原本关闭托盘。重新创建托盘时立即初始化当前 Agents 菜单。
+1. **扫描按钮不再阻塞 Tk**：`Monitor.rescan()` 现在只提交合并式 Event 并唤醒现有 Monitor/ProcessProbe worker。watcher cache reset、强制 UIA topology refresh 和 terminal re-resolve 都在 Monitor worker 执行。请求 pending 时的重复点击为零 UI 工作。
+2. **按钮统一走一次 render**：配置、并发展示、绑定和导航动作不再同时调用 `_aggregate()`、页面 `refresh()` 与 dirty render。同一事件批次由 `UiCoordinator` 合并成一个 render idle，并只刷新当前可见页。
+3. **Configure 事件有限收敛**：滚动容器把 Canvas/inner Configure 合并到一个 `after_idle`，缓存 window width 与 scrollregion，仅在值变化时调用 geometry manager。滚轮命中判断不再用 `update_idletasks()` 重入事件循环。
+4. **相同值为零工作**：`Config.set()` / `update_many()` 会识别无变化输入；外观控制器因此不会重复增加 revision、保存配置、构建皮肤或刷新 UI。导航按钮、状态标签和条件控件也跳过相同状态更新。
+5. **设置页慢操作转入后台**：开机启动状态读取、切换和修复使用 Dashboard 持有的单个 transient worker。结果由现有 UI bridge 在 Tk 线程收割；busy 时拒绝重复提交，关闭后丢弃迟到结果，并在全局 3 秒 shutdown deadline 内回收。
+6. **异常不会形成重试风暴**：开机启动状态读取失败后显示稳定的“不可用”状态，不会每个 bridge tick 重建 worker。配置保存结果通过 dirty render 更新设置页状态。
+7. **托盘菜单真实跟踪下的确定性退出**：桌面空闲时 Windows 可能把前台授予托盘窗口，`TrackPopupMenuEx` 真实进入模态跟踪并阻塞 worker；posted `WM_CANCELMODE` 不能可靠结束菜单（官方文档注明它只是 `EndMenu` 的回退手段），`request_stop` 因此无法在 shutdown 预算内到达 STOPPED。现在 worker 在自己的 wndproc 收到 `WM_CANCELMODE` / `WM_APP_QUIT` 时调用 `EndMenu()`（一级 API，作用于调用线程），菜单跟踪被确定性解除。该路径由自动验收暴露，并以 3 项回归锁定。
 
-## 修复原因与实现
+## 自动验收
 
-1. **菜单堵塞和重复执行**：去除“菜单存活时反复 after_idle 等待”的循环。Windows 原生菜单退栈后只派发一次选中操作；程序退出先结束菜单跟踪，再销毁 Tk。菜单失败、取消和退出都回收对象与回调。
-2. **托盘残留和退出丢失**：阻止原生菜单重入；补齐再次弹出需要的 WM_NULL；回收构建失败时尚未挂接的子菜单；线程最终退出一定删除图标。退出意图独立锁存，不因队列满或旧托盘 generation 回收而丢失。
-3. **按钮整体失效**：UI bridge 异常后仍会继续调度。监控快照读取失败也不阻止托盘与退出事件处理；退出后停止继续消费同一批事件。
-4. **窗口和弹窗残留**：选择 Agent 的窗口不再依附隐藏的根窗口，空列表请求也清理旧窗口；绑定时重新校验 Agent 存活和占用状态。仪表盘原生对话框禁止重入，隐藏或退出后丢弃迟到结果。
-5. **终端拖死桌宠**：恢复最小化终端使用 ShowWindowAsync，避免同步等待无响应终端处理恢复消息。仍遵守 Windows 前台策略，不发送键盘输入。
-6. **退出中途失败**：各子系统独立执行清理，一步抛错不跳过其他停止信号。保留 3 秒全局回收预算；最终配置写入可与后台停止并行进行。
-7. **转换进程泄漏**：修复关闭 stdin 后 communicate 再次 flush 引发异常的问题；补齐 Job HANDLE 的 ABI 声明；Job 分配失败不放行转换器。取消检查、Job 分配和单字节启动信号在同一短临界区内完成，避免取消竞态产生未受管的转换子进程；异常和取消均回收自有子进程及管道。
+本轮按要求不使用 computer use、真人鼠标/键盘或人工截图。`tools/real_machine_acceptance.py` 只有显式传入 `--interactive` / `--visual` 才会进入对应诊断；普通自动模式不会生成强制人工视觉门槛。
 
-原生 API 依据：[TrackPopupMenu 生命周期](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-trackpopupmenu)、[ShowWindowAsync](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindowasync)。
+- 完整单元回归：**670 项通过**。覆盖 slow fake UIA 下扫描回调 50ms 内返回、20 次扫描合并、UIA refresh 异常不杀 worker、同批 dirty 单 render、100 次 Configure 收敛、相同配置零工作、20 次快速外观变化合并为单保存/单 render/单最终尺寸 build、单 Dashboard worker、异常不自激、shutdown 丢弃迟到结果，以及托盘菜单真实跟踪被 EndMenu 确定性解除。
+- Dashboard 自动验收检查 retained widget identity、重复 active-nav 零 render/reflow、Configure storm 收敛、同批 20 次 dirty 只 render 一次、真实几何、hide/reopen 与单实例生命周期。
+- UI 架构基准新增硬断言：导航/重扫描/外观按钮回调耗时有界（<50ms，重扫描 O(1) 提交）、200 次 Configure 合并为一个 idle 并收敛、同宽零重复写入。
+- 全部非交互套件以默认强度完成：200 轮 tray synthetic、100 轮 tray generation、三条退出路径、100 轮 Dashboard、warm/cold startup、300 秒 idle 和 200 轮菜单 controller；资源上限未调整。
+- UI 架构、Monitor、Presentation、Bubble 四组资源基准通过。Bubble 基准已改为干净环境可运行的自包含 retained-render 检查，不依赖旧缓存、审批控件或截图。
+- release-layout、Python byte-compile 和差异空白检查通过。
 
-## 验证
-
-使用项目现有 Windows Python 3.12 / Tk 8.6 环境：
-
-- 完整单元回归：**624 项通过**，包含新增的 27 项交互、故障注入和自有转换子进程测试。
-- 仪表盘连续 20 次关闭/唤起：复用窗口、保留当前页；右键关闭与程序退出语义分别验证。
-- UI 架构基准：通过。8 个 Agent 连续 500 次无变化 tick 仅初始化 reconcile 一次，无额外 render；桌宠数量 1→8 时 bridge 仍为单槽；菜单反复创建/取消后无残留 timer。
-- 呈现基准：通过。缓存、解码队列及动画调度器保持原有上限，view/cursor 注册表无泄漏。
-- Python 编译检查、修改文件差异空白检查：通过。
-- 按用户要求使用独立子代理审查。子代理发现并推动修复托盘快照、最后一宠恢复入口、旧 generation 的退出意图，以及转换任务取消竞态；真实 Windows tk_popup 自动探针验证选择、菜单内退出、已选退出后的重复唤起，均正常结束且无残留回调。
-
-子代理最终再验证 5 项全部通过：真实仪表盘右键关闭/退出、连续重开与最小化恢复、嵌套弹窗保护、转换器注册后取消以及运行后取消自有子孙进程，均无超时、异常或 Tk 回调错误。结果见 `.test-artifacts/review-dashboard-results.json`。
-
-日志位于 `.test-artifacts/interaction-full-tests.log`、`interaction-ui-benchmark.log`、`interaction-presentation-benchmark.log`。完整回归中的 `builder boom` 是预期的构建失败注入日志；另有一条原有测试读取源文件未关闭的 ResourceWarning，不是测试失败。
-
-自动验收未模拟所有第三方终端卡死、多显示器/DPI 切换或长时间桌面使用场景，也未运行远端发布 CI。此记录描述本次本地修复与验收，不声明发布完成。
+本地日志写入被忽略的 `.test-artifacts/`。自动验收只证明可自动观察的线程、回调、资源和 Tk 模型行为；本轮没有声明真人交互、多显示器/DPI 热切换或第三方终端真实卡死已被人工验证。

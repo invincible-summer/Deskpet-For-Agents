@@ -491,10 +491,12 @@ class Config:
         self.set(path, value)
         return self.commit()
 
-    def update_many(self, values: dict) -> None:
-        """批量 set（一次 commit，v4plan §9.6 集中写入）。"""
+    def update_many(self, values: dict) -> bool:
+        """批量更新内存配置；返回是否有值实际变化。"""
+        changed = False
         for path, value in values.items():
-            self.set(path, value)
+            changed = self.set(path, value) is not False or changed
+        return changed
 
     @property
     def dirty(self) -> bool:
@@ -524,9 +526,13 @@ class Config:
                     child = {}
                     node[part] = child
                 node = child
-            node[parts[-1]] = copy.deepcopy(value)
+            leaf = parts[-1]
+            if leaf in node and node[leaf] == value:
+                return False
+            node[leaf] = copy.deepcopy(value)
             self._dirty = True
             self._revision += 1
+            return True
 
     def ensure_fleet_slots(self, count: int) -> bool:
         """保证 pet-1...pet-count 均有持久化 slot（v4.3 §7.2）。

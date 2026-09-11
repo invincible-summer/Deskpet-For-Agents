@@ -119,7 +119,8 @@ class AppearanceController:
         value = self._normalize(path, value)
         if value is None:
             return
-        self.config.set(path, value)
+        if self.config.set(path, value) is False:
+            return
         self.pet_manager.apply_appearance_change(
             scope="global", changed_paths={path})
         self._notify_render({path})
@@ -140,7 +141,8 @@ class AppearanceController:
             appearance = {}
             slot["appearance"] = appearance
         appearance["skin"] = skin
-        self.config.set("presentation.concurrent.slots", slots)
+        if self.config.set("presentation.concurrent.slots", slots) is False:
+            return
         self.pet_manager.apply_appearance_change(
             scope=slot_id, changed_paths={"skin"})
         self._notify_render({"skin"})
@@ -159,7 +161,7 @@ class AppearanceController:
             for part in parts:
                 node = node[part]
             values[path] = node
-        self.config.update_many(values)
+        changed = self.config.update_many(values)
         slots = list(self.config.get("presentation.concurrent.slots") or [])
         for slot in slots:
             if isinstance(slot, dict):
@@ -168,7 +170,10 @@ class AppearanceController:
                     appearance["skin"] = None
                 else:
                     slot["appearance"] = {"skin": None}
-        self.config.set("presentation.concurrent.slots", slots)
+        changed = (self.config.set("presentation.concurrent.slots", slots)
+                   is not False) or changed
+        if not changed:
+            return
         self.pet_manager.refresh_all_slot_configs()
         self.pet_manager.apply_appearance_change(
             scope="global", changed_paths=set(RESET_FIELDS))

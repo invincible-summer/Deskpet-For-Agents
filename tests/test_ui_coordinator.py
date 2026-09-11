@@ -150,8 +150,14 @@ class FakeDashboard:
     def on_diagnostics_page(self):
         return self.diag_page
 
-    def refresh_current_page(self):
+    def refresh_current_page(self, reason=0):
         self.refresh_calls += 1
+
+    def actions_pending(self):
+        return False
+
+    def poll_actions(self):
+        return False
 
 
 # ================================================================ tests
