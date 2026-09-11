@@ -710,7 +710,58 @@ class RealConverterSmokeTests(unittest.TestCase):
                 self.assertIsNone(skins.ready_cache_paths("realskin", 96, 12))
                 self.assertIsNotNone(skins.ready_cache_paths("realskin", 96, 6))
 
-    def test_cancelled_real_converter_reports_failure_fast(self):
+    def test_cancel_request_is_nonblocking(self):
+        """合同 A（plan §13.3）：cancel() 请求本身不等待。
+
+        deterministic 结构证明（无真实进程）：cancel 只做 CloseHandle +
+        proc.kill（真实 Win32 语义均为立即返回的异步终止请求）；
+        FakeProc 故意不提供 communicate/wait/poll/join——若 cancel()
+        走任何等待路径，AttributeError 立即暴露。附确定性 wall-clock
+        sanity（<50ms，不依赖 hosted runner）。
+        """
+        import ctypes
+        import pet.skins as skins
+        conv = skins.ConverterJob()
+        calls = []
+
+        class FakeProc:
+            def kill(self):
+                calls.append("kill")   # TerminateProcess：异步请求，立即返回
+
+        conv._proc = FakeProc()
+        conv._hjob = 0xF00D
+
+        def fake_close(handle):
+            calls.append(("close", int(handle)))
+            return 1
+
+        kernel32 = ctypes.windll.kernel32
+        t0 = time.monotonic()
+        with patch.object(kernel32, "CloseHandle", fake_close):
+            conv.cancel()
+        latency = time.monotonic() - t0
+        self.assertLess(latency, 0.05,
+                        f"cancel() 必须立即返回（{latency * 1000:.1f}ms）")
+        self.assertEqual(calls, [("close", 0xF00D), "kill"],
+                         "cancel 只允许 close job + kill，无其他调用")
+        self.assertTrue(conv.cancelled)
+        self.assertIsNone(conv._proc)
+        self.assertIsNone(conv._hjob)
+        # 幂等二连：已取消时直接返回
+        t0 = time.monotonic()
+        conv.cancel()
+        self.assertLess(time.monotonic() - t0, 0.05)
+
+    def test_cancelled_real_converter_eventually_fails_and_reaps(self):
+        """合同 B（plan §13.3）：真实 converter 取消——worker 最终返回
+        False、无孤儿、句柄清空。
+
+        旧测试把"cancel 请求延迟"与"进程树终止 + pipe EOF + worker
+        finally + reap"混成一个 <1s 合同；实测（本机 2026-09-11）：
+        cancel() 调用本身 0.0ms，总 reap 延迟完全取决于 OS 终止进程树
+        的速度（本机毫秒级，CI runner 2.1s）——因此本合同只约束
+        cancel 调用快 + 有界窗口内完成 reap，不再对 reap 设 <1s 假阈值。
+        """
         import pet.skins as skins
         with tempfile.TemporaryDirectory() as root:
             pets, cache, src = (Path(root, p) for p in
@@ -737,13 +788,19 @@ class RealConverterSmokeTests(unittest.TestCase):
                         "本机转换快于取消窗口（无法确定性地测取消）")
                 t0 = time.monotonic()
                 conv.cancel()
-                th.join(6.0)
-                latency = time.monotonic() - t0
-                th.join(2.0)
+                cancel_call_ms = (time.monotonic() - t0) * 1000
+                th.join(8.0)
+                total_reap_ms = (time.monotonic() - t0) * 1000
+                self.assertTrue(not th.is_alive(),
+                                "worker 必须在有界窗口内完成 reap")
                 self.assertFalse(result.get("ok"),
                                  "被取消的转换必须报告失败（实测 job-kill "
                                  "进程 returncode==0，不得据退出码判成功）")
-                self.assertLess(latency, 1.0)
+                self.assertLess(cancel_call_ms, 500.0,
+                                "cancel() 调用本身必须立即返回（真实调用，"
+                                "宽裕阈值）")
+                self.assertIsNone(conv._proc, "reap 后不得残留进程引用")
+                self.assertIsNone(conv._hjob, "reap 后不得残留 job 句柄")
 
 
 class BuildWaiterSetTests(unittest.TestCase):
