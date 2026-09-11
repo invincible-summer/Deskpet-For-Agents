@@ -429,6 +429,10 @@ def _create_kill_on_close_job():
                 ("PeakJobMemoryUsed", ctypes.c_size_t)]
 
         kernel32 = ctypes.windll.kernel32
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wt.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wt.HANDLE
+        kernel32.CloseHandle.argtypes = [wt.HANDLE]
+        kernel32.CloseHandle.restype = wt.BOOL
         hjob = kernel32.CreateJobObjectW(None, None)
         if not hjob:
             return None
@@ -444,6 +448,7 @@ def _create_kill_on_close_job():
             return None
         kernel32.AssignProcessToJobObject.argtypes = [
             wt.HANDLE, wt.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wt.BOOL
         kernel32.CloseHandle.argtypes = [wt.HANDLE]
         return hjob
     except Exception:
@@ -505,72 +510,81 @@ class ConverterJob:
         cwd = os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)))
         hjob = _create_kill_on_close_job()
+        if os.name == "nt" and not hjob:
+            if log:
+                log("无法建立转换进程的退出保护，未启动转换")
+            return False
+        proc = None
+        err = b""
         try:
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, cwd=cwd,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        except Exception as e:
-            if hjob:
-                import ctypes
-                ctypes.windll.kernel32.CloseHandle(hjob)
-            if log:
-                log(f"子进程转换异常: {e!r}")
-            return False
-        with self._lock:
-            if self.cancelled:
-                # cancel 先于注册到达：gate 从未放行，converter 还没
-                # spawn 任何子进程，直接 kill 即可
-                self._release_handles(proc, hjob)
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                return False
-            self._proc, self._hjob = proc, hjob
-        if hjob:
-            import ctypes
-            try:
-                # gate 未放行前 converter 不会 spawn ffmpeg：无 assign race
-                ctypes.windll.kernel32.AssignProcessToJobObject(
-                    hjob, int(proc._handle))
-            except Exception:
-                pass
-        try:
-            proc.stdin.write(b"g")   # 放行 gate：开始真实工作
-            proc.stdin.flush()
-        except Exception:
-            pass
-        finally:
-            try:
+            with self._lock:
+                cancelled = self.cancelled
+                if not cancelled:
+                    self._proc, self._hjob = proc, hjob
+                    hjob = None  # cancellation slot now owns the handle
+            if cancelled:
+                return False  # finally kills/reaps the still-gated child
+            # Check cancellation even when cancel() has already cleared the
+            # job slot. Registration, assignment and the one-byte gate must
+            # not allow a cancelled, unassigned process to spawn descendants.
+            with self._lock:
+                if self.cancelled:
+                    return False
+                if self._hjob:
+                    import ctypes
+                    assigned = ctypes.windll.kernel32.AssignProcessToJobObject(
+                        self._hjob, int(proc._handle))
+                    if not assigned:
+                        raise OSError("无法将转换进程加入退出保护")
+                # One byte fits in the initially empty pipe; this does not
+                # wait for the child to read or perform conversion work.
+                proc.stdin.write(b"g")
+                proc.stdin.flush()
                 proc.stdin.close()
-            except Exception:
-                pass
-        try:
+                # communicate() must not flush a closed pipe.
+                proc.stdin = None
             _out, err = proc.communicate(timeout=_CONVERT_TIMEOUT_SEC)
         except subprocess.TimeoutExpired:
             self.cancel()
-            try:
-                proc.communicate(timeout=5.0)
-            except Exception:
-                pass
             if log:
                 log("子进程转换超时（已终止）")
             return False
+        except Exception as exc:
+            self.cancel()
+            if log:
+                log(f"子进程转换异常: {exc!r}")
+            return False
         finally:
-            # 正常结束：关闭 job 句柄（KILL_ON_JOB_CLOSE 顺带清理 job
-            # 内可能残留的进程；converter 退出码 0 时其 ffmpeg 必已结束）。
-            # 取消路径：cancel() 已关句柄并清空槽位。
             with self._lock:
                 hjob_done = self._hjob
                 self._proc = None
                 self._hjob = None
-            if hjob_done is not None:
-                import ctypes
+            for handle in (hjob_done, hjob):
+                if handle:
+                    import ctypes
+                    ctypes.windll.kernel32.CloseHandle(handle)
+            if proc is not None:
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                # Only this worker reaps. UI cancel() remains nonblocking.
                 try:
-                    ctypes.windll.kernel32.CloseHandle(hjob_done)
-                except Exception:
+                    if proc.stdin is not None:
+                        proc.stdin.close()
+                        proc.stdin = None
+                    proc.communicate(timeout=1.0)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
                     pass
+                finally:
+                    for stream in (proc.stdin, proc.stdout, proc.stderr):
+                        if stream is not None:
+                            stream.close()
         # 实测（Windows）：KILL_ON_JOB_CLOSE 终止的进程 returncode==0，
         # 必须先看 cancelled 再看退出码，否则被取消的转换会误报成功。
         if self.cancelled:

@@ -636,7 +636,9 @@ class PetContextMenuControllerTests(unittest.TestCase):
                 ctrl.show("owner", 1, 2, build)
                 self.assertEqual(active_flags, [True])
                 path = menus[0]._w
-                # show 返回 = popup 已确定性销毁
+                # Native posted commands must drain before teardown.
+                self.assertTrue(ctrl.active)
+                app.root.update()
                 self.assertFalse(ctrl.active)
                 ctrl.show("owner2", 3, 4, build)
             # 旧 popup 不因第二次 show 复活/残留

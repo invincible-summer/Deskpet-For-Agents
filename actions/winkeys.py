@@ -29,8 +29,8 @@ if user32:
     user32.IsWindowVisible.restype = wt.BOOL
     user32.IsIconic.argtypes = [wt.HWND]
     user32.IsIconic.restype = wt.BOOL
-    user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
-    user32.ShowWindow.restype = wt.BOOL
+    user32.ShowWindowAsync.argtypes = [wt.HWND, ctypes.c_int]
+    user32.ShowWindowAsync.restype = wt.BOOL
     user32.SetForegroundWindow.argtypes = [wt.HWND]
     user32.SetForegroundWindow.restype = wt.BOOL
     user32.GetForegroundWindow.restype = wt.HWND
@@ -152,11 +152,11 @@ def validate_window(identity: WindowIdentity) -> bool:
 
 
 def restore_window(hwnd: int) -> bool:
-    """最小化时恢复（SW_RESTORE）。"""
+    """异步恢复最小化窗口，避免失去响应的终端堵塞 Tk 主线程。"""
     if not user32 or not user32.IsWindow(int(hwnd)):
         return False
     if user32.IsIconic(int(hwnd)):
-        user32.ShowWindow(int(hwnd), 9)   # SW_RESTORE
+        return bool(user32.ShowWindowAsync(int(hwnd), 9))   # SW_RESTORE
     return True
 
 

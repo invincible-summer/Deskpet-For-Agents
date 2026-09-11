@@ -57,6 +57,7 @@ class PetWindow:
 
     # ---- 可见性 ----
     def hide(self):
+        self._drag_off = None
         self.root.withdraw()
 
     def show(self):
@@ -148,7 +149,6 @@ class PetWindow:
         if not self.root.winfo_exists():
             return False
         try:
-            self.root.update_idletasks()
             hwnd = int(self.root.winfo_id())
         except tk.TclError:
             return False
@@ -205,8 +205,10 @@ class PetWindow:
         不创建 menu、不调用 Win32 popup helper——菜单生命周期由
         TkContextMenuController 单一拥有。
         """
+        self._drag_off = None
         if self.on_context_menu:
             self.on_context_menu(ev.x_root, ev.y_root)
+        return "break"
 
     def hit_button(self, x: int, y: int):
         if self._hit_cb:

@@ -105,7 +105,7 @@ class GeometryTests(unittest.TestCase):
 
             def GetClassNameW(self, h, buf, n): return 1
 
-            def ShowWindow(self, *args): self.calls.append('restore')
+            def ShowWindowAsync(self, *args): self.calls.append('restore'); return True
 
             def SetForegroundWindow(self, h): self.calls.append('activate')
 
@@ -708,23 +708,39 @@ class MenuCommandsAliveTests(unittest.TestCase):
         app._disarm_first_map_trigger()
         return app
 
-    def _walk(self, menu, invoked, path="menu"):
-        """递归 invoke 全部 command entry；cascade 递归子菜单。"""
+    def _entries(self, menu, path="menu", indices=()):
         end = menu.index("end")
         if end is None:
             return
         for i in range(end + 1):
             kind = menu.type(i)
             if kind == "cascade":
-                sub_path = menu.entrycget(i, "menu")
-                if sub_path:
-                    sub = menu.nametowidget(sub_path)
-                    self._walk(sub, invoked,
-                               f"{path}/{menu.entrycget(i, 'label')}")
+                sub = menu.nametowidget(menu.entrycget(i, "menu"))
+                yield from self._entries(
+                    sub, f"{path}/{menu.entrycget(i, 'label')}", indices + (i,))
             elif kind in ("command", "checkbutton", "radiobutton"):
-                label = menu.entrycget(i, "label")
-                menu.invoke(i)   # 死按钮：command 悬空/抛异常在此失败
-                invoked.append(f"{path}/{label}")
+                yield indices + (i,), f"{path}/{menu.entrycget(i, 'label')}"
+
+    def _audit_menu(self, app, view, path):
+        # Each real popup permits one selection. Audit every entry in its
+        # own lifecycle instead of invoking an entire menu in one posting.
+        probe = tk.Menu(app.root, tearoff=0)
+        app._build_pet_menu(probe, view)
+        entries = list(self._entries(probe, path))
+        probe.destroy()
+        for indices, _label in entries:
+            def build(menu):
+                app._build_pet_menu(menu, view)
+                selected = menu
+                for i in indices[:-1]:
+                    selected = selected.nametowidget(selected.entrycget(i, "menu"))
+                selected.invoke(indices[-1])
+                self.assertTrue(app._menu_controller.active)
+            with patch.object(tk.Menu, "tk_popup", lambda *args: None):
+                app._menu_controller.show(view, 0, 0, build)
+            self.assertFalse(app._menu_controller.active)
+            app.root.update()
+        return [label for _, label in entries]
 
     def test_every_menu_entry_dispatches_after_teardown_exactly_once(self):
         from pet import autostart
@@ -740,16 +756,8 @@ class MenuCommandsAliveTests(unittest.TestCase):
             with patch.object(app, "quit", _spy("quit")),                  patch.object(app, "set_tray_enabled",
                               _spy("tray")),                  patch.object(app, "toggle_autostart",
                               _spy("autostart")),                  patch.object(app.monitor, "rescan", _spy("rescan")),                  patch.object(app, "activate_agent", _spy("activate")),                  patch.object(app, "_open_agent_picker", _spy("picker")),                  patch.object(app, "_rebuild_skin", _spy("rebuild")):
-                pet_menu = tk.Menu(app.root, tearoff=0)
                 view = app.pet_manager.views["pet-1"]
-                app._build_pet_menu(pet_menu, view)
-                invoked = []
-                self._walk(pet_menu, invoked, "pet")
-                # deferred：invoke 后业务 action 尚未同步执行
-                self.assertEqual(counts, {},
-                                 "menu command 不得同步执行业务 action")
-                app._menu_controller._destroy(pet_menu)
-                app.root.update()   # teardown + idle 后 exactly once
+                invoked = self._audit_menu(app, view, "pet")
                 joined = "\n".join(invoked)
                 for needle in ("退出", "仪表盘", "重建当前皮肤缓存",
                                "暂时隐藏桌宠", "摸摸头"):
@@ -784,12 +792,7 @@ class MenuCommandsAliveTests(unittest.TestCase):
                  patch.object(app, "set_tray_enabled"), \
                  patch.object(app, "toggle_autostart", return_value=True), \
                  patch.object(app, "_rebuild_skin"):
-                menu = tk.Menu(app.root, tearoff=0)
-                app._build_pet_menu(menu, view)
-                invoked = []
-                self._walk(menu, invoked, "fleet")
-                app._menu_controller._destroy(menu)
-                app.root.update()
+                invoked = self._audit_menu(app, view, "fleet")
             joined = "\n".join(invoked)
             for needle in ("打开此 Agent 终端", "更换 Agent", "解除绑定",
                            "隐藏此桌宠", "仪表盘", "退出"):

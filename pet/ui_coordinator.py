@@ -18,6 +18,7 @@ request() 合并成一次 after_idle `_flush_render`（§4.4 A-F 固定顺序）
 from __future__ import annotations
 
 import time
+import logging
 from enum import IntFlag
 
 
@@ -179,18 +180,23 @@ class UiCoordinator:
         finally:
             self.bridge_count += 1
             self.bridge_last_ms = (time.perf_counter() - t0) * 1000.0
-        self._arm_bridge()
+            # A failed consumer must not permanently disable every UI input.
+            self._arm_bridge()
 
     def _bridge_tick(self):
         """只做 §4.3 的六项 O(1)/有界检查；有变化才 request()。"""
         # 1) monitor 语义 revision（不变 → 零 reconcile/复制）
         if self.monitor is not None:
-            revision, targets = self.monitor.get_targets_if_changed(
-                self._last_monitor_revision)
-            if targets is not None:
-                self._last_monitor_revision = revision
-                self._cached_targets = targets
-                self.request(UiDirty.MONITOR)
+            try:
+                revision, targets = self.monitor.get_targets_if_changed(
+                    self._last_monitor_revision)
+                if targets is not None:
+                    self._last_monitor_revision = revision
+                    self._cached_targets = targets
+                    self.request(UiDirty.MONITOR)
+            except Exception:
+                logging.getLogger(__name__).exception("Monitor UI snapshot failed")
+                # Keep serving tray/quit even when this source stays broken.
         # 1b) presentation 语义 revision：mode/bind/focus/include 等
         #     运行期变化（任何入口改了呈现事实，这里统一收割，无需
         #     各 mutation 点自行 request）
@@ -205,6 +211,8 @@ class UiCoordinator:
                 self.tray_drain()
             except Exception:
                 pass
+        if self._stopping:
+            return  # tray quit may have destroyed the interpreter
         # 2b) stale terminal binding 的异步 repair 结果（DP43-R08 §16.6；
         #     bounded O(1)/bounded-drain，<=4 条/tick）
         if self.activation_repair_drain is not None:

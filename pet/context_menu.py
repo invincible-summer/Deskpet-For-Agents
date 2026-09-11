@@ -1,113 +1,180 @@
-"""TkContextMenuController（DP43-R14 §5）：单一 Tk Pet context menu owner。
+"""Own one pet popup and dispatch its selected action after native tracking ends.
 
-只负责 Tk context menu 的生命周期与 deferred 语义发布，不懂
-Agent/skin/business logic，不做 click-away polling、不绑定全局
-FocusOut、不加 timer、不调用任何 Win32 foreground helper。
-
-严格合同（plan §5）：
-
-  1. 同一 Tk interpreter 同时最多一个 App-owned Pet context menu；
-  2. show() 前先 dismiss 旧对象；
-  3. menu 生命周期固定 create → build → tk_popup → finally
-     unpost/release/destroy → clear owner；
-  4. deferred() 生成的 menu command 不直接执行业务 command——菜单
-     仍处于 native/Tk 交互阶段时只重排 idle，菜单确定性销毁
-     （active 为 False）后才通过 root.after_idle 执行一次；
-  5. deferred action 运行前检查 is_closing()；closing 状态丢弃
-     （quit 本身以 allow_when_closing=True 豁免）；
-  6. menu build 失败同样 finally 清理（不留悬浮死菜单）；
-  7. shutdown()/dismiss() 幂等。
+Windows Tk runs a nested native loop inside tk_popup; X11 returns while the
+menu is still posted. Neither path may poll with after_idle: Windows services
+idle callbacks inside its menu loop, so an idle that requeues itself can starve
+input forever. Menu completion is event driven and actions are single use.
 """
 from __future__ import annotations
 
+import logging
 import tkinter as tk
+
+_log = logging.getLogger(__name__)
 
 
 class TkContextMenuController:
-    """一个 controller，一个 active popup，一套 deferred 语义。"""
-
     def __init__(self, root, *, is_closing=None):
         self._root = root
         self._is_closing = is_closing or (lambda: False)
         self._menu: tk.Menu | None = None
         self._owner = None
+        self._posting = False
+        self._stopped = False
+        self._pending = None
+        self._completion_after = None
+        self._action_after = None
+        self._window_system = root.tk.call("tk", "windowingsystem")
 
-    # ------------------------------------------------------------ 状态
     @property
     def active(self) -> bool:
-        """当前是否有本 controller 拥有的 popup menu。"""
         return self._menu is not None
 
     @property
+    def posting(self) -> bool:
+        """True while tk_popup's native stack has not unwound."""
+        return self._posting
+
+    @property
     def owner(self):
-        """当前 popup 的语义 owner（PetView）；无 popup 为 None。"""
         return self._owner
 
-    # ------------------------------------------------------------ deferred
     def deferred(self, command, *args, **kwargs):
-        """把一个业务 action 包装成 menu command。
-
-        返回的 callable 作为 Tk menu entry 的 command 使用；被菜单
-        调用时只发布一次 after_idle，不在菜单交互阶段同步执行业务。
-        """
         allow_when_closing = bool(kwargs.pop("allow_when_closing", False))
+        menu = self._menu
+        used = False
 
-        def _publish():
-            self._root.after_idle(
-                lambda: self._run(command, args, kwargs,
-                                  allow_when_closing))
+        def publish():
+            nonlocal used
+            if used or self._stopped:
+                return
+            if menu is not None and self._menu is not menu:
+                return  # obsolete menu generation
+            if self._is_closing() and not allow_when_closing:
+                return
+            used = True
+            if self._pending is not None:
+                return  # one selection per popup, including nested callbacks
+            self._pending = (command, args, kwargs, allow_when_closing)
+            if self._posting:
+                self._end_native_menu()
+                # show() finally publishes exactly one idle after native return.
+            else:
+                self._schedule_completion()
 
-        return _publish
+        return publish
 
-    def _run(self, command, args, kwargs, allow_when_closing):
-        if self._menu is not None:
-            # 菜单尚未确定性销毁（仍在 native/Tk 交互/teardown 阶段）：
-            # 再等一个 idle，绝不在菜单存活期间做生命周期动作
-            self._root.after_idle(
-                lambda: self._run(command, args, kwargs,
-                                  allow_when_closing))
-            return
-        if self._is_closing() and not allow_when_closing:
-            return   # closing 状态丢弃普通 action（quit 豁免）
-        command(*args, **kwargs)
+    def _schedule_completion(self):
+        if self._completion_after is None and not self._stopped:
+            self._completion_after = self._root.after_idle(self._complete)
 
-    # ------------------------------------------------------------ 生命周期
-    def show(self, owner, x_root, y_root, build_fn) -> None:
-        """显示一个 popup：先 dismiss 旧的，再 create → build →
-        tk_popup → finally destroy → clear owner。"""
+    def close_then(self, command):
+        """An explicit app exit supersedes any selection still in tracking."""
+        self._pending = (command, (), {}, True)
+        if self._posting:
+            self._end_native_menu()
+        else:
+            self._schedule_completion()
+
+    def _complete(self):
+        self._completion_after = None
+        if self._posting:
+            return  # show() owns completion; never spin in an idle callback
         self.dismiss()
+        pending, self._pending = self._pending, None
+        if pending is not None and not self._stopped:
+            def run():
+                self._action_after = None
+                command, args, kwargs, allow = pending
+                if not self._stopped and (allow or not self._is_closing()):
+                    command(*args, **kwargs)
+            self._action_after = self._root.after_idle(run)
+
+    def show(self, owner, x_root, y_root, build_fn) -> None:
+        if (self._stopped or self._is_closing() or self._posting
+                or self._action_after is not None
+                or self._completion_after is not None):
+            return  # native modal loop can reenter Python; never nest popups
+        self.dismiss()
+        self._pending = None
         menu = tk.Menu(self._root, tearoff=0)
-        self._menu = menu
-        self._owner = owner
+        self._menu, self._owner = menu, owner
+        self._posting = True
+        failed = False
         try:
+            menu.bind("<Unmap>", lambda event: self._on_unmap(menu, event))
             build_fn(menu)
             menu.tk_popup(int(x_root), int(y_root))
         except Exception:
-            pass   # build/popup 失败：finally 仍确定性销毁（§16）
+            failed = True
+            self._pending = None
+            _log.exception("Could not open pet context menu")
         finally:
-            self._destroy(menu)
-            if self._menu is menu:
-                self._menu = None
-                self._owner = None
+            self._posting = False
+            # X11 retains a mapped popup until Unmap/selection. Windows has
+            # already finished native tracking when tk_popup returns.
+            if (failed or self._stopped or self._pending is not None
+                    or self._window_system != "x11"
+                    or not menu.winfo_exists() or not menu.winfo_ismapped()):
+                if failed or self._stopped or self._pending is not None:
+                    self._complete()
+                else:
+                    # A real Windows mouse selection posts WM_COMMAND.
+                    # TrackPopupMenu may return BEFORE Tk dispatches it.
+                    # Keep Tcl commands/Win32 command IDs alive until queued
+                    # input has been serviced; menu.invoke tests bypass this.
+                    self._schedule_completion()
+
+    def _on_unmap(self, menu, event):
+        if event.widget is menu and self._menu is menu and not self._posting:
+            self._schedule_completion()
+
+    def _end_native_menu(self):
+        if self._posting and self._window_system == "win32":
+            # EndMenu is thread-local: this controller always runs on Tk's
+            # thread, never on the tray worker. Tk's unpost is a Windows no-op.
+            import ctypes
+            end_menu = ctypes.windll.user32.EndMenu
+            end_menu.argtypes = []
+            end_menu.restype = ctypes.c_int
+            end_menu()
 
     def dismiss(self) -> None:
-        """确定性销毁当前 popup；幂等。"""
-        menu = self._menu
-        self._menu = None
+        self._cancel("_completion_after")
+        if self._posting:
+            self._end_native_menu()
+            return  # never destroy a menu still referenced by native tracking
+        menu, self._menu = self._menu, None
         self._owner = None
-        self._destroy(menu)
+        if menu is not None:
+            # Restore Tk's saved focus/grab state as well as the widget. This
+            # is also what Tk's normal Escape/click-away handling uses.
+            try:
+                menu.tk.call("tk::MenuUnpost", menu._w)
+            except tk.TclError:
+                pass
+            self._destroy(menu)
 
     def shutdown(self) -> None:
-        """App 退出路径：等价 dismiss（幂等）。"""
+        self._stopped = True
+        self._pending = None
+        self._cancel("_action_after")
         self.dismiss()
 
-    # ------------------------------------------------------------ 内部
+    def _cancel(self, attr):
+        token = getattr(self, attr)
+        setattr(self, attr, None)
+        if token is not None:
+            try:
+                self._root.after_cancel(token)
+            except tk.TclError:
+                pass
+
     @staticmethod
     def _destroy(menu) -> None:
-        """幂等销毁一个 popup menu；任何阶段失败都不抛 TclError。"""
         if menu is None:
             return
-        for op in ("grab_release", "unpost", "destroy"):
+        for op in ("unpost", "grab_release", "destroy"):
             try:
                 getattr(menu, op)()
             except tk.TclError:

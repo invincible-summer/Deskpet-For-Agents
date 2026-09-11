@@ -923,7 +923,7 @@ class AppearancePage(DashboardPage):
         app = self.dash.app
         # DP43-R16：native dialog 用标准 Tk parent 关系即可——已无
         # auto-collapse，也就不需要任何 suppress 标志
-        ok = messagebox.askyesno(
+        ok = self.dash.run_dialog(messagebox.askyesno,
             "重置全部外观",
             "恢复默认皮肤（内置猫）与全部视觉参数；不影响监听、隐私、"
             "slot 绑定与摆放。确定重置？",
@@ -935,7 +935,7 @@ class AppearancePage(DashboardPage):
 
     def _import_skin(self):
         dash = self.dash
-        src = filedialog.askdirectory(
+        src = dash.run_dialog(filedialog.askdirectory,
             title="选择包含 5 个素材文件的文件夹", parent=dash)
         if not src:
             return
@@ -1517,6 +1517,8 @@ class Dashboard(tk.Toplevel):
         self.selected_key = ""
         self._page = PAGE_OVERVIEW
         self._closing = False
+        self._dialog_active = False
+        self._visibility_epoch = 0
         # 诊断页 ≥1s 节流时间戳（bridge 规则 5 读取，monotonic）
         self.last_diag_refresh = 0.0
         # DP43-R16：retained Toplevel——失焦绝不推断用户关闭意图，
@@ -1529,6 +1531,9 @@ class Dashboard(tk.Toplevel):
         self._register_pages()
         # 滚轮只在页面 canvas 内滚动（§11.5）
         self.bind("<MouseWheel>", self._on_wheel)
+        self.bind("<Button-3>", self._on_context_menu)
+        self.bind("<Menu>", self._on_context_menu)
+        self.bind("<Shift-F10>", self._on_context_menu)
         # DPI/宽度 breakpoint 重排：50ms debounce（§10.3）
         self._reflow_after = None
         self._last_reflow_width = -1
@@ -1669,6 +1674,30 @@ class Dashboard(tk.Toplevel):
         if self._current is not None and self._current.built:
             self.content.wheel_scroll(event.delta, event.x_root, event.y_root)
 
+    def _on_context_menu(self, event):
+        if self._closing or self.app._closing or self._dialog_active:
+            return "break"
+        # Preserve editing/selection gestures inside text and choice inputs.
+        if event.widget.winfo_class() in (
+                "Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox"):
+            return
+        self.tooltip.hide()
+        if getattr(event, "num", None) == 3:
+            x, y = event.x_root, event.y_root
+        else:
+            x, y = self.winfo_rootx() + 32, self.winfo_rooty() + 48
+        self.app._menu_controller.show(self, x, y, self._build_context_menu)
+        return "break"
+
+    def _build_context_menu(self, menu):
+        defer = self.app._menu_controller.deferred
+        menu.add_command(label="刷新当前页", command=defer(self.refresh_current_page))
+        menu.add_command(label="显示桌宠", command=defer(self.app.show_pet))
+        menu.add_separator()
+        menu.add_command(label="关闭仪表盘", command=defer(self.hide_dashboard))
+        menu.add_command(label="退出 DeskPet",
+                         command=defer(self.app.quit, allow_when_closing=True))
+
     def _on_configure(self, event):
         if event.widget is not self:
             return
@@ -1698,17 +1727,49 @@ class Dashboard(tk.Toplevel):
     # ================================================== 生命周期
     def open(self):
         """显示（刷新由 UiCoordinator 驱动；无周期 timer）。"""
+        if self._closing or self.app._closing:
+            return
+        was_hidden = self.state() == "withdrawn"
         self.deiconify()
         self.lift()
+        if not self._dialog_active:
+            self.focus_set()
         if self._current is None:
             self._show_page(PAGE_OVERVIEW)
-        else:
+        elif was_hidden:
             self._current.on_show()
         self.refresh_current_page()
 
+    def run_dialog(self, dialog, *args, **kwargs):
+        """Native dialogs run nested event loops; allow only one at a time.
+
+        A result arriving after hide/shutdown must not mutate settings or
+        submit another background job.
+        """
+        if self._dialog_active or self._closing or self.app._closing:
+            return None
+        epoch = self._visibility_epoch
+        self._dialog_active = True
+        self.tooltip.hide()
+        try:
+            result = dialog(*args, **kwargs)
+        finally:
+            self._dialog_active = False
+        if (self._closing or self.app._closing
+                or epoch != self._visibility_epoch):
+            return None
+        return result
+
     def hide_dashboard(self):
         """用户关闭窗口：隐藏（0 周期唤醒；bridge 降回低档）。"""
+        if self._closing:
+            return
+        self._visibility_epoch += 1
+        if self.app._menu_controller.owner is self:
+            self.app._menu_controller.dismiss()
         self.tooltip.hide()
+        if self._current is not None:
+            self._current.on_hide()
         self.withdraw()
         try:
             self.app.ui.kick()

@@ -12,6 +12,7 @@ UI 激活 Terminal 只允许 Monitor.activate_target(exact agent_key)。
 Aggregate 模式下桌宠 body 单击/双击只做互动，绝不激活 Terminal。
 """
 import gc
+import logging
 import os
 import queue
 import random
@@ -267,6 +268,8 @@ class PetApp:
         repair，结果由 bridge 收割后做最后一次激活（一次性语义，
         不循环）。
         """
+        if self._closing:
+            return
         result = self.monitor.activate_target(key)
         if result.code == ActivationCode.OK:
             self.agent_toast(key, "已打开该 Agent 的终端窗口", 2)
@@ -339,15 +342,21 @@ class PetApp:
         v4.3：进程内最多一个 picker（重复打开先销毁旧的，杜绝死弹窗
         残留）；Escape/取消/选择后确定性销毁；quit() 一并销毁。
         """
+        if self._closing:
+            return
+        self._menu_controller.dismiss()
+        self._destroy_agent_picker()
         targets = self.monitor.get_targets()
         if not targets:
             self.toast("当前没有发现任何 Agent", 4)
             return
-        self._destroy_agent_picker()
         picker = tk.Toplevel(self.root)
         picker.title("选择要绑定的 Agent")
         picker.geometry("420x300")
-        picker.transient(self.root)
+        # The controller root is withdrawn; a transient of it can be hidden
+        # by the window manager. Use a visible owner when one exists.
+        if self.dashboard is not None and self.dashboard.is_open():
+            picker.transient(self.dashboard)
         self._agent_picker = picker
         tk.Label(picker, text=f"绑定到 {slot_id}（只影响本次运行期）",
                  font=("Microsoft YaHei UI", 10)).pack(anchor="w", padx=12,
@@ -361,8 +370,6 @@ class PetApp:
                           f"{t.instance.project or t.instance.source} · "
                           f"{status_text(s)}"))
             listbox.insert("end", items[-1][1])
-        taken = {v.agent_key for v in self.pet_manager.views.values()}
-
         def _close(_evt=None):
             self._destroy_agent_picker()
 
@@ -371,6 +378,12 @@ class PetApp:
             if not sel:
                 return
             key = items[sel[0]][0]
+            if not self.monitor.is_live_key(key):
+                self.toast("该 Agent 已退出，请重新选择", 4)
+                _close()
+                return
+            taken = {v.agent_key for v in self.pet_manager.views.values()
+                     if v.view_id != slot_id}
             if key in taken:
                 self.toast("该 Agent 已由其他桌宠展示", 4)
                 return
@@ -624,6 +637,10 @@ class PetApp:
 
     # ================= 显示/隐藏/托盘/自启 =================
     def hide_pet(self):
+        if self._closing:
+            return
+        self._menu_controller.dismiss()
+        self._destroy_agent_picker()
         was_desired = self._tray_desired()
         self.pet_manager.hide_all()
         if not was_desired:
@@ -634,6 +651,8 @@ class PetApp:
         self._update_tray_snapshot()
 
     def show_pet(self):
+        if self._closing:
+            return
         self.pet_manager.show_all()
         self._reconcile_tray_runtime()
         self._update_tray_snapshot()
@@ -704,6 +723,11 @@ class PetApp:
         from .tray import TrayIcon, TrayState
         desired = self._tray_desired()
         tray = self.tray
+        if tray is not None:
+            quit_requested = getattr(tray, "quit_requested", None)
+            if quit_requested is not None and quit_requested.is_set():
+                self.quit()
+                return  # never reap an unconsumed exit intent
         if tray is None:
             if desired and not self._tray_generation_failed:
                 self._spawn_tray_generation()
@@ -729,6 +753,7 @@ class PetApp:
     def _spawn_tray_generation(self):
         from .tray import TrayIcon
         self.tray = TrayIcon("DeskPet - 左键显示桌宠，右键菜单")
+        self._update_tray_snapshot()
         self.tray.start()
 
     def _update_tray_snapshot(self, targets: dict | None = None):
@@ -778,7 +803,13 @@ class PetApp:
         tray = self.tray
         if tray is None:
             return
+        quit_requested = getattr(tray, "quit_requested", None)
+        if quit_requested is not None and quit_requested.is_set():
+            self.quit()
+            return
         for _ in range(TRAY_DRAIN_MAX):
+            if self._closing:
+                break
             try:
                 ev = tray.events.get_nowait()
             except queue.Empty:
@@ -797,6 +828,7 @@ class PetApp:
                 self.activate_agent(getattr(ev, "agent_key", "") or "")
             elif command == "quit":
                 self.quit()
+                return
 
     # ================= ephemeral 菜单生命周期 =================
     # DP43-R20：_destroy_menu/_active_menu/_dismiss_active_menu 已删除——
@@ -874,7 +906,7 @@ class PetApp:
                              command=d(self._open_agent_picker,
                                        view.view_id))
         menu.add_separator()
-        menu.add_command(label="隐藏此桌宠", command=d(view.hide))
+        menu.add_command(label="隐藏此桌宠", command=d(self._hide_view, view))
         menu.add_command(label="仪表盘", command=d(self.open_dashboard))
         menu.add_separator()
         self._appearance_menu(menu)
@@ -882,6 +914,18 @@ class PetApp:
         menu.add_separator()
         menu.add_command(label="❌ 退出",
                          command=d(self.quit, allow_when_closing=True))
+
+    def _hide_view(self, view: PetView):
+        if self._closing:
+            return
+        self._menu_controller.dismiss()
+        view.hide()
+        if not self.pet_manager.any_visible():
+            # Hiding the last fleet pet needs the same tray restore path as
+            # hiding the whole fleet, even with tray_enabled=False.
+            self.hide_pet()
+        else:
+            self._update_tray_snapshot()
 
     def _unbind_view(self, view: PetView):
         """解除绑定：slot 释放 + 该 Agent 移出并发展示（否则下一轮自动
@@ -970,6 +1014,9 @@ class PetApp:
 
         DP43-R18 §9.8：Dashboard 是约千行级完整设置 UI——首次实际
         需要时才局部 import（普通启动不加载其页面类）。"""
+        if self._closing:
+            return
+        self._menu_controller.dismiss()
         if self.dashboard is None or not tk.Toplevel.winfo_exists(self.dashboard):
             from .dashboard import Dashboard
             self.dashboard = Dashboard(self)
@@ -1017,60 +1064,58 @@ class PetApp:
         """
         if self._closing:
             return
+        if self._menu_controller.posting:
+            # A tray quit can arrive inside Tk's native menu loop. Unwind it
+            # before destroying Tcl or waiting for workers.
+            self._menu_controller.close_then(self.request_quit)
+            return
         self._closing = True
-        try:
-            # ---- A. UI 封口（必须快） ----
-            self._menu_controller.shutdown()   # Pet 菜单先确定性结束
-            self._destroy_agent_picker()
-            self._disarm_first_map_trigger()
-            if self.dashboard is not None:
-                try:
-                    self.dashboard.shutdown()
-                except tk.TclError:
-                    pass
-            self.pet_manager.hide_all_for_shutdown()   # 只 withdraw
-            self.ui.stop()
-            for attr in ("_janitor_after", "_reassert_after",
-                         "_toast_after"):
-                callback = getattr(self, attr, None)
-                if callback is not None:
-                    try:
-                        self.root.after_cancel(callback)
-                    except tk.TclError:
-                        pass
-                    setattr(self, attr, None)
-            # ---- B. stop signal（不得 join） ----
-            self.monitor.request_stop()
-            self.pet_manager.request_stop()   # scheduler + skin lane
-            if self.tray is not None:
-                # request_stop 先发 WM_CANCELMODE 结束可能 active 的
-                # native menu
-                self.tray.request_stop()
-            self.config_saver.begin_shutdown()   # 停 debounce（不写盘）
-            # ---- C. 全局 deadline 回收 ----
-            deadline = time.monotonic() + SHUTDOWN_BUDGET_SEC
+        deadline = time.monotonic() + SHUTDOWN_BUDGET_SEC
 
-            def _remaining() -> float:
-                return max(0.0, deadline - time.monotonic())
-
-            self.monitor.join_for_shutdown(_remaining())
-            self.pet_manager.join_for_shutdown(_remaining())
-            if self.tray is not None:
-                self.tray.join_for_shutdown(_remaining())
-                self.tray = None
-            # deadline 内恰一个最新快照 writer；到期不再启动第二个、
-            # 绝不双 writer
-            self.config_saver.flush_for_shutdown(_remaining())
-            # ---- D. Tk 资源最终清理 ----
-            self.pet_manager.finalize_tk_resources()
-        finally:
+        def clean(fn, *args):
             try:
-                self.root.quit()
-            finally:
-                self.root.destroy()
-        # 主线程立即回收残余引用环（v4.2.1）：PhotoImage 已在
-        # finalize_tk_resources 里释放，这里兜底保证之后任何工作线程
-        # 触发 GC 都不会再碰到 Tcl 对象
+                return fn(*args)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Shutdown step failed: %s", getattr(fn, "__name__", fn))
+
+        def remaining():
+            return max(0.0, deadline - time.monotonic())
+
+        try:
+            # Each owner is independent: one broken widget/worker must never
+            # prevent the other owners from receiving their stop signals.
+            clean(self._menu_controller.shutdown)
+            clean(self._destroy_agent_picker)
+            clean(self._disarm_first_map_trigger)
+            if self.dashboard is not None:
+                clean(self.dashboard.shutdown)
+            clean(self.pet_manager.hide_all_for_shutdown)
+            clean(self.ui.stop)
+            for attr in ("_janitor_after", "_reassert_after", "_toast_after"):
+                callback = getattr(self, attr, None)
+                setattr(self, attr, None)
+                if callback is not None:
+                    clean(self.root.after_cancel, callback)
+            clean(self.monitor.request_stop)
+            clean(self.pet_manager.request_stop)
+            if self.tray is not None:
+                clean(self.tray.request_stop)
+            # Give the final config snapshot a chance to save while other
+            # workers stop, even if one of them consumes the entire deadline.
+            if getattr(self.config, "dirty", False):
+                clean(lambda: self.config_saver.request_save(immediate=True))
+            clean(self.config_saver.begin_shutdown)
+            clean(self.monitor.join_for_shutdown, remaining())
+            clean(self.pet_manager.join_for_shutdown, remaining())
+            if self.tray is not None:
+                clean(self.tray.join_for_shutdown, remaining())
+                self.tray = None
+            clean(self.config_saver.flush_for_shutdown, remaining())
+        finally:
+            clean(self.pet_manager.finalize_tk_resources)
+            clean(self.root.quit)
+            clean(self.root.destroy)
         gc.collect()
 
     def quit(self):

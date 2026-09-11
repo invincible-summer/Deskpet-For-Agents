@@ -152,6 +152,7 @@ _AGENT_CMD_BASE = 200
 class NOTIFYICONDATAW(ctypes.Structure):
     class _UNION(ctypes.Union):
         _fields_ = [("uTimeout", wt.UINT), ("uVersion", wt.UINT)]
+    _anonymous_ = ("union",)
     _fields_ = [
         ("cbSize", wt.DWORD), ("hWnd", wt.HWND), ("uID", wt.UINT),
         ("uFlags", wt.UINT), ("uCallbackMessage", wt.UINT), ("hIcon", wt.HICON),
@@ -279,6 +280,8 @@ class TrayIcon:
         # immutable 菜单模型（Tk 线程换入；worker 打开菜单时读取）
         self._menu_snapshot = TrayMenuSnapshot()
         self._menu_open_failures = 0
+        self._menu_active = False
+        self.quit_requested = threading.Event()
 
     # ---- 生命周期（start 立即返回；request_stop 只投递不 join） ----
     def start(self) -> None:
@@ -382,17 +385,21 @@ class TrayIcon:
                                        else TrayState.FAILED)
                 self._ready.set()
 
-                if icon_ok:
+                if icon_ok and self.status() is not TrayState.STOPPING:
                     msg = wt.MSG()
                     lpmsg = ctypes.byref(msg)
                     while user32.GetMessageW(lpmsg, None, 0, 0) > 0:
                         user32.TranslateMessage(lpmsg)
                         user32.DispatchMessageW(lpmsg)
         finally:
+            # WM_QUIT can bypass WM_APP_QUIT (including a startup race).
+            # The resource owner must remove the icon on every exit path.
+            self._remove()
             if hwnd:
                 _unregister_hwnd(hwnd)
                 user32.DestroyWindow(hwnd)
             self._hwnd = None
+            self._thread_id = 0
             self._destroy_owned_hicon()
             with self._state_lock:
                 if self._state is not TrayState.FAILED:
@@ -422,6 +429,8 @@ class TrayIcon:
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _enqueue(self, event: TrayEvent) -> None:
+        if event.command == "quit":
+            self.quit_requested.set()  # exit cannot be lost behind a full queue
         try:
             self.events.put_nowait(event)
         except queue.Full:
@@ -430,6 +439,15 @@ class TrayIcon:
 
     # ---- native context menu（worker 线程；plan §6.4） ----
     def _open_native_menu(self):
+        if self._menu_active or self.status() is TrayState.STOPPING:
+            return
+        self._menu_active = True
+        try:
+            self._track_native_menu()
+        finally:
+            self._menu_active = False
+
+    def _track_native_menu(self):
         snapshot = self._menu_snapshot
         hmenu = user32.CreatePopupMenu()
         if not hmenu:
@@ -444,6 +462,8 @@ class TrayIcon:
             _CMD_QUIT: TrayEvent("quit"),
         }
         next_id = _AGENT_CMD_BASE
+        agents_menu = None
+        agents_attached = False
         try:
             self._append(hmenu, MF_STRING,
                          _CMD_TOGGLE_VISIBLE,
@@ -462,6 +482,7 @@ class TrayIcon:
                              "（当前没有发现 Agent）")
             self._append(hmenu, MF_STRING | MF_POPUP, int(agents_menu),
                          "Agents")
+            agents_attached = True
             self._append(hmenu, MF_STRING, _CMD_DASHBOARD, "仪表盘")
             self._append(hmenu, MF_STRING, _CMD_RESCAN, "重新扫描")
             self._append(hmenu, MF_SEPARATOR, 0, None)
@@ -487,11 +508,16 @@ class TrayIcon:
             self._record_menu_open_failure(str(exc)[:120])
             return
         finally:
+            # Microsoft TrackPopupMenu contract: this benign message fixes
+            # immediate dismissal on the next notification-area invocation.
+            user32.PostMessageW(self._hwnd, 0x0000, 0, 0)  # WM_NULL
+            if agents_menu and not agents_attached:
+                user32.DestroyMenu(agents_menu)
             # HMENU 生命周期固定在本次 popup 内：root destroy 递归释放
             # submenus，不依赖 Python GC（Microsoft Learn / DestroyMenu）。
             user32.DestroyMenu(hmenu)
             self._set_focus_tray()
-        if cmd:
+        if cmd and self.status() is not TrayState.STOPPING:
             event = cmd_by_id.get(int(cmd))
             if event is not None:
                 self._enqueue(event)

@@ -49,6 +49,9 @@ class _FakeUser32:
         return True
 
     def ShowWindow(self, hwnd, cmd):
+        raise AssertionError("Synchronous ShowWindow can hang the UI")
+
+    def ShowWindowAsync(self, hwnd, cmd):
         self.calls.append('restore')
         return True
 
