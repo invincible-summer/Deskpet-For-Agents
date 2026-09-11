@@ -410,6 +410,61 @@ class DashboardGeometryTests(unittest.TestCase):
         assert_page_has_visible_geometry(self, self.app, PAGE_PETS)
 
 
+class DashboardActionSemanticsTests(unittest.TestCase):
+    """v4.3.1 plan §10/§11/§19：Agents 行真实可点击区域 + "打开终端"
+    统一语义（不改 focused 状态）。"""
+
+    def setUp(self):
+        self.app = _make_app()
+        _inject_agents(self.app, 2)
+        self.app._aggregate()
+        self.app.open_dashboard()
+        self.app.root.update()
+        self.dash = self.app.dashboard
+        self.dash._show_page(PAGE_AGENTS)
+        self.dash.refresh_current_page()   # 生产刷新路径：行真实进入页面
+        self.app.root.update()
+
+    def tearDown(self):
+        self.app.quit()
+
+    def test_open_terminal_uses_activate_agent_without_focus_mutation(self):
+        # §11/§19.1：exact key、恰好一次、focused_key 不变、
+        # 不调用 presentation.set_focus
+        page = self.dash._pages[PAGE_AGENTS]
+        key = sorted(self.app.monitor.instances)[0]
+        self.app.presentation.set_focus(
+            sorted(self.app.monitor.instances)[1])
+        focused_before = self.app.presentation.focused_key
+        page._detail_key = key
+        with patch.object(self.app, "activate_agent") as act_mock, \
+                patch.object(self.app.presentation, "set_focus") as sf:
+            page._activate_selected()
+        act_mock.assert_called_once_with(key)
+        sf.assert_not_called()
+        self.assertEqual(self.app.presentation.focused_key, focused_before,
+                         "打开终端不得偷偷改变 focused 状态")
+
+    def test_row_click_areas_all_select_exact_agent(self):
+        """§10.2/§19.2：frame / title / chip 三处 synthetic <Button-1>
+        event 都选中 exact key——chip 是独立 child widget，必须显式
+        绑定才可点（真实鼠标点击由 interactive 验收覆盖）。"""
+        page = self.dash._pages[PAGE_AGENTS]
+        keys = sorted(page._rows)
+        self.assertTrue(keys)
+        for key in keys:
+            row = page._rows[key]
+            for widget_name in ("frame", "title", "chip"):
+                widget = row[widget_name]
+                self.assertTrue(widget.bind("<Button-1>"),
+                                f"{widget_name} 缺少 <Button-1> 绑定")
+                page._detail_key = ""
+                widget.event_generate("<Button-1>")   # synthetic routing
+                self.app.root.update()
+                self.assertEqual(page._detail_key, key,
+                                 f"{widget_name} 点击必须选中 exact key")
+
+
 class ControllerWiringTests(unittest.TestCase):
     """v4.3.1 DP43-R11/R02/R03：Dashboard 控件必须接回 controller/
     saver/monitor（无死控件），保存全部异步。"""

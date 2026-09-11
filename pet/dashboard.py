@@ -306,8 +306,10 @@ class AgentsPage(DashboardPage):
 
     # ------------------------------------------------------------ actions
     def _activate_selected(self):
+        # §11：打开终端只恢复并前置该 Agent 的 Terminal 窗口——不偷偷
+        # 改 presentation 的 focused 状态（与 Fleet/Tray/Overview 同语义）。
         if self._detail_key:
-            self.dash.app._focus_and_activate(self._detail_key)
+            self.dash.app.activate_agent(self._detail_key)
 
     def _toggle_include(self):
         app = self.dash.app
@@ -331,6 +333,7 @@ class AgentsPage(DashboardPage):
             if key not in targets:
                 row = self._rows.pop(key)
                 row["frame"].destroy()
+        created = False
         for key in targets:
             if key not in self._rows:
                 frame = tk.Frame(self._list_frame, bg=LIGHT.surface,
@@ -341,12 +344,16 @@ class AgentsPage(DashboardPage):
                 title.pack(side="left", fill="x", expand=True)
                 chip = StatusChip(frame)
                 chip.pack(side="right")
-                frame.bind("<Button-1>",
-                           lambda _e, k=key: self.select(k))
-                title.bind("<Button-1>",
-                           lambda _e, k=key: self.select(k))
+                # §10.1：StatusChip 是独立 child widget——点击 chip 区域
+                # 不会触发 parent frame 的 widget-level binding，必须
+                # 显式绑定同一 select_row，整行才是真实可点击区域。
+                def select_row(_event=None, k=key):
+                    self.select(k)
+                for widget in (frame, title, chip):
+                    widget.bind("<Button-1>", select_row)
                 self._rows[key] = {"frame": frame, "title": title,
                                    "chip": chip}
+                created = True
         for key, target in targets.items():
             row = self._rows[key]
             snap = target.snapshot
@@ -360,7 +367,9 @@ class AgentsPage(DashboardPage):
                                 STATUS_COLOR.get(snap.status.value,
                                                  LIGHT.unknown))
         ordered = sorted(targets)
-        if [k for k in self._rows] != ordered:
+        # 新建的行必须 pack（创建顺序 == sorted 顺序时旧条件永远不触发，
+        # 行不可见也不可点——与 OverviewPage 的 order_changed 同语义）
+        if created or [k for k in self._rows] != ordered:
             for widget in self._list_frame.winfo_children():
                 widget.pack_forget()
             for key in ordered:

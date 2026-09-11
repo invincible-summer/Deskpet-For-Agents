@@ -323,15 +323,6 @@ class PetApp:
                 self.agent_toast(res.agent_key,
                                  "Windows 未允许将终端置于前台，已闪烁任务栏提醒", 4)
 
-    def _focus_and_activate(self, key: str):
-        """Dashboard"查看并设为当前"类操作：设焦点 + 激活（§8.5）。
-
-        Fleet pet body/bubble、Tray Agent、Dashboard"打开终端"只走
-        activate_agent(key)，不偷偷改变 presentation 的 focused 状态。
-        """
-        self.presentation.set_focus(key)
-        self.activate_agent(key)
-
     def _on_vacant_double_click(self, view: PetView):
         """空 slot 双击 → Agent picker（fleet 绑定入口，v4plan §8.2）。"""
         self._open_agent_picker(view.view_id)
