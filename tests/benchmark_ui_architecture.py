@@ -596,12 +596,25 @@ def check_dp43_reliability_structural(checks):
     root.withdraw()
     ctrl = TkContextMenuController(root)
     from unittest.mock import patch as _patch
+    lifecycles_ok = True
     with _patch('tkinter.Menu.tk_popup', lambda self, x, y, entry="": None):
+        # §35.1：100 个真实 controller lifecycle——每轮 show 后 completion
+        # pending（Windows queued-command 合同），必须 drain 才算一轮，
+        # 而不是连续 100 次被 gate 拒绝的调用。
         for i in range(100):
-            ctrl.show("owner", 1, 2, lambda m: m.add_command(label=str(i)))
+            ctrl.show("owner", 1, 2, lambda m, n=i: m.add_command(label=str(n)))
+            if not ctrl.active:
+                lifecycles_ok = False
+                break
+            root.update()
+            if ctrl.active:
+                lifecycles_ok = False
+                break
     ctrl.dismiss()
     root.update()
     afters = root.tk.splitlist(root.tk.call('after', 'info'))
+    checks.append(("100 轮真实 controller lifecycle（show→update→inactive）",
+                   lifecycles_ok))
     checks.append(("context menu churn 后无 after timer",
                    len(afters) == 0))
     root.destroy()

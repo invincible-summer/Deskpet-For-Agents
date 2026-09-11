@@ -50,6 +50,15 @@ class MenuReliabilityTests(unittest.TestCase):
         self.assertFalse(self.ctrl.active)
 
     def test_posted_native_command_survives_popup_return(self):
+        """Windows queue-order regression（v4.3.1 §7）。
+
+        真实复现路径的模型：用户点击菜单项后，Windows 把 command 投递
+        到消息队列；native tracking（tk_popup）可以先返回。controller
+        在 popup return 后必须保持 menu/Tcl command 存活，等队列里的
+        command 被 dispatch 后才 teardown——立即 destroy 会丢命令
+        （旧 bug：真实鼠标点"打开仪表盘/退出"失效，而 menu.invoke
+        同步直调、测不出该时序）。
+        """
         calls = []
         def track(menu, *_args):
             # Model Windows posted WM_COMMAND: selection is dispatched only
@@ -61,6 +70,69 @@ class MenuReliabilityTests(unittest.TestCase):
         self.assertTrue(self.ctrl.active, "command registry must survive native return")
         self.root.update()
         self.assertEqual(calls, ["opened"])
+        self.assertFalse(self.ctrl.active)
+        self.assertEqual(self.root.tk.call("after", "info"), "")
+
+    def test_cancelled_popup_tears_down_after_idle_without_action(self):
+        """取消（未选择任何条目）：一次 idle teardown，无业务 action，
+        controller inactive，after 队列无菜单残留，再次 popup 正常。"""
+        calls = []
+
+        def build(menu):
+            menu.add_command(label="x",
+                             command=self.ctrl.deferred(calls.append, "never"))
+
+        with patch.object(tk.Menu, "tk_popup", lambda *a: None):
+            self.ctrl.show("pet", 0, 0, build)
+        self.assertTrue(self.ctrl.active, "completion 仍 pending")
+        self.root.update()
+        self.assertEqual(calls, [])
+        self.assertFalse(self.ctrl.active)
+        self.assertEqual(self.root.tk.call("after", "info"), "")
+        # 取消后的下一次 popup 必须能正常打开
+        with patch.object(tk.Menu, "tk_popup", lambda *a: None):
+            self.ctrl.show("pet", 0, 0, build)
+        self.assertTrue(self.ctrl.active)
+        self.root.update()
+        self.assertFalse(self.ctrl.active)
+
+    def test_duplicate_native_command_dispatch_runs_action_once(self):
+        """同一 native command 被意外重复 dispatch：wrapper used 只放一次。"""
+        calls = []
+        command = self.ctrl.deferred(calls.append, "once")
+
+        def track(menu, *_args):
+            self.root.after(0, lambda: menu.invoke(0))
+            self.root.after(0, lambda: menu.invoke(0))   # duplicate post
+
+        with patch.object(tk.Menu, "tk_popup", track):
+            self.ctrl.show("pet", 0, 0, lambda m: m.add_command(
+                label="x", command=command))
+        self.root.update()
+        self.assertEqual(calls, ["once"])
+        self.assertFalse(self.ctrl.active)
+        self.assertEqual(self.root.tk.call("after", "info"), "")
+
+    def test_disabled_entry_does_not_imply_selection(self):
+        """disabled 条目（如"当前没有发现 Agent"）synthetic invoke 是
+        no-op：不产生 pending action，controller 只等 idle cleanup——
+        wiring 审计绝不能把 disabled 占位当 selectable selection。"""
+        calls = []
+        invoked = []
+
+        def build(menu):
+            menu.add_command(label="（当前没有发现 Agent）", state="disabled",
+                             command=self.ctrl.deferred(calls.append, "never"))
+            menu.add_command(label="enabled", command=self.ctrl.deferred(
+                invoked.append, "yes"))
+
+        with patch.object(tk.Menu, "tk_popup", lambda *a: None):
+            self.ctrl.show("pet", 0, 0, build)
+        # Tk 对 disabled entry 的 invoke 是 no-op（model 层验证）
+        menu_alive = self.ctrl._menu
+        menu_alive.invoke(0)
+        self.root.update()
+        self.assertEqual(calls, [], "disabled entry 不得产生 action")
         self.assertFalse(self.ctrl.active)
         self.assertEqual(self.root.tk.call("after", "info"), "")
 
@@ -228,6 +300,82 @@ class AppReliabilityTests(unittest.TestCase):
             app._menu_controller.show("pet", 0, 0, lambda m: m.add_command(label="x"))
         app.root.update_idletasks()
         self.assertTrue(app._closing)
+
+    def test_dashboard_command_queued_after_popup_return(self):
+        """Queue-order regression（App 级）：真实 controller + 真实
+        open_dashboard。popup return 时 Dashboard 尚未打开、controller
+        仍 active；队列 drain（root.update）后 Dashboard 可见、action
+        恰好一次、controller inactive。"""
+        app = make_app()
+        try:
+            def track(menu, *_args):
+                app.root.after(0, lambda: menu.invoke(0))
+            with patch.object(tk.Menu, "tk_popup", track):
+                app._menu_controller.show(
+                    "pet", 0, 0,
+                    lambda m: m.add_command(
+                        label="打开仪表盘",
+                        command=app._menu_controller.deferred(
+                            app.open_dashboard)))
+            self.assertTrue(app._menu_controller.active,
+                            "queued command 未处理前 menu/command 必须存活")
+            self.assertTrue(app.dashboard is None
+                            or not app.dashboard.is_open(),
+                            "popup return 瞬间 Dashboard 尚未打开")
+            app.root.update()
+            self.assertIsNotNone(app.dashboard)
+            self.assertTrue(app.dashboard.is_open())
+            self.assertFalse(app._menu_controller.active)
+            self.assertIsNone(app._menu_controller._completion_after)
+            self.assertIsNone(app._menu_controller._action_after)
+        finally:
+            app.quit()
+
+    def test_exit_command_queued_after_popup_return(self):
+        """Queue-order regression（App 级）：queued Exit 在 native stack
+        退出前不得销毁 root；队列 drain 后 menu teardown → quit 恰好
+        一次；pending 窗口内的第二次右键不能取消已选 Exit。"""
+        app = make_app()
+        quit_calls = []
+        real_quit = app.request_quit
+
+        def counting_quit():
+            quit_calls.append(1)
+            real_quit()
+
+        app.request_quit = counting_quit
+        root_destroys = []
+        real_destroy = app.root.destroy
+
+        def counting_destroy():
+            root_destroys.append(1)
+            real_destroy()
+
+        app.root.destroy = counting_destroy
+
+        def track(menu, *_args):
+            app.root.after(0, lambda: menu.invoke(0))
+
+        with patch.object(tk.Menu, "tk_popup", track):
+            app._menu_controller.show(
+                "pet", 0, 0,
+                lambda m: m.add_command(
+                    label="退出",
+                    command=app._menu_controller.deferred(
+                        app.request_quit, allow_when_closing=True)))
+        self.assertTrue(app._menu_controller.active)
+        self.assertTrue(app.root.winfo_exists(),
+                        "command 未 drain 前 root 不得销毁")
+        self.assertFalse(app._closing)
+        # pending 窗口内的第二次右键：被 controller gate 拒绝
+        with patch.object(tk.Menu, "tk_popup", lambda *a: None):
+            app._menu_controller.show("pet", 0, 0,
+                                      lambda m: m.add_command(label="x"))
+        app.root.update()
+        self.assertEqual(quit_calls, [1], "quit 必须 exactly once")
+        self.assertTrue(app._closing)
+        self.assertEqual(root_destroys, [1],
+                         "queue drain 后 root 在 Tk 清理阶段销毁")
 
     def test_stopped_tray_generation_cannot_lose_exit_intent(self):
         from pet.tray import TrayIcon, TrayEvent, TrayState

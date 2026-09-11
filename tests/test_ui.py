@@ -671,9 +671,14 @@ class TrayLifecycleTests(unittest.TestCase):
 
 
 class MenuCommandsAliveTests(unittest.TestCase):
-    """v4.3.1 DP43-R14 菜单存活审计：桌宠右键菜单（含全部 cascade 子
-    菜单）的每个 command entry 都是活按钮——invoke 后业务 action 不
-    同步执行，menu teardown + idle 后 exactly once。
+    """v4.3.1 菜单 wiring 审计（synthetic command wiring 证据层级）。
+
+    本类只证明：menu entry 存在、enabled command wiring 到 callable、
+    cascade 捕获 exact key/view、wrapper exactly-once。`menu.invoke()`
+    是同步直调 Tcl command，不经过 Windows 消息队列——不能证明真实
+    鼠标 selection 送达（v4.3.1 §6.1/§14 Level 1）。真实 selection
+    delivery 由 tests/test_interaction_reliability.py 的 queue-order
+    regression 与 real_machine_acceptance 的 interactive suite 覆盖。
 
     Tray 菜单已原生化（worker 内 HMENU），语义映射由
     test_tray_native 覆盖；本类只审计 Pet Tk 菜单 wiring。
@@ -689,42 +694,57 @@ class MenuCommandsAliveTests(unittest.TestCase):
         app._disarm_first_map_trigger()
         return app
 
-    def _entries(self, menu, path="menu", indices=()):
-        end = menu.index("end")
-        if end is None:
-            return
-        for i in range(end + 1):
-            kind = menu.type(i)
-            if kind == "cascade":
-                sub = menu.nametowidget(menu.entrycget(i, "menu"))
-                yield from self._entries(
-                    sub, f"{path}/{menu.entrycget(i, 'label')}", indices + (i,))
-            elif kind in ("command", "checkbutton", "radiobutton"):
-                yield indices + (i,), f"{path}/{menu.entrycget(i, 'label')}"
-
-    def _audit_menu(self, app, view, path):
-        # Each real popup permits one selection. Audit every entry in its
-        # own lifecycle instead of invoking an entire menu in one posting.
+    def _inventory_entries(self, app, view, path):
+        """枚举菜单条目（path/type/state/label）——只做 inventory，
+        不 invoke。disabled 条目记录 state 供断言，绝不当 selection。"""
         probe = tk.Menu(app.root, tearoff=0)
         app._build_pet_menu(probe, view)
-        entries = list(self._entries(probe, path))
-        probe.destroy()
-        for indices, _label in entries:
-            def build(menu):
-                app._build_pet_menu(menu, view)
-                selected = menu
-                for i in indices[:-1]:
-                    selected = selected.nametowidget(selected.entrycget(i, "menu"))
-                selected.invoke(indices[-1])
-                self.assertTrue(app._menu_controller.active)
-            with patch.object(tk.Menu, "tk_popup", lambda *args: None):
-                app._menu_controller.show(view, 0, 0, build)
-            self.assertFalse(app._menu_controller.active)
-            app.root.update()
-        return [label for _, label in entries]
+        entries = []
 
-    def test_every_menu_entry_dispatches_after_teardown_exactly_once(self):
-        from pet import autostart
+        def walk(menu, prefix, indices):
+            end = menu.index("end")
+            if end is None:
+                return
+            for i in range(end + 1):
+                kind = menu.type(i)
+                if kind == "cascade":
+                    label = menu.entrycget(i, "label")
+                    sub = menu.nametowidget(menu.entrycget(i, "menu"))
+                    walk(sub, f"{prefix}/{label}", indices + (i,))
+                elif kind in ("command", "checkbutton", "radiobutton"):
+                    entries.append((indices + (i,),
+                                    f"{prefix}/{menu.entrycget(i, 'label')}",
+                                    str(menu.entrycget(i, "state"))))
+
+        walk(probe, path, ())
+        probe.destroy()
+        return entries
+
+    def _invoke_enabled_entry_synthetically(self, app, view, indices):
+        """Synthetic command wiring / deferred semantic 检查：每个 enabled
+        entry 独立 popup 生命周期，build 内 synthetic invoke，之后用
+        root.update() 驱动（处理 pending events + idle，§7.2），deferred
+        action 必须恰好执行一次、controller 回到 inactive。
+
+        show() 返回瞬间的 active 状态不属于 wiring 合同——Windows 真实
+        queued command 允许在 popup return 之后才送达。
+        """
+        selected_path = list(indices)
+
+        def build(menu):
+            app._build_pet_menu(menu, view)
+            selected = menu
+            for i in selected_path[:-1]:
+                selected = selected.nametowidget(selected.entrycget(i, "menu"))
+            selected.invoke(selected_path[-1])   # synthetic, not real input
+
+        with patch.object(tk.Menu, "tk_popup", lambda *args: None):
+            app._menu_controller.show(view, 0, 0, build)
+        app.root.update()   # queued events + idle completion + action idle
+        self.assertFalse(app._menu_controller.active,
+                         "idle cleanup 后 controller 必须回到 inactive")
+
+    def test_pet_menu_enabled_entries_are_wired_once(self):
         app = self._app()
         try:
             counts = {}
@@ -738,20 +758,32 @@ class MenuCommandsAliveTests(unittest.TestCase):
                               _spy("tray")),                  patch.object(app, "toggle_autostart",
                               _spy("autostart")),                  patch.object(app.monitor, "rescan", _spy("rescan")),                  patch.object(app, "activate_agent", _spy("activate")),                  patch.object(app, "_open_agent_picker", _spy("picker")),                  patch.object(app, "_rebuild_skin", _spy("rebuild")):
                 view = app.pet_manager.views["pet-1"]
-                invoked = self._audit_menu(app, view, "pet")
-                joined = "\n".join(invoked)
-                for needle in ("退出", "仪表盘", "重建当前皮肤缓存",
+                entries = self._inventory_entries(app, view, "pet")
+                joined = "\n".join(label for _, label, _state in entries)
+                for needle in ("退出", "打开仪表盘", "重建当前皮肤缓存",
                                "暂时隐藏桌宠", "摸摸头"):
                     self.assertIn(needle, joined)
+                # 0 Agent 时 Agents 子菜单必须有显式 disabled 占位
+                disabled = [label for _, label, state in entries
+                            if state == "disabled"]
+                self.assertTrue(
+                    any(label.endswith("（当前没有发现 Agent）")
+                        for label in disabled),
+                    f"Agents 空列表需要 disabled 占位，got {disabled}")
+                for indices, _label, state in entries:
+                    if state == "disabled":
+                        continue
+                    self._invoke_enabled_entry_synthetically(app, view,
+                                                              indices)
                 for name in ("quit", "tray", "autostart", "rebuild"):
                     self.assertEqual(counts.get(name), 1,
                                      f"{name} 必须 exactly once")
         finally:
             app.quit()
 
-    def test_fleet_menu_entries_dispatch_with_explicit_view(self):
-        """Fleet：builder 显式 view（production 回调携带），不再手工
-        _menu_view。"""
+    def test_fleet_menu_enabled_entries_capture_exact_view(self):
+        """Fleet（synthetic wiring 证据）：builder 显式 view，激活作用于
+        exact view 的 agent key。"""
         from pet.presentation import PresentationMode
         from tests.test_fleet_ui import FleetConfig, _slot, inst, snap
         from agents.models import AgentKind
@@ -773,11 +805,16 @@ class MenuCommandsAliveTests(unittest.TestCase):
                  patch.object(app, "set_tray_enabled"), \
                  patch.object(app, "toggle_autostart", return_value=True), \
                  patch.object(app, "_rebuild_skin"):
-                invoked = self._audit_menu(app, view, "fleet")
-            joined = "\n".join(invoked)
-            for needle in ("打开此 Agent 终端", "更换 Agent", "解除绑定",
-                           "隐藏此桌宠", "仪表盘", "退出"):
-                self.assertIn(needle, joined)
+                entries = self._inventory_entries(app, view, "fleet")
+                joined = "\n".join(label for _, label, _state in entries)
+                for needle in ("打开此 Agent 终端", "更换 Agent", "解除绑定",
+                               "隐藏此桌宠", "仪表盘", "退出"):
+                    self.assertIn(needle, joined)
+                for indices, _label, state in entries:
+                    if state == "disabled":
+                        continue
+                    self._invoke_enabled_entry_synthetically(app, view,
+                                                              indices)
             # fleet 激活作用于 exact view 的 agent
             self.assertTrue(act_mock.called)
             for call in act_mock.call_args_list:

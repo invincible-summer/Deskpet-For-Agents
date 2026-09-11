@@ -740,14 +740,39 @@ class PetContextMenuControllerTests(unittest.TestCase):
             app.quit()
 
     def test_controller_churn_leaves_no_after_timers(self):
+        """§17.2：真实 100 个 controller create/destroy 生命周期。
+
+        新 controller 在 show return 后 completion pending（Windows
+        queued-command 合同），后续 show 会被设计性拒绝——所以每轮
+        必须 show → root.update() → assert inactive，再进入下一轮。
+        """
         app = make_app()
         try:
             ctrl = app._menu_controller
+            created = 0
+            destroyed = 0
+            orig_destroy = ctrl._destroy
+
+            def counting_destroy(menu):
+                nonlocal destroyed
+                if menu is not None:
+                    destroyed += 1
+                orig_destroy(menu)
+
+            ctrl._destroy = counting_destroy
             with patch('tkinter.Menu.tk_popup',
                        lambda self, x, y, entry="": None):
                 for i in range(100):
                     ctrl.show("owner", 1, 2,
-                              lambda m: m.add_command(label=str(i)))
+                              lambda m, n=i: m.add_command(label=str(n)))
+                    self.assertTrue(ctrl.active,
+                                    "每轮 show 后 completion 应 pending")
+                    app.root.update()   # queued events + idle completion
+                    self.assertFalse(ctrl.active, f"轮 {i} 未回到 inactive")
+                    created += 1
+            self.assertEqual(created, 100)
+            self.assertEqual(destroyed, 100,
+                             "100 轮 lifecycle 必须 created==destroyed")
             ctrl.dismiss()
             app.root.update()
             # Tk after 队列为空（菜单生命周期不靠定时器）
