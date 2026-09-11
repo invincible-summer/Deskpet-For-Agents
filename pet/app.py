@@ -101,7 +101,7 @@ class PetApp:
         self.pet_manager.set_hooks(
             on_activate=self.activate_agent,
             on_context_menu=self._show_pet_menu,
-            on_interact=self._on_interact,
+            on_interact=self.interact,
             on_moved=self._on_pet_moved,
             on_double_vacant=self._on_vacant_double_click,
         )
@@ -252,9 +252,6 @@ class PetApp:
     # ================= 交互入口 =================
     def interact(self):
         self.toast(random.choice(INTERACT_LINES), 4)
-
-    def _on_interact(self):
-        self.interact()
 
     def activate_agent(self, key: str):
         """唯一激活入口：UI 只携带 exact agent_key（v4.1.3 §20/§21）。

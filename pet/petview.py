@@ -198,8 +198,8 @@ class PetView:
             build_manager.forget(self.view_id, self._build_key)
         self._build_key = key
         # v4.3.1 DP43-R04/§12：ready 判定走 manager 内存 index
-        # （已验证 manifest 的唯一 cache 真值）；Tk 路径不再做
-        # built_gifs_any 的 CACHE_DIR listdir。就绪回退用同 skin 同
+        # （已验证 manifest 的唯一 cache 真值）；Tk 路径不做
+        # CACHE_DIR listdir。就绪回退用同 skin 同
         # fps 的就近高度（同样来自 index，无 I/O）。
         paths = build_manager.ready_paths(skin, height, fps)
         if paths:

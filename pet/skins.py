@@ -675,28 +675,6 @@ def _build_builtin_skin_into(out_dir: str, height: int) -> None:
             }, f, ensure_ascii=False)
 
 
-# 兼容入口：旧测试/诊断脚本直接调用（existence-only，无 manifest 校验）
-def built_gifs(skin: str, height: int) -> dict[str, str] | None:
-    """已构建的 GIF 路径表（existence check；完整 ready 判定用
-    ready_cache_paths / SkinBuildManager.ready_paths）。"""
-    return cache_files_ok(cache_dir(skin, height))
-
-
-def built_gifs_any(skin: str) -> dict[str, str] | None:
-    """任意已构建好的高度缓存（诊断用；Pet 加载路径请用
-    SkinBuildManager.nearest_ready_cache——不在 Tk 做 listdir）。"""
-    try:
-        entries = sorted(os.listdir(CACHE_DIR), reverse=True)
-    except OSError:
-        return None
-    for name in entries:
-        if "@" in name and name.split("@")[0] == skin:
-            got = cache_files_ok(os.path.join(CACHE_DIR, name))
-            if got:
-                return got
-    return None
-
-
 # ================================================================ 导入事务（§10）
 def prepare_import(src_dir: str, name: str, cancel=None) -> str:
     """复制素材 + 校验齐全 + 写标准 manifest（完整事务，§10）。

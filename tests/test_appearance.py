@@ -214,8 +214,6 @@ class SlotSkinTests(unittest.TestCase):
             view = app.pet_manager.views["pet-1"]
             with patch("pet.skins.list_skins",
                        return_value={BUILTIN_SKIN: {}}), \
-                 patch("pet.skins.built_gifs", return_value=None), \
-                 patch("pet.skins.built_gifs_any", return_value=None), \
                  patch.object(SkinBuildManager, "request",
                               return_value=None) as req:
                 h.real_load_skin(view)
@@ -268,8 +266,8 @@ class PetViewCloseTests(unittest.TestCase):
     def _real_load(self, h, view):
         with patch("pet.skins.list_skins",
                    return_value={BUILTIN_SKIN: {}}), \
-             patch("pet.skins.built_gifs",
-                   return_value=self._ready_paths()):
+             patch.object(SkinBuildManager, "ready_paths",
+                          return_value=self._ready_paths()):
             h.real_load_skin(view)
 
     def test_close_with_active_build_key(self):

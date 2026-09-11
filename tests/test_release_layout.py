@@ -25,13 +25,18 @@ _PERSONAL_MINICONDA_ALT = "D:/miniconda3"
 class ReleaseLayoutTests(unittest.TestCase):
     def test_no_personal_absolute_paths_in_tracked_sources(self):
         # AC-REL-01：仓库不再含个人开发机路径（本测试文件自身除外——
-        # 它需要字面量定义被禁 token）
+        # 它需要字面量定义被禁 token）。
+        # v4.3.1 §20.5：目标扩大到 pet/agents/actions/tools 全部 py、
+        # tests 全部 py（不只 test_*.py）、README/SourceLink 与双 launcher。
         banned = (_PERSONAL_MINICONDA, _PERSONAL_MINICONDA_ALT, "启动桌宠.bat")
-        targets = list((ROOT / "pet").glob("*.py")) + \
-            list((ROOT / "agents").glob("*.py")) + \
-            list((ROOT / "tools").glob("*.py")) + \
-            list((ROOT / "tests").glob("test_*.py")) + \
-            [ROOT / "README.md", ROOT / "main.py"]
+        targets = (list((ROOT / "pet").glob("*.py"))
+                   + list((ROOT / "agents").glob("*.py"))
+                   + list((ROOT / "actions").glob("*.py"))
+                   + list((ROOT / "tools").glob("*.py"))
+                   + list((ROOT / "tests").glob("*.py"))
+                   + [ROOT / "README.md", ROOT / "SourceLink.md",
+                      ROOT / "main.py", ROOT / "Start-Desktop.bat",
+                      ROOT / "Setup-Desktop.bat"])
         targets = [p for p in targets if p != Path(__file__).resolve()]
         for path in targets:
             text = path.read_text(encoding="utf-8", errors="replace")

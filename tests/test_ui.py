@@ -385,7 +385,7 @@ class DashboardStableToplevelTests(unittest.TestCase):
         （标志已删除，包装函数直接调用）。"""
         from pet import dashboard as dash_mod
         self.assertFalse(hasattr(dash_mod.Dashboard, '_maybe_auto_collapse'))
-        src = open(dash_mod.__file__, encoding='utf-8').read()
+        src = Path(dash_mod.__file__).read_text(encoding="utf-8")
         self.assertNotIn('_native_dialog_open', src)
         self.assertNotIn('_had_focus', src)
 
