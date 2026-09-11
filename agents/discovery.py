@@ -26,7 +26,13 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .models import AgentKind, AgentInstance, SourceProbeSnapshot, TerminalAttachment
+from .models import (
+    AgentKind,
+    AgentInstance,
+    DesktopHost,
+    SourceProbeSnapshot,
+    TerminalAttachment,
+)
 from .paths import ENV_ALLOWLIST
 
 _SELF_PID = os.getpid()
@@ -155,8 +161,6 @@ def _match_kind(name: str, cmd: str) -> AgentKind | None:
     base = name.lower()
     if base == "claude.exe":
         return AgentKind.CLAUDE
-    if base.startswith("codex") and base.endswith(".exe"):
-        return AgentKind.CODEX
     if base == "kimi.exe" or base == "kimi":
         return AgentKind.KIMI
     if "claude-code" in cmd or "@anthropic-ai/claude-code" in cmd or "@anthropic-ai\\claude-code" in cmd:
@@ -171,46 +175,337 @@ def _match_kind(name: str, cmd: str) -> AgentKind | None:
     return None
 
 
-def scan_windows() -> list[AgentInstance]:
-    """Windows 原生进程扫描：canonicalize 后只为 runtime 进程建实例。
+# ------------------------------------------------- Windows 运行时角色（plan2 §4）
+#
+# v4.4 把"二元 kind 分类"升级为内部 runtime-role 分类，但仍只有一次
+# psutil census。角色只影响本次 census 内的归组，不是新对外合同：
+#   * TERMINAL_AGENT            —— 终端宿主下的 CLI Agent（4.3.1 语义）
+#   * CODEX_DESKTOP_HOST        —— Codex 桌面应用宿主（GUI 主进程）
+#   * CODEX_APP_SERVER_HELPER   —— Codex 宿主树内的 app-server/辅助进程
+#   * ZCODE_DESKTOP_HOST        —— ZCode 桌面应用宿主
+#   * ZCODE_AGENT_HELPER        —— ZCode 宿主树内的 app-server/plugin 辅助
+#   * OTHER                     —— 不构成任何 target（含证据冲突项）
+
+ROLE_TERMINAL_AGENT = "terminal_agent"
+ROLE_CODEX_DESKTOP_HOST = "codex_desktop_host"
+ROLE_CODEX_APP_SERVER_HELPER = "codex_app_server_helper"
+ROLE_ZCODE_DESKTOP_HOST = "zcode_desktop_host"
+ROLE_ZCODE_AGENT_HELPER = "zcode_agent_helper"
+ROLE_OTHER = "other"
+
+# Electron 多进程标记（renderer/gpu/utility/crashpad 均以 --type= 开头）
+_ELECTRON_HELPER_FLAG = "--type="
+
+# 终端宿主进程名（CLI Agent 的 ancestry 证据；不含 code.exe——IDE 集成
+# 的 codex 语言服务器与集成终端无法从 ancestry 区分，宁可漏报）
+_TERMINAL_HOST_BASENAMES = frozenset({
+    "windowsterminal.exe", "openterminal.exe", "openconsole.exe",
+    "conhost.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+    "bash.exe", "wsl.exe", "mintty.exe", "wezterm-gui.exe", "alacritty.exe",
+})
+
+# GUI 宿主 exe（大小写不敏感；Windows 文件系统不区分大小写）
+_ZCODE_GUI_BASENAMES = frozenset({"zcode.exe"})
+_CHATGPT_GUI_BASENAMES = frozenset({"chatgpt.exe"})
+# ChatGPT Desktop 成为 Codex 宿主的正向证据：MSIX 包族目录含 openai.codex
+_CHATGPT_CODEX_PKG_MARK = "openai.codex"
+# Codex 桌面/CLI 家族进程名（含 codex-app-server.exe 等 helper）
+_CODEX_PROC_MARK = ("codex", ".exe")
+# Codex app-server/daemon 子命令（cmdline 明确开关名）
+_CODEX_HELPER_ARGS = frozenset({"app-server", "app-server-daemon", "daemon"})
+# ZCode helper：zcode.cjs 入口 + CLI/host-local 辅助进程名
+_ZCODE_HELPER_CMD_MARKS = ("zcode.cjs",)
+_ZCODE_HELPER_BASENAMES = frozenset({"zcode-cli.exe", "zcode-host-local.exe"})
+
+_MAX_ANCESTRY_HOPS = 16
+_DIAG_MAX = 8
+
+
+def _args_of(info: dict) -> tuple[str, ...]:
+    cl = info.get("cmdline") or []
+    return tuple(str(x) for x in cl)
+
+
+def _basename_of(info: dict) -> str:
+    return str(info.get("name") or "").lower()
+
+
+def _exe_of(info: dict) -> str:
+    return str(info.get("exe") or "").lower()
+
+
+def _is_electron_helper(args: tuple[str, ...]) -> bool:
+    return any(a.startswith(_ELECTRON_HELPER_FLAG) for a in args)
+
+
+def _is_zcode_helper_cmd(args: tuple[str, ...]) -> bool:
+    joined = " ".join(args).lower()
+    return any(mark in joined for mark in _ZCODE_HELPER_CMD_MARKS)
+
+
+def _is_codex_helper_cmd(args: tuple[str, ...]) -> bool:
+    # 与 _CODEX_HELPER_ARGS 精确匹配的开关名（不匹配 prompt/path 参数）
+    return any(a in _CODEX_HELPER_ARGS for a in args)
+
+
+def _ancestor_chain(pid: int, parent_by_pid: dict[int, int],
+                    max_hops: int = _MAX_ANCESTRY_HOPS) -> list[int]:
+    chain: list[int] = []
+    cur = parent_by_pid.get(pid, 0)
+    hops = 0
+    while cur and hops < max_hops:
+        chain.append(cur)
+        cur = parent_by_pid.get(cur, 0)
+        hops += 1
+    return chain
+
+
+def _classify_windows_inventory(info_by_pid: dict[int, dict],
+                                parent_by_pid: dict[int, int],
+                                ) -> tuple[dict[int, str], list[str]]:
+    """一次内存分类：pid → role + 有界诊断（plan2 §4.1 证据顺序）。
+
+    证据优先级：明确 cmdline/helper 子命令 > GUI exe + GUI ancestry >
+    终端 ancestry CLI > 同 kind 子进程收敛到 canonical host；
+    冲突时不作为 terminal agent 发出（宁可 Desktop source UNKNOWN）。
+    """
+    roles: dict[int, str] = {}
+    diagnostics: list[str] = []
+
+    def note(msg: str):
+        if len(diagnostics) < _DIAG_MAX:
+            diagnostics.append(msg)
+
+    def info(pid: int) -> dict:
+        return info_by_pid.get(pid) or {}
+
+    def basename(pid: int) -> str:
+        return _basename_of(info(pid))
+
+    # ---- 1) 定位 GUI 宿主主进程（无同 exe 祖先、无 --type=、无 helper 命令） ----
+    zcode_mains: list[int] = []
+    chatgpt_mains: list[int] = []
+    codex_gu: list[int] = []
+    for pid, inf in info_by_pid.items():
+        args = _args_of(inf)
+        base = _basename_of(inf)
+        if base in _ZCODE_GUI_BASENAMES:
+            if _is_electron_helper(args) or _is_zcode_helper_cmd(args):
+                continue
+            if any(basename(a) in _ZCODE_GUI_BASENAMES
+                   for a in _ancestor_chain(pid, parent_by_pid)):
+                continue
+            zcode_mains.append(pid)
+        elif base in _CHATGPT_GUI_BASENAMES:
+            if _is_electron_helper(args):
+                continue
+            if any(basename(a) in _CHATGPT_GUI_BASENAMES
+                   for a in _ancestor_chain(pid, parent_by_pid)):
+                continue
+            chatgpt_mains.append(pid)
+        elif base.startswith(_CODEX_PROC_MARK[0]) and base.endswith(_CODEX_PROC_MARK[1]):
+            codex_gu.append(pid)
+
+    # ChatGPT Desktop 的 Codex 正向证据（plan2 §4.3）：包族目录或树内
+    # codex*.exe 后代；否则绝不把 ChatGPT.exe 当 Codex。
+    def _has_codex_descendant(root: int) -> bool:
+        seen: set[int] = set()
+        stack = [root]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            b = basename(cur)
+            if (cur != root and b.startswith("codex")
+                    and b.endswith(".exe")):
+                return True
+            stack.extend(p for p, pp in parent_by_pid.items() if pp == cur)
+            if len(seen) > 512:
+                return False
+        return False
+
+    codex_host_roots: list[int] = []
+    for pid in chatgpt_mains:
+        if (_CHATGPT_CODEX_PKG_MARK in _exe_of(info(pid))
+                or _has_codex_descendant(pid)):
+            codex_host_roots.append(pid)
+
+    # 独立 Codex GUI app（未来形态）：无 codex.exe 祖先、无终端 ancestry、
+    # 且存在同 exe Electron(--type=) 后代或 app-server/daemon 后代；
+    # 已位于任何桌面宿主树内的 codex*.exe 不重复成 root（helper 收敛）。
+    _desktop_mains = set(codex_host_roots) | set(chatgpt_mains) | set(zcode_mains)
+    for pid in codex_gu:
+        if pid in codex_host_roots:
+            continue
+        args = _args_of(info(pid))
+        if _is_electron_helper(args):
+            continue
+        if any(basename(a) == "codex.exe"
+               for a in _ancestor_chain(pid, parent_by_pid)):
+            continue
+        if any(a in _desktop_mains
+               for a in _ancestor_chain(pid, parent_by_pid)):
+            continue
+        if _has_codex_descendant(pid) and not _tree_has_terminal_ancestor(
+                pid, parent_by_pid, info_by_pid):
+            codex_host_roots.append(pid)
+
+    # ---- 2) 宿主树归组：祖先链到达任一宿主 root 的进程 ----
+    host_root_by_pid: dict[int, tuple[str, int]] = {}
+    for root in codex_host_roots:
+        host_root_by_pid[root] = (ROLE_CODEX_DESKTOP_HOST, root)
+    for root in zcode_mains:
+        host_root_by_pid[root] = (ROLE_ZCODE_DESKTOP_HOST, root)
+
+    def _host_of(pid: int) -> tuple[str, int] | None:
+        if pid in host_root_by_pid:
+            return host_root_by_pid[pid]
+        for anc in _ancestor_chain(pid, parent_by_pid):
+            if anc in host_root_by_pid:
+                return host_root_by_pid[anc]
+        return None
+
+    # 宿主 root 自身获得 HOST 角色（plan2 §4.1.4：helper 收敛到 root）
+    for root, (role, _r) in host_root_by_pid.items():
+        roles[root] = role
+
+    for pid in info_by_pid:
+        if pid in host_root_by_pid:
+            continue
+        host = _host_of(pid)
+        if host is None:
+            continue
+        role, _root = host
+        base = basename(pid)
+        if role == ROLE_CODEX_DESKTOP_HOST:
+            # codex*.exe / app-server 子命令 / ChatGPT 同 app Electron
+            # 进程 → Codex helper；树内其他进程（bash 等）保持 OTHER，
+            # 不形成 target
+            is_codex_proc = (
+                (base.startswith("codex") and base.endswith(".exe"))
+                or base in _CHATGPT_GUI_BASENAMES
+                or _is_codex_helper_cmd(_args_of(info(pid))))
+            roles[pid] = (ROLE_CODEX_APP_SERVER_HELPER if is_codex_proc
+                          else ROLE_OTHER)
+        else:
+            is_zcode_proc = (base in _ZCODE_GUI_BASENAMES
+                             or base in _ZCODE_HELPER_BASENAMES
+                             or _is_zcode_helper_cmd(_args_of(info(pid))))
+            roles[pid] = (ROLE_ZCODE_AGENT_HELPER if is_zcode_proc
+                          else ROLE_OTHER)
+
+    # ---- 3) 终端 CLI 判定（未被宿主树认领的进程） ----
+    def _terminal_ancestry(pid: int) -> bool:
+        for anc in _ancestor_chain(pid, parent_by_pid):
+            if basename(anc) in _TERMINAL_HOST_BASENAMES:
+                # 终端宿主自身位于桌面宿主树内（ZCode 集成终端）时，
+                # 它承载的仍是真实 CLI——继续成立
+                return True
+        return False
+
+    for pid, inf in info_by_pid.items():
+        if roles.get(pid) not in (None, ROLE_OTHER):
+            continue
+        base = _basename_of(inf)
+        if base.startswith("codex") and base.endswith(".exe"):
+            # CLI 判定严格于 4.3.1 的宽 name 匹配：必须终端 ancestry 或
+            # 控制台宿主证据；explorer/未知 ancestry 的 codex.exe 不再
+            # 冒充 CLI（避免桌面宿主 runtime 误报）
+            if _terminal_ancestry(pid) or _has_conhost_child(
+                    pid, parent_by_pid, info_by_pid):
+                roles[pid] = ROLE_TERMINAL_AGENT
+            else:
+                roles[pid] = ROLE_OTHER
+                note(f"codex.exe pid={pid} unattributed: no terminal ancestry")
+            continue
+        # claude/kimi/pi 保持 4.3.1 name/cmdline 匹配（无桌面宿主冲突；
+        # ZCode/终端集成 shell 内的真实 CLI 不因宿主树而被吞）
+        cmd = " ".join(_args_of(inf)).lower()
+        kind = _match_kind(base, cmd)
+        if kind is not None:
+            roles[pid] = ROLE_TERMINAL_AGENT
+    return roles, diagnostics
+
+
+def _tree_has_terminal_ancestor(pid: int, parent_by_pid: dict[int, int],
+                                info_by_pid: dict[int, dict]) -> bool:
+    for anc in _ancestor_chain(pid, parent_by_pid):
+        if _basename_of(info_by_pid.get(anc) or {}) in _TERMINAL_HOST_BASENAMES:
+            return True
+    return False
+
+
+def _has_conhost_child(pid: int, parent_by_pid: dict[int, int],
+                       info_by_pid: dict[int, dict]) -> bool:
+    """控制台子系统进程会拉起 conhost 子进程（explorer 双击运行 CLI）。"""
+    for child, ppid in parent_by_pid.items():
+        if ppid == pid and _basename_of(info_by_pid.get(child) or {}) == "conhost.exe":
+            return True
+    return False
+
+
+@dataclass(frozen=True)
+class WindowsRuntimeInventory:
+    """一次 Windows census 的两类权威结果（plan2 §4.2）。
+
+    terminal_instances 与 desktop_hosts 来自同一 psutil 枚举；
+    Monitor 绝不为 Desktop 再启动第二个扫描线程。
+    """
+    terminal_instances: tuple[AgentInstance, ...] = ()
+    desktop_hosts: tuple[DesktopHost, ...] = ()
+    authoritative: bool = True
+    diagnostics: tuple[str, ...] = ()
+
+
+def scan_windows_inventory() -> WindowsRuntimeInventory:
+    """Windows 原生进程扫描：同一 census 产出终端 Agent 与桌面宿主。
 
     全局 process_iter 失败抛 ProbeUnavailable（authoritative=False），
-    绝不返回空列表冒充"权威确认无 Agent"（v4plan §4.1）。
-    单个进程的 AccessDenied/NoSuchProcess 只跳过该进程，不影响整轮。
+    绝不返回空结果冒充"权威确认无 Agent"（v4plan §4.1）。
     """
     import psutil
 
     try:
         procs = list(psutil.process_iter(
-            attrs=["pid", "name", "cmdline", "create_time", "ppid"]))
+            attrs=["pid", "name", "cmdline", "create_time", "ppid", "exe"]))
     except Exception as exc:
         raise ProbeUnavailable(f"process_iter failed: {exc!r}") from exc
-
-    out: list[AgentInstance] = []
 
     parent_by_pid: dict[int, int] = {}
     info_by_pid: dict[int, dict] = {}
     for p in procs:
         try:
-            parent_by_pid[p.info["pid"]] = int(p.info.get("ppid") or 0)
-            info_by_pid[p.info["pid"]] = p.info
+            pid = p.info["pid"]
+            if pid == _SELF_PID:
+                continue
+            parent_by_pid[pid] = int(p.info.get("ppid") or 0)
+            info_by_pid[pid] = p.info
         except Exception:
             continue
 
+    roles, diagnostics = _classify_windows_inventory(info_by_pid, parent_by_pid)
+
+    # 终端候选照旧走 canonicalization（npm wrapper 折叠）
     candidates: list[ProcessCandidate] = []
-    for pid, info in info_by_pid.items():
-        if pid == _SELF_PID:
+    for pid, role in roles.items():
+        if role != ROLE_TERMINAL_AGENT:
             continue
-        name = info.get("name") or ""
-        cmd = " ".join(str(x) for x in (info.get("cmdline") or [])).lower()
-        if not name and not cmd:
+        info = info_by_pid.get(pid, {})
+        base = _basename_of(info)
+        if base.startswith("codex") and base.endswith(".exe"):
+            kind = AgentKind.CODEX   # 角色分类已确认 CLI，不经过宽 name 匹配
+        else:
+            name = info.get("name") or ""
+            cmd = " ".join(str(x) for x in (info.get("cmdline") or [])).lower()
+            kind = _match_kind(name, cmd)
+        if kind is None:
             continue
-        kind = _match_kind(name, cmd)
-        if kind:
-            candidates.append(ProcessCandidate(
-                kind=kind, pid=pid, ppid=parent_by_pid.get(pid, 0)))
+        candidates.append(ProcessCandidate(
+            kind=kind, pid=pid, ppid=parent_by_pid.get(pid, 0)))
 
     canonical, launchers = canonicalize_agent_processes(candidates, parent_by_pid)
+    out: list[AgentInstance] = []
     for cand in candidates:
         if cand.pid not in canonical:
             continue
@@ -224,9 +519,6 @@ def scan_windows() -> list[AgentInstance]:
             ppid=parent_by_pid.get(cand.pid, 0),
             launcher_pids=launchers.get(cand.pid, ()),
         )
-        # canonical group 的外部父进程：跳过 same-kind launcher chain，
-        # 找最高 same-kind launcher 的 ppid（v4.2.3 §2.4）。O(短 parent
-        # chain)，不新增 psutil process iteration。
         external_parent_pid = parent_by_pid.get(cand.pid, 0) or 0
         for launcher_pid in launchers.get(cand.pid, ()):
             external_parent_pid = parent_by_pid.get(launcher_pid, 0) or 0
@@ -242,7 +534,50 @@ def scan_windows() -> list[AgentInstance]:
         except Exception:
             pass
         out.append(inst)
-    return out
+
+    # 桌面宿主：每个 host root 一个 DesktopHost，helper 收敛、不单独成 target
+    hosts: list[DesktopHost] = []
+    for pid, role in sorted(roles.items()):
+        if role not in (ROLE_CODEX_DESKTOP_HOST, ROLE_ZCODE_DESKTOP_HOST):
+            continue
+        info = info_by_pid.get(pid, {})
+        kind = (AgentKind.CODEX if role == ROLE_CODEX_DESKTOP_HOST
+                else AgentKind.ZCODE)
+        created = float(info.get("create_time") or 0.0)
+        helpers = tuple(sorted(
+            other for other, orole in roles.items()
+            if orole in (ROLE_CODEX_APP_SERVER_HELPER, ROLE_ZCODE_AGENT_HELPER)
+            and _host_root_for(other, roles, parent_by_pid) == pid))
+        hosts.append(DesktopHost(
+            kind=kind, source="windows", pid=pid,
+            process_token=f"{created:.3f}",
+            exe=str(info.get("exe") or ""),
+            cmdline=_args_of(info),
+            started_at=created,
+            helper_pids=helpers,
+        ))
+    return WindowsRuntimeInventory(
+        terminal_instances=tuple(out),
+        desktop_hosts=tuple(hosts),
+        authoritative=True,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def _host_root_for(pid: int, roles: dict[int, str],
+                   parent_by_pid: dict[int, int]) -> int | None:
+    """pid 所属的桌面宿主 root pid（自身或祖先链上的 host 角色）。"""
+    if roles.get(pid) in (ROLE_CODEX_DESKTOP_HOST, ROLE_ZCODE_DESKTOP_HOST):
+        return pid
+    for anc in _ancestor_chain(pid, parent_by_pid):
+        if roles.get(anc) in (ROLE_CODEX_DESKTOP_HOST, ROLE_ZCODE_DESKTOP_HOST):
+            return anc
+    return None
+
+
+def scan_windows() -> list[AgentInstance]:
+    """兼容包装（plan2 §4.2）：只返回终端 Agent 实例，Monitor/测试不改。"""
+    return list(scan_windows_inventory().terminal_instances)
 
 
 # ------------------------------------------------------------------ WSL

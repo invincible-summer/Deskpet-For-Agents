@@ -772,5 +772,225 @@ class KimiIndexTests(unittest.TestCase):
             self.assertTrue(all(p.endswith("wire.jsonl") for _m, p in candidates))
 
 
+# ==================================================== v4.4 Windows inventory
+
+def _proc_rows(rows):
+    """(pid, ppid, name, cmdline, create_time, exe) → 假 psutil process_iter。"""
+    import types
+    out = []
+    for pid, ppid, name, cmd, ct, exe in rows:
+        out.append(types.SimpleNamespace(info={
+            "pid": pid, "ppid": ppid, "name": name, "cmdline": list(cmd),
+            "create_time": ct, "exe": exe}))
+    return out
+
+
+_EXPLORER = 4
+_CHATGPT_CODEX_EXE = ("C:\\Program Files\\WindowsApps\\"
+                      "OpenAI.Codex_26.903.9818.0_x64__2p2nqsd0c76g0\\app\\ChatGPT.exe")
+_CHATGPT_PLAIN_EXE = ("C:\\Program Files\\WindowsApps\\"
+                      "OpenAI.ChatGPT_26.903.9818.0_x64__2p2nqsd0c76g0\\app\\ChatGPT.exe")
+
+
+class WindowsInventoryTests(unittest.TestCase):
+    """plan2 §4/§15：一次 census 同时产出终端 Agent 与 DesktopHost；
+    Codex 桌面宿主不再冒充 CLI（4.3.1 宽 codex*.exe 匹配的修正）。"""
+
+    def _scan(self, rows):
+        from agents.discovery import scan_windows_inventory
+        with unittest.mock.patch(
+                "psutil.process_iter",
+                return_value=_proc_rows(rows)):
+            return scan_windows_inventory()
+
+    # ---- 身份模型 ----
+
+    def test_terminal_key_unchanged_from_v431(self):
+        # plan2 §3.3：TERMINAL .key 生成与 4.3.1 完全一致
+        inv = self._scan([
+            (100, _EXPLORER, "WindowsTerminal.exe", ["wt"], 1000.0, ""),
+            (101, 100, "codex.exe", ["codex"], 1001.5,
+             "C:\\Users\\u\\AppData\\Local\\OpenAI\\Codex\\bin\\h\\codex.exe"),
+        ])
+        self.assertEqual(len(inv.terminal_instances), 1)
+        inst = inv.terminal_instances[0]
+        self.assertEqual(inst.key, f"windows|codex|101|1001.500")
+        from agents.models import AgentSurface
+        self.assertIs(inst.surface, AgentSurface.TERMINAL)
+        self.assertEqual(inv.desktop_hosts, ())
+
+    def test_desktop_instance_and_host_key_shape(self):
+        from agents.models import AgentInstance, AgentSurface, DesktopHost
+        inst = AgentInstance(kind=AgentKind.CODEX, pid=0, source="windows",
+                             surface=AgentSurface.DESKTOP,
+                             host_process_token="1789146850.665",
+                             host_pid=8068,
+                             logical_session_id="thread-abc")
+        self.assertEqual(
+            inst.key, "windows|codex|desktop|1789146850.665|thread-abc")
+        host_a = DesktopHost(kind=AgentKind.CODEX, pid=8068,
+                             process_token="111.000")
+        host_b = DesktopHost(kind=AgentKind.CODEX, pid=8068,
+                             process_token="222.000")
+        # 宿主重启（同 PID 复用）→ 新 runtime key，旧 target 不被继承
+        self.assertNotEqual(host_a.host_key, host_b.host_key)
+        self.assertIn("111.000", host_a.host_key)
+
+    # ---- Codex 桌面 / CLI 区分 ----
+
+    def test_codex_cli_not_collapsed_into_desktop(self):
+        # plan2 §15：终端 ancestry 下的 codex.exe 仍是 CLI target
+        inv = self._scan([
+            (100, _EXPLORER, "WindowsTerminal.exe", ["wt"], 1000.0, ""),
+            (101, 100, "codex.exe", ["codex"], 1001.5,
+             "C:\\Users\\u\\.codex\\bin\\codex.exe"),
+        ])
+        self.assertEqual([i.kind for i in inv.terminal_instances],
+                         [AgentKind.CODEX])
+        self.assertEqual(inv.desktop_hosts, ())
+
+    def test_codex_gui_host_not_emitted_as_terminal_agent(self):
+        # 实机形态：ChatGPT.exe(OpenAI.Codex 包) + codex.exe runtime 子进程。
+        # 4.3.1 会把 codex.exe 误判成 CLI；v4.4 折叠为一个 Codex DesktopHost。
+        inv = self._scan([
+            (200, _EXPLORER, "ChatGPT.exe", ["ChatGPT.exe"], 2000.0,
+             _CHATGPT_CODEX_EXE),
+            (201, 200, "codex.exe",
+             ["codex.exe", "-c", "features.code_mode_host=true"], 2001.0,
+             "C:\\Users\\u\\AppData\\Local\\OpenAI\\Codex\\bin\\h\\codex.exe"),
+            (202, 200, "ChatGPT.exe",
+             ["ChatGPT.exe", "--type=renderer", "--s"], 2002.0,
+             _CHATGPT_CODEX_EXE),
+        ])
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertEqual(len(inv.desktop_hosts), 1)
+        host = inv.desktop_hosts[0]
+        self.assertIs(host.kind, AgentKind.CODEX)
+        self.assertEqual(host.pid, 200)
+        self.assertIn(201, host.helper_pids)
+        self.assertIn(202, host.helper_pids)
+
+    def test_codex_helpers_fold_into_one_host(self):
+        inv = self._scan([
+            (200, _EXPLORER, "ChatGPT.exe", ["ChatGPT.exe"], 2000.0,
+             _CHATGPT_CODEX_EXE),
+            (202, 200, "ChatGPT.exe",
+             ["ChatGPT.exe", "--type=gpu-process"], 2002.0, _CHATGPT_CODEX_EXE),
+            (203, 200, "codex-app-server.exe", ["codex-app-server.exe"], 2003.0, ""),
+            (204, 203, "codex.exe", ["codex", "app-server"], 2004.0, ""),
+        ])
+        self.assertEqual(len(inv.desktop_hosts), 1)
+        host = inv.desktop_hosts[0]
+        self.assertEqual(set(host.helper_pids), {202, 203, 204})
+
+    def test_codex_exe_unknown_ancestry_is_not_terminal(self):
+        # 证据冲突/不足（explorer 直启、无 conhost）→ 宁可漏报也不冒充 CLI
+        inv = self._scan([
+            (400, _EXPLORER, "codex.exe", ["codex"], 4000.0,
+             "C:\\Users\\u\\AppData\\Local\\OpenAI\\Codex\\bin\\h\\codex.exe"),
+        ])
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertEqual(inv.desktop_hosts, ())
+        self.assertTrue(any("unattributed" in d for d in inv.diagnostics))
+
+    def test_codex_exe_with_conhost_child_is_terminal(self):
+        # explorer 双击启动的控制台 CLI：conhost 子进程是控制台宿主证据
+        inv = self._scan([
+            (400, _EXPLORER, "codex.exe", ["codex"], 4000.0,
+             "C:\\Users\\u\\.codex\\bin\\codex.exe"),
+            (401, 400, "conhost.exe", ["conhost"], 4000.1, ""),
+        ])
+        self.assertEqual(len(inv.terminal_instances), 1)
+        self.assertEqual(inv.terminal_instances[0].pid, 400)
+
+    # ---- ChatGPT 边界 ----
+
+    def test_plain_chatgpt_without_codex_evidence_is_nothing(self):
+        # plan2 §4.3：不能把所有 ChatGPT.exe 都当 Codex
+        inv = self._scan([
+            (210, _EXPLORER, "ChatGPT.exe", ["ChatGPT.exe"], 2100.0,
+             _CHATGPT_PLAIN_EXE),
+            (211, 210, "ChatGPT.exe",
+             ["ChatGPT.exe", "--type=renderer"], 2101.0, _CHATGPT_PLAIN_EXE),
+        ])
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertEqual(inv.desktop_hosts, ())
+
+    # ---- ZCode 宿主 ----
+
+    def test_zcode_helpers_fold_into_one_host(self):
+        inv = self._scan([
+            (300, _EXPLORER, "ZCode.exe", ["ZCode.exe"], 3000.0,
+             "D:\\Zcode\\ZCode.exe"),
+            (301, 300, "ZCode.exe",
+             ["ZCode.exe", "--type=renderer",
+              "--user-data-dir=C:\\Users\\u\\AppData\\Roaming\\ZCode"],
+             3001.0, "D:\\Zcode\\ZCode.exe"),
+            (302, 301, "ZCode.exe",
+             ["ZCode.exe", "D:\\Zcode\\resources\\glm\\zcode.cjs", "app-server"],
+             3002.0, "D:\\Zcode\\ZCode.exe"),
+            (303, 302, "ZCode.exe",
+             ["ZCode.exe", "D:\\Zcode\\resources\\glm\\zcode.cjs",
+              "__zcode-plugin-host"],
+             3003.0, "D:\\Zcode\\ZCode.exe"),
+            (304, 300, "bash.exe",
+             ["bash.exe", "-c", ".", "snapshot-bash-1"], 3004.0, ""),
+            (305, 300, "wsl.exe", ["wsl.exe", "-d", "Ubuntu"], 3005.0, ""),
+        ])
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertEqual(len(inv.desktop_hosts), 1)
+        host = inv.desktop_hosts[0]
+        self.assertIs(host.kind, AgentKind.ZCODE)
+        self.assertEqual(host.pid, 300)
+        # 同 app Electron/app-server/plugin-host 收敛；bash/wsl 不是 helper
+        self.assertEqual(set(host.helper_pids), {301, 302, 303})
+
+    def test_zcode_standalone_cli_is_not_a_target(self):
+        # zcode-cli 在终端里运行：无 GUI 宿主 → 4.4 不产生任何 target
+        inv = self._scan([
+            (100, _EXPLORER, "WindowsTerminal.exe", ["wt"], 1000.0, ""),
+            (310, 100, "zcode-cli.exe", ["zcode-cli"], 3100.0, ""),
+        ])
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertEqual(inv.desktop_hosts, ())
+
+    # ---- 混合：ZCode 集成终端内的真实 Codex CLI ----
+
+    def test_codex_cli_inside_zcode_tree_survives(self):
+        # ZCode 集成终端（bash）里运行 codex CLI 是真实 CLI，
+        # 不被 ZCode 宿主树吞掉（CLI 本体不能被吞进 DesktopHost）
+        inv = self._scan([
+            (300, _EXPLORER, "ZCode.exe", ["ZCode.exe"], 3000.0, ""),
+            (304, 300, "bash.exe", ["bash"], 3004.0, ""),
+            (306, 304, "codex.exe", ["codex"], 3006.0, ""),
+        ])
+        hosts = {(h.kind, h.pid) for h in inv.desktop_hosts}
+        self.assertEqual(hosts, {(AgentKind.ZCODE, 300)})
+        self.assertEqual([i.pid for i in inv.terminal_instances], [306])
+        self.assertEqual([i.kind for i in inv.terminal_instances],
+                         [AgentKind.CODEX])
+
+    def test_claude_terminal_matching_unchanged(self):
+        # claude/kimi/pi 的 4.3.1 name/cmdline 匹配保持不变
+        inv = self._scan([
+            (100, _EXPLORER, "WindowsTerminal.exe", ["wt"], 1000.0, ""),
+            (110, 100, "claude.exe", ["claude"], 1100.0, ""),
+        ])
+        self.assertEqual([i.kind for i in inv.terminal_instances],
+                         [AgentKind.CLAUDE])
+
+    def test_scan_windows_wrapper_compat(self):
+        # plan2 §4.2：scan_windows() 兼容包装只返回 terminal_instances
+        from agents.discovery import scan_windows
+        rows = [
+            (100, _EXPLORER, "WindowsTerminal.exe", ["wt"], 1000.0, ""),
+            (101, 100, "codex.exe", ["codex"], 1001.0, ""),
+        ]
+        with unittest.mock.patch("psutil.process_iter",
+                                 return_value=_proc_rows(rows)):
+            insts = scan_windows()
+        self.assertEqual([i.pid for i in insts], [101])
+
+
 if __name__ == "__main__":
     unittest.main()

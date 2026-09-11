@@ -16,6 +16,9 @@ class AgentKind(str, Enum):
     CODEX = "codex"
     KIMI = "kimi"
     PI = "pi"
+    # v4.4：ZCode Desktop 逻辑会话 kind（plan2 §3.1）。Codex Desktop 不
+    # 新增 kind——与 Codex CLI 同为 CODEX，通过 surface 区分。
+    ZCODE = "zcode"
 
     @property
     def label(self) -> str:
@@ -24,7 +27,18 @@ class AgentKind(str, Enum):
             "codex": "Codex",
             "kimi": "Kimi",
             "pi": "pi",
+            "zcode": "ZCode",
         }[self.value]
+
+
+class AgentSurface(str, Enum):
+    """Agent 目标的运行表面（plan2 §3.1）。
+
+    TERMINAL 是 4.3.1 唯一表面，保持默认值不变，所有旧构造/测试
+    无需修改即维持原语义。DESKTOP 表示同一 GUI 宿主下的逻辑会话。
+    """
+    TERMINAL = "terminal"
+    DESKTOP = "desktop"
 
 
 class TerminalAttachment(str, Enum):
@@ -187,6 +201,36 @@ class Observation:
 
 
 @dataclass
+class DesktopHost:
+    """桌面应用宿主的物理身份（plan2 §3.2）。
+
+    只回答"哪个 GUI 进程在承载 Agent 会话"（liveness/activation 的
+    物理实体）；不进入 Presentation，不直接成为宠物。N 个逻辑会话
+    共享一个 host lease；helper_pids 是同树 Electron/app-server 辅助
+    进程，永远不形成独立 target。运行期身份，绝不持久化。
+    """
+    kind: AgentKind
+    source: str = "windows"          # v4.4 仅 "windows"
+    pid: int = 0
+    process_token: str = ""          # 与 AgentInstance 同语义（create_time）
+    exe: str = ""
+    cmdline: tuple[str, ...] = ()
+    started_at: float = 0.0
+    host_key: str = ""
+    helper_pids: tuple[int, ...] = ()
+    window_class_hint: str = ""
+    data_root_hint: str = ""
+    # 只作诊断（例如 app-server control socket 是否存在），绝不连接
+    app_server_endpoint_hint: str = ""
+
+    def __post_init__(self):
+        if not self.host_key:
+            token = self.process_token or str(self.pid)
+            self.host_key = (
+                f"{self.source}|{self.kind.value}|desktop-host|{self.pid}|{token}")
+
+
+@dataclass
 class AgentInstance:
     """Agent 进程身份（plan.md §3.1）。
 
@@ -243,10 +287,34 @@ class AgentInstance:
     # True/False = 本轮 census 明确看到存在/不存在；None = 无法判断
     external_parent_alive: bool | None = None
 
+    # ---- Desktop 逻辑会话身份（plan2 §3.3；TERMINAL 实例保持默认） ----
+    # surface 区分终端 CLI 实例与 GUI 宿主下的逻辑会话；同一 kind 的
+    # Codex CLI/桌面会话靠它区分，不新增重复 AgentKind。
+    surface: AgentSurface = AgentSurface.TERMINAL
+    # 逻辑会话标识（Codex thread id / ZCode session id）；空表示终端实例
+    logical_session_id: str = ""
+    # 承载该会话的 DesktopHost 身份（runtime-only，绝不持久化）
+    host_key: str = ""
+    host_pid: int = 0
+    host_process_token: str = ""
+    # Desktop source 已知的 exact 会话文件（例如 Codex rollout 绝对路径）
+    session_file_hint: str = ""
+    # 临时性会话（如 Side Conversation）：app 退出/关闭后直接移除
+    volatile_session: bool = False
+
     def __post_init__(self):
         if not self.key:
-            identity = self.process_token or self.pid
-            self.key = f"{self.source}|{self.kind.value}|{self.identity_token()}"
+            if (self.surface is AgentSurface.DESKTOP
+                    and self.logical_session_id):
+                # plan2 §3.3：宿主 incarnation + 逻辑会话 id 组成 runtime
+                # key——app 重启后同 thread/session 复现也绝不继承旧
+                # incarnation 的 target 身份。
+                host_token = self.host_process_token or str(self.host_pid)
+                self.key = (f"{self.source}|{self.kind.value}|desktop|"
+                            f"{host_token}|{self.logical_session_id}")
+            else:
+                identity = self.process_token or self.pid
+                self.key = f"{self.source}|{self.kind.value}|{self.identity_token()}"
 
     def identity_token(self) -> str:
         if self.process_token:
