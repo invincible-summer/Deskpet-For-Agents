@@ -627,6 +627,31 @@ def check_dp43_reliability_structural(checks):
                    "_reload_skins" not in app_src
                    and "_skin_after" not in app_src))
 
+    # §35.2 v4.3.1 交互收口结构合同
+    dashboard_src = (repo / "pet" / "dashboard.py").read_text(
+        encoding="utf-8")
+    widgets_src = (repo / "pet" / "widgets.py").read_text(encoding="utf-8")
+    skins_src = (repo / "pet" / "skins.py").read_text(encoding="utf-8")
+    checks.append((
+        "Dashboard scroller 不再关闭 _center propagation"
+        "（_center.pack_propagate 归零）",
+        "_center.pack_propagate" not in dashboard_src))
+    checks.append((
+        "Dashboard inner <Configure> 追加（add='+'）不覆盖 scroll owner",
+        'add="+"' in dashboard_src))
+    checks.append((
+        "ScrollableFrame.wheel_scroll 使用 contains_point bounds",
+        "contains_point(x, y)" in widgets_src))
+    checks.append(("_focus_and_activate 死 helper 归零",
+                   "_focus_and_activate" not in app_src
+                   and "_focus_and_activate" not in dashboard_src))
+    checks.append(("built_gifs/built_gifs_any 死入口归零",
+                   "def built_gifs(" not in skins_src
+                   and "def built_gifs_any(" not in skins_src))
+    checks.append((
+        "Dashboard 无自重排周期 after（唯一 after 是 50ms resize debounce）",
+        dashboard_src.count("self.after(") == 1))
+
     import pet.skins as skins_mod
     cat = skins_mod.SkinCatalog()
     with _patch.object(skins_mod, "_scan_skins",
