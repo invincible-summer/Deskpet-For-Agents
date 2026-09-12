@@ -26,11 +26,43 @@ new = '''    run(cmd)
 if old not in text:
     raise RuntimeError("build dist block not found")
 text = text.replace(old, new, 1)
+
+# The first real Windows build showed that forcing LTO spends most of the build
+# in a whole-program link (~19 minutes for this dependency set). The release
+# contract does not depend on LTO and we have no measured runtime benefit yet,
+# so make the build deterministic and maintainable with LTO disabled.
+old = '        "--lto=yes",\n'
+new = '        "--lto=no",\n'
+if old not in text:
+    raise RuntimeError("build LTO option not found")
+text = text.replace(old, new, 1)
 p.write_text(text, encoding="utf-8", newline="\n")
 
-# Validate the actual bundled FFmpeg binary, not merely package metadata.
+# Release-content checks must be scoped to paths *inside* the distribution.
+# The staging parent is intentionally .release/, so examining absolute path
+# parts would reject every valid artifact before it can be packaged.
 p = ROOT / "tools" / "release_acceptance.py"
 text = p.read_text(encoding="utf-8")
+old = '''    for path in dist.rglob("*"):
+        if path.name in banned_names:
+            raise SystemExit(f"mutable user data leaked into release: {path}")
+        lowered = {p.lower() for p in path.parts}
+        if "tests" in lowered or ".release" in lowered:
+            raise SystemExit(f"development-only path leaked into release: {path}")
+'''
+new = '''    for path in dist.rglob("*"):
+        if path.name in banned_names:
+            raise SystemExit(f"mutable user data leaked into release: {path}")
+        relative = path.relative_to(dist)
+        lowered = {part.lower() for part in relative.parts}
+        if "tests" in lowered or ".release" in lowered:
+            raise SystemExit(f"development-only path leaked into release: {relative}")
+'''
+if old not in text:
+    raise RuntimeError("release relative-path validation block not found")
+text = text.replace(old, new, 1)
+
+# Validate the actual bundled FFmpeg binary, not merely package metadata.
 needle = '''    if conv.returncode != 1 or "usage:" not in (conv.stdout + conv.stderr):
         raise SystemExit("internal converter dispatch smoke failed")
 
