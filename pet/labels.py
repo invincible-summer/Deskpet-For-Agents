@@ -34,6 +34,22 @@ def phase_text(snap) -> str:
     return ""
 
 
+def environment_label(inst) -> str:
+    """来源只读标签（plan2 §11）：Codex · Desktop / Codex · WSL / ZCode · Desktop。
+
+    仅展示用；selector 持久化绝不写 runtime session id。
+    """
+    from agents.models import AgentSurface
+    kind = getattr(inst, "kind", None)
+    base = kind.label if kind is not None else ""
+    if getattr(inst, "surface", AgentSurface.TERMINAL) is AgentSurface.DESKTOP:
+        return f"{base} · Desktop".strip(" ·")
+    distro = getattr(inst, "distro", "") or ""
+    if distro:
+        return f"{base} · WSL {distro}"
+    return base
+
+
 def mode_text(snap) -> str:
     mode = getattr(snap, "mode", Mode.NONE)
     if isinstance(mode, Mode):

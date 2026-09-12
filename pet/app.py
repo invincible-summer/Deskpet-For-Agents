@@ -19,7 +19,7 @@ import random
 import time
 import tkinter as tk
 
-from agents.models import ActivationCode
+from agents.models import ActivationCode, AgentSurface
 
 from . import autostart, skins
 from .labels import status_text
@@ -269,10 +269,16 @@ class PetApp:
         if self._closing:
             return
         result = self.monitor.activate_target(key)
+        desktop = self._target_is_desktop(key)
         if result.code == ActivationCode.OK:
-            self.agent_toast(key, "已打开该 Agent 的终端窗口", 2)
+            if desktop:
+                # plan2 §10：Desktop 激活 capability = APP_ONLY，文案不
+                # 承诺会话级跳转
+                self.agent_toast(key, "已唤起该 Agent 的应用窗口（桌面会话不支持定位到具体对话）", 3)
+            else:
+                self.agent_toast(key, "已打开该 Agent 的终端窗口", 2)
         elif result.code == ActivationCode.FOREGROUND_DENIED:
-            self.agent_toast(key, "Windows 未允许将终端置于前台，已闪烁任务栏提醒", 4)
+            self.agent_toast(key, "Windows 未允许将该窗口置于前台，已闪烁任务栏提醒", 4)
         elif result.code == ActivationCode.AGENT_GONE:
             # 该 Agent 的卡片会随本轮 reconcile 消失，无卡可挂 → 主卡提示
             self.toast("该 Agent 已退出", 4)
@@ -284,6 +290,15 @@ class PetApp:
             self.agent_toast(key, "原终端窗口已失效，正在重新识别…", 4)
         else:
             self.agent_toast(key, "无法打开该 Agent 的终端窗口", 4)
+
+    def _target_is_desktop(self, key: str) -> bool:
+        try:
+            target = self.monitor.get_target(key)
+        except Exception:
+            return False
+        return (target is not None
+                and getattr(target.instance, "surface", None)
+                is AgentSurface.DESKTOP)
 
     def _drain_activation_repairs(self):
         """bridge 每 tick 调用（bounded，<=4 条；DP43-R08 §16.6）。

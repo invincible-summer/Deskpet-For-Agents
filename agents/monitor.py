@@ -34,6 +34,7 @@ from .desktop import (
     DesktopSourceSnapshot,
     build_terminal_claims,
 )
+from .desktop_window import DesktopWindowService, is_desktop_instance
 from .discovery import (
     ProbeUnavailable,
     WslProcessProbe,
@@ -311,6 +312,9 @@ class Monitor:
             observer = None
         self._terminal_service = WindowsTerminalService(
             observer, cfg=monitor_cfg)
+        # Desktop 宿主 app 级激活（plan2 §10）：无状态、fail-closed，
+        # 与 terminal service 彻底分离
+        self._desktop_window_service = DesktopWindowService()
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._rescan_requested = threading.Event()
@@ -603,17 +607,23 @@ class Monitor:
         self._log("已请求重新扫描（清 Process/Session/Terminal 运行期缓存）")
 
     def activate_target(self, key: str) -> ActivationResult:
-        """UI 激活 Terminal 窗口的唯一入口（v4.1.1 §9.2）。
+        """UI 激活窗口的唯一入口（v4.1.1 §9.2；plan2 §10 surface dispatch）。
 
         UI 只携带 exact agent_key；服务内部重新核验 Agent live、
-        window binding、WindowIdentity，fail-closed。不依赖 UIA、
-        不做 UIA refresh（v4.3.1 DP43-R08：stale 由 request_activation_repair
-        异步修复，Tk 不阻塞）。
+        window binding、WindowIdentity，fail-closed。TERMINAL →
+        WindowsTerminalService；DESKTOP → DesktopWindowService（app 级
+        唤醒，不承诺会话级跳转）。不依赖 UIA、不做 UIA refresh
+        （v4.3.1 DP43-R08：stale 由 request_activation_repair 异步
+        修复，Tk 不阻塞）。
         """
         if not key:
             return ActivationResult(ActivationCode.NO_BINDING)
         if not self.is_live_key(key):
             return ActivationResult(ActivationCode.AGENT_GONE)
+        with self.lock:
+            inst = self.instances.get(key)
+        if inst is not None and is_desktop_instance(inst):
+            return self._desktop_window_service.activate_host(inst)
         return self._terminal_service.activate_cached(
             key, is_agent_live=self.is_live_key)
 
