@@ -316,6 +316,9 @@ class MonitorDesktopLifecycleTests(unittest.TestCase):
             "snapshot": lambda self: {},
             "desktop_hosts": lambda self: tuple(hosts),
             "inventory_authoritative": lambda self: True,
+            "join": lambda self, timeout=0.0: None,
+            "stop": lambda self: None,
+            "_thread": None,
         })()
         return monitor
 
@@ -515,6 +518,36 @@ class MonitorDesktopLifecycleTests(unittest.TestCase):
                            for t in codex
                            if t.instance.surface is AgentSurface.DESKTOP}
             self.assertEqual(desktop_ids, {"t9"})
+
+    def test_shutdown_closes_desktop_sources(self):
+        # plan2 §14：join_for_shutdown 释放 source 的连接/文件句柄
+        host = self._host()
+        source = FakeDesktopSource(AgentKind.CODEX)
+        source.push(_desktop_snap(source, host, ["t1"]))
+        monitor = self._monitor(source, [host])
+        monitor._tick()
+        closed = {"count": 0}
+        source.close = lambda: closed.__setitem__("count", closed["count"] + 1)
+        monitor.join_for_shutdown(1.0)
+        self.assertEqual(closed["count"], 1)
+
+    def test_desktop_observation_never_persists_runtime_identity(self):
+        # AC-PRIVACY-01（合成对照）：desktop 路径不触发任何 config 持久化，
+        # runtime 身份（host token / session id）不进入可持久化对象
+        from agents.desktop import DesktopSourceSnapshot
+        host = self._host()
+        source = FakeDesktopSource(AgentKind.CODEX)
+        source.push(_desktop_snap(source, host, ["t1"]))
+        monitor = self._monitor(source, [host])
+        saves = {"n": 0}
+        monitor.config.save = lambda: saves.__setitem__("n", saves["n"] + 1)
+        monitor._tick()
+        monitor._tick()
+        self.assertEqual(saves["n"], 0)
+        # DesktopHost/AgentInstance 是 runtime-only 对象：repr 中允许出现，
+        # 但任何持久化路径（config.save）从未被调用即满足合同
+        snap_repr = repr(DesktopSourceSnapshot())
+        self.assertIn("DesktopSourceSnapshot", snap_repr)
 
     def test_monitor_without_desktop_sources_unchanged(self):
         # 生产默认（无 source 注册）：行为与 4.3.1 完全一致

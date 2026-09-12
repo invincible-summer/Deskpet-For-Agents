@@ -123,6 +123,7 @@ class CodexDesktopSource(DesktopSessionSource):
         self._failures = 0
         self.db_query_count = 0
         self.db_busy_count = 0
+        self.refresh_count = 0
         self.active_window_sec = float(self._cfg.get("active_file_window_sec", 180.0) or 180.0)
 
     # ------------------------------------------------------------ 公共
@@ -143,6 +144,7 @@ class CodexDesktopSource(DesktopSessionSource):
             "codex_desktop_sessions": len(self._sessions),
             "codex_desktop_db_queries": self.db_query_count,
             "codex_desktop_db_busy": self.db_busy_count,
+            "codex_desktop_refreshes": self.refresh_count,
         }
 
     # ------------------------------------------------------------ 主路径
@@ -178,6 +180,7 @@ class CodexDesktopSource(DesktopSessionSource):
             self._fingerprint = fingerprint
             self._last_sql = now
             self._retry_at = 0.0
+            self.refresh_count += 1
             self._apply_catalog(rows, codex_hosts)
         instances, observations, claims = self._collect(codex_hosts,
                                                         claimed_sessions, now)

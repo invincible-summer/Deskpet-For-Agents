@@ -46,6 +46,12 @@ jobs:
         with:
           name: ui-architecture-benchmark
           path: ui-architecture-benchmark.json
+      - name: Upload desktop sources benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-source-benchmark
+          path: desktop-source-benchmark.json
       # 单测已覆盖：terminal window activation 逻辑、并发激活矩阵、
       # source-disabled 停扫、config 运行时 clamp。
       # 真实 Windows Terminal foreground policy / UIA 事件接受度属于

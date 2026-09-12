@@ -251,6 +251,7 @@ class ZCodeDesktopSource(DesktopSessionSource):
         self._sessions: dict[str, _ZcodeSession] = {}
         self.db_query_count = 0
         self.db_busy_count = 0
+        self.refresh_count = 0
 
     # ------------------------------------------------------------ 公共
     def close(self) -> None:
@@ -273,6 +274,7 @@ class ZCodeDesktopSource(DesktopSessionSource):
             "zcode_desktop_sessions": len(self._sessions),
             "zcode_desktop_db_queries": self.db_query_count,
             "zcode_desktop_db_busy": self.db_busy_count,
+            "zcode_desktop_refreshes": self.refresh_count,
         }
 
     # ------------------------------------------------------------ 主路径
@@ -304,6 +306,7 @@ class ZCodeDesktopSource(DesktopSessionSource):
             self._fingerprint = fingerprint
             self._last_sql = now
             self._retry_at = 0.0
+            self.refresh_count += 1
             self._last_facts = facts
             self._apply_catalog(facts["catalog"], zcode_hosts)
         else:
