@@ -26,10 +26,13 @@ jobs:
         run: python -m pip install -r requirements.txt -c constraints.txt
       - name: Apply repository patch
         run: python tools/_apply_portable_patch.py
+      - name: Apply acceptance fixes
+        run: python tools/_fix_after_portable_patch.py
       - name: Remove staging patch machinery
         shell: pwsh
         run: |
           Remove-Item tools/_apply_portable_patch.py
+          Remove-Item tools/_fix_after_portable_patch.py
           Remove-Item .github/workflows/_apply-portable-patch.yml
       - name: Byte-compile
         run: python -m compileall agents pet actions tools
