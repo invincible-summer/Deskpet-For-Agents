@@ -1,7 +1,8 @@
-"""DeskPet 版本常量（v4.6.0）。
+"""DeskPet version constants.
 
-app/dashboard 的版本展示统一从这里 import，不再各自复制版本字符串。
+`APP_VERSION` is the single application-version source of truth. Release tags use
+`v{APP_VERSION}`; version policy is documented in VERSIONING.md.
 """
 APP_NAME = "DeskPet"
-APP_VERSION = "4.6.0"
+APP_VERSION = "4.0.0"
 APP_LABEL = f"{APP_NAME} V{APP_VERSION}"

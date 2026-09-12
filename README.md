@@ -1,4 +1,4 @@
-# DeskPet V4.6.0
+# DeskPet V4.0.0
 
 DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的 AI 编码 Agent，并把当前任务、模式和工作状态显示成桌宠动画与气泡。
 
@@ -146,6 +146,8 @@ SHA256SUMS.txt                     ZIP 的 SHA-256 校验值
 
 ## 项目资料
 
+- `VERSIONING.md`：Semantic Versioning 2.0.0 版本与正式 Release 规则。
+- `CHANGELOG.md`：正式版本历史和 2026-09-12 一次性旧 tag 归一化记录。
 - `SourceLink.md`：Agent 监听、Windows/WSL、桌面端数据源等调研与依据。
 - `AGENTS.md`：仓库开发和验收约定。
 - `THIRD_PARTY_NOTICES.md`：Portable 包中第三方组件说明。

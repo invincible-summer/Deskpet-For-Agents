@@ -25,12 +25,15 @@ jobs:
         run: python -m pip install -r requirements.txt -c constraints.txt
       - name: Install build dependencies
         run: python -m pip install -r requirements-build.txt
-      - name: Verify tag and source version
+      - name: Verify stable SemVer tag and source version
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
           $version = python -c "from pet.version import APP_VERSION; print(APP_VERSION)"
           $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw "release tag must be stable SemVer vX.Y.Z without leading zeroes: $tag"
+          }
           if ($tag -ne "v$version") { throw "tag $tag != v$version" }
       - name: Byte-compile
         run: python -m compileall agents pet actions tools
@@ -70,7 +73,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
-          gh release create "${{ github.ref_name }}" `
+          $tag = "${{ github.ref_name }}"
+          gh release create "$tag" `
             ".release/DeskPet-windows-x64-portable.zip" `
             ".release/SHA256SUMS.txt" `
-            --verify-tag --generate-notes
+            --verify-tag --generate-notes --draft
+          if ($LASTEXITCODE -ne 0) { throw "failed to create draft release $tag" }
+          gh release edit "$tag" --draft=false
+          if ($LASTEXITCODE -ne 0) { throw "failed to publish release $tag" }

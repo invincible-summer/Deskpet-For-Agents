@@ -50,8 +50,21 @@ on Windows. A task is not complete while required CI/acceptance is red. Review t
 final diff for stale code, duplicated paths, documentation drift and privacy/resource
 regressions before declaring completion.
 
+## Versioning and releases
+
+Follow `VERSIONING.md` and Semantic Versioning 2.0.0 for every release decision.
+Version numbers describe changes to the documented public compatibility contract, not
+plan phases, refactors, CI work or internal milestones. `pet/version.py` is the single
+application-version source of truth.
+
+A published release tag is immutable project history: never move it, delete and reuse
+it, or replace its release assets. If a published release needs correction, increment
+the version and publish a new release. Release work is complete only after the required
+source tests, blocking benchmarks and compiled-artifact acceptance pass.
+
 ## Documentation
 
-README describes current user behavior and maintained architecture; release notes carry
-version history; SourceLink records external research evidence. Keep commands, paths,
-versions and file names synchronized with the actual repository.
+README describes current user behavior and maintained architecture; `CHANGELOG.md`
+records release history; `VERSIONING.md` defines release/version policy; release notes
+carry version-specific user changes; SourceLink records external research evidence.
+Keep commands, paths, versions and file names synchronized with the actual repository.
