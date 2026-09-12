@@ -391,6 +391,10 @@ class Monitor:
         if AgentKind.CODEX in enabled:
             self._desktop_sources.append(
                 CodexDesktopSource(cfg=dict(self._source_cfg)))
+        if AgentKind.ZCODE in enabled:
+            from .zcode_desktop import ZCodeDesktopSource
+            self._desktop_sources.append(
+                ZCodeDesktopSource(cfg=dict(self._source_cfg)))
 
     def _start_terminal(self):
         # 启动失败不锁存：backend.available() 是唯一可用性事实来源
