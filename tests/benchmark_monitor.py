@@ -184,8 +184,10 @@ def run(ticks: int = 20000, report_path: str = "") -> int:
             return node
 
     from agents.monitor import ProcessProbeWorker
+    from agents.discovery import WindowsRuntimeInventory
     disabled_worker = ProcessProbeWorker(_ProbeCfg(False))
-    with patch("agents.monitor.scan_windows", return_value=[]) as scan_mock:
+    with patch("agents.monitor.scan_windows_inventory",
+               return_value=WindowsRuntimeInventory()) as scan_mock:
         for _ in range(3):
             disabled_worker._tick()
     windows_disabled_delta = scan_mock.call_count

@@ -38,6 +38,7 @@ def probe(sources: dict, gen: int = 1, t: float = 1000.0):
             authoritative=auth, instances=tuple(insts),
             error="" if auth else "probe failed")
     return out
+from agents import discovery as discovery_mod
 from agents.discovery import scan_windows
 from agents.monitor import Monitor
 from agents.terminal_service import WindowsTerminalService
@@ -1509,8 +1510,8 @@ class SourceToggleTests(unittest.TestCase):
 
     def test_windows_disabled_never_scans(self):
         worker = self._worker(windows_enabled=False)
-        with patch("agents.monitor.scan_windows") as scan:
-            scan.return_value = []
+        with patch("agents.monitor.scan_windows_inventory") as scan:
+            scan.return_value = discovery_mod.WindowsRuntimeInventory()
             for _ in range(5):
                 worker._tick()
         self.assertEqual(scan.call_count, 0)
@@ -1521,7 +1522,9 @@ class SourceToggleTests(unittest.TestCase):
     def test_windows_disable_clears_snapshot_and_cache(self):
         worker = self._worker(windows_enabled=True)
         inst = AgentInstance(AgentKind.CODEX, 5, "windows", process_token="5")
-        with patch("agents.monitor.scan_windows", return_value=[inst]):
+        inv = discovery_mod.WindowsRuntimeInventory(
+            terminal_instances=(inst,))
+        with patch("agents.monitor.scan_windows_inventory", return_value=inv):
             worker._tick()
         self.assertIn("windows", worker.snapshot())
         self.assertEqual(worker._windows_cache, (inst,))
@@ -1536,7 +1539,8 @@ class SourceToggleTests(unittest.TestCase):
         worker = self._worker(windows_enabled=False)
         worker._tick()
         worker.config.set("monitor.windows_enabled", True)
-        with patch("agents.monitor.scan_windows", return_value=[]) as scan:
+        with patch("agents.monitor.scan_windows_inventory",
+                   return_value=discovery_mod.WindowsRuntimeInventory()) as scan:
             worker._tick()
         self.assertEqual(scan.call_count, 1)   # 下一 probe 周期立即恢复
 

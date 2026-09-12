@@ -229,6 +229,15 @@ class DesktopHost:
             self.host_key = (
                 f"{self.source}|{self.kind.value}|desktop-host|{self.pid}|{token}")
 
+    @property
+    def key(self) -> str:
+        """WindowsExitWatcher 注册语义需要的统一 identity 名。
+
+        与 AgentInstance.key 同角色：host 退出事件以 host_key 核对后
+        fan-out 到全部逻辑会话（plan2 §9）。绝不持久化。
+        """
+        return self.host_key
+
 
 @dataclass
 class AgentInstance:

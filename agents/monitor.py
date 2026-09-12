@@ -29,14 +29,25 @@ from dataclasses import dataclass
 from .base import BaseWatcher
 from .claude import ClaudeWatcher
 from .codex import CodexWatcher
-from .discovery import ProbeUnavailable, WslProcessProbe, scan_windows
+from .desktop import (
+    DesktopSourceSnapshot,
+    build_terminal_claims,
+)
+from .discovery import (
+    ProbeUnavailable,
+    WslProcessProbe,
+    WindowsRuntimeInventory,
+    scan_windows_inventory,
+)
 from .kimi import KimiWatcher
 from .models import (
     ActivationCode,
     ActivationResult,
     AgentInstance,
     AgentKind,
+    AgentSurface,
     AgentTarget,
+    DesktopHost,
     EvidenceSource,
     Observation,
     ObservationBindingConfidence,
@@ -125,6 +136,9 @@ class ProcessProbeWorker:
         self._gen = 0
         # Windows 全局枚举失败时保留的上一轮权威实例（不判死）
         self._windows_cache: tuple[AgentInstance, ...] = ()
+        # v4.4：同一次 census 的 DesktopHost 清单（plan2 §4.2）；
+        # None 表示 Windows source 关闭或尚未成功扫描
+        self._inventory: WindowsRuntimeInventory | None = None
         self._wsl = WslProcessProbe(
             allow_root_metadata=bool(config.get(
                 "privacy.wsl_root_metadata_fallback", False)))
@@ -155,6 +169,17 @@ class ProcessProbeWorker:
     def snapshot(self) -> dict[str, SourceProbeSnapshot]:
         with self._lock:
             return dict(self._snapshot)
+
+    def desktop_hosts(self) -> tuple[DesktopHost, ...]:
+        """最新一次 census 的 DesktopHost 清单（plan2 §4.2）。"""
+        with self._lock:
+            inv = self._inventory
+        return inv.desktop_hosts if inv is not None else ()
+
+    def inventory_authoritative(self) -> bool:
+        with self._lock:
+            inv = self._inventory
+        return bool(inv is not None and inv.authoritative)
 
     def set_wsl_root_metadata_fallback(self, enabled: bool) -> None:
         """DP43-R03：运行期切换 WSL root metadata 权限。O(1)、无 WSL
@@ -189,11 +214,17 @@ class ProcessProbeWorker:
                 t0 = time.perf_counter()
                 self._gen += 1
                 try:
-                    found = scan_windows()
-                    self._windows_cache = tuple(found)
+                    # 一次 census 同时产出 terminal instances 与
+                    # desktop hosts（plan2 §4.2：禁止第二个 psutil 扫描线程）
+                    inv = scan_windows_inventory()
+                    self._windows_cache = inv.terminal_instances
                     snap = SourceProbeSnapshot(
                         source="windows", generation=self._gen, observed_at=now,
-                        authoritative=True, instances=self._windows_cache)
+                        authoritative=inv.authoritative,
+                        instances=self._windows_cache,
+                        error="; ".join(inv.diagnostics))
+                    with self._lock:
+                        self._inventory = inv
                     self.windows_probe_error = ""
                 except ProbeUnavailable as exc:
                     # 全局枚举失败：authoritative=False，保留旧实例（v4plan §4.1）
@@ -217,6 +248,7 @@ class ProcessProbeWorker:
             # 重新开启时因间隔已过而立即恢复扫描，无需重启。
             with self._lock:
                 self._snapshot.pop("windows", None)
+                self._inventory = None
             self._windows_cache = ()
             self.windows_scan_ms = 0.0
             self.windows_probe_error = ""
@@ -306,6 +338,15 @@ class Monitor:
         self._repair_next_id = 1
         self._repair_results: "queue.Queue[ActivationRepairResult]" = (
             queue.Queue(maxsize=16))
+        # ---- v4.4 Desktop sources（plan2 §5/§9）----
+        # 生产 source 在 Phase 3/4 注册；这里保持空列表即可让 Monitor
+        # 行为与 4.3.1 完全一致（测试注入 fake source）。
+        self._desktop_sources: list = []
+        # 当前 live DesktopHost（host_key → DesktopHost，runtime-only）
+        self._desktop_hosts: dict[str, DesktopHost] = {}
+        # 本轮 non-authoritative desktop source 的 session keys（stale 标记）
+        self._desktop_stale_keys: set[str] = set()
+        self._desktop_poll_count = 0
 
     # ------------------------------------------------------------ 生命周期
     def start(self):
@@ -641,6 +682,9 @@ class Monitor:
             "native_terminal_leases": len(self._native_terminal_leases),
             "rescan_requests": self._rescan_request_count,
             "rescan_completed": self._rescan_complete_count,
+            "desktop_hosts": len(self._desktop_hosts),
+            "desktop_sources": len(self._desktop_sources),
+            "desktop_polls": self._desktop_poll_count,
         }
         out.update(self._terminal_service.stats())
         return out
@@ -729,6 +773,13 @@ class Monitor:
             for key, inst in old.items():
                 if key in found:
                     continue
+                if getattr(inst, "surface", AgentSurface.TERMINAL) is AgentSurface.DESKTOP:
+                    # Desktop 逻辑会话的生死由 desktop source 的
+                    # authoritative snapshot 与 host lease 管理（plan2 §5/§9），
+                    # 绝不按 process census absence 判死；本轮保留，
+                    # 退场判定在 _poll_desktop_sources。
+                    merged[key] = inst
+                    continue
                 source_disabled = (
                     (inst.source == "windows" and not windows_enabled)
                     or (inst.source.startswith("wsl:") and not wsl_enabled))
@@ -782,18 +833,119 @@ class Monitor:
 
         事件只携带注册时的 key/pid/process_token；必须核对仍是当前
         exact incarnation（防 PID 复用/替换竞态），不匹配即丢弃。
+        Desktop host 事件按 host_key 核对后 fan-out 删除该 host 的
+        全部逻辑会话（plan2 §9：N sessions 共用一个 host handle）。
         """
         if self._exit_watcher is None:
             return
+        dropped_hosts: list[str] = []
         for ev in self._exit_watcher.drain():
             with self.lock:
                 inst = self.instances.get(ev.key)
-                if inst is None:
+                if inst is not None:
+                    if (inst.pid != ev.pid
+                            or str(inst.process_token) != ev.process_token):
+                        continue
+                    self._commit_exit(ev.key, "process-exit-event", now)
                     continue
-                if (inst.pid != ev.pid
-                        or str(inst.process_token) != ev.process_token):
-                    continue
-                self._commit_exit(ev.key, "process-exit-event", now)
+                host = self._desktop_hosts.get(ev.key)
+                if host is not None:
+                    if (host.pid != ev.pid
+                            or str(host.process_token) != ev.process_token):
+                        continue
+                    self._drop_desktop_host_locked(
+                        ev.key, "desktop-host-exit-event", now)
+                    dropped_hosts.append(ev.key)
+        for host_key in dropped_hosts:
+            self._notify_sources_host_dropped(host_key)
+
+    # ------------------------------------------------------------ desktop lifecycle
+    def _sync_desktop_hosts(self, now: float):
+        """从最新 inventory 同步 host 表；census 权威缺席即 drop（plan2 §9）。"""
+        hosts = self._probe.desktop_hosts()
+        if self._probe.inventory_authoritative():
+            live_keys = {h.host_key for h in hosts}
+            dropped: list[str] = []
+            with self.lock:
+                for host_key in list(self._desktop_hosts):
+                    if host_key not in live_keys:
+                        self._drop_desktop_host_locked(
+                            host_key, "desktop-host-census-absence", now)
+                        dropped.append(host_key)
+            for host_key in dropped:
+                self._notify_sources_host_dropped(host_key)
+        for host in hosts:
+            self._desktop_hosts[host.host_key] = host
+
+    def _drop_desktop_host_locked(self, host_key: str, reason: str,
+                                  now: float) -> None:
+        """删除一个 host 的全部逻辑会话（调用方必须已持有 self.lock）。"""
+        self._desktop_hosts.pop(host_key, None)
+        for key, inst in list(self.instances.items()):
+            if (getattr(inst, "surface", AgentSurface.TERMINAL)
+                    is AgentSurface.DESKTOP and inst.host_key == host_key):
+                self._commit_exit(key, reason, now)
+        for key in list(self._desktop_stale_keys):
+            inst = self.instances.get(key)
+            if inst is None or getattr(inst, "host_key", "") == host_key:
+                self._desktop_stale_keys.discard(key)
+
+    def _notify_sources_host_dropped(self, host_key: str) -> None:
+        """锁外通知各 source 清空该 host 的运行期状态（plan2 §9）。"""
+        for source in self._desktop_sources:
+            try:
+                source.drop_host(host_key)
+            except Exception:
+                pass
+
+    def _poll_desktop_sources(self, instances: dict[str, AgentInstance],
+                              session_obs: dict[str, Observation],
+                              now: float):
+        """plan2 §5 顺序 3–5：terminal claims → desktop poll → merge。
+
+        source non-authoritative：保留 last good、标记 stale、绝不判死
+        （plan2 §13）；authoritative 且某 session 缺席 → source 内部
+        退场。SQL/rollout 细节全部在各 source 内部，Monitor 不感知。
+        """
+        if not self._desktop_sources:
+            return
+        claims = build_terminal_claims(self._watchers, instances)
+        hosts = tuple(self._desktop_hosts.values())
+        for source in self._desktop_sources:
+            try:
+                snap = source.poll(hosts, claims, now)
+            except Exception as exc:
+                self._log(f"{getattr(source, 'kind', '?')} desktop source 异常: {exc!r}")
+                snap = DesktopSourceSnapshot(
+                    authoritative=False, diagnostics=(repr(exc),))
+            found: dict[str, AgentInstance] = {
+                inst.key: inst for inst in snap.instances}
+            with self.lock:
+                self._desktop_poll_count += 1
+                if snap.authoritative:
+                    for key, inst in list(self.instances.items()):
+                        if (getattr(inst, "surface", AgentSurface.TERMINAL)
+                                is AgentSurface.DESKTOP
+                                and inst.kind == source.kind
+                                and key not in found):
+                            self._commit_exit(
+                                key, "desktop-source-absence", now)
+                    for key, inst in found.items():
+                        if key not in self.instances:
+                            self._log(f"发现桌面会话 "
+                                      f"{inst.kind.label} (host pid={inst.host_pid})")
+                        self.instances[key] = inst
+                        self._desktop_stale_keys.discard(key)
+                    # 只合并权威观察；缺失的 key 由 reduce 保守降级
+                    for key, obs in snap.observations.items():
+                        if key in found:
+                            session_obs[key] = obs
+                else:
+                    for key, inst in list(self.instances.items()):
+                        if (getattr(inst, "surface", AgentSurface.TERMINAL)
+                                is AgentSurface.DESKTOP
+                                and inst.kind == source.kind):
+                            self._desktop_stale_keys.add(key)
 
     def _prune_detached_native(self, instances: dict[str, AgentInstance],
                                probe_snap: dict[str, SourceProbeSnapshot],
@@ -819,6 +971,9 @@ class Monitor:
         with self.lock:
             for key, inst in instances.items():
                 if inst.source != "windows":
+                    continue
+                if getattr(inst, "surface", AgentSurface.TERMINAL) is AgentSurface.DESKTOP:
+                    # Desktop 会话无 terminal binding 概念，不参与 lease
                     continue
                 binding = self.window_bindings.get(key)
                 strong = (binding is not None
@@ -865,12 +1020,18 @@ class Monitor:
         # 顺序契约（plan §10.3）：merge → snapshot → register → drain
         # → 重新 snapshot——保证 _commit_exit 后同一 tick 不再为已退出
         # Agent 重建 snapshot/binding/observation。
+        # Desktop：每 host 一个 handle，绝不按 session 注册（plan2 §9）。
+        self._sync_desktop_hosts(now)
         if self._exit_watcher is not None:
             with self.lock:
                 insts = dict(self.instances)
             for inst in insts.values():
-                if inst.source == "windows":
+                if (inst.source == "windows"
+                        and getattr(inst, "surface", AgentSurface.TERMINAL)
+                        is AgentSurface.TERMINAL):
                     self._exit_watcher.register(inst)
+            for host in list(self._desktop_hosts.values()):
+                self._exit_watcher.register(host)
             self._drain_exit_events(now)
 
         with self.lock:
@@ -878,9 +1039,13 @@ class Monitor:
 
         # 1) 会话观察：每个 watcher 每轮都 poll（即使该 kind 当前为 0），
         #    让 BaseWatcher 的全清理语义真正发生（v4plan §4.6）。
+        #    DESKTOP 逻辑会话不进入 CLI watcher（plan2 §5：desktop source
+        #    自己产出 Observation；CLI 的 mutual-unique 绑定不适用 1:N）。
         session_obs: dict[str, Observation] = {}
         by_kind: dict[AgentKind, list[AgentInstance]] = {}
         for inst in instances.values():
+            if getattr(inst, "surface", AgentSurface.TERMINAL) is AgentSurface.DESKTOP:
+                continue
             by_kind.setdefault(inst.kind, []).append(inst)
         for kind, watcher in self._watchers.items():
             insts = by_kind.get(kind, [])
@@ -892,18 +1057,22 @@ class Monitor:
         # 2) 终端观察（poll 内含 topology 事件重学习）
         self._terminal_service.poll(now)
 
-        # 3) 终端绑定（节流：实例集合或 topology 变化、或每 3s）
+        # 3) 终端绑定（节流：实例集合或 topology 变化、或每 3s）。
+        #    DESKTOP target 不进 terminal service（plan2 §5.6/§10）。
+        terminal_instances = [
+            inst for inst in instances.values()
+            if getattr(inst, "surface", AgentSurface.TERMINAL)
+            is AgentSurface.TERMINAL]
         observer = self._terminal_service.observer
         topo_sig = (observer.topology_signature()
                     if observer is not None else ())
-        sig = (tuple(sorted(instances)), topo_sig)
+        sig = (tuple(sorted(inst.key for inst in terminal_instances)), topo_sig)
         if sig != self._instance_sig or now - self._last_resolve >= 3.0:
             self._instance_sig = sig
             self._last_resolve = now
             try:
                 self.window_bindings, self.terminal_observation_bindings = \
-                    self._terminal_service.resolve(
-                        list(instances.values()), now)
+                    self._terminal_service.resolve(terminal_instances, now)
             except Exception:
                 self.window_bindings = {}
                 self.terminal_observation_bindings = {}
@@ -920,8 +1089,15 @@ class Monitor:
         # （Tk 绝不同步等待），结果发布到 bounded 队列由 bridge 收割。
         self._process_repair_requests(now)
 
+        # 3.7) Desktop sources（plan2 §5 顺序 3–5）：terminal claims →
+        # poll → 合并逻辑会话/观察。之后重新拷贝 instances 供融合使用。
+        self._poll_desktop_sources(instances, session_obs, now)
+        with self.lock:
+            instances = dict(self.instances)
+
         # 4) 状态融合
         grace = _num(cfg_m.get("activity_grace_sec", 10.0), 10.0)
+        stale_desktop = set(self._desktop_stale_keys)
         new_snaps: dict[str, Snapshot] = {}
         for key, inst in instances.items():
             session = session_obs.get(key)
@@ -929,7 +1105,9 @@ class Monitor:
             prev = self.snapshots.get(key)
             snap = reduce_state(inst, session, terminal, prev, now)
             sp = probe_snap.get(inst.source)
-            snap.stale = bool(sp is not None and not sp.authoritative)
+            snap.stale = bool(
+                (sp is not None and not sp.authoritative)
+                or key in stale_desktop)
             new_snaps[key] = snap
             self._fill_policy(snap, key)
             self._fill_parser_health(snap, key)
