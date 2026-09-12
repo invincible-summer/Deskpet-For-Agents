@@ -17,13 +17,15 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install -r requirements.txt -c constraints-v4.3.0.txt
+        run: pip install -r requirements.txt -c constraints.txt
       - name: Byte-compile
         run: python -m compileall agents pet actions tools
       - name: Unit tests
         run: python -m unittest discover tests -p "test_*.py"
       - name: Monitor benchmark
         run: python tests/benchmark_monitor.py --ticks 5000 --report benchmark-report.json
+      - name: Desktop sources benchmark
+        run: python tests/benchmark_desktop_sources.py --ticks 5000 --report desktop-source-benchmark.json
       - name: Presentation benchmark
         run: python tests/benchmark_presentation.py --report presentation-benchmark.json
       - name: UI architecture benchmark

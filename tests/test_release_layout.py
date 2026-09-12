@@ -85,7 +85,7 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertIn("rename or delete", reusing)
 
     def test_docs_match_v44_runtime_policy(self):
-        # v4.4.0：README 与 runtime policy 一致；SourceLink 为 4.4.0
+        # v4.5.0：README 与 runtime policy 一致；SourceLink 为 4.5.0
         # 调研快照（官方合同/上游实现/issue 实证/第三方逆向四类标注）
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertNotIn("并发呈现（手动开启）", readme)
@@ -98,7 +98,7 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertIn("启动默认并行监听 + 单宠聚合", app_src)
         sourcelink = (ROOT / "SourceLink.md").read_text(encoding="utf-8")
         self.assertNotIn("v4.2.3 — SourceLink", sourcelink)
-        # v4.4.0 四类信任标注齐备（plan2 §20.12）
+        # v4.5.0 四类信任标注齐备（plan2 §20.12）
         for marker in ("Official contract", "Upstream implementation",
                        "Empirical issue", "Third-party reverse evidence"):
             self.assertIn(marker, sourcelink)
@@ -114,8 +114,8 @@ class ReleaseLayoutTests(unittest.TestCase):
     def test_version_module_is_single_source(self):
         from pet.version import APP_LABEL, APP_NAME, APP_VERSION
         self.assertEqual(APP_NAME, "DeskPet")
-        self.assertEqual(APP_VERSION, "4.4.0")
-        self.assertEqual(APP_LABEL, "DeskPet V4.4.0")
+        self.assertEqual(APP_VERSION, "4.5.0")
+        self.assertEqual(APP_LABEL, "DeskPet V4.5.0")
         import pet.dashboard as dashboard
         self.assertEqual(dashboard.APP_VERSION, APP_LABEL)
 

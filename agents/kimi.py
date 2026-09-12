@@ -29,7 +29,7 @@ from .models import (
     Status,
     parse_mode,
 )
-from .summarize import fmt_command, shorten
+from .summarize import fmt_command, shorten, question_summary
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
@@ -174,7 +174,7 @@ class KimiFile(FileState):
         elif isinstance(args, dict):
             detail = str(args.get("command") or args.get("path") or args.get("file_path") or "")
         self.last_cmd = fmt_command(f"{name}: {detail}" if detail else str(name), 100)
-        self.last_tool = shorten(f"{name}: {detail}" if detail else str(name), SUMMARY_MAX)
+        self.last_tool = fmt_command(f"{name}: {detail}" if detail else str(name), SUMMARY_MAX)
         self.last_tool_ts = ts
         self.last_activity_kind = "tool"
         phase = classify_phase(str(name), detail)
@@ -257,7 +257,9 @@ class KimiFile(FileState):
                 self.input_id = iid
                 summary = _text(_first_present(
                     payload, "question", "prompt", "message", "text"))
-                self.input_summary = shorten(summary or "等待输入", GOAL_MAX)
+                self.input_summary = (question_summary(payload, GOAL_MAX)
+                                      if payload.get("questions") or payload.get("options")
+                                      else shorten(summary or "等待输入", GOAL_MAX))
                 self.phase = Phase.USER_INPUT
         elif t == "interaction.resolved":
             iid = str(obj.get("id") or "")
@@ -461,13 +463,13 @@ class KimiFile(FileState):
             obs.phase = self.phase
             obs.turn_active = True
             obs.confidence = Confidence.HIGH
-            obs.summary = shorten(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            obs.summary = fmt_command(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
             return obs
         if self.turn_known_over:
             obs.status = Status.IDLE
             obs.phase = Phase.NONE
             obs.confidence = Confidence.HIGH
-            obs.summary = shorten(self._summary_text(Status.WORKING) or "待命", SUMMARY_MAX)
+            obs.summary = fmt_command(self._summary_text(Status.WORKING) or "待命", SUMMARY_MAX)
             return obs
         grace = self.activity_grace(cfg)
         anchor = max(self.last_event_ts, self.last_arrival_ts)
@@ -477,7 +479,7 @@ class KimiFile(FileState):
             obs.turn_active = False
             obs.expires_at = anchor + grace
             obs.confidence = Confidence.MEDIUM
-            obs.summary = shorten(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            obs.summary = fmt_command(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
             return obs
         return None
 

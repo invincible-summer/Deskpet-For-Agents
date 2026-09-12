@@ -170,7 +170,7 @@ class PiFile(FileState):
                 elif isinstance(args, str):
                     detail = args
                 self.last_cmd = fmt_command(f"{name}: {detail}" if detail else str(name), 100)
-                self.last_tool = shorten(f"{name}: {detail}" if detail else str(name), SUMMARY_MAX)
+                self.last_tool = fmt_command(f"{name}: {detail}" if detail else str(name), SUMMARY_MAX)
                 self.last_tool_ts = ts
                 self.last_activity_kind = "tool"
                 phase = classify_phase(str(name), detail)
@@ -292,7 +292,7 @@ class PiFile(FileState):
             obs.phase = self.phase
             obs.turn_active = True
             obs.confidence = Confidence.HIGH
-            obs.summary = shorten(self._summary_text() or "处理中", SUMMARY_MAX)
+            obs.summary = fmt_command(self._summary_text() or "处理中", SUMMARY_MAX)
             return obs
         if self.turn_known_over:
             obs.status = Status.IDLE
@@ -307,7 +307,7 @@ class PiFile(FileState):
             obs.turn_active = False
             obs.expires_at = anchor + grace
             obs.confidence = Confidence.MEDIUM
-            obs.summary = shorten(self._summary_text() or "处理中", SUMMARY_MAX)
+            obs.summary = fmt_command(self._summary_text() or "处理中", SUMMARY_MAX)
             return obs
         return None
 

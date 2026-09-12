@@ -1,4 +1,4 @@
-# DeskPet V4.4.0 — 被动 Agent 观察桌宠（终端 + Codex/ZCode 桌面端 + 窗口唤起 + 并发呈现）
+# DeskPet V4.5.0 — 被动 Agent 观察桌宠（终端 + Codex/ZCode 桌面端 + 窗口唤起 + 并发呈现）
 
 一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），以及 **Codex Desktop（含 ChatGPT 桌面端 Codex 模式）与 ZCode Desktop** 里的并行桌面会话；自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
 
@@ -219,3 +219,10 @@ CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 com
 5. 不向终端写输入      11. 终端文本只做匹配归类
 6. 不自动审批          12. （见上）
 ```
+
+## 4.5.0：进程监听状态解析优化
+
+- 根据各 Agent 的结构化会话事件持续识别工作、审批、选择题待回复、完成和 Goal 模式；正在进行的回合不会因长时间无日志而误报待命。
+- 修复新回合继承旧错误、问题被无关工具结果清除、完成后仍显示待回复等状态衔接问题。
+- 外观设置可关闭文本框，或切换详细信息与简要状态；单宠、聚合和多宠共用长度受限的显示文本。详细信息保留模式与状态，命令路径、下划线和参数不再被 Markdown 清理破坏。
+- 审批只根据明确的协议或终端证据识别；桌面端未提供审批证据时仍显示工作中或状态暂不可读。完成庆祝保留 8 秒，之后等待新任务。

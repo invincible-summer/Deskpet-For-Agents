@@ -102,6 +102,7 @@ class ClaudeFile(FileState):
         self.error_ts = 0.0
         self.input_pending = False
         self.input_summary = ""
+        self.input_call_id = ""
         self.last_assistant_ts = 0.0
         self.last_tool_ts = 0.0
         self.last_activity_kind = ""
@@ -166,7 +167,7 @@ class ClaudeFile(FileState):
                     self.phase = Phase.ANSWERING
                 elif btype == "tool_use":
                     name, detail = _summarize_tool(block)
-                    summary = shorten(f"{name}: {detail}" if detail else name, SUMMARY_MAX)
+                    summary = fmt_command(f"{name}: {detail}" if detail else name, SUMMARY_MAX)
                     self.last_tool = summary
                     self.last_tool_ts = ts
                     self.last_activity_kind = "tool"
@@ -175,12 +176,12 @@ class ClaudeFile(FileState):
                     self.open_tools[str(block.get("id") or "")] = summary
                     if block.get("name") == "AskUserQuestion":
                         self.input_pending = True
+                        self.input_call_id = str(block.get("id") or "")
                         self.input_summary = question_summary(block.get("input"), GOAL_MAX)
                         self.phase = Phase.USER_INPUT
             return
 
         if t == "user":
-            self.input_pending = False
             msg = obj.get("message") or {}
             content = msg.get("content")
             blocks = content if isinstance(content, list) else []
@@ -188,6 +189,10 @@ class ClaudeFile(FileState):
             for block in blocks:
                 if isinstance(block, dict):
                     if block.get("type") == "tool_result":
+                        if self.input_call_id and block.get("tool_use_id") == self.input_call_id:
+                            self.input_pending = False
+                            self.input_call_id = ""
+                            self.phase = Phase.THINKING
                         self.open_tools.pop(str(block.get("tool_use_id") or ""), None)
                     elif block.get("type") == "text":
                         plain.append(_text(block.get("text")))
@@ -200,6 +205,11 @@ class ClaudeFile(FileState):
             # 纯 tool_result block 不构成"新用户 Goal"，不清瞬态。
             text = shorten(" ".join(x for x in plain if x.strip()), GOAL_MAX)
             if text:
+                self.input_pending = False
+                self.input_call_id = ""
+                self.phase = Phase.THINKING
+                self.last_text = self.last_tool = ""
+                self.last_activity_kind = ""
                 self.goal = text
                 self.turn_active = True
                 self.turn_known_over = False
@@ -228,6 +238,9 @@ class ClaudeFile(FileState):
             self.open_tools.clear()
             self.phase = Phase.NONE
         elif t in {"result", "turn_complete", "turn_finished"}:
+            self.input_pending = False
+            self.input_call_id = ""
+            self.open_tools.clear()
             self.done_ts = ts
             self.turn_active = False
             self.turn_known_over = True
@@ -283,7 +296,7 @@ class ClaudeFile(FileState):
             obs.phase = self.phase
             obs.turn_active = True
             obs.confidence = Confidence.HIGH
-            obs.summary = shorten(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            obs.summary = fmt_command(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
             return obs
         if self.turn_known_over:
             obs.status = Status.IDLE

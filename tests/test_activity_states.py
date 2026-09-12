@@ -1,8 +1,9 @@
 import json
+import unittest
 
 from agents.codex import CodexFile
 from agents.claude import ClaudeFile
-from agents.models import Mode, Status, parse_mode, Snapshot
+from agents.models import AgentKind, Mode, Status, parse_mode, Snapshot
 from agents.summarize import shorten, fmt_command
 from pet.labels import activity_text
 
@@ -53,6 +54,69 @@ def test_bounded_display_preserves_command_syntax():
     for limit in (1, 2, 40, 120):
         assert len(shorten('x' * 200, limit)) <= limit
         assert len(fmt_command('x' * 200, limit)) <= limit
-    snap = Snapshot(status=Status.WORKING, summary='rg foo_bar /tmp/my_path')
+    snap = Snapshot(key="test", kind=AgentKind.CODEX, source="windows", pid=1, status=Status.WORKING, summary='rg foo_bar /tmp/my_path')
     assert 'foo_bar /tmp/my_path' in activity_text(snap)
     assert 'foo_bar' not in activity_text(snap, False)
+
+
+def test_codex_error_does_not_resurrect_and_new_input_clears_error():
+    state = CodexFile('unused')
+    feed(state, dict(type='function_call', name='exec_command', arguments='{}'))
+    feed(state, dict(type='error', message='failed'), 101)
+    assert state.observation(102, {}).status == Status.ERROR
+    assert state.observation(200, {}).status == Status.IDLE
+    feed(state, dict(type='message', role='user', content=[]), 103)
+    assert state.observation(104, {}).status == Status.WORKING
+    assert 'exec_command' not in state.observation(104, {}).summary
+
+
+def test_codex_async_question_survives_ack_until_user_reply():
+    state = CodexFile('unused')
+    feed(state, dict(type='function_call', name='functions.request_user_input_async',
+                    call_id='q', arguments=json.dumps({'questions': [{'title': 'Which?', 'options': ['A', 'B']}]})))
+    feed(state, dict(type='function_call_output', call_id='q', output='queued'), 101)
+    assert state.observation(1000, {}).status == Status.INPUT
+    feed(state, dict(type='message', role='user', content=[{'text':'A'}]), 102)
+    assert state.observation(103, {}).status == Status.WORKING
+
+
+def test_claude_question_only_matching_result_or_completion_clears():
+    state = ClaudeFile('unused')
+    def event(t, **kwargs):
+        state.feed(json.dumps(dict(type=t, timestamp=100, **kwargs)))
+    def ask():
+        event('assistant', message={'content': [{'type':'tool_use', 'name':'AskUserQuestion', 'id':'q', 'input':{'questions':[{'question':'Which?'}]}}]})
+    ask()
+    event('user', message={'content':[{'type':'tool_result', 'tool_use_id':'other'}]})
+    assert state.observation(101, {}).status == Status.INPUT
+    event('user', message={'content':[{'type':'tool_result', 'tool_use_id':'q'}]})
+    assert state.observation(101, {}).status == Status.WORKING
+    ask()
+    event('result', result='finished')
+    assert state.observation(101, {}).status == Status.DONE
+
+
+def test_goal_is_visible_in_both_display_modes_and_bounded():
+    snap = Snapshot(key='test', kind=AgentKind.CODEX, source='windows', pid=1,
+                    status=Status.WORKING, mode=Mode.GOAL,
+                    summary='rg foo_bar /tmp/my_path ' + 'x' * 200)
+    for detail in (False, True):
+        assert 'Goal' in activity_text(snap, detail)
+        for limit in (1, 2, 20, 80, 120):
+            assert len(activity_text(snap, detail, limit)) <= limit
+
+
+def test_codex_wrapper_displays_literal_command_without_executing_code():
+    state = CodexFile('unused')
+    feed(state, dict(type='custom_tool_call', name='functions.exec',
+                    input='text(await tools.exec_command({cmd: "rg foo_bar /tmp/my_path", max_output_tokens: 1000}));'))
+    summary = state.observation(1000, {}).summary
+    assert 'rg foo_bar /tmp/my_path' in summary
+    assert 'max_output_tokens' not in summary
+
+
+def load_tests(loader, tests, pattern):
+    # This repository runs unittest discovery, including these regression functions.
+    return unittest.TestSuite(unittest.FunctionTestCase(value)
+                              for name, value in sorted(globals().items())
+                              if name.startswith('test_') and callable(value))

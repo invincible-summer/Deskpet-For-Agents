@@ -3,6 +3,7 @@
 只做规则处理（截断、去 markdown、命令合并），绝不调用 LLM，
 也不把 Agent 原始输出整段搬进气泡。
 """
+import json
 import re
 
 _MD_NOISE = re.compile(r"^[\s>#*\-`·•]+")
@@ -58,6 +59,23 @@ def fmt_command(cmd, limit: int = 70) -> str:
         keep = limit - 1                  # 给一个“…”留位
         return s[: keep // 2] + "…" + s[-(keep - keep // 2):]
     return s
+
+
+def wrapped_command(value):
+    """Extract a literal shell command from a Codex JavaScript tool wrapper.
+
+    Never execute code or infer lifecycle state from source text. Dynamic
+    expressions stay as bounded source text instead of being guessed.
+    """
+    if not isinstance(value, str):
+        return value
+    match = re.search(r'\btools\.exec_command\s*\(\s*\{\s*["\']?cmd["\']?\s*:\s*("(?:\\.|[^"\\])*")\s*[,}]', value)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except ValueError:
+            pass
+    return value
 
 
 _TOOL_RULES = (

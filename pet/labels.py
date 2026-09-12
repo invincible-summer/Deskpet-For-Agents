@@ -64,7 +64,7 @@ def activity_text(snap, detail=True, limit=120):
     if snap.status == Status.INPUT and "等待选择回复" in (snap.summary or ""):
         label = "等待选择回复"
     elif snap.status == Status.IDLE:
-        label = "已结束 · 等待新任务"
+        label = "等待新任务"
     elif snap.status == Status.WORKING:
         label = phase_text(snap) or label
     mode = mode_text(snap)
@@ -72,5 +72,13 @@ def activity_text(snap, detail=True, limit=120):
         label = f"{mode} · {label}"
     if not detail:
         return fmt_command(label, limit)
-    body = snap.waiting_detail or snap.summary if snap.status in (Status.WAITING, Status.INPUT) else snap.summary
-    return fmt_command(body or label, limit)
+    body = (snap.waiting_detail or snap.summary) if snap.status in (Status.WAITING, Status.INPUT) else snap.summary
+    if not body:
+        return fmt_command(label, limit)
+    # 保留状态和独立模式；命令参数仅在剩余空间内截断。
+    prefix = label + "："
+    if body.startswith(label) and not mode:
+        return fmt_command(body, limit)
+    if len(prefix) >= limit:
+        return fmt_command(label, limit)
+    return prefix + fmt_command(body, limit - len(prefix))

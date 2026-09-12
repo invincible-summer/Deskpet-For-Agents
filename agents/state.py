@@ -161,6 +161,7 @@ def reduce_state(instance: AgentInstance,
         snap.waiting_detail = detail or snap.summary or "等待审批"
     elif snap.status == Status.INPUT:
         snap.phase = Phase.USER_INPUT
+        snap.summary = winner.summary or snap.summary
         snap.waiting_detail = snap.summary or "等待输入"
 
     # 终端活动 + 会话证据并存 → 融合来源（仅限会话 WORKING；

@@ -25,7 +25,7 @@ from .models import (
     Status,
     parse_mode,
 )
-from .summarize import CODEX_MODE, CODEX_SANDBOX, fmt_command, shorten, question_summary
+from .summarize import CODEX_MODE, CODEX_SANDBOX, fmt_command, shorten, question_summary, wrapped_command
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
@@ -51,6 +51,7 @@ _ITEM_TYPES = frozenset({
     "message", "function_call", "tool_call", "local_shell_call",
     "custom_tool_call", "input", "request_user_input", "error",
     "reasoning",
+    "function_call_output", "custom_tool_call_output", "tool_result",
 })
 
 
@@ -138,6 +139,7 @@ class CodexFile(FileState):
         self.error_text = shorten(str(value), SUMMARY_MAX)
         self.error_ts = ts
         self.task_active = False
+        self.turn_active = False
         self.turn_known_over = True
         self.input_pending = False
         self.done_ts = 0.0
@@ -145,9 +147,19 @@ class CodexFile(FileState):
 
     def _set_input(self, payload: dict):
         self.input_pending = True
-        value = payload.get("question") or payload.get("prompt") or payload.get("message")
         self.input_summary = question_summary(payload, GOAL_MAX)
         self.phase = Phase.USER_INPUT
+
+    def _begin_turn(self):
+        self.task_active = self.turn_active = True
+        self.turn_known_over = False
+        self.done_ts = self.error_ts = 0.0
+        self.error_text = ""
+        self.input_pending = False
+        self.input_call_id = ""
+        self.last_text = self.last_tool = self.last_cmd = ""
+        self.last_activity_kind = ""
+        self.phase = Phase.THINKING
 
     def _set_assistant(self, text: str, ts: float):
         text = shorten(text, SUMMARY_MAX)
@@ -164,7 +176,7 @@ class CodexFile(FileState):
         self.error_ts = 0.0
         detail_s = fmt_command(detail, 100) if detail else ""
         self.last_cmd = detail_s or self.last_cmd
-        self.last_tool = shorten(f"{name}: {detail_s}" if detail_s else str(name), SUMMARY_MAX)
+        self.last_tool = fmt_command(f"{name}: {detail_s}" if detail_s else str(name), SUMMARY_MAX)
         self.last_tool_ts = ts
         self.last_activity_kind = "tool"
         phase = classify_phase(name, detail_s)
@@ -231,6 +243,7 @@ class CodexFile(FileState):
             self._set_input(payload)
         elif ptype in {"task_started", "turn_started"}:
             # TurnStartedEvent：collaboration_mode_kind 是结构化 Plan 证据。
+            self._begin_turn()
             self.task_active = True
             self.turn_active = True
             self.turn_known_over = False
@@ -265,6 +278,7 @@ class CodexFile(FileState):
             self.phase = Phase.NONE
         elif ptype == "user_message":
             # 普通用户输入 → Goal 第一来源；用户提交即开始新 turn。
+            self._begin_turn()
             self._set_goal(payload.get("message"))
             self.task_active = True
             self.turn_active = True
@@ -298,10 +312,11 @@ class CodexFile(FileState):
     def _feed_turn_item(self, item: dict, ts: float):
         """paginated history 的 item_completed TurnItem（command_execution 等）。"""
         itype = str(item.get("type") or "").lower()
-        item_ts = _event_ts(item) or ts
+        item_ts = parse_ts(item.get("timestamp")) or ts
         if itype in {"agentmessage", "assistantmessage", "message"}:
             role = str(item.get("role") or "")
             if role == "user":
+                self._begin_turn()
                 self._set_goal(item.get("text") or item.get("content"))
                 self.turn_active = True
                 self.turn_known_over = False
@@ -332,6 +347,7 @@ class CodexFile(FileState):
                     texts.append(_text_content(content))
             text = " ".join(x for x in texts if x)
             if role == "user":
+                self._begin_turn()
                 if self._set_goal(text):
                     self.turn_active = True
                     self.turn_known_over = False
@@ -352,11 +368,13 @@ class CodexFile(FileState):
                     command = parsed.get("cmd") or parsed.get("command") or parsed.get("path") or args
             elif isinstance(args, dict):
                 command = args.get("cmd") or args.get("command") or args.get("path") or str(args)
+            if str(name).split(".")[-1] == "exec":
+                command = wrapped_command(command)
             self._set_tool(str(name), command, ts)
             tool = str(name).split(".")[-1]
             if tool in {"request_user_input", "request_user_input_async", "AskUserQuestion"}:
                 self._set_input(parsed if isinstance(parsed, dict) else {})
-                self.input_call_id = str(payload.get("call_id") or "")
+                self.input_call_id = str(payload.get("call_id") or "") if tool != "request_user_input_async" else ""
             elif tool == "create_goal":
                 self.goal_mode = True
             elif tool == "update_goal" and isinstance(parsed, dict) and parsed.get("status") in {"complete", "blocked"}:
@@ -418,7 +436,7 @@ class CodexFile(FileState):
             obs.phase = self.phase
             obs.turn_active = True
             obs.confidence = Confidence.HIGH
-            obs.summary = shorten(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            obs.summary = fmt_command(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
             return obs
         if self.turn_known_over:
             # 已知 turn 结束：立即 IDLE（plan §27），不被活动宽限拖回 WORKING。
@@ -435,7 +453,7 @@ class CodexFile(FileState):
             obs.turn_active = False
             obs.expires_at = anchor + grace
             obs.confidence = Confidence.MEDIUM
-            obs.summary = shorten(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            obs.summary = fmt_command(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
             return obs
         # 没有任何 turn 生命周期证据 → 不伪造状态。
         return None

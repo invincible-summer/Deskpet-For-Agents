@@ -26,6 +26,7 @@ RESET_FIELDS = (
     "animated",
     "force_state",
     "bubble.enabled",
+    "bubble.show_details",
     "bubble.font_family",
     "bubble.font_size",
     "bubble.font_color",
@@ -54,7 +55,7 @@ _NUMERIC_BOUNDS = {
     "bubble.autohide_sec": (0, 3600),
 }
 _BOOL_FIELDS = {
-    "animated", "bubble.enabled", "bubble.always_visible",
+    "animated", "bubble.enabled", "bubble.always_visible", "bubble.show_details",
 }
 _FORCE_STATES = ("", "walk", "attack", "die", "special", "sleep")
 
