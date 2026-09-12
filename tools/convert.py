@@ -18,7 +18,7 @@ import tempfile
 from PIL import Image
 
 # 注意：numpy/scipy 在函数内惰性导入——运行中的桌宠进程只引用本模块的常量，
-# 重转换在独立子进程（python -m tools.convert）中进行，转换内存随子进程退出释放。
+# 重转换在独立 converter 子进程中进行，转换内存随子进程退出释放。
 
 STATES = ["walk", "attack", "die", "special", "sleep"]
 MAGIC = (0x10, 0x10, 0x11)        # tkinter transparentcolor（避开纯黑）
@@ -274,31 +274,30 @@ def convert_skin(src_dir: str, out_dir: str, height: int = 240, fps: int = 12,
     return done
 
 
-def _selftest() -> None:
-    """CLI 入口：python -m tools.convert [--gated] <skin_dir> <out_dir> [height] [fps]
-    在独立子进程中执行转换，numpy/scipy 内存随进程退出释放。
+def main(argv=None) -> int:
+    """Converter CLI used by both source and compiled internal entry points.
 
-    --gated（v4.3.1 DP43-R05）：启动后先阻塞读 stdin 的 1 字节 gate
-    再做任何真实工作。父进程先 AssignProcessToJobObject（Windows Job
-    Object，KILL_ON_JOB_CLOSE）再放行 gate——保证 converter 在加入 job
-    前绝不可能 spawn ffmpeg（无 assign race，DeskPet 退出可杀整棵树）。
+    ``--gated`` blocks on one stdin byte before any conversion work, so the
+    parent can first place this process in a KILL_ON_JOB_CLOSE Job Object.
     """
     import sys
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    if "--gated" in sys.argv[1:]:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    args = [a for a in raw if not a.startswith("--")]
+    if "--gated" in raw:
         try:
-            sys.stdin.buffer.read(1)   # 等 gate 字节
+            sys.stdin.buffer.read(1)
         except Exception:
             pass
     if len(args) < 2:
         print("usage: python -m tools.convert [--gated] <skin_dir> <out_dir> [height] [fps]")
-        raise SystemExit(1)
+        return 1
     src_dir, out_dir = args[0], args[1]
     height = int(args[2]) if len(args) > 2 else 240
     fps = int(args[3]) if len(args) > 3 else 12
     convert_skin(src_dir, out_dir, height=height, fps=fps,
                  log=print if sys.stdout else None)
+    return 0
 
 
 if __name__ == "__main__":
-    _selftest()
+    raise SystemExit(main())

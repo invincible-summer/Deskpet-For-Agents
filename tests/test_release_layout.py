@@ -103,6 +103,16 @@ class ReleaseLayoutTests(unittest.TestCase):
                        "Empirical issue", "Third-party reverse evidence"):
             self.assertIn(marker, sourcelink)
 
+    def test_portable_release_files_present(self):
+        self.assertTrue((ROOT / "pet" / "runtime_paths.py").is_file())
+        self.assertTrue((ROOT / "requirements-build.txt").is_file())
+        self.assertTrue((ROOT / "tools" / "build_release.py").is_file())
+        self.assertTrue((ROOT / ".github" / "workflows" / "release.yml").is_file())
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("DeskPet-windows-x64-portable.zip", readme)
+        self.assertIn("现有 Python 3.12", readme)
+        self.assertIn("%LOCALAPPDATA%\\DeskPet", readme)
+
     def test_constraints_file_pins_verified_set(self):
         path = ROOT / "constraints.txt"
         self.assertTrue(path.exists())
@@ -114,8 +124,8 @@ class ReleaseLayoutTests(unittest.TestCase):
     def test_version_module_is_single_source(self):
         from pet.version import APP_LABEL, APP_NAME, APP_VERSION
         self.assertEqual(APP_NAME, "DeskPet")
-        self.assertEqual(APP_VERSION, "4.5.0")
-        self.assertEqual(APP_LABEL, "DeskPet V4.5.0")
+        self.assertEqual(APP_VERSION, "4.6.0")
+        self.assertEqual(APP_LABEL, "DeskPet V4.6.0")
         import pet.dashboard as dashboard
         self.assertEqual(dashboard.APP_VERSION, APP_LABEL)
 

@@ -1,8 +1,7 @@
 """配置模块：V4.1 schema（config_version=4）、原子保存、备份、normalize。
 
 v4plan §9 合同：
-  * 继续使用项目内路径（config.json / assets/pets / assets/cache），
-    不迁 %LOCALAPPDATA%；
+  * 用户可变数据统一位于 %LOCALAPPDATA%\\DeskPet；程序目录不写配置/素材/cache；
   * save 永不静默吞错：commit() 返回 ConfigSaveResult；
   * 临时文件 → flush → 可选 fsync → backup → os.replace；
   * 主文件损坏 → 尝试 config.json.bak → DEFAULTS；
@@ -17,12 +16,17 @@ import tempfile
 import threading
 from dataclasses import dataclass
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_PATH = os.path.join(ROOT, "config.json")
-BACKUP_PATH = os.path.join(ROOT, "config.json.bak")
-ASSETS_DIR = os.path.join(ROOT, "assets")
-PETS_DIR = os.path.join(ASSETS_DIR, "pets")
-CACHE_DIR = os.path.join(ASSETS_DIR, "cache")
+from .runtime_paths import get_runtime_paths
+
+_RUNTIME_PATHS = get_runtime_paths()
+# Compatibility exports: existing tests/tools may import these names, but their
+# single source of truth is RuntimePaths rather than the repository root.
+ROOT = str(_RUNTIME_PATHS.program_root)
+CONFIG_PATH = str(_RUNTIME_PATHS.config_file)
+BACKUP_PATH = str(_RUNTIME_PATHS.config_backup)
+ASSETS_DIR = str(_RUNTIME_PATHS.assets_dir)
+PETS_DIR = str(_RUNTIME_PATHS.pets_dir)
+CACHE_DIR = str(_RUNTIME_PATHS.cache_dir)
 
 # skins.py 在其顶部（路径 import 之前）先定义 BUILTIN_SKIN，
 # 因此这里反向 import 不会循环失败。
@@ -412,6 +416,9 @@ class Config:
         directory = os.path.dirname(self.path) or "."
         temporary = None
         try:
+            # Fresh portable install has no DeskPet directory yet. Create it
+            # inside the worker immediately before the first atomic save.
+            os.makedirs(directory, exist_ok=True)
             fd, temporary = tempfile.mkstemp(
                 prefix=".deskpet-config-", dir=directory)
             with os.fdopen(fd, "w", encoding="utf-8") as f:

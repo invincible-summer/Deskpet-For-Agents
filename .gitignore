@@ -29,3 +29,9 @@ desktop-source-benchmark.json
 plan.md
 plan1.md
 plan2.md
+# Nuitka / portable release build
+.release/
+*.build/
+*.dist/
+*.onefile-build/
+nuitka-report.xml

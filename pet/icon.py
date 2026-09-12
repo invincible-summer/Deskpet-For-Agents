@@ -6,7 +6,7 @@
   * 托盘图标**绝不使用桌宠形象/皮肤素材**——皮肤是用户自备的版权
     素材，只放在本机 ``assets/pets/``（不入库）；
   * 图标完全由代码绘制（椭圆 + 三角），零素材依赖，仓库保持零二进制；
-  * ``assets/icon.ico`` 仍是本机生成产物（gitignored）：启动时缺文件
+  * ``%LOCALAPPDATA%/DeskPet/icon.ico`` 是本机生成产物：启动时缺文件
     自动生成，内容哈希与当前绘制不一致自动重写——旧版"从皮肤 GIF
     裁帧"生成的桌宠图标会在下一次启动被无感替换成小猫；
   * PIL 属于 core 依赖（requirements-core: Pillow>=10）；任何失败都
@@ -17,6 +17,8 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+
+from .runtime_paths import get_runtime_paths
 
 # 绘制内容变更时 +1：内容哈希天然不同，旧 icon.ico 会被自动重写
 ICON_REVISION = 1
@@ -86,13 +88,14 @@ def cat_ico_bytes() -> bytes:
 
 
 def icon_ico_path(root_dir: str | None = None) -> str:
-    base = root_dir or os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, "assets", "icon.ico")
+    if root_dir is not None:
+        # Explicit root is retained for deterministic unit/build tooling.
+        return os.path.join(root_dir, "assets", "icon.ico")
+    return str(get_runtime_paths().runtime_icon)
 
 
 def ensure_icon_ico(root_dir: str | None = None) -> str | None:
-    """确保 assets/icon.ico 存在且等于当前小猫绘制。
+    """确保运行期 LocalAppData icon.ico 存在且等于当前小猫绘制。
 
     * 缺文件 → 生成；内容哈希不一致（如旧版皮肤裁帧图标）→ 原子重写；
     * 任何异常（无 PIL / 目录不可写）→ 返回 None，调用方回退默认图标。

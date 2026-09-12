@@ -24,7 +24,8 @@ v4.3.1 DP43-R04/R05/R06 重构合同（plan2 §8-§14）：
   * stop()：封口 lane（不再接受/启动新 job）、取消 active、有界等待。
 
 注意：不要在本模块顶层 import tools.convert（会连带加载 PIL）。
-转换全部走独立子进程 python -m tools.convert，主进程保持低内存。
+转换全部走独立 converter 子进程；source 使用 python -m tools.convert，
+compiled 使用 DeskPet.exe 的 internal converter 入口，主进程保持低内存。
 """
 import enum
 import json
@@ -40,15 +41,19 @@ STATES = ["walk", "attack", "die", "special", "sleep"]
 # 程序化原创 fallback 皮肤（v4.2.3 §10.4）：公开源码包无用户版权素材
 # 时仍首启可见。唯一常量，fresh config 与 desired_build_key 的最终
 # fallback 都引用它，不再出现隐藏的 amiya 默认值。
-# 必须定义在 `from .config import ...` 之前：pet.config 反向引用本常量
-# 构造 DEFAULTS，导入顺序保证两个方向都无循环失败。
+# pet.config 反向引用本常量构造 DEFAULTS；skins 自身只依赖
+# runtime_paths，不再从 config 取得文件系统路径，因此没有路径循环。
 BUILTIN_SKIN = "builtin-cat"
 
 # builtin-cat 每 state 的循环语义（与导入 manifest 一致）
 _BUILTIN_LOOP = {"walk": True, "sleep": True, "attack": False,
                  "die": False, "special": False}
 
-from .config import CACHE_DIR, PETS_DIR  # noqa: E402
+from .runtime_paths import get_runtime_paths, is_compiled  # noqa: E402
+
+_RUNTIME_PATHS = get_runtime_paths()
+PETS_DIR = str(_RUNTIME_PATHS.pets_dir)
+CACHE_DIR = str(_RUNTIME_PATHS.cache_dir)
 
 # ------------------------------------------------------------ 常量
 MANIFEST_SCHEMA = 1
@@ -494,21 +499,27 @@ class ConverterJob:
 
     def run(self, src: str, out_dir: str, height: int, fps: int,
             log=None) -> bool:
-        """执行 python -m tools.convert --gated；成功返回 True。"""
+        """执行受控 converter 子进程；成功返回 True。"""
         import subprocess
         import sys
         if self.cancelled:
             return False
         exe = sys.executable
-        # pythonw 没有 stdout，子进程里 print 会崩，优先用 python.exe
-        if os.path.splitext(exe)[0].endswith("pythonw"):
-            sibling = os.path.join(os.path.dirname(exe), "python.exe")
-            if os.path.isfile(sibling):
-                exe = sibling
-        cmd = [exe, "-m", "tools.convert", "--gated",
-               src, out_dir, str(height), str(fps)]
-        cwd = os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))
+        if is_compiled():
+            # Nuitka standalone: sys.executable is DeskPet.exe. Re-enter the
+            # same executable through the early internal-converter dispatch.
+            cmd = [exe, "--deskpet-internal-converter", "--gated",
+                   src, out_dir, str(height), str(fps)]
+            cwd = str(_RUNTIME_PATHS.program_root)
+        else:
+            # pythonw has no stdout; converter diagnostics need python.exe.
+            if os.path.splitext(exe)[0].endswith("pythonw"):
+                sibling = os.path.join(os.path.dirname(exe), "python.exe")
+                if os.path.isfile(sibling):
+                    exe = sibling
+            cmd = [exe, "-m", "tools.convert", "--gated",
+                   src, out_dir, str(height), str(fps)]
+            cwd = str(_RUNTIME_PATHS.program_root)
         hjob = _create_kill_on_close_job()
         if os.name == "nt" and not hjob:
             if log:

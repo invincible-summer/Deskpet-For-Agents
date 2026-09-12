@@ -1,228 +1,393 @@
-# DeskPet V4.5.0 — 被动 Agent 观察桌宠（终端 + Codex/ZCode 桌面端 + 窗口唤起 + 并发呈现）
+# DeskPet V4.6.0
 
-一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），以及 **Codex Desktop（含 ChatGPT 桌面端 Codex 模式）与 ZCode Desktop** 里的并行桌面会话；自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
+轻量、被动、零 Hook 的 Windows / WSL AI Agent 桌宠观察器。
 
-**V4.4 桌面端监听概览**：同一 Codex Desktop / ZCode Desktop 宿主下至少 3 个并行逻辑会话各自成为独立目标（聚合/多宠均可消费），终端 CLI 与桌面会话同 thread 自动去重（terminal exact binding 优先）；数据面全部只读——Codex 读自己的 `state_N.sqlite` threads 目录 + exact rollout JSONL（复用 CLI 解析器），ZCode 读 `~/.zcode/cli/db/db.sqlite` 的 root task / model / tool / turn 表；ZCode 的 permission 确认可精确映射 WAITING。零配置：不需要 hook、插件、MCP、代理脚本，也不改 Agent 启动方式；绝不连接 Codex App Server / ZCode 私有控制面，绝不写任何 Agent 数据库，绝不 checkpoint WAL。
+DeskPet 常驻 Windows 桌面，被动观察已经由用户启动的 AI 编码 Agent，
+把 Goal、Mode、Thinking / Reading / Coding / Testing / Waiting Approval 等
+状态映射为桌宠动画和状态气泡。支持 Codex CLI、Claude Code、Kimi CLI、
+pi，以及 Codex Desktop / ChatGPT Desktop Codex 模式和 ZCode Desktop。
 
-DeskPet 不创建、不托管、不控制任何 Agent：不配置 hooks、不注入进程、不发送键盘事件、不自动审批。
+DeskPet 不创建、不托管、不控制 Agent：不要求 hooks、MCP、插件或代理
+脚本，不注入 Agent 进程，不自动审批，不向 Agent 数据库写数据。
 
-**终端唤起语义（V4.1.3，v3-compatible 被动 heuristic；V4.1.4 增强）**：DeskPet 的 Terminal window wake 使用被动启发式——Windows native 优先使用进程祖先关系（多个候选窗口时再按标题/屏幕证据细分）；WSL 使用当前可观察 TermControl 标题**与每 control 最近一次可见屏幕文本的内存摘要**（V4.1.4：标题常停在 profile 名如 "Ubuntu"，屏幕上的项目路径/Agent 标识才能把多个窗口区分开）做 kind/cwd/user/distro 评分。高置信匹配失败但仍有一个 v3 best-positive control 时，DeskPet 可以把它所属的顶层 Terminal window 作为用户显式唤起候选；这不会自动授予 Terminal text/approval attribution。屏幕摘要只在内存参与评分（产出 int 分数与证据 token），绝不进入绑定、日志或配置。DeskPet 不切换 Tab/Pane，也不发送键盘输入。Windows Terminal 目前没有稳定的公开"按 `WT_SESSION` 激活既有标签页"接口（[microsoft/terminal#19783](https://github.com/microsoft/terminal/issues/19783)，closed/not_planned），因此只承诺 window 级唤起；候选窗口经 `WindowIdentity`（HWND+PID+进程创建时间+窗口类）校验后才动作，OS 拒绝抢前台时闪烁任务栏提醒，绝不绕过。
+## 下载与启动
 
-V4.3/V4.4 的能力概览：
+DeskPet 同时保留两种运行方式。
 
-1. **终端窗口唤起**：点击某 Agent 时恢复并前置它所在的 Windows Terminal 顶层窗口；窗口归属用 `WindowIdentity`（HWND+PID+进程创建时间+窗口类）安全校验，stale 即 fail-closed；OS 拒绝抢前台时闪烁任务栏提醒，绝不绕过系统策略（无键盘注入、无剪贴板注入）。
-2. **并行监听 + 呈现模式**：并行监听默认开启；每次 DeskPet 启动固定进入"单宠聚合"（一只桌宠把各 Agent 的卡片叠成一摞气泡，V4.1.4，双击对应气泡唤起对应终端）。用户可以在本次运行内切换非并发 / 单宠聚合 / 多宠分离（多宠分离：每个 Agent 一只桌宠，**自动绑定**现有 Agent，普通空 slot 不产生额外桌宠——不是"设了 3 就唤起 3 只"）；重启再次回到并行监听 + 单宠聚合。除用户显式隐藏外不会出现 0 桌宠：整个 Fleet 0 Agent / 0 binding 时仍保留 pet-1 idle fallback。
-3. **可靠设置持久化 + 自启修复**：设置写入失败会明确提示；开机自启能识别"注册路径已失效"并一键修复。
-4. **精确退出生命周期**：Agent CLI 进程退出即从列表消失（terminal/shell 还开着也不会"复活"）；Windows 上事件驱动、零轮询；桌面宿主退出时其全部逻辑会话原子移除。
-5. **桌面会话监听（V4.4）**：Codex Desktop（含 ChatGPT 桌面端 Codex 模式）与 ZCode Desktop 的并行逻辑会话各自成为独立目标；同一 thread/session 被终端 CLI 认领时自动去重（terminal 优先，CLI 退出后桌面自动接管）；宿主收敛——Electron/app-server helper 进程永不形成目标；ZCode subagent 归并父任务不膨胀宠物。
+### 方式 A：Windows x64 Portable（普通用户推荐）
 
-```
-Process tells us WHO.          /proc + psutil（含 cwd/tty/uid/启动 token）
-Session data tells us WHAT.    各 Agent 自己落盘的 JSONL（增量只读 tail）
-Terminal UIA tells us          Windows Terminal 官方 UI Automation 接口
-  WHAT THE USER IS ASKED.      （Notification 事件 + 当前可见区域）
-StateReducer combines them.    ERROR > WAITING > INPUT > WORKING > DONE > IDLE > UNKNOWN
-DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
-```
+正式 Release 提供：
 
-## 正常使用流程
+**[下载最新 DeskPet Windows x64 Portable](https://github.com/invincible-summer/Deskpet-For-Agents/releases/latest/download/DeskPet-windows-x64-portable.zip)**
 
-```
-打开 Windows Terminal → 进入 Windows/WSL → 自己执行 codex / claude / kimi
-        ↓ DeskPet 自动发现、自动绑定会话、自动关联终端窗口
-桌宠动画 + 气泡（Codex · Plan · 编码中 / 目标 / 当前活动）
-```
+使用：
 
-等待审批时气泡提示"请在终端处理"。**交互（V4.1.3 固定三种模式，均为双击）**：
+1. 下载 `DeskPet-windows-x64-portable.zip`；
+2. 解压到任意普通用户可执行目录；
+3. 双击 `DeskPet.exe`。
 
-- 非并发 SINGLE：双击桌宠或气泡 → 唤起该 Agent 的 Terminal 窗口
-- 并发 AGGREGATE（单宠聚合）：每张候选卡在**同一桌宠上叠成一摞气泡**（V4.1.4——最底一张带指向桌宠的倒三角尾巴，上方卡片无尾巴、卡片间只留小间隔）；**双击对应气泡 → 唤起该气泡对应 Agent 的 Terminal**；双击桌宠 → 只互动。唤起结果（如"已打开终端"）**只显示在被双击的那张气泡上**，其他气泡不受影响、叠层不收起（V4.1.4）
-- 并发 FLEET（多宠分离）：双击各自的桌宠或气泡 → 唤起各自 Agent 的 Terminal
+无需安装 Python、pip、虚拟环境或安装器，也不要求管理员权限。普通用户
+请下载 Release asset，不要把 GitHub 自动生成的 `Source code (zip)` 当作
+可运行程序。
 
-气泡/桌宠单击不激活。仪表盘卡片"打开终端"按钮与托盘 Agents 子菜单同样按 exact agent_key 唤起。**桌面会话（Codex/ZCode Desktop）的唤起是 app 级**：恢复并前置宿主应用主窗口（身份经 PID+进程创建时间+窗口类校验），不承诺跳转到具体对话——上游没有公开稳定的会话级导航接口，DeskPet 不猜测。托盘左键 = 显示/恢复桌宠（绝不隐藏已可见的桌宠），右键/键盘菜单键 = native context menu。
+默认发布采用 Nuitka **standalone** 而不是 onefile：仍然免安装，但避免
+常驻小工具每次启动都做 onefile 临时解包和额外磁盘 I/O。
 
-## 功能
+### 方式 B：使用现有 Python 3.12 环境
 
-- **五状态动画**：`walk` 工作中 ｜ `attack` 下达指令 ｜ `die` 等待审批 ｜ `special` 任务完成（×3）｜ `sleep` 空闲
-- **语义化状态气泡**：`Agent · Mode · Phase` + Goal（≤120 字）+ 当前活动摘要（≤160 字，本地规则压缩，不调用 LLM）
-- **等待审批检测**：Kimi 来自 wire durable `interaction.request(kind=approval)`（EXACT；legacy `ApprovalRequest`/`approval.request` 兼容兜底），`question`/`user_tool` 归类为 INPUT 而非 WAITING；Codex/Claude 来自 Windows Terminal UIA 当前可见审批 UI（高置信 + 1.5s TTL 复检）——**静默永远不被推断为等待审批**
-- **多 Agent**：自动跟随（WAITING > INPUT > ERROR > WORKING …，工作中粘性），或并发模式（单宠聚合/多宠分离）
-- **仪表盘 V4.3**：左侧导航七页（概览/Agents/桌宠/外观/监听与隐私/诊断/设置），页面懒构建 + retained 行（状态变化只 configure 不重建）、只有当前页刷新；V4.3.1 将按钮动作、render 与 Configure 合并到单一事件批次，重复点击和相同配置值为零工作；重新扫描只提交后台请求，不在 Tk 线程等待 UIA；**retained Toplevel——失去焦点绝不自动收起**（关闭只来自 X / 显式隐藏 / 退出）；PID/HWND 等运行期细节收在"高级诊断"折叠区
-- **每只桌宠独立皮肤（V4.3）**：Fleet 每个槽位可单独选皮肤（同一皮肤可被多只重复选择），"跟随全局"继承；换皮先请求构建、完成前保持当前画面，失败保持旧画面绝不空白
-- **外观即时生效（V4.3）**：整体大小/速度/气泡宽高/文字缩放全部为离散值滑块，每跨一档立即应用；无 Apply 按钮，配置经 650ms debounce 原子落盘
-- **非阻塞 UI（V4.3）**：单一 UiCoordinator bridge timer（125/200/500ms 三档自适应）+ 合并式 render flush；Monitor 语义 revision 不变则零 reconcile；冷动画帧每 idle slice 最多解码 1 帧、frame 级全局 LRU 保护正在显示的帧；配置保存、开机启动注册表操作使用有界 transient worker；皮肤导入（复制/校验/manifest）在后台单 job lane 进行
-- **原生托盘菜单（V4.3.1）**：托盘右键/键盘菜单键 = **标准 Windows native context menu**（`NOTIFYICON_VERSION_4` + `WM_CONTEXTMENU` + `TrackPopupMenuEx`，一次手势恰一个菜单，菜单在托盘线程内确定性销毁）；托盘左键/键盘激活 = 显示/恢复桌宠
-- **首帧优先启动（V4.3.1）**：首个桌宠窗口的可见首帧（纯 Tk 启动占位）先于 Monitor 扫描 / UIA 引导 / 托盘加载 / 皮肤缓存维护；皮肤 catalog 纯内存快照，磁盘扫描全部在锁外的后台 lane
-- **确定性退出（V4.3.1）**：hide-first + 单一 3s 绝对 deadline——菜单先结束、可见窗口立即隐藏，所有后台子系统只用全局剩余预算回收，无局部超时叠加、不留孤儿 converter
-- **双击桌宠/气泡/卡片按钮**：唤起该 Agent 所在的 Windows Terminal 窗口（公共 Win32 API 恢复并前置；foreground 被拒时闪烁任务栏；AGGREGATE 下双击桌宠只互动）
-- **系统集成**：托盘图标（程序内绘制的原创小猫，**不使用桌宠形象素材**）、开机自启、隐藏、换肤、缩放、锁定动画
-- **隐私**：`/proc/<pid>/environ` 只在 WSL 内部按 allowlist（`WT_SESSION`/`CODEX_HOME` 等 9 项）过滤后才进入 Python；终端文本只在内存、绝不落盘
-
-## 快速开始
-
-公开源码包使用 repo-local `.venv`（`.gitignore` 已忽略，不污染系统 Python）：
+如果机器已经有 Python 3.12，可以直接使用现有环境；不强制创建 DeskPet
+专用 `.venv`：
 
 ```bat
-:: 1) 一次性安装（只寻找已安装的 Python 3.12，不自动联网下载 Python）
-Setup-Desktop.bat
+python -m pip install -r requirements.txt -c constraints.txt
+python main.py
+```
 
-:: 2) 启动（只启动，绝不联网/pip install；环境缺失时明确失败）
+希望无控制台窗口时可使用：
+
+```bat
+pythonw main.py
+```
+
+如果更希望依赖隔离，仓库仍保留可选的 repo-local `.venv` 流程：
+
+```bat
+Setup-Desktop.bat
 Start-Desktop.bat
 ```
 
-安装与启动脚本都按"确定性"设计：Setup 用 `constraints-v4.3.0.txt` 锁定 CI 已验证的 Python 3.12 依赖集；Start 只使用 `.venv\Scripts\pythonw.exe`（隐藏控制台），不 fallback 到任意 Conda/System Python——"能双击"不能以"随机使用一个缺依赖环境"为代价。
+`Setup-Desktop.bat` 只寻找已有 Python 3.12 并创建 `.venv`；
+`Start-Desktop.bat` 只启动，不执行 pip 安装或联网修复。
 
-全新安装默认皮肤为程序化原创 fallback `builtin-cat`（`pet/icon.py` 绘制，无版权素材依赖）；导入自己的皮肤后完全走原流程。已有用户 config 中的自定义皮肤原样保留。
+## 第一次使用
 
-旧配置自动迁移到当前 schema（`config_version=5`；v5 迁移移除已废弃的并发 enabled/mode 持久键——它们现在是运行期 session state，重启固定恢复“并行监听 + 单宠聚合”；迁移从不写入 Agent 身份）。
+首次启动即使没有用户皮肤，也会显示程序化生成的 `builtin-cat`。并行监听
+默认开启，每次启动固定进入单宠聚合模式；没有任何 Agent 时仍保留
+`pet-1 idle fallback`，除非用户本次运行中显式隐藏全部桌宠。
 
-依赖已拆分：`requirements-core.txt`（psutil/Pillow/comtypes，常驻监控路径）与 `requirements-convert.txt`（imageio-ffmpeg/numpy/scipy，仅皮肤转换期使用，转换在独立子进程完成）；完整安装仍是 `pip install -r requirements.txt`（release 安装由 constraints 锁定版本）。
-
-## 三路观察（安全、无 hooks）
-
-1. **进程探测**（`agents/discovery.py`）：psutil 扫 Windows；WSL 每发行版每周期 1×`ps` + 1×匹配 PID 批量 metadata（`/proc/<pid>/cwd`、`stat` 启动 ticks=进程 token、allowlisted environ、`getent passwd` 解析 HOME，不再枚举 `/home/*`）
-2. **会话文件 tail**（`agents/*.py`）：增量只读，容忍残行/轮转/超长行
-
-| Agent | 数据根（env 覆盖） | 结构化状态 |
-|---|---|---|
-| Codex | `$CODEX_HOME`（默认 `~/.codex`） | `task_started.collaboration_mode_kind` → Plan/Default（EXACT）；user_message → Goal |
-| Claude Code | `$CLAUDE_CONFIG_DIR`（默认 `~/.claude`） | `permission-mode` → 六种模式；`sessions/<pid>.json` 为强 hint（/clear 后自动切换新 transcript） |
-| Kimi | `$KIMI_CODE_HOME`（默认 `~/.kimi-code`，legacy `~/.kimi` 兜底） | `session_index.jsonl` 按 cwd 精确定位（sessionDir 受 containment 校验）；`state.json.lastPrompt` + `prompt.accepted` → Goal；`plan_mode.enter/exit`（EXACT）；wire `interaction.request(kind=approval/question/user_tool)`（EXACT）+ legacy `ApprovalRequest` 兜底 |
-| pi | `~/.pi/agent/sessions`（可用 `PI_CODING_AGENT_SESSION_DIR` 覆盖） | assistant `stopReason`（stop/length/toolUse/error/aborted）驱动 turn 生命周期；独立 `role=toolResult` message 是活动证据（工具失败 ≠ Agent ERROR） |
-| Codex Desktop | `state_N.sqlite`（threads 表，只读）+ exact rollout JSONL | threads capability 探测（archived/has_user_event/thread_source/originator 过滤）；rollout 复用 CLI 解析器（task_started/complete/aborted durable 语义）；审批事件上游明确 transient 不落盘 → 不从静默合成 WAITING |
-| ZCode Desktop | `~/.zcode/cli/db/db.sqlite`（只读） | root task catalog（subagent_child 排除，child 活动归并父任务）；`tool_usage.approval_status='requested'+running` → WAITING/EXACT（行级归属，resolved 由行状态闭合）；turn completed/error → DONE/ERROR 展示窗口 |
-
-3. **终端 UIA**（`agents/terminal_uia.py`，观察专用）：独立 MTA 线程（comtypes `CUIAutomation8`/`IUIAutomation5`），订阅 TermControl 的 Notification（2022 起携带新增文本）+ TextChanged（0.15s debounce 的有界审批 fallback）+ 窗口级 StructureChanged（control 开合立即重发现，20s 周期仅为兜底）；弱触发词命中才读 `GetVisibleRanges()` 当前可见区域；审批识别要求**标题模式 + 选项结构同时出现**且识别器种类与绑定 Agent 一致；内存边界：delta≤2048 / ring≤8192 / control≤16 / 事件队列≤256 / UIA 命令队列≤32 / 可见读取全局≤6/s（单 control≥0.5s 间隔）。
-
-## 终端窗口关联的置信度（诚实原则）
-
-Windows Terminal 没有 `WT_SESSION → tab/pane` 公开接口，DeskPet 只做 window 级关联（两条独立链）。**confidence 不是唤起开关**：能否尝试唤起只由"解析器是否给出候选窗口"决定，confidence 只说明候选是怎么选出来的（仪表盘高级诊断可见）。
-
-- **窗口唤起链**（用户双击/按钮"打开终端"，v3-compatible 候选选择）：
-  - **Windows 原生 Agent**：PID 祖先链 → 唯一 WT 窗口 → `CONFIRMED`（窗口内 control 数量不影响）
-  - **WSL Agent**：TermControl 标题评分（kind+3 / cwd+2 / user@+1 / distro+1），**互相唯一匹配** → `HIGH`
-  - 正向证据不够唯一时：保留 best control 所属窗口作唤起候选（`AMBIGUOUS`，v3 行为）——可唤起，但不归属终端证据
-  - 无 Agent 证据但桌面只有一个 WT 窗口：保留该窗口（`NONE` + 唯一窗口兜底）——可唤起，不归属终端证据
-  - 多窗口且无正向证据 / 无 WT 窗口：无候选（fail-closed，不猜）
-- **观察归属链**（WAITING/activity 证据归给谁）：只有 `CONFIRMED`（祖先唯一窗口 + 窗口内唯一被观察 control）或 `HIGH`（标题证据互相唯一，WT 顶层窗口标题仅在窗口内唯一 control 时作第二证据）才归属；其余宁可没有终端证据也不错归。观察用 UIA RuntimeId 是运行期内部句柄，不持久化、不参与激活、不在普通诊断展示。
-- UIA 不可用时正常降级：Goal/Mode/Phase 来自会话文件，"打开终端"不受影响（窗口目录来自 Win32 枚举，不依赖 UIA；仅 WSL 标题评分与"等待审批"观察缺位）
-
-## 稳定性设计
-
-- **线程架构（V4.3 仍为 5 常驻线程上限）**：Tk UI ｜ Monitor Core ｜ ProcessProbe worker ｜ UIA MTA ｜ WindowsExitWatcher；临时 worker 仅用户操作产生：`deskpet-convert`（皮肤 build/import，≤1）与 `deskpet-config-save`（配置保存，≤1）—— WSL 卡顿、皮肤转换、配置写盘都不卡 Tk
-- **进程身份**：key 含启动 token（`wsl:Ubuntu|codex|4812|<ticks>`），PID 复用不继承旧绑定；wrapper/runtime 折叠（npm shim → node 只保留最深 runtime，不跨 kind 折叠）；`/proc` ticks 缺失时用稳定 fallback 代次 token，绝不退化成裸 PID
-- **来源隔离与三态生命周期**：探测健康按真实 source（`windows` / `wsl:Ubuntu` / `wsl:Debian`…）判定，一个 distro 扫描失败不污染其他来源的实例与"状态可能延迟"标记。WSL source 有三种内部语义（V3.1.1）：
-  1. **healthy + instances** —— 发行版运行且 Agent 被发现；
-  2. **healthy + empty** —— 已权威确认当前发行版没有 Agent，或发行版已停止（`wsl --list --running --quiet` 成功且输出为空即是权威空结果）；权威缺席**立即**清除该实例（V4.1 起无消失宽限），同时清掉该 distro 的进程缓存与 fallback 代次 token——重启后 Linux PID 从小整数再来也不会继承旧绑定；
-  3. **unhealthy** —— WSL 枚举/ps 读取失败：DeskPet 保留上一轮缓存并显示"状态可能延迟"，绝不误判退出（无法读取 ≠ 已经不存在）。
-  Running 清单**每轮全新查询，绝不缓存正结果**（V3.1.2 被动性闭环）：`wsl -d <distro> --exec` 本身会启动目标发行版（Microsoft 官方 networking 文档原文），而 probe 间隔 3s 小于 WSL 空闲关机延迟（官方 "8 second rule"），一份过期的 Running 缓存会把用户刚停止的 distro 重新拉起并形成"探测保活"循环——因此只有**本轮刚确认 Running** 的发行版才会被 `wsl -d` 探测；`--list --running` 是宿主侧查询，不会启动任何发行版。停止检测的最坏延迟约为 3s 调度 + 一轮权威缺席确认。
-- **状态语义**：已知 active turn → 无限保持 WORKING；仅活动证据 → 10s 宽限后回 UNKNOWN（不伪造）；DONE 展示 8s；IDLE 只在明确见过 turn 结束后出现；**泛化终端活动（pane 有文本变化）永远不能推翻结构化 Session 的 DONE/IDLE/ERROR/INPUT**
-- **interactive-terminal liveness（V4.2.3）**："进程存在"不等价于"用户还有一个打开的终端 Agent"。Claude/Codex 关闭终端后进程可能 orphan 存活（上游已确认行为）。WSL 用已有 `ps` 的 `tty/tpgid` 直接分类：有效 controlling TTY → attached 继续显示；TTY 被 revoke 且无前台进程组 → detached，下一轮健康 census 即从列表消失；证据矛盾 → UNKNOWN 保留（tmux/screen 内的 Agent 只要 tmux 仍提供 TTY 就保留；nohup/无 TTY 后台进程不再作为"终端 Agent"展示）。Windows native 采用保守判定：只有曾被 `windows-ancestor CONFIRMED` 强绑定、且外部父进程连续两个权威 generation 消失的实例才退出；证据不足一律保留。**DeskPet 只修正自己的观察事实，绝不 kill/terminate/signal 用户的残余 Agent 进程**——orphan 清理是上游 CLI 的生命周期职责。
-- **Status/Phase/Mode 正交**：Mode 是独立维度（Plan/Default/UNKNOWN+原始值），终端 WAITING 成为状态胜者时无权擦除 Session 已解析的 Mode——`WAITING + APPROVAL + PLAN` 是合法且必要的最终状态；优先级为 Session 结构化 Mode → 胜者明确携带的 Mode → NONE
-- **会话解析**：绑定用互相唯一匹配（source/session_id/cwd/started_at 评分，结果与实例遍历顺序无关），同分竞争保持未绑定；late-start 每 15s 无窗 fallback（最近 12 候选）；目录重扫有绑定时降为 15s
-- **兼容性诊断**：会话解析器按已知记录类型集合判定 `OK / PARTIAL / UNKNOWN`，上游格式变化会在仪表盘显示"未知记录"而不是静默失败；Mode 出现未知原始值时显示 `Unknown（原始值：…）`
-
-## 项目结构
-
-```
-main.py                 入口（DPI 感知、单实例互斥）
-pet/                    UI：app/dashboard/bubble/labels/petwindow/context_menu/
-                        animator/skins/tray/config（context_menu = 单一
-                        Tk 右键菜单 owner + deferred 语义发布）
-agents/
-  models.py             Status/Phase/Mode/Observation/AgentInstance/TerminalWindowBinding/
-                        TerminalObservationBinding/AgentTarget/ActivationCode
-  state.py              StateReducer（状态融合；语义证据 > 泛化终端活动）
-  matching.py           互相唯一匹配（session/control 绑定共用，顺序无关）
-  discovery.py          Windows + WSL ProcessProbe（三层探测、canonicalization、env allowlist）
-  paths.py              数据根/wsl_unc 安全转换/Kimi 索引/Claude PID registry
-  base.py               watcher 基座（互相唯一绑定、late-start fallback、parser 诊断）
-  codex.py claude.py kimi.py pi.py
-  terminal_uia.py       UIA 观察器 + 审批识别器（observation-only；订阅生命周期有界）
-  terminal_resolver.py  TerminalWindowResolver + TerminalObservationResolver（双链分离）
-  terminal_service.py   观察/解析/window-only 激活统一 facade（仅 TERMINAL）
-  desktop.py            SessionClaimKey/DesktopSourceSnapshot/source 协议
-  desktop_window.py     Desktop 宿主 app 级窗口激活（身份校验 fail-closed）
-  sqlite_ro.py          只读 SQLite substrate（mode=ro + query_only + 指纹 + schema capability）
-  codex_desktop.py      Codex Desktop 被动 source（threads catalog + exact rollout + lease）
-  zcode_desktop.py      ZCode Desktop 被动 source（schema adapter/catalog/state projector）
-  monitor.py            ProcessProbeWorker + Monitor Core + AgentTarget API（desktop source 编排）
-  tailer.py summarize.py
-actions/winkeys.py      仅窗口唤起（公共 Win32 + WindowIdentity 属主 PID/创建时间/窗口类
-                        一致性验证，fail-closed；无任何键盘注入）
-tools/convert.py                    素材→透明GIF 管线
-tools/desktop_source_probe.py       Codex/ZCode 桌面数据面只读实机 probe（输出脱敏）
-tools/terminal_window_probe.py      WT 窗口 list/validate/activate 实机 probe
-tools/terminal_observer_probe.py    UIA 观察（observation-only）实机 probe
-tests/                              单元/隐私/UIA/匹配/基准/实机回归
-.github/workflows/                  CI（windows-latest：compileall + unittest + benchmark）
+```text
+启动 DeskPet
+  ↓
+自己打开 Windows Terminal / WSL / Desktop Agent
+  ↓
+DeskPet 自动发现并被动观察
+  ↓
+桌宠动画 + Agent 状态气泡
 ```
 
-## 常用配置（config.json）
+用户可在本次运行内切换 SINGLE / AGGREGATE / FLEET；重启后再次回到
+并行监听默认开启 + 单宠聚合。
 
-```jsonc
-{
-  "monitor": {
-    "agents": { "claude": true, "codex": true, "kimi": true, "pi": true,
-                "zcode": true },
-    "windows_enabled": true, "wsl_enabled": true,
-    "windows_scan_sec": 3.0, "wsl_scan_sec": 3.0,
-    "file_poll_sec": 0.5, "session_scan_sec": 3.0,
-    "activity_grace_sec": 10.0, "terminal_observer": true
-  },
-  "privacy": {
-    "terminal_text_to_disk": false, "session_text_to_disk": false,
-    "wsl_root_metadata_fallback": false,
-    "goal_max_chars": 120, "summary_max_chars": 160
-  }
-}
+## 皮肤导入
+
+Dashboard → 外观 → `导入皮肤…`，选择包含五个状态素材的文件夹：
+
+```text
+MyPet/
+├─ walk.webm      工作中
+├─ attack.webm    下达指令
+├─ die.webm       等待审批
+├─ special.webm   完成
+└─ sleep.webm     空闲
 ```
 
-节奏类配置有代码级 clamp（加载与每轮读取时生效，改坏配置文件也不会制造高频 loop）：`windows_scan_sec` 1–60、`wsl_scan_sec` 1–120、`file_poll_sec` 0.2–5（运行中修改下一轮即生效）、`session_scan_sec` 1–60、`activity_grace_sec` 1–60、`active_file_window_sec` 30–3600。运行期 identity（PID/HWND/RuntimeId/WT_SESSION/exact key）绝不持久化。
+也支持转换器允许的 mp4/mkv/mov/avi/gif。外部目录只是 import source：
+DeskPet 会先校验，再复制到自己的数据目录、生成 manifest、再次校验并原子
+发布。因此移动/删除原 Downloads/Desktop 素材目录不会破坏已导入皮肤。
 
-`privacy.wsl_root_metadata_fallback` 默认关闭：默认绝不使用 WSL root 读取进程 metadata（Agent 仍会被发现，会话可能显示未解析）；仅在仪表盘显式开启后允许一次 root 补读（只读 cwd/启动 token/uid/HOME/allowlist env）。
+FLEET 模式下每只桌宠可独立选择皮肤；同一套皮肤可以重复使用。
 
-## 测试
+## 本地数据目录
+
+所有用户可变数据统一位于：
+
+```text
+%LOCALAPPDATA%\DeskPet\
+├─ config.json
+├─ config.json.bak
+├─ icon.ico
+└─ assets\
+   ├─ pets\
+   │  └─ MyPet\
+   │     ├─ walk.webm
+   │     ├─ attack.webm
+   │     ├─ die.webm
+   │     ├─ special.webm
+   │     ├─ sleep.webm
+   │     └─ manifest.json
+   └─ cache\
+      ├─ MyPet@240\
+      └─ builtin-cat@240\
+```
+
+Dashboard → 设置 → 本地数据会显示实际路径，并提供 **打开数据目录**。
+程序目录与用户数据彻底分离，因此替换 portable 程序目录不会删除配置、
+皮肤或缓存。
+
+普通配置全部通过 Dashboard 修改：内存立即生效，经 650ms debounce 后由
+单一后台 writer 原子保存到 `config.json`。`config.json` 是内部持久化格式，
+普通用户无需手工编辑。
+
+## 状态与交互
+
+状态优先级：
+
+```text
+ERROR > WAITING > INPUT > WORKING > DONE > IDLE > UNKNOWN
+```
+
+Mode 是独立维度，因此 `WAITING + APPROVAL + PLAN` 是合法组合。
+
+- SINGLE：双击桌宠/气泡，唤起对应 Terminal。
+- AGGREGATE：多张 Agent 卡片叠在同一只桌宠上；双击卡片只唤起该 Agent，
+  双击桌宠 body 只互动。
+- FLEET：每个目标有自己的桌宠/气泡并可使用不同皮肤。
+- Codex/ZCode Desktop 只承诺恢复并前置宿主应用，不猜测私有会话导航。
+
+## 被动观察、安全与隐私
+
+```text
+Process tells us WHO.
+Session data tells us WHAT.
+Terminal UIA tells us WHAT THE USER IS ASKED.
+StateReducer combines evidence.
+DeskPet only observes.
+```
+
+DeskPet 不发送键盘输入、不自动审批、不写 Agent 数据库、不 checkpoint WAL，
+不因为静默而推断 WAITING。PID/HWND/RuntimeId/WT_SESSION/exact key 等运行期
+identity 不持久化。终端可见文本只在内存参与状态/归属判断，默认不落盘；
+归属证据不足时宁可缺失证据，也不把审批错归给其他 Agent。
+
+Windows Terminal 唤起使用公共 Win32 API，并在操作前校验 HWND + PID +
+进程创建时间 + 窗口类；系统拒绝抢前台时只闪烁提醒，不绕过 foreground
+policy。WSL 只探测本轮确认正在运行的 distro，不为了监听而启动已停止 WSL。
+
+# 架构与接口合同
+
+以下边界是维护时必须保持的长期合同。发行逻辑不得扩散进 Monitor、状态融合
+或 Presentation。
+
+## `main.py` — 进程入口
+
+启动顺序：
+
+```text
+early argv dispatch
+→ Windows guard
+→ DPI awareness
+→ single-instance mutex
+→ Config
+→ PetApp
+```
+
+维护接口：
+
+```text
+DeskPet.exe --version
+```
+
+内部 worker 接口：
+
+```text
+DeskPet.exe --deskpet-internal-converter --gated ...
+```
+
+internal converter 必须在 mutex、Tk、Monitor 之前 dispatch，否则转换子进程
+会被 GUI 单实例保护拦截或加载不必要的常驻组件。
+
+## `pet/runtime_paths.py` — 唯一路径真值
+
+`RuntimePaths` 提供：
+
+```text
+program_root
+ data_root
+ config_file / config_backup
+ assets_dir
+ pets_dir / cache_dir
+ runtime_icon
+```
+
+Windows data root 通过 `SHGetKnownFolderPath(FOLDERID_LocalAppData)` 获取，
+`LOCALAPPDATA` 仅为 API 失败 fallback；永不回退到程序目录。
+
+`open_data_root()` 负责 lazy mkdir + `ShellExecuteW("open")`，返回结构化结果，
+不会把 Win32 异常抛进 Tk event loop。
+
+## `pet/config.py` / `pet/config_save.py`
+
+默认持久化：
+
+```text
+%LOCALAPPDATA%\DeskPet\config.json
+%LOCALAPPDATA%\DeskPet\config.json.bak
+```
+
+Config 继续负责 schema、migrate、normalize/clamp、revision、dirty 和原子写盘。
+测试仍可显式传 `Config(path=temp_file)`，其 backup 跟随 custom path。
+
+运行时保存协议：
+
+```text
+Config.set
+→ revision++ / dirty
+→ ConfigSaveCoordinator 650ms debounce
+→ short snapshot
+→ <=1 transient writer
+→ temp + flush + optional fsync + backup + replace
+→ acknowledge revision
+```
+
+磁盘写入期间新的 revision 不能被旧 snapshot 错误标记为 clean；同一失败
+revision 不无限自动重试。
+
+## `pet/skins.py` / `tools/convert.py`
+
+`SkinBuildManager` 是唯一 skin mutation lane，串行 bootstrap/build/rebuild/
+import/maintenance。import 与 cache build 都先写同 filesystem staging，再完整
+校验并 atomic directory swap；失败保持旧 live 目录。
+
+source 模式 converter：
+
+```text
+python.exe -m tools.convert --gated ...
+```
+
+compiled 模式：
+
+```text
+DeskPet.exe --deskpet-internal-converter --gated ...
+```
+
+二者复用同一个 `tools.convert.main(argv)`。converter 保持独立子进程；
+numpy/scipy 在函数内惰性 import，转换结束后峰值内存随子进程退出释放。
+Windows 使用 KILL_ON_JOB_CLOSE Job Object + one-byte gate，确保加入 job 之前
+不会 spawn ffmpeg，取消/退出可终止整棵 converter→ffmpeg 树。
+
+## `pet/petview.py`
+
+一个 Tk interpreter、N 个 Toplevel PetView。所有 Pet 共享：
+
+- `SharedAnimationCache`
+- `AnimationScheduler`
+- `SkinBuildManager`
+- Monitor / Presentation
+
+增加桌宠数量不得复制这些全局对象；这是 FLEET 仍保持低 CPU/内存的核心。
+
+## `agents/monitor.py`
+
+Monitor 只负责 Agent data plane 编排，输出 revision 驱动的 `AgentTarget`。
+它不负责 LocalAppData、Nuitka、GitHub Release、皮肤目录或配置保存。本次 portable
+发行不改变 Codex/Claude/Kimi/pi/Codex Desktop/ZCode Desktop 的监听协议。
+
+## `pet/presentation.py`
+
+Presentation 只负责 SINGLE / AGGREGATE / FLEET 和 target→slot/view 映射，
+不负责 discovery 或持久化。每次启动固定初始化并行监听 + AGGREGATE；运行时
+切换不改变下一次启动默认值。
+
+## `pet/dashboard.py`
+
+Dashboard 是普通用户控制面：设置写入走 Config/AppearanceController +
+ConfigSaveCoordinator；皮肤选择只产生 import request，真实复制/校验/发布由
+SkinBuildManager 完成；本地数据目录通过 RuntimePaths 显示/打开。
+
+## `pet/autostart.py`
+
+source 模式注册 `pythonw.exe main.py`；compiled 模式注册当前 `DeskPet.exe`。
+portable 目录被移动后旧注册项视为 stale，由现有 repair 操作重新登记。不引入
+Windows service、Task Scheduler 或安装器专属状态。
+
+# 项目结构
+
+```text
+main.py                    GUI / --version / internal converter 入口
+pet/runtime_paths.py       LocalAppData 与 program root 唯一边界
+pet/config.py              schema / normalize / persistence
+pet/config_save.py         async single-writer save coordinator
+pet/dashboard.py           用户控制面
+pet/skins.py               skin catalog/import/build/cache transaction
+pet/petview.py             N PetView + shared cache/scheduler/build
+pet/presentation.py        single/aggregate/fleet
+agents/                    passive discovery/session/state/terminal/desktop sources
+actions/winkeys.py         fail-closed Win32 activation
+tools/convert.py           conversion child process
+tools/build_release.py     standalone build 唯一入口
+tools/release_acceptance.py compiled artifact acceptance
+tests/                     unit / benchmark / acceptance contracts
+.github/workflows/test.yml source CI
+.github/workflows/release.yml tag -> standalone -> GitHub Release
+```
+
+# 测试
+
+现有 Python 3.12 环境中：
 
 ```bat
-:: 使用 Setup-Desktop.bat 创建的 repo 环境（或任何 Python 3.12 + requirements）
-.venv\Scripts\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（479+）
-.venv\Scripts\python.exe tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json    # 合成基准（队列/预算/churn 上限）
-.venv\Scripts\python.exe tests\benchmark_presentation.py            # Presentation/Fleet/动画缓存基准（blocking）
-.venv\Scripts\python.exe tests\benchmark_ui_architecture.py         # UI 架构基准：revision 驱动/dirty-view/单 worker/单 bridge（blocking）
-.venv\Scripts\python.exe tests\benchmark_desktop_sources.py --ticks 5000 --report desktop-source-benchmark.json   # Desktop source 基准：SQL 随变更/安全刷新而非 ticks×sessions（blocking）
-.venv\Scripts\python.exe tools\terminal_window_probe.py --list      # WT 窗口实机 probe（list/validate/activate/resolve）
-.venv\Scripts\python.exe tools\terminal_observer_probe.py           # UIA 观察实机 probe（默认不打印终端原文）
-.venv\Scripts\python.exe -X utf8 tests\regression.py                # 位置/气泡/缩放/托盘/自启
-.venv\Scripts\python.exe -X utf8 tests\replay_real.py               # 真实会话数据回放
+python -m unittest discover tests -p "test_*.py"
+python tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json
+python tests\benchmark_desktop_sources.py --ticks 5000 --report desktop-source-benchmark.json
+python tests\benchmark_presentation.py --report presentation-benchmark.json
+python tests\benchmark_ui_architecture.py --report ui-architecture-benchmark.json
+python tools\ttfv_probe.py
+python tools\real_machine_acceptance.py
 ```
 
-CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试（含 window 激活逻辑、并发激活矩阵、source 停扫、config 运行时测试、Desktop source 生命周期/失败降级）+ monitor benchmark + presentation benchmark + UI architecture benchmark + desktop sources benchmark（均 blocking）（`PYTHONUTF8=1`，benchmark 报告以 artifact 上传）。真实 Windows Terminal foreground policy / UIA 事件接受度属于本机 manual acceptance：CI 只验证纯逻辑、Win32 调用契约 mock、资源边界和 UI dataflow。**Release acceptance requires GitHub Actions green**：workflow conclusion=success 是发布验收的必要条件，CI 红期间不标记版本完成。
+真实 Windows Terminal 前台策略/UIA 事件仍属于实机 acceptance；CI 只验证纯逻辑、
+Win32 调用合同 mock、资源预算和 UI dataflow。
 
-## 已知边界（如实说明）
+# Portable 构建与 GitHub Release
 
-- Codex 的审批事件明确不持久化到 rollout（官方 transient 策略），因此 Codex/Claude 的"等待审批"只能来自终端 UIA 可见区域；若审批 control 无法唯一关联到 Agent（多 control/后台 tab），在"不 hooks、不控制 Agent"的约束下没有第三条可靠信息源——此时显示 UNKNOWN/工作中而不是猜（plan §55 物理边界）。**Codex Desktop 同理**：state DB + rollout 无法诚实重建隐藏会话的审批，v4.4 不从静默合成 WAITING；App Server 能提供 waitingOnApproval 但其 initialize 会改写进程级 client metadata（上游实现证实），DeskPet 明确不连接
-- Claude Code 上游存在"活跃 session transcript 不实时写出"的回归 → 终端活动观察可补充 WORKING 证据，但不伪造具体 Phase
-- Codex Desktop / ZCode Desktop 监听依赖宿主自己的本地数据面：Codex threads 表/rollout、ZCode db.sqlite。上游升级改变 schema 时按 capability 探测降级（INCOMPATIBLE_SCHEMA 诊断，保留 last good），绝不猜列
-- Codex Desktop 历史冷会话（DB 无近期更新且 rollout 无新增长）不会变成宠物；每个桌面 kind 最多同时显示 8 个活跃会话（与 Presentation 上限一致）
-- ZCode Side Conversation（临时侧对话）：当前版本没有可被动归属的稳定 session 身份，v4.4 不单独显示（不猜窗口标题/文本）；持久 task 的多并行与 permission 等待已完整支持
-- ZCode 桌面端缩到托盘后监控继续（以进程 incarnation 为准，不看窗口可见性）；宿主退出则其全部桌面会话立即移除
-- 自定义桌宠素材版权自负；`assets/pets/*`、`assets/cache/`、`config.json` 不入 git
+构建依赖与 runtime 依赖分离：
 
-## V3 不变量（任何实现不得违反）
-
-```
-1. 不启动 Agent        7. 不把静默解释为审批     13. 不确定 Agent↔control 时不乱绑定
-2. 不修改 Agent        8. 不扫描用户整个 HOME    14. UI 只暴露 AgentTarget
-3. 不配置 hooks        9. 不持久化终端原文       （PID/JSONL/HWND 只在高级诊断）
-4. 不使用 SendInput   10. 不持久化完整 environ
-5. 不向终端写输入      11. 终端文本只做匹配归类
-6. 不自动审批          12. （见上）
+```text
+requirements.txt          runtime/source dependencies
+constraints.txt           verified runtime pins
+requirements-build.txt    build-only Nuitka pin
 ```
 
-## 4.5.0：进程监听状态解析优化
+维护者构建：
 
-- 根据各 Agent 的结构化会话事件持续识别工作、审批、选择题待回复、完成和 Goal 模式；正在进行的回合不会因长时间无日志而误报待命。
-- 修复新回合继承旧错误、问题被无关工具结果清除、完成后仍显示待回复等状态衔接问题。
-- 外观设置可关闭文本框，或切换详细信息与简要状态；单宠、聚合和多宠共用长度受限的显示文本。详细信息保留模式与状态，命令路径、下划线和参数不再被 Markdown 清理破坏。
-- 审批只根据明确的协议或终端证据识别；桌面端未提供审批证据时仍显示工作中或状态暂不可读。完成庆祝保留 8 秒，之后等待新任务。
+```bat
+python -m pip install -r requirements.txt -c constraints.txt
+python -m pip install -r requirements-build.txt
+python tools\build_release.py
+```
+
+输出：
+
+```text
+.release/
+├─ DeskPet.dist/
+├─ DeskPet-windows-x64-portable.zip
+├─ SHA256SUMS.txt
+└─ nuitka-report.xml
+```
+
+二进制和 ZIP 不提交 Git history。
+
+正式版本使用 `vX.Y.Z` tag，并强制：
+
+```text
+tag == v{pet.version.APP_VERSION}
+```
+
+`release.yml` 在 Windows 2022 + Python 3.12 上重新执行单测和 blocking benchmarks，
+然后构建 Nuitka standalone、运行 compiled acceptance、生成 ZIP/SHA256，并把：
+
+```text
+DeskPet-windows-x64-portable.zip
+SHA256SUMS.txt
+```
+
+发布为 GitHub Release assets。Actions artifacts 只保存 build report/benchmark 等
+诊断数据，不作为长期用户下载入口。
+
+Release 前还必须核验最终发行物中的 FFmpeg license/build configuration，禁止
+发布 `--enable-nonfree` 构建；实际依赖族记录于 `THIRD_PARTY_NOTICES.md`。
+
+## 研究资料
+
+Agent 上游合同、实现快照与实证来源见 [SourceLink.md](./SourceLink.md)。

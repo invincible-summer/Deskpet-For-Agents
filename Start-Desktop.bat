@@ -1,5 +1,5 @@
 @echo off
-rem DeskPet launcher (v4.3.0 release start): start only, never install.
+rem DeskPet source/developer launcher: start only, never install.
 rem Uses the repo-local .venv created by Setup-Desktop.bat; no network,
 rem no pip install, no fallback to random system/Conda Python.
 setlocal

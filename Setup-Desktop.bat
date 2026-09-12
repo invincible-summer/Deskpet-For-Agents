@@ -1,5 +1,5 @@
 @echo off
-rem DeskPet one-time setup (v4.3.0 release setup): repo-local .venv only.
+rem DeskPet source/developer setup: optional repo-local .venv.
 rem Runs once; Start-Desktop.bat only starts and never installs.
 setlocal EnableExtensions
 cd /d "%~dp0"

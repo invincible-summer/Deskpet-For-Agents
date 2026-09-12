@@ -1408,8 +1408,9 @@ class SettingsPage(DashboardPage):
     def build(self, parent):
         self.dash.page_header(parent, PAGE_SETTINGS)
         body = self.dash.page_body(parent)
-        from .config import CONFIG_PATH
+        from .runtime_paths import get_runtime_paths
         app = self.dash.app
+        runtime_paths = get_runtime_paths()
         auto = SurfacePanel(body)
         auto.pack(fill="x", pady=(0, SECTION_GAP))
         _section_title(auto.body, "开机启动")
@@ -1475,15 +1476,26 @@ class SettingsPage(DashboardPage):
         InfoButton(srow, "所有设置经 650ms debounce 原子写入 config.json"
                    "（临时文件+替换）；失败绝不静默——此处标红并可重试。",
                    self.dash.tooltip).pack(side="left", padx=(6, 0))
-        tk.Label(savep.body,
-                 text=f"配置文件位置（只读展示）：{CONFIG_PATH}",
+        drow = tk.Frame(savep.body, bg=LIGHT.surface)
+        drow.pack(fill="x", pady=(6, 0))
+        tk.Label(drow, text=f"配置与素材目录：{runtime_paths.data_root}",
                  bg=LIGHT.surface, fg=LIGHT.text_secondary,
-                 font=pick_font(savep, 9)).pack(anchor="w", pady=(6, 0))
+                 font=pick_font(savep, 9), anchor="w").pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(drow, text="打开数据目录",
+                   command=self._open_data_root).pack(side="right")
         abt = SurfacePanel(body)
         abt.pack(fill="x")
         _section_title(abt.body, "关于")
         tk.Label(abt.body, text=APP_VERSION, bg=LIGHT.surface,
                  fg=LIGHT.text, font=pick_font(abt, 10)).pack(anchor="w")
+
+    def _open_data_root(self):
+        from .runtime_paths import open_data_root
+        result = open_data_root()
+        if not result.ok:
+            self.dash.app.toast(
+                f"无法打开数据目录：{result.error or result.path}", 5)
 
     def _toggle_autostart(self):
         self._submit_autostart("autostart-toggle", autostart.toggle)
@@ -1683,6 +1695,10 @@ class Dashboard(tk.Toplevel):
         self._reflow_after = None
         self._last_reflow_width = -1
         self._last_reflow_dpi = self.metrics.dpi
+        # Deiconify/reopen can emit redundant same-size Configure events.
+        # Reflow depends on size/DPI, not window position; suppressing these
+        # avoids scheduling useless 50ms work on every retained-dashboard open.
+        self._last_configure_size = None
         self.bind("<Configure>", self._on_configure)
         # Overview 立即构建（默认页）
         self._show_page(PAGE_OVERVIEW)
@@ -1953,6 +1969,10 @@ class Dashboard(tk.Toplevel):
     def _on_configure(self, event):
         if event.widget is not self:
             return
+        size = (int(event.width), int(event.height))
+        if size == self._last_configure_size:
+            return
+        self._last_configure_size = size
         if self._reflow_after is not None:
             return
         self._reflow_after = self.after(50, self._reflow_debounced)
