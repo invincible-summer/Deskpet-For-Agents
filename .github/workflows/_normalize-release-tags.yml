@@ -1,0 +1,70 @@
+name: normalize-release-tags-once
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  normalize:
+    if: github.event.head_commit.message == 'chore(release): run one-time tag normalization'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_COMMIT: 266f421d9f374eeffd4fed10e5808e2e491e73f2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify canonical history and release preconditions
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin '+refs/tags/*:refs/tags/*' --force
+          check_tag() {
+            local tag="$1"
+            local expected="$2"
+            local actual
+            actual="$(git rev-list -n 1 "$tag")"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "canonical tag $tag points to $actual, expected $expected" >&2
+              exit 1
+            fi
+          }
+          check_tag v1.0.0 c0ca087b74c2545dbbccbff5a58a380638becfd1
+          check_tag v2.0.0 e032640fb78fa043214214b292e76b81405e277f
+          check_tag v3.0.0 da20a689654093e247abf1c996011b9351d36604
+          test "$(python -c 'from pet.version import APP_VERSION; print(APP_VERSION)')" = "4.0.0"
+          test "$(git rev-parse "$RELEASE_COMMIT^{commit}")" = "$RELEASE_COMMIT"
+          release_count="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq 'length')"
+          if [[ "$release_count" != "0" ]]; then
+            echo "expected no existing GitHub Releases before one-time normalization" >&2
+            exit 1
+          fi
+      - name: Retire development milestone tags and create canonical v4.0.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          legacy=(
+            v3.1.0 v3.1.2 v4.0.0 v4.1.0 v4.1.1 v4.2.0 v4.2.1
+            v4.2.2 v4.2.3 v4.3.0 v4.3.1 4.4.0 4.5.0
+          )
+          for tag in "${legacy[@]}"; do
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+              git push origin ":refs/tags/$tag"
+            fi
+            git tag -d "$tag" >/dev/null 2>&1 || true
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a v4.0.0 "$RELEASE_COMMIT" -m "DeskPet v4.0.0 — canonical portable release"
+          git push origin refs/tags/v4.0.0
+      - name: Dispatch canonical release build
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml --ref v4.0.0
