@@ -134,8 +134,65 @@ class DesktopWindowServiceTests(unittest.TestCase):
                        "send_input", "set_clipboard"):
             self.assertFalse(hasattr(real_winkeys, banned), banned)
 
+    def test_tray_hidden_main_window_restored_for_both_agents(self):
+        for kind in (AgentKind.CODEX, AgentKind.ZCODE):
+            with self.subTest(kind=kind), \
+                 patch('agents.desktop_window.winkeys') as wk, \
+                 patch('psutil.Process') as proc:
+                proc.return_value.create_time.return_value = 111.0
+                wk.enum_windows.side_effect = [[], [
+                    (60, 900, 'helper', 'Chrome_WidgetWin_1'),
+                    (70, 900, 'app', 'Chrome_WidgetWin_1'),
+                    (80, 900, 'IME', 'IME')]]
+                wk.is_app_window.side_effect = lambda hwnd: hwnd == 70
+                wk.window_identity.return_value = type('I', (), {'hwnd':70})
+                wk.validate_window.return_value = True
+                wk.try_set_foreground.return_value = True
+                result = self.svc.activate_host(_desktop_instance(kind=kind))
+                self.assertIs(result.code, ActivationCode.OK)
+                wk.enum_windows.assert_called_with(include_hidden=True)
+                wk.restore_window.assert_called_once_with(70)
+                wk.try_set_foreground.assert_called_once_with(70)
+
+    def test_restore_hidden_and_minimized_use_distinct_commands(self):
+        from actions import winkeys
+        for iconic, visible, expected in [(True, True, 9), (False, False, 5),
+                                           (False, True, None)]:
+            with self.subTest(iconic=iconic, visible=visible), \
+                 patch.object(winkeys, 'user32') as u:
+                u.IsWindow.return_value = True
+                u.IsIconic.return_value = iconic
+                u.IsWindowVisible.return_value = visible
+                winkeys.restore_window(70)
+                if expected is None:
+                    u.ShowWindowAsync.assert_not_called()
+                else:
+                    u.ShowWindowAsync.assert_called_once_with(70, expected)
+
 
 class MonitorSurfaceDispatchTests(unittest.TestCase):
+    def test_pet_double_click_routes_exact_desktop_key(self):
+        from agents.monitor import Monitor
+        from agents.models import ActivationResult
+        from pet.petview import PetView
+        from tests.test_monitoring import MemoryConfig
+        for kind in (AgentKind.CODEX, AgentKind.ZCODE):
+            with self.subTest(kind=kind):
+                monitor = Monitor(MemoryConfig())
+                inst = _desktop_instance(kind=kind)
+                monitor.instances = {inst.key: inst}
+                view = object.__new__(PetView)
+                view.body_activates = True
+                view.agent_key = inst.key
+                view._on_activate = monitor.activate_target
+                with patch.object(monitor._desktop_window_service, 'activate_host',
+                                  return_value=ActivationResult(ActivationCode.OK)) as activate:
+                    view._on_body_double()
+                    activate.assert_called_once_with(inst)
+                    activate.reset_mock()
+                    view._on_hit_tag(('activate', inst.key))
+                    activate.assert_called_once_with(inst)
+
     def test_desktop_target_routed_to_desktop_service(self):
         from agents.monitor import Monitor
         from agents.terminal_service import WindowsTerminalService

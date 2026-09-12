@@ -42,9 +42,13 @@ if user32:
     user32.GetWindowTextW.restype = ctypes.c_int
     user32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
     user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+    user32.GetWindowLongW.restype = ctypes.c_long
+    user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+    user32.GetWindow.restype = wt.HWND
 
 
-def enum_windows():
+def enum_windows(*, include_hidden=False):
     if not user32:
         return []
     out = []
@@ -52,7 +56,7 @@ def enum_windows():
 
     @callback
     def visit(hwnd, _):
-        if user32.IsWindowVisible(hwnd):
+        if include_hidden or user32.IsWindowVisible(hwnd):
             pid = wt.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             n = user32.GetWindowTextLengthW(hwnd)
@@ -66,6 +70,16 @@ def enum_windows():
 
     user32.EnumWindows(visit, 0)
     return out
+
+
+def is_app_window(hwnd: int) -> bool:
+    """Exclude owned/tool/child windows, including hidden Electron helpers."""
+    if not user32 or not user32.IsWindow(hwnd):
+        return False
+    style = user32.GetWindowLongW(hwnd, -16)
+    exstyle = user32.GetWindowLongW(hwnd, -20)
+    return not (style & 0x40000000 or exstyle & 0x80
+                or user32.GetWindow(hwnd, 4))  # WS_CHILD / TOOLWINDOW / OWNER
 
 
 def _ancestor_pids(pid, depth=12):
@@ -157,6 +171,8 @@ def restore_window(hwnd: int) -> bool:
         return False
     if user32.IsIconic(int(hwnd)):
         return bool(user32.ShowWindowAsync(int(hwnd), 9))   # SW_RESTORE
+    if not user32.IsWindowVisible(int(hwnd)):
+        return bool(user32.ShowWindowAsync(int(hwnd), 5))   # SW_SHOW (tray hidden)
     return True
 
 

@@ -61,6 +61,13 @@ class DesktopWindowService:
             if pid == host_pid or _window_owner_exe_matches(kind, pid):
                 candidates.append(hwnd)
         if not candidates:
+            # 托盘隐藏窗口不在可见枚举中。仅接纳当前宿主的 Electron
+            # 主窗口，避免唤起消息接收窗口、工具窗或另一实例。
+            for hwnd, pid, _title, cls in winkeys.enum_windows(include_hidden=True):
+                if (pid == host_pid and cls == "Chrome_WidgetWin_1"
+                        and winkeys.is_app_window(hwnd)):
+                    candidates.append(hwnd)
+        if not candidates:
             return ActivationResult(
                 ActivationCode.NO_BINDING, detail="no host window")
         # 3) 完整身份建立 + 验证（HWND/PID/create_time/class 四元组）
