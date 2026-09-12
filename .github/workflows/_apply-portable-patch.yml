@@ -28,11 +28,17 @@ jobs:
         run: python tools/_apply_portable_patch.py
       - name: Apply acceptance fixes
         run: python tools/_fix_after_portable_patch.py
+      - name: Keep Settings page compact
+        run: python tools/_fix_dashboard_compact.py
+      - name: Harden release build
+        run: python tools/_fix_release_build.py
       - name: Remove staging patch machinery
         shell: pwsh
         run: |
           Remove-Item tools/_apply_portable_patch.py
           Remove-Item tools/_fix_after_portable_patch.py
+          Remove-Item tools/_fix_dashboard_compact.py
+          Remove-Item tools/_fix_release_build.py
           Remove-Item .github/workflows/_apply-portable-patch.yml
       - name: Byte-compile
         run: python -m compileall agents pet actions tools
@@ -46,6 +52,10 @@ jobs:
         run: python tests/benchmark_presentation.py --report presentation-benchmark.json
       - name: UI architecture benchmark
         run: python tests/benchmark_ui_architecture.py --report ui-architecture-benchmark.json
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Build and accept portable standalone
+        run: python tools/build_release.py
       - name: Commit implementation
         shell: pwsh
         run: |
