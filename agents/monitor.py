@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from .base import BaseWatcher
 from .claude import ClaudeWatcher
 from .codex import CodexWatcher
+from .codex_desktop import CodexDesktopSource
 from .desktop import (
     DesktopSourceSnapshot,
     build_terminal_claims,
@@ -301,6 +302,8 @@ class Monitor:
         watcher_cfg.setdefault("summary_max_chars", privacy.get("summary_max_chars", 160))
         self._watchers: dict[AgentKind, BaseWatcher] = {
             k: v(dict(watcher_cfg)) for k, v in WATCHERS.items()}
+        # Desktop source 共享 watcher 配置（grace/隐私截断/活跃窗口）
+        self._source_cfg = dict(watcher_cfg)
         # 终端观察/解析/激活统一由 TerminalService 收口（v4plan §5.8）
         try:
             observer = make_observer(monitor_cfg)
@@ -355,6 +358,7 @@ class Monitor:
         self._stop.clear()
         self._wake.clear()
         self._rescan_requested.clear()
+        self._register_desktop_sources()
         self._probe.start()
         # UIA 后端初始化（comtypes/typelib/control 发现）可能耗时数秒，
         # 绝不能阻塞 UI 线程：放独立引导线程异步启动（plan §15/§32）。
@@ -371,6 +375,22 @@ class Monitor:
         self._thread = threading.Thread(
             target=self._loop, name="deskpet-monitor", daemon=True)
         self._thread.start()
+
+    def _register_desktop_sources(self):
+        """按启用 kind 注册生产 Desktop sources（plan2 §5/§11）。
+
+        只在 start() 执行一次；单元测试直接 _tick 不经过这里，
+        由测试注入 fake source。不在 __init__ 注册是为了让 Monitor
+        构造保持零 IO。不新增 desktop 专属开关（plan2 §11）：kind
+        toggle 即 CLI+Desktop surface 总开关。
+        """
+        if self._desktop_sources:
+            return
+        cfg_m = dict(self.config.get("monitor") or {})
+        enabled = self._enabled_kinds(cfg_m)
+        if AgentKind.CODEX in enabled:
+            self._desktop_sources.append(
+                CodexDesktopSource(cfg=dict(self._source_cfg)))
 
     def _start_terminal(self):
         # 启动失败不锁存：backend.available() 是唯一可用性事实来源
@@ -445,6 +465,11 @@ class Monitor:
         for watcher in self._watchers.values():
             try:
                 watcher.release()
+            except Exception:
+                pass
+        for source in self._desktop_sources:
+            try:
+                source.close()
             except Exception:
                 pass
         return exited
@@ -911,7 +936,18 @@ class Monitor:
             return
         claims = build_terminal_claims(self._watchers, instances)
         hosts = tuple(self._desktop_hosts.values())
+        enabled = self._enabled_kinds(
+            self.config.get("monitor") or {})
         for source in self._desktop_sources:
+            if source.kind not in enabled:
+                # kind toggle 关闭：立即清除该 source 的全部会话
+                with self.lock:
+                    for key, inst in list(self.instances.items()):
+                        if (getattr(inst, "surface", AgentSurface.TERMINAL)
+                                is AgentSurface.DESKTOP
+                                and inst.kind == source.kind):
+                            self._commit_exit(key, "kind-disabled", now)
+                continue
             try:
                 snap = source.poll(hosts, claims, now)
             except Exception as exc:

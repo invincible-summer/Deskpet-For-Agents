@@ -41,6 +41,67 @@ def _user_home() -> str:
     return os.path.expanduser("~")
 
 
+# ------------------------------------------------ v4.4 Desktop 数据根（plan2 §14）
+
+def codex_home_root() -> str:
+    """Codex Desktop 状态根：CODEX_HOME env 优先，否则 ~/.codex。
+
+    只做本机定位，不做网络路径；返回未展开的规范 Windows 路径。
+    """
+    env = os.environ.get("CODEX_HOME") or ""
+    root = env.strip() if env.strip() else os.path.join(_user_home(), ".codex")
+    return os.path.normpath(root)
+
+
+def codex_state_db_candidates(codex_home: str | None = None) -> list[str]:
+    """Codex 状态 DB 候选（state_N.sqlite 文件名随上游版本演进）。
+
+    返回按版本号降序的现存候选；capability probe 由调用方执行
+    （plan2 §6.3：schema 永远 capability-detect，不硬编码版本）。
+    """
+    import re
+    root = codex_home or codex_home_root()
+    out: list[tuple[tuple[int, ...], str]] = []
+    try:
+        for name in os.listdir(root):
+            m = re.fullmatch(r"state_(\d+)\.sqlite", name)
+            if m:
+                out.append((tuple(int(x) for x in m.group(1).split("_")),
+                            os.path.join(root, name)))
+    except OSError:
+        return []
+    out.sort(reverse=True)
+    return [path for _v, path in out]
+
+
+def codex_rollout_roots(codex_home: str | None = None) -> list[str]:
+    """rollout 文件的合法 containment 根（sessions / archived_sessions）。
+
+    path 校验（plan2 §7.2）：DB rollout_path 规范化后必须位于其中之一。
+    """
+    home = codex_home or codex_home_root()
+    return [
+        os.path.normpath(os.path.join(home, "sessions")),
+        os.path.normpath(os.path.join(home, "archived_sessions")),
+    ]
+
+
+def zcode_cli_root() -> str:
+    """ZCode CLI 数据根（官方 Hooks 文档证实 ~/.zcode/cli 布局）。"""
+    override = os.environ.get("ZCODE_CLI_DIR") or ""
+    root = override.strip() if override.strip() else os.path.join(
+        _user_home(), ".zcode", "cli")
+    return os.path.normpath(root)
+
+
+def zcode_db_path() -> str:
+    return os.path.join(zcode_cli_root(), "db", "db.sqlite")
+
+
+def zcode_log_root() -> str:
+    return os.path.join(zcode_cli_root(), "log")
+
+
 def wsl_unc(distro: str, linux_path: str) -> str:
     """Linux 绝对路径 → Windows UNC 路径（plan.md §9）。
 
