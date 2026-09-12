@@ -65,7 +65,7 @@ class ReleaseLayoutTests(unittest.TestCase):
 
     def test_setup_script_is_one_shot_with_constraints(self):
         text = (ROOT / "Setup-Desktop.bat").read_text(encoding="utf-8")
-        self.assertIn("constraints-v4.3.0.txt", text)
+        self.assertIn("constraints.txt", text)
         self.assertIn("3.12", text)
         self.assertIn("venv", text.lower())
         self.assertNotIn("conda", text.lower())
@@ -84,21 +84,27 @@ class ReleaseLayoutTests(unittest.TestCase):
         # 不自动删除用户环境
         self.assertIn("rename or delete", reusing)
 
-    def test_docs_match_v43_runtime_policy(self):
-        # v4.3.1 DP43-R13：README/toast 与 v4.3 runtime policy 一致
+    def test_docs_match_v44_runtime_policy(self):
+        # v4.4.0：README 与 runtime policy 一致；SourceLink 为 4.4.0
+        # 调研快照（官方合同/上游实现/issue 实证/第三方逆向四类标注）
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertNotIn("并发呈现（手动开启）", readme)
         self.assertIn("并行监听默认开启", readme)
         self.assertIn("pet-1 idle fallback", readme)
+        self.assertIn("Codex Desktop", readme)
+        self.assertIn("ZCode Desktop", readme)
         app_src = (ROOT / "pet" / "app.py").read_text(encoding="utf-8")
         self.assertNotIn("并发需手动开启", app_src)
         self.assertIn("启动默认并行监听 + 单宠聚合", app_src)
         sourcelink = (ROOT / "SourceLink.md").read_text(encoding="utf-8")
         self.assertNotIn("v4.2.3 — SourceLink", sourcelink)
-        self.assertIn("39941c2", sourcelink)
+        # v4.4.0 四类信任标注齐备（plan2 §20.12）
+        for marker in ("Official contract", "Upstream implementation",
+                       "Empirical issue", "Third-party reverse evidence"):
+            self.assertIn(marker, sourcelink)
 
     def test_constraints_file_pins_verified_set(self):
-        path = ROOT / "constraints-v4.3.0.txt"
+        path = ROOT / "constraints.txt"
         self.assertTrue(path.exists())
         text = path.read_text(encoding="utf-8")
         for pin in ("psutil==7.2.2", "Pillow==12.3.0", "comtypes==1.4.16",
@@ -108,8 +114,8 @@ class ReleaseLayoutTests(unittest.TestCase):
     def test_version_module_is_single_source(self):
         from pet.version import APP_LABEL, APP_NAME, APP_VERSION
         self.assertEqual(APP_NAME, "DeskPet")
-        self.assertEqual(APP_VERSION, "4.3.1")
-        self.assertEqual(APP_LABEL, "DeskPet V4.3.1")
+        self.assertEqual(APP_VERSION, "4.4.0")
+        self.assertEqual(APP_LABEL, "DeskPet V4.4.0")
         import pet.dashboard as dashboard
         self.assertEqual(dashboard.APP_VERSION, APP_LABEL)
 

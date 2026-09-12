@@ -57,8 +57,8 @@ if not exist "%VENV_PY%" (
 )
 
 :install
-echo Installing dependencies (pinned by constraints-v4.3.0.txt)...
-"%VENV_PY%" -m pip install -r requirements.txt -c constraints-v4.3.0.txt
+echo Installing dependencies (pinned by constraints.txt)...
+"%VENV_PY%" -m pip install -r requirements.txt -c constraints.txt
 if errorlevel 1 (
     echo [ERROR] Dependency installation failed.
     exit /b 1

@@ -1,107 +1,138 @@
-# DeskPet v4.3.1 — SourceLink
+# DeskPet v4.4.0 — SourceLink
 
-## DeskPet implementation baseline
+> Research snapshot: 2026-09-12  
+> DeskPet baseline: `main@9635e1bac225378fd120e32f0a6f89512da46069` (`4.3.1`)  
+> Purpose: sources used to design passive, zero-hook Codex Desktop / ZCode Desktop monitoring.  
+> Trust labels used below: **Official contract**, **Upstream implementation**, **Empirical issue**, **Third-party reverse evidence**.
 
-- [DeskPet v4.3.0 release commit](https://github.com/invincible-summer/Deskpet-For-Agents/commit/39941c2815581eadf948ab8e4e90d82eb1c52207) — 当前审计/发布基线（v4.3.1 DP43 修复计划 plan.md §1 所固定的代码基线 `39941c2`）。
-- [README.md @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/README.md) — 当前产品合同、安装说明与 Agent 支持范围。
-- [agents/discovery.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/agents/discovery.py) — Windows/WSL 进程发现、canonicalization 与现有 ps 字段。
-- [agents/monitor.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/agents/monitor.py) — SourceProbeSnapshot 合并、退出级联、状态融合和线程架构。
-- [agents/process_watch.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/agents/process_watch.py) — Windows process handle 阻塞退出观察器。
-- [agents/terminal_uia.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/agents/terminal_uia.py) — 单 MTA UIA observer、事件订阅、可见文本读取预算。
-- [agents/terminal_resolver.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/agents/terminal_resolver.py) — window-only 与 observation-only 双绑定解析。
-- [pet/app.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/pet/app.py) — tray menu、Agents 唤醒菜单和应用生命周期。
-- [pet/petwindow.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/pet/petwindow.py) — 桌宠 Tk popup menu 的当前实现。
-- [pet/animator.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/pet/animator.py) — SharedAnimationCache、单 scheduler 与缓存预算。
-- [pet/icon.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/pet/icon.py) — 程序化原创小猫 renderer，可作为公开发行 fallback skin 源。
-- [pet/autostart.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/pet/autostart.py) — HKCU Run 健康校验与当前解释器路径生成。
-- [tests/benchmark_monitor.py @ v4.3.0](https://github.com/invincible-summer/Deskpet-For-Agents/blob/39941c2815581eadf948ab8e4e90d82eb1c52207/tests/benchmark_monitor.py) — Monitor/UIA 有界队列和资源预算基准。
+## DeskPet current implementation baseline
 
-## v4.3.1 reliability closure（DP43-R14..R22）上游依据
+- [DeskPet current audited commit `9635e1b`](https://github.com/invincible-summer/Deskpet-For-Agents/commit/9635e1bac225378fd120e32f0a6f89512da46069) — v4.4.0 plan baseline.
+- [AGENTS.md @ `9635e1b`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/AGENTS.md) — project-wide passive-monitoring, safety/privacy, plan and acceptance contract.
+- [README.md @ `9635e1b`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/README.md) — current supported Agents/product behavior.
+- [agents/models.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/models.py) — current process-centric AgentInstance/Observation/AgentTarget model; v4.4 adds Desktop logical-session identity here.
+- [agents/discovery.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/discovery.py) — current one-pass Windows/WSL process discovery; current broad `codex*.exe` classification is the desktop/CLI ambiguity v4.4 must remove.
+- [agents/base.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/base.py) — current bounded file watcher, mutual-unique process/session binding and late-start fallback. Remains CLI-specific in v4.4.
+- [agents/codex.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/codex.py) — existing Codex rollout state parser reused by Codex Desktop exact rollout paths.
+- [agents/monitor.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/monitor.py) — current process/session/terminal evidence orchestration; v4.4 inserts DesktopSessionSource before StateReducer.
+- [agents/state.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/state.py) — state precedence/TTL; retained unchanged.
+- [agents/paths.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/paths.py) — canonical data roots / containment rules.
+- [agents/tailer.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/tailer.py) — bounded incremental file tailer.
+- [agents/process_watch.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/process_watch.py) — single blocking Windows process-exit watcher reused for DesktopHost leases.
+- [agents/terminal_uia.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/terminal_uia.py) — current single-MTA, event-driven UIA observer and bounded visible-text reads.
+- [agents/terminal_resolver.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/terminal_resolver.py) — terminal-only binding boundary retained by v4.4.
+- [agents/terminal_service.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/terminal_service.py) — terminal observation/activation service; Desktop surface must not be routed here.
+- [actions/winkeys.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/actions/winkeys.py) — fail-closed HWND/PID/create-time validation and no input injection.
+- [pet/app.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/pet/app.py) — startup/shutdown and activation dispatch integration point.
+- [pet/config.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/pet/config.py) — config v5, runtime identity non-persistence, monitor cadence clamps, eligible kinds.
+- [pet/presentation.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/pet/presentation.py) — aggregate/fleet consumes AgentTarget and should remain surface-agnostic.
+- [pet/dashboard.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/pet/dashboard.py) — ZCode eligible-kind UI integration.
+- [.github/workflows/test.yml](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/.github/workflows/test.yml) — current Windows/Python 3.12 CI and blocking benchmarks.
+- [tests/benchmark_monitor.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/tests/benchmark_monitor.py) — existing monitor resource budget.
+- [tests/benchmark_presentation.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/tests/benchmark_presentation.py) — existing concurrent presentation budget.
+- [tests/benchmark_ui_architecture.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/tests/benchmark_ui_architecture.py) — current UI scheduling/shutdown budget.
 
-- [Notifications and the Notification Area](https://learn.microsoft.com/en-us/windows/win32/shell/notification-area) — 任务栏通知区 context menu 的官方交互模型（TrackPopupMenu 前的前台准备、菜单结束后 NIM_SETFOCUS）。
-- [Shell_NotifyIconW](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyiconw) — NIM_ADD/NIM_MODIFY/NIM_DELETE/NIM_SETFOCUS/NIM_SETVERSION 消息语义与返回值合同；NIM_SETVERSION 必须在每次 NIM_ADD 后调用。
-- [NOTIFYICONDATAW](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-notifyicondataw) — NOTIFYICON_VERSION_4 回调组成：LOWORD(lParam)=通知事件（WM_CONTEXTMENU/NIN_SELECT/NIN_KEYSELECT/鼠标消息）、HIWORD(lParam)=icon id、wParam=锚点坐标；NIF_SHOWTIP 保留标准 tooltip。
-- [TrackPopupMenuEx](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-trackpopupmenuex) — TPM_RETURNCMD 返回所选 command id（0=取消）；native HMENU 生命周期。
-- [EndMenu](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-endmenu) — 结束“调用线程”的活动菜单（WM_CANCELMODE 仅为文档回退路径）；托盘 worker 在 wndproc 收到 WM_CANCELMODE/WM_APP_QUIT 时自行调用，保证菜单真实跟踪被授予前台时 request_stop 仍在 shutdown 预算内到达 STOPPED。
-- [DestroyMenu](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-destroymenu) — root menu 销毁递归释放 submenus；菜单资源不依赖 GC。
-- [DestroyIcon](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-destroyicon) — 文件加载（非 shared）icon 由调用方释放；shared icon（LoadIconW 所得）不得 Destroy。
-- [WM_CONTEXTMENU](https://learn.microsoft.com/en-us/windows/win32/menurc/wm-contextmenu) — v4 Shell 对鼠标右键与键盘 context selection 统一发送 WM_CONTEXTMENU（替代 legacy WM_RBUTTONDOWN/UP 组合）的依据。
-- [CreateWindowExW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createwindowexw) / [GetModuleHandleW](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandlew) / [LoadImageW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadimagew) — tray worker 隐藏窗口与 HICON 的 64 位 ABI 原型声明依据（handle 返回值不得依赖 ctypes 默认 C int restype）。
-- [Python 3.12 ctypes](https://docs.python.org/3.12/library/ctypes.html) — 未声明 restype 的 foreign function 默认按 C int 处理（指针截断风险）。
-- [Tk `tk_popup`](https://www.tcl-lang.org/man/tcl9.1/TkCmd/popup.html) — Tk popup menu 的 traversal/lifecycle 入口；DP43-R14 的 deferred-after-teardown 菜单语义基础。
+## Codex Desktop — official product contracts
 
-## Historical baselines
+- **Official contract** — [Introducing the Codex app](https://openai.com/index/introducing-the-codex-app/) — Codex app is designed to manage multiple agents in parallel; page includes the March 4, 2026 Windows availability update.
+- **Official contract** — [Using Codex with your ChatGPT plan](https://help.openai.com/en/articles/11369540) — current supported Codex clients include ChatGPT desktop app (Codex mode), CLI, IDE and web; Windows local Codex behavior is part of the same product family.
+- **Official contract** — [ChatGPT Work and Codex](https://help.openai.com/en/articles/20001275/) — current ChatGPT desktop app exposes Codex as a separate local desktop view; history is separate from ordinary ChatGPT history.
+- **Official contract** — [Codex App Server](https://learn.chatgpt.com/docs/app-server) — thread/turn/item model, initialize handshake, `thread/read`, `thread/list`, `thread/loaded/list`, runtime thread status, `thread/status/changed`, approvals/server requests and transport behavior. Important research source, but not used as a v4.4 production monitoring control plane because initialization is not side-effect-free in the current upstream implementation.
 
-- [DeskPet v4.2.2 audit baseline commit](https://github.com/invincible-summer/Deskpet-For-Agents/commit/3d0ab8e515cd79fa703ee62138789b00f3c8f474) — v4.2.3 计划所依据的固定代码基线（历史追溯）。
+## Codex — audited upstream implementation snapshot
 
-## Windows Terminal / Win32 / UI Automation
+The following links pin the upstream code audited for this plan to `openai/codex@654b0a77d0d2f81aa21f61caf7af4be88fe550bb`. These are implementation evidence, not immutable public API contracts.
 
-- [Windows Terminal command-line arguments](https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments) — `wt` 的 window/tab 命令能力与不能作为 exact runtime identity 的边界。
-- [microsoft/terminal#19783](https://github.com/microsoft/terminal/issues/19783) — 外部进程缺少稳定 `WT_SESSION → existing tab` 激活接口的能力缺口。
-- [microsoft/terminal#19818](https://github.com/microsoft/terminal/issues/19818) — Windows Terminal 缺少公开 tab/state query 接口的能力缺口。
-- [microsoft/terminal#18692](https://github.com/microsoft/terminal/issues/18692) — `focus-tab` 有 index 执行接口但缺乏可靠 selected-tab query。
-- [microsoft/terminal#18429](https://github.com/microsoft/terminal/issues/18429) — 仅 foreground 顶层窗口不等价于恢复正确 Tab。
-- [Windows Terminal TabManagement.cpp](https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalApp/TabManagement.cpp) — 当前 Tab selection/XAML content attach 行为的上游实现参考。
-- [Windows Terminal ConptyConnection.cpp](https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalConnection/ConptyConnection.cpp) — `WT_SESSION` 等 session environment 的上游实现来源。
-- [Windows Terminal AppCommandlineArgs.cpp](https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalApp/AppCommandlineArgs.cpp) — 当前 focus-tab/focus-pane/move-focus 命令解析实现。
-- [Windows Terminal README / OpenConsole](https://github.com/microsoft/terminal) — OpenConsole/ConPTY 与 Windows Terminal 的总体进程架构说明。
-- [Default Terminal spec #492](https://github.com/microsoft/terminal/blob/main/doc/specs/%23492%20-%20Default%20Terminal/spec.md) — 说明 terminal/console server 解耦以及依赖 process-tree spelunking 的可靠性风险。
-- [ClosePseudoConsole](https://learn.microsoft.com/en-us/windows/console/closepseudoconsole) — 关闭 ConPTY 会向连接客户端发送 CTRL_CLOSE_EVENT，但客户端可继续存活一段时间。
-- [UI Automation threading](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading) — UIA client 使用独立非 UI MTA、同线程管理 event handler 的官方指导。
-- [IUIAutomationElement::GetRuntimeId](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-getruntimeid) — RuntimeId 只适合作 runtime-only opaque identity。
-- [IUIAutomationSelectionItemPattern::Select](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationselectionitempattern-select) — v4.1 历史 Tab 选择方案的公开 UIA 语义，v4.1.2 后已弃用为产品导航合同。
-- [IUIAutomationSelectionItemPattern](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nn-uiautomationclient-iuiautomationselectionitempattern) — v4.1 历史 SelectionItemPattern 能力参考。
-- [UI Automation Event IDs](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-event-ids) — UIA 标准事件 ID 参考。
-- [IUIAutomationElement::SetFocus](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-setfocus) — v4.1 历史 Pane focus 方案语义，当前 window-only 激活不依赖它。
-- [SetForegroundWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow) — Windows 前台抢占策略与可能被 OS 拒绝的合同。
-- [FlashWindowEx](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-flashwindowex) — foreground 被拒时的非侵入任务栏提醒能力。
-- [GetWindowThreadProcessId](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowthreadprocessid) — HWND 属主 PID 校验依据。
-- [GetClassNameW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclassnamew) — WindowIdentity 的窗口类校验依据。
-- [SetWindowPos](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos) — DeskPet 自身 Z-order 调整且配合 SWP_NOACTIVATE 的依据。
-- [Terminating a Process](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process) — process 终止后 process object 变 signaled 的官方语义。
-- [OpenProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess) — WindowsExitWatcher 获取 SYNCHRONIZE process handle 的接口。
-- [WaitForMultipleObjects](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects) — 多 process handle 阻塞等待以及 pending wait 时关闭 handle 属 undefined behavior 的合同。
-- [Run and RunOnce Registry Keys](https://learn.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys) — HKCU Run 自启动和 260 字符 command-line 限制。
-- [MonitorFromWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfromwindow) — 多显示器窗口归属参考。
-- [MonitorFromPoint](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfrompoint) — 多显示器位置恢复参考。
-- [GetMonitorInfoW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmonitorinfow) — monitor work area 读取依据。
-- [GetDpiForWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdpiforwindow) — 每 Pet/窗口 DPI 读取依据。
+- **Upstream implementation** — [state migration 0001: threads table](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/state/migrations/0001_threads.sql) — `id`, `rollout_path`, `updated_at`, `source`, `cwd`, `title`, `approval_mode`, `has_user_event`, `archived`, etc.
+- **Upstream implementation** — [state migration 0030: `thread_source`](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/state/migrations/0030_threads_thread_source.sql) — root/user vs generated thread filtering evidence.
+- **Upstream implementation** — [state migration 0053: `originator`](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/state/migrations/0053_threads_originator.sql) — client-origin metadata used as positive Desktop provenance when present.
+- **Upstream implementation** — [originator tags](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/otel/src/metrics/tags.rs) — current known originators include `codex_desktop`, CLI/TUI/VSCode families.
+- **Upstream implementation** — [default client/originator logic](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/login/src/auth/default_client.rs) — current first-party/originator behavior and desktop-related values.
+- **Upstream implementation** — [rollout persistence policy](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/rollout/src/policy.rs) — durable turn markers vs transient non-persisted approval/input events. This is the key reason v4.4 must not infer hidden approval from rollout silence.
+- **Upstream implementation** — [App Server thread data](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs) — thread object/status/source shapes.
+- **Upstream implementation** — [ThreadWatchManager](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server/src/thread_status.rs) — runtime `waitingOnApproval` / `waitingOnUserInput` facts and `thread/status/changed`.
+- **Upstream implementation** — [App Server transport routing](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server/src/transport.rs) — notifications broadcast to initialized connections unless opted out.
+- **Upstream implementation** — [App Server initialize processor](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server/src/request_processors/initialize_processor.rs) — critical safety finding: ordinary client initialize can mutate process-global client metadata / `USER_AGENT_SUFFIX`; only internal non-originating client names are exempt. Therefore DeskPet v4.4 does not attach as a live observer.
+- **Upstream implementation** — [control socket transport](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server-transport/src/transport/unix_socket.rs) — App Server control socket uses WebSocket over UDS.
+- **Upstream implementation** — [cross-platform UDS](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/uds/src/lib.rs) — Windows protected socket-directory DACL and peer-security implementation.
+- **Upstream implementation** — [App Server daemon/control socket](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server-daemon/src/lib.rs) — control socket/daemon lifecycle evidence.
 
-## WSL / Linux process semantics
+## Codex — empirical multi-client / desktop issues
 
-- [/proc/PID/stat](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html) — PPID、process group、session、controlling terminal、TPGID、starttime 和 dead/zombie state 的定义。
-- [/proc/PID/cwd](https://man7.org/linux/man-pages/man5/proc_pid_cwd.5.html) — WSL Agent cwd/project evidence 的内核接口。
-- [ps(1)](https://man7.org/linux/man-pages/man1/ps.1.html) — `tty/tpgid/stat` 等 process table 字段的用户态定义。
-- [credentials(7)](https://man7.org/linux/man-pages/man7/credentials.7.html) — session、process group、controlling terminal 与 foreground/background group 语义。
-- [tty(4)](https://man7.org/linux/man-pages/man4/tty.4.html) — controlling terminal、detach 与 hangup 相关终端语义。
-- [WSL basic commands](https://learn.microsoft.com/en-us/windows/wsl/basic-commands) — `wsl --list --running` 等发行版生命周期命令。
-- [WSL configuration](https://learn.microsoft.com/en-us/windows/wsl/wsl-config) — WSL VM/distribution 生命周期与停止行为参考。
+Issues are useful evidence of real behavior and capability gaps; they are not stable contracts.
 
-## Agent upstream references
+- **Empirical issue** — [openai/codex#40134 — Allow Codex Desktop to connect to an externally managed App Server](https://github.com/openai/codex/issues/40134) — illustrates that transport multi-connection and full Desktop multi-client ownership are not the same guarantee; approval/active-writer ownership needs explicit semantics.
+- **Empirical issue** — [openai/codex#37967 — Remote Control cannot attach reliably to an already-live CLI session](https://github.com/openai/codex/issues/37967) — further evidence that secondary-client semantics must not be assumed.
+- **Empirical issue** — [openai/codex#20864](https://github.com/openai/codex/issues/20864) — evidence around shared local session history / scaling cost when broad-scanning rollouts.
+- **Empirical issue** — [Windows Terminal #19783](https://github.com/microsoft/terminal/issues/19783) — still relevant to CLI activation: no reliable external `WT_SESSION -> exact existing tab` activation contract.
 
-- [Codex protocol.rs](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/protocol.rs) — Codex `task_started/turn_started`、collaboration mode 等当前 rollout/protocol 类型来源。
-- [openai/codex#14962](https://github.com/openai/codex/issues/14962) — terminal close 后 Codex wrapper/runtime orphan、PTY revoked/EIO spin 的上游缺陷证据。
-- [anthropics/claude-code#21287](https://github.com/anthropics/claude-code/issues/21287) — terminal close 后 Claude orphan 且 `PPID=1/TTY=??` 的直接复现证据。
-- [anthropics/claude-code#53037](https://github.com/anthropics/claude-code/issues/53037) — `/clear` 后 PID registry sessionId stale、旧 JSONL 冻结而新 JSONL 增长的直接证据。
-- [Kimi data locations](https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/configuration/data-locations.md) — `$KIMI_CODE_HOME`、session_index 与 `sessions/<workDirKey>/<sessionId>` 布局。
-- [Kimi interactionOps.ts](https://github.com/MoonshotAI/kimi-code/blob/main/packages/agent-core-v2/src/agent/interaction/interactionOps.ts) — durable `interaction.request/resolved` 及 approval/question/user_tool schema。
-- [Kimi promptOps.ts](https://github.com/MoonshotAI/kimi-code/blob/main/packages/agent-core-v2/src/agent/prompt/promptOps.ts) — durable `prompt.accepted` 当前 schema。
-- [Kimi session-store.ts](https://github.com/MoonshotAI/kimi-code/blob/main/apps/vis/server/src/lib/session-store.ts) — canonical `<sessionDir>/state.json` 与 session directory 读取逻辑。
-- [pi session format](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/session.md) — pi v3 JSONL 路径、session version、assistant/toolResult message 结构。
-- [pi AI types](https://github.com/badlogic/pi-mono/blob/main/packages/ai/src/types.ts) — `stopReason=stop|length|toolUse|error|aborted` 与独立 ToolResultMessage 类型。
-- [pi settings](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/settings.md) — pi sessionDir 与 `PI_CODING_AGENT_SESSION_DIR` 配置来源。
+## ZCode — official product contracts
 
-## Tk / Python / public distribution
+- **Official contract** — [Install](https://zcode.z.ai/en/docs/install) — current ZCode desktop platform support including Windows.
+- **Official contract** — [ZCode Agent / Side Conversation](https://zcode.z.ai/en/docs/agents) — Side Conversation is desktop-only, fully capable, permission-aware, per-window, temporary and not part of normal task history.
+- **Official contract** — [Safety Confirmation](https://zcode.z.ai/en/docs/safety-confirm) — permission requests pause the task, are task-scoped, remain pending when navigating away, and can appear as waiting confirmation in the sidebar.
+- **Official contract** — [Usage Stats](https://zcode.z.ai/en/docs/usage-stats) — App Usage reads local ZCode session records on the current device; confirms the existence/usefulness of a local persistent session data plane.
+- **Official contract** — [Hooks](https://zcode.z.ai/en/docs/hooks) — Hooks are a configurable local subprocess protocol and require configuration such as `~/.zcode/cli/config.json` / `hooks.enabled`; permission hooks can affect behavior. Explicitly excluded from DeskPet's zero-configuration observer architecture.
+- **Official contract** — [Subagents](https://zcode.z.ai/en/docs/subagents) — ZCode can run foreground/background subagents in parallel; DeskPet treats these as internal work of the parent task, not user conversations/pets.
+- **Official contract** — [Plugin](https://zcode.z.ai/en/docs/plugin) — plugins can bundle hooks/MCP/subagents. DeskPet does not require a plugin for monitoring.
 
-- [Tk `tk_popup`](https://www.tcl-lang.org/man/tcl9.1/TkCmd/popup.html) — popup menu 及其 cascaded children 的标准 traversal/lifecycle 入口。
-- [Python venv 3.12](https://docs.python.org/3.12/library/venv.html) — Windows repo-local `.venv/Scripts` 与无需 activate 即可调用环境解释器的官方说明。
-- [Python on Windows](https://docs.python.org/3/using/windows.html) — Windows Python/launcher 发现与版本选择参考。
-- [Windows `start`](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/start) — `Start-Desktop.bat` 的 `start "" /D ...` 命令语义与 quoted title 规则。
-- [GitHub Releases](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases) — tag-based public release 和 release asset 的官方工作流。
-- [GitHub source archives](https://docs.github.com/en/repositories/working-with-files/using-files/downloading-source-code-archives) — clean source archive/reproducibility 与 release 的区别。
+## ZCode — third-party reverse evidence
 
-## UI guidance retained by the project
+These sources demonstrate current implementation details but are not official ZCode API contracts. Production code must feature-detect and fail closed when the schema changes.
 
-- [NavigationView guidance](https://learn.microsoft.com/en-us/windows/apps/design/controls/navigationview) — Dashboard 左侧顶级导航的信息架构参考，不要求迁移 WinUI。
-- [App settings guidelines](https://learn.microsoft.com/en-us/windows/apps/design/app-settings/guidelines-for-app-settings) — Dashboard settings 页面布局与可滚动宽度参考。
-- [Accessible text requirements](https://learn.microsoft.com/en-us/windows/apps/design/accessibility/accessible-text-requirements) — 状态文字可读性、contrast 与不只依赖颜色表达状态的依据。
+- **Third-party reverse evidence** — [yiyanwannian/zcode-monitor @ `fe8857f`](https://github.com/yiyanwannian/zcode-monitor/tree/fe8857f23708e7b45b6bbb00a075021ddb799984) — independent read-only ZCode local monitoring implementation.
+- **Third-party reverse evidence** — [zcode-monitor `server/db.js`](https://github.com/yiyanwannian/zcode-monitor/blob/fe8857f23708e7b45b6bbb00a075021ddb799984/server/db.js) — current `~/.zcode/cli/db/db.sqlite` location and observed session/model/tool/turn database usage.
+- **Third-party reverse evidence / negative design reference** — [zcode-monitor `server/zcode-runtime.js`](https://github.com/yiyanwannian/zcode-monitor/blob/fe8857f23708e7b45b6bbb00a075021ddb799984/server/zcode-runtime.js) — documents current WAL behavior but opens a writable connection after ZCode exit to checkpoint. DeskPet deliberately does **not** adopt that behavior.
+- **Third-party reverse evidence** — [zcode-acp](https://github.com/coder/zcode-acp) — evidence that private ZCode agent/app-server permission flows are bidirectional control requests. Useful for understanding why DeskPet must not attach to the private control plane as a silent observer.
+
+## SQLite read-only concurrency references
+
+- **Official contract** — [SQLite URI filenames](https://www.sqlite.org/uri.html) — `mode=ro`; also explains `nolock` risks. DeskPet uses read-only URI mode and does not use `nolock`.
+- **Official contract** — [SQLite `PRAGMA query_only`](https://www.sqlite.org/pragma.html#pragma_query_only) — defense-in-depth read-only connection behavior.
+- **Official contract** — [SQLite Write-Ahead Logging](https://www.sqlite.org/wal.html) — WAL readers/writers, checkpoint behavior and constraints. DeskPet reads a live WAL DB but never checkpoints or repairs it.
+- **Python contract** — [Python 3.12 `sqlite3`](https://docs.python.org/3.12/library/sqlite3.html) — stdlib database client used to avoid a new runtime dependency.
+
+## Windows UI Automation / activation / process-liveness references
+
+- **Official contract** — [UI Automation threading](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading) — UIA clients should use a dedicated non-UI MTA thread and manage event handlers there.
+- **Official contract** — [UI Automation Event IDs](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-event-ids) — event-driven observer reference.
+- **Official contract** — [IUIAutomationElement::GetRuntimeId](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-getruntimeid) — runtime-only opaque identity; not persisted.
+- **Official contract** — [SetForegroundWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow) — foreground restrictions.
+- **Official contract** — [FlashWindowEx](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-flashwindowex) — non-invasive fallback when foreground activation is denied.
+- **Official contract** — [GetWindowThreadProcessId](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowthreadprocessid) — HWND owner verification.
+- **Official contract** — [GetClassNameW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclassnamew) — window-class identity evidence.
+- **Official contract** — [OpenProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess) — SYNCHRONIZE process-handle acquisition.
+- **Official contract** — [WaitForMultipleObjects](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects) — shared blocking process-exit watcher.
+- **Official contract** — [Terminating a Process](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process) — terminated process object becomes signaled.
+
+## Windows Terminal / WSL references retained for mixed CLI + Desktop behavior
+
+- [Windows Terminal command-line arguments](https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments)
+- [microsoft/terminal#19783](https://github.com/microsoft/terminal/issues/19783)
+- [microsoft/terminal#19818](https://github.com/microsoft/terminal/issues/19818)
+- [microsoft/terminal#18692](https://github.com/microsoft/terminal/issues/18692)
+- [Default Terminal spec #492](https://github.com/microsoft/terminal/blob/main/doc/specs/%23492%20-%20Default%20Terminal/spec.md)
+- [`/proc/PID/stat`](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html)
+- [`/proc/PID/cwd`](https://man7.org/linux/man-pages/man5/proc_pid_cwd.5.html)
+- [`ps(1)`](https://man7.org/linux/man-pages/man1/ps.1.html)
+- [WSL basic commands](https://learn.microsoft.com/en-us/windows/wsl/basic-commands)
+
+## Existing Agent upstream references retained
+
+- [Codex protocol.rs](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/protocol.rs)
+- [anthropics/claude-code#53037](https://github.com/anthropics/claude-code/issues/53037)
+- [Kimi data locations](https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/configuration/data-locations.md)
+- [Kimi interactionOps.ts](https://github.com/MoonshotAI/kimi-code/blob/main/packages/agent-core-v2/src/agent/interaction/interactionOps.ts)
+- [Kimi promptOps.ts](https://github.com/MoonshotAI/kimi-code/blob/main/packages/agent-core-v2/src/agent/prompt/promptOps.ts)
+- [pi session format](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/session.md)
+- [pi AI types](https://github.com/badlogic/pi-mono/blob/main/packages/ai/src/types.ts)
+
+## Source interpretation rules for 4.4.0
+
+1. Official product/API documentation defines intended behavior.
+2. Upstream source at a pinned commit can justify an implementation strategy, but its private details must be capability-detected.
+3. GitHub issues provide empirical failure/compatibility evidence, not API guarantees.
+4. Third-party reverse-engineered ZCode schema is a probe target, not a compile-time contract.
+5. If an implementation detail conflicts with DeskPet's passive/no-side-effect contract, DeskPet must decline that path even if it exposes richer state.
+6. Ambiguous identity/status must degrade to UNKNOWN/WORKING rather than be guessed.
+7. No source justifies hooks, Agent configuration changes, input injection, DB writes, WAL checkpointing, memory injection, or automatic approval.

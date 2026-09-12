@@ -1,17 +1,20 @@
-# DeskPet V4.3.1 — 被动 Agent 观察桌宠（终端窗口唤起 + 并发呈现 + 非阻塞多皮肤 UI）
+# DeskPet V4.4.0 — 被动 Agent 观察桌宠（终端 + Codex/ZCode 桌面端 + 窗口唤起 + 并发呈现）
 
-一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
+一只常驻桌面的自定义桌宠，**被动观察**你已经在 Windows / WSL 终端里启动的 AI 编码 Agent（**Codex / Claude Code / Kimi / pi**），以及 **Codex Desktop（含 ChatGPT 桌面端 Codex 模式）与 ZCode Desktop** 里的并行桌面会话；自动识别 Agent、项目、WSL 发行版、会话与终端，实时展示 Goal、Mode（Plan/Default…）、Thinking / Reading / Coding / Testing / Waiting Approval 等状态，并映射到桌宠动画和气泡。
+
+**V4.4 桌面端监听概览**：同一 Codex Desktop / ZCode Desktop 宿主下至少 3 个并行逻辑会话各自成为独立目标（聚合/多宠均可消费），终端 CLI 与桌面会话同 thread 自动去重（terminal exact binding 优先）；数据面全部只读——Codex 读自己的 `state_N.sqlite` threads 目录 + exact rollout JSONL（复用 CLI 解析器），ZCode 读 `~/.zcode/cli/db/db.sqlite` 的 root task / model / tool / turn 表；ZCode 的 permission 确认可精确映射 WAITING。零配置：不需要 hook、插件、MCP、代理脚本，也不改 Agent 启动方式；绝不连接 Codex App Server / ZCode 私有控制面，绝不写任何 Agent 数据库，绝不 checkpoint WAL。
 
 DeskPet 不创建、不托管、不控制任何 Agent：不配置 hooks、不注入进程、不发送键盘事件、不自动审批。
 
 **终端唤起语义（V4.1.3，v3-compatible 被动 heuristic；V4.1.4 增强）**：DeskPet 的 Terminal window wake 使用被动启发式——Windows native 优先使用进程祖先关系（多个候选窗口时再按标题/屏幕证据细分）；WSL 使用当前可观察 TermControl 标题**与每 control 最近一次可见屏幕文本的内存摘要**（V4.1.4：标题常停在 profile 名如 "Ubuntu"，屏幕上的项目路径/Agent 标识才能把多个窗口区分开）做 kind/cwd/user/distro 评分。高置信匹配失败但仍有一个 v3 best-positive control 时，DeskPet 可以把它所属的顶层 Terminal window 作为用户显式唤起候选；这不会自动授予 Terminal text/approval attribution。屏幕摘要只在内存参与评分（产出 int 分数与证据 token），绝不进入绑定、日志或配置。DeskPet 不切换 Tab/Pane，也不发送键盘输入。Windows Terminal 目前没有稳定的公开"按 `WT_SESSION` 激活既有标签页"接口（[microsoft/terminal#19783](https://github.com/microsoft/terminal/issues/19783)，closed/not_planned），因此只承诺 window 级唤起；候选窗口经 `WindowIdentity`（HWND+PID+进程创建时间+窗口类）校验后才动作，OS 拒绝抢前台时闪烁任务栏提醒，绝不绕过。
 
-V4.3 的能力概览：
+V4.3/V4.4 的能力概览：
 
 1. **终端窗口唤起**：点击某 Agent 时恢复并前置它所在的 Windows Terminal 顶层窗口；窗口归属用 `WindowIdentity`（HWND+PID+进程创建时间+窗口类）安全校验，stale 即 fail-closed；OS 拒绝抢前台时闪烁任务栏提醒，绝不绕过系统策略（无键盘注入、无剪贴板注入）。
 2. **并行监听 + 呈现模式**：并行监听默认开启；每次 DeskPet 启动固定进入"单宠聚合"（一只桌宠把各 Agent 的卡片叠成一摞气泡，V4.1.4，双击对应气泡唤起对应终端）。用户可以在本次运行内切换非并发 / 单宠聚合 / 多宠分离（多宠分离：每个 Agent 一只桌宠，**自动绑定**现有 Agent，普通空 slot 不产生额外桌宠——不是"设了 3 就唤起 3 只"）；重启再次回到并行监听 + 单宠聚合。除用户显式隐藏外不会出现 0 桌宠：整个 Fleet 0 Agent / 0 binding 时仍保留 pet-1 idle fallback。
 3. **可靠设置持久化 + 自启修复**：设置写入失败会明确提示；开机自启能识别"注册路径已失效"并一键修复。
-4. **精确退出生命周期**：Agent CLI 进程退出即从列表消失（terminal/shell 还开着也不会"复活"）；Windows 上事件驱动、零轮询。
+4. **精确退出生命周期**：Agent CLI 进程退出即从列表消失（terminal/shell 还开着也不会"复活"）；Windows 上事件驱动、零轮询；桌面宿主退出时其全部逻辑会话原子移除。
+5. **桌面会话监听（V4.4）**：Codex Desktop（含 ChatGPT 桌面端 Codex 模式）与 ZCode Desktop 的并行逻辑会话各自成为独立目标；同一 thread/session 被终端 CLI 认领时自动去重（terminal 优先，CLI 退出后桌面自动接管）；宿主收敛——Electron/app-server helper 进程永不形成目标；ZCode subagent 归并父任务不膨胀宠物。
 
 ```
 Process tells us WHO.          /proc + psutil（含 cwd/tty/uid/启动 token）
@@ -36,7 +39,7 @@ DeskPet only observes.         桌宠动画 + 气泡 + 仪表盘
 - 并发 AGGREGATE（单宠聚合）：每张候选卡在**同一桌宠上叠成一摞气泡**（V4.1.4——最底一张带指向桌宠的倒三角尾巴，上方卡片无尾巴、卡片间只留小间隔）；**双击对应气泡 → 唤起该气泡对应 Agent 的 Terminal**；双击桌宠 → 只互动。唤起结果（如"已打开终端"）**只显示在被双击的那张气泡上**，其他气泡不受影响、叠层不收起（V4.1.4）
 - 并发 FLEET（多宠分离）：双击各自的桌宠或气泡 → 唤起各自 Agent 的 Terminal
 
-气泡/桌宠单击不激活。仪表盘卡片"打开终端"按钮与托盘 Agents 子菜单同样按 exact agent_key 唤起。托盘左键 = 显示/恢复桌宠（绝不隐藏已可见的桌宠），右键/键盘菜单键 = native context menu。
+气泡/桌宠单击不激活。仪表盘卡片"打开终端"按钮与托盘 Agents 子菜单同样按 exact agent_key 唤起。**桌面会话（Codex/ZCode Desktop）的唤起是 app 级**：恢复并前置宿主应用主窗口（身份经 PID+进程创建时间+窗口类校验），不承诺跳转到具体对话——上游没有公开稳定的会话级导航接口，DeskPet 不猜测。托盘左键 = 显示/恢复桌宠（绝不隐藏已可见的桌宠），右键/键盘菜单键 = native context menu。
 
 ## 功能
 
@@ -86,6 +89,8 @@ Start-Desktop.bat
 | Claude Code | `$CLAUDE_CONFIG_DIR`（默认 `~/.claude`） | `permission-mode` → 六种模式；`sessions/<pid>.json` 为强 hint（/clear 后自动切换新 transcript） |
 | Kimi | `$KIMI_CODE_HOME`（默认 `~/.kimi-code`，legacy `~/.kimi` 兜底） | `session_index.jsonl` 按 cwd 精确定位（sessionDir 受 containment 校验）；`state.json.lastPrompt` + `prompt.accepted` → Goal；`plan_mode.enter/exit`（EXACT）；wire `interaction.request(kind=approval/question/user_tool)`（EXACT）+ legacy `ApprovalRequest` 兜底 |
 | pi | `~/.pi/agent/sessions`（可用 `PI_CODING_AGENT_SESSION_DIR` 覆盖） | assistant `stopReason`（stop/length/toolUse/error/aborted）驱动 turn 生命周期；独立 `role=toolResult` message 是活动证据（工具失败 ≠ Agent ERROR） |
+| Codex Desktop | `state_N.sqlite`（threads 表，只读）+ exact rollout JSONL | threads capability 探测（archived/has_user_event/thread_source/originator 过滤）；rollout 复用 CLI 解析器（task_started/complete/aborted durable 语义）；审批事件上游明确 transient 不落盘 → 不从静默合成 WAITING |
+| ZCode Desktop | `~/.zcode/cli/db/db.sqlite`（只读） | root task catalog（subagent_child 排除，child 活动归并父任务）；`tool_usage.approval_status='requested'+running` → WAITING/EXACT（行级归属，resolved 由行状态闭合）；turn completed/error → DONE/ERROR 展示窗口 |
 
 3. **终端 UIA**（`agents/terminal_uia.py`，观察专用）：独立 MTA 线程（comtypes `CUIAutomation8`/`IUIAutomation5`），订阅 TermControl 的 Notification（2022 起携带新增文本）+ TextChanged（0.15s debounce 的有界审批 fallback）+ 窗口级 StructureChanged（control 开合立即重发现，20s 周期仅为兜底）；弱触发词命中才读 `GetVisibleRanges()` 当前可见区域；审批识别要求**标题模式 + 选项结构同时出现**且识别器种类与绑定 Agent 一致；内存边界：delta≤2048 / ring≤8192 / control≤16 / 事件队列≤256 / UIA 命令队列≤32 / 可见读取全局≤6/s（单 control≥0.5s 间隔）。
 
@@ -135,12 +140,18 @@ agents/
   codex.py claude.py kimi.py pi.py
   terminal_uia.py       UIA 观察器 + 审批识别器（observation-only；订阅生命周期有界）
   terminal_resolver.py  TerminalWindowResolver + TerminalObservationResolver（双链分离）
-  terminal_service.py   观察/解析/window-only 激活统一 facade
-  monitor.py            ProcessProbeWorker + Monitor Core + AgentTarget API
+  terminal_service.py   观察/解析/window-only 激活统一 facade（仅 TERMINAL）
+  desktop.py            SessionClaimKey/DesktopSourceSnapshot/source 协议
+  desktop_window.py     Desktop 宿主 app 级窗口激活（身份校验 fail-closed）
+  sqlite_ro.py          只读 SQLite substrate（mode=ro + query_only + 指纹 + schema capability）
+  codex_desktop.py      Codex Desktop 被动 source（threads catalog + exact rollout + lease）
+  zcode_desktop.py      ZCode Desktop 被动 source（schema adapter/catalog/state projector）
+  monitor.py            ProcessProbeWorker + Monitor Core + AgentTarget API（desktop source 编排）
   tailer.py summarize.py
 actions/winkeys.py      仅窗口唤起（公共 Win32 + WindowIdentity 属主 PID/创建时间/窗口类
                         一致性验证，fail-closed；无任何键盘注入）
 tools/convert.py                    素材→透明GIF 管线
+tools/desktop_source_probe.py       Codex/ZCode 桌面数据面只读实机 probe（输出脱敏）
 tools/terminal_window_probe.py      WT 窗口 list/validate/activate 实机 probe
 tools/terminal_observer_probe.py    UIA 观察（observation-only）实机 probe
 tests/                              单元/隐私/UIA/匹配/基准/实机回归
@@ -152,7 +163,8 @@ tests/                              单元/隐私/UIA/匹配/基准/实机回归
 ```jsonc
 {
   "monitor": {
-    "agents": { "claude": true, "codex": true, "kimi": true, "pi": true },
+    "agents": { "claude": true, "codex": true, "kimi": true, "pi": true,
+                "zcode": true },
     "windows_enabled": true, "wsl_enabled": true,
     "windows_scan_sec": 3.0, "wsl_scan_sec": 3.0,
     "file_poll_sec": 0.5, "session_scan_sec": 3.0,
@@ -177,20 +189,24 @@ tests/                              单元/隐私/UIA/匹配/基准/实机回归
 .venv\Scripts\python.exe -m unittest discover tests -p "test_*.py"  # 全部单元测试（479+）
 .venv\Scripts\python.exe tests\benchmark_monitor.py --ticks 5000 --report benchmark-report.json    # 合成基准（队列/预算/churn 上限）
 .venv\Scripts\python.exe tests\benchmark_presentation.py            # Presentation/Fleet/动画缓存基准（blocking）
-.venv\Scripts\python.exe testsenchmark_ui_architecture.py         # UI 架构基准：revision 驱动/dirty-view/单 worker/单 bridge（blocking）
+.venv\Scripts\python.exe tests\benchmark_ui_architecture.py         # UI 架构基准：revision 驱动/dirty-view/单 worker/单 bridge（blocking）
+.venv\Scripts\python.exe tests\benchmark_desktop_sources.py --ticks 5000 --report desktop-source-benchmark.json   # Desktop source 基准：SQL 随变更/安全刷新而非 ticks×sessions（blocking）
 .venv\Scripts\python.exe tools\terminal_window_probe.py --list      # WT 窗口实机 probe（list/validate/activate/resolve）
 .venv\Scripts\python.exe tools\terminal_observer_probe.py           # UIA 观察实机 probe（默认不打印终端原文）
 .venv\Scripts\python.exe -X utf8 tests\regression.py                # 位置/气泡/缩放/托盘/自启
 .venv\Scripts\python.exe -X utf8 tests\replay_real.py               # 真实会话数据回放
 ```
 
-CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试（含 window 激活逻辑、并发激活矩阵、source 停扫、config 运行时测试）+ monitor benchmark 5000 ticks + presentation benchmark + UI architecture benchmark（`PYTHONUTF8=1`，benchmark 报告以 artifact 上传）。真实 Windows Terminal foreground policy / UIA 事件接受度属于本机 manual acceptance：CI 只验证纯逻辑、Win32 调用契约 mock、资源边界和 UI dataflow。**Release acceptance requires GitHub Actions green**：workflow conclusion=success 是发布验收的必要条件，CI 红期间不标记版本完成。
+CI（`.github/workflows/test.yml`）：windows-latest + Python 3.12，运行 compileall + 全部单元测试（含 window 激活逻辑、并发激活矩阵、source 停扫、config 运行时测试、Desktop source 生命周期/失败降级）+ monitor benchmark + presentation benchmark + UI architecture benchmark + desktop sources benchmark（均 blocking）（`PYTHONUTF8=1`，benchmark 报告以 artifact 上传）。真实 Windows Terminal foreground policy / UIA 事件接受度属于本机 manual acceptance：CI 只验证纯逻辑、Win32 调用契约 mock、资源边界和 UI dataflow。**Release acceptance requires GitHub Actions green**：workflow conclusion=success 是发布验收的必要条件，CI 红期间不标记版本完成。
 
 ## 已知边界（如实说明）
 
-- Codex 的审批事件明确不持久化到 rollout（官方 transient 策略），因此 Codex/Claude 的"等待审批"只能来自终端 UIA 可见区域；若审批 control 无法唯一关联到 Agent（多 control/后台 tab），在"不 hooks、不控制 Agent"的约束下没有第三条可靠信息源——此时显示 UNKNOWN/工作中而不是猜（plan §55 物理边界）
+- Codex 的审批事件明确不持久化到 rollout（官方 transient 策略），因此 Codex/Claude 的"等待审批"只能来自终端 UIA 可见区域；若审批 control 无法唯一关联到 Agent（多 control/后台 tab），在"不 hooks、不控制 Agent"的约束下没有第三条可靠信息源——此时显示 UNKNOWN/工作中而不是猜（plan §55 物理边界）。**Codex Desktop 同理**：state DB + rollout 无法诚实重建隐藏会话的审批，v4.4 不从静默合成 WAITING；App Server 能提供 waitingOnApproval 但其 initialize 会改写进程级 client metadata（上游实现证实），DeskPet 明确不连接
 - Claude Code 上游存在"活跃 session transcript 不实时写出"的回归 → 终端活动观察可补充 WORKING 证据，但不伪造具体 Phase
-- Codex 桌面版不写 rollout → 只能检测进程存活（UNKNOWN）
+- Codex Desktop / ZCode Desktop 监听依赖宿主自己的本地数据面：Codex threads 表/rollout、ZCode db.sqlite。上游升级改变 schema 时按 capability 探测降级（INCOMPATIBLE_SCHEMA 诊断，保留 last good），绝不猜列
+- Codex Desktop 历史冷会话（DB 无近期更新且 rollout 无新增长）不会变成宠物；每个桌面 kind 最多同时显示 8 个活跃会话（与 Presentation 上限一致）
+- ZCode Side Conversation（临时侧对话）：当前版本没有可被动归属的稳定 session 身份，v4.4 不单独显示（不猜窗口标题/文本）；持久 task 的多并行与 permission 等待已完整支持
+- ZCode 桌面端缩到托盘后监控继续（以进程 incarnation 为准，不看窗口可见性）；宿主退出则其全部桌面会话立即移除
 - 自定义桌宠素材版权自负；`assets/pets/*`、`assets/cache/`、`config.json` 不入 git
 
 ## V3 不变量（任何实现不得违反）
