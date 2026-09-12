@@ -172,6 +172,23 @@ class CodexDesktopSourceTests(unittest.TestCase):
 
     # ---- 过滤（plan2 §7.1） ----
 
+    def test_windows_desktop_user_without_has_user_event_is_monitored(self):
+        path = self.fx.write_rollout('desktop.jsonl', active_rollout('desktop'))
+        self.fx.add_thread(_thread_row('desktop', path,
+                                      originator='Codex Desktop', source='vscode',
+                                      has_user_event=0, thread_source='user'))
+        snap = self._poll(self._source())
+        self.assertEqual(len(snap.instances), 1)
+        self.assertEqual(snap.observations[snap.instances[0].key].status,
+                         Status.WORKING)
+
+    def test_desktop_originator_does_not_admit_generated_or_empty_threads(self):
+        for tid, source in [('child', 'subagent'), ('empty', None)]:
+            path = self.fx.write_rollout(tid + '.jsonl', active_rollout(tid))
+            self.fx.add_thread(_thread_row(tid, path, originator='Codex Desktop',
+                                          has_user_event=0, thread_source=source))
+        self.assertFalse(self._poll(self._source()).instances)
+
     def test_generated_and_archived_threads_excluded(self):
         p1 = self.fx.write_rollout("s.jsonl", active_rollout("t-sub"))
         self.fx.add_thread(_thread_row("t-sub", p1,

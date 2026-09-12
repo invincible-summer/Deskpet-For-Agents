@@ -63,6 +63,7 @@ from .sqlite_ro import (
 _DESKTOP_ORIGINATORS = frozenset({
     "codex_desktop", "codex_chatgpt_desktop", "codex_work_desktop",
     "codex_atlas",
+    "codex desktop",  # Windows Desktop state_5.sqlite 实机来源名称
 })
 # thread_source（上游 migration 0030 / protocol thread_data.rs）中明确
 # 非 root/user 的 generated 值：绝不形成用户 pet。
@@ -239,7 +240,10 @@ class CodexDesktopSource(DesktopSessionSource):
         select += [c for c in _PREFERRED_COLUMNS if c in cols]
         where = ["archived = 0"]
         if "has_user_event" in cols:
-            where.append("has_user_event = 1")
+            # Desktop 用户任务可保持 has_user_event=0；明确 user 来源
+            # 同样构成候选资格，实际活动仍由 rollout 生命周期判断。
+            where.append("(has_user_event = 1 OR thread_source = 'user')"
+                         if "thread_source" in cols else "has_user_event = 1")
         if "thread_source" in cols:
             quoted = ",".join(
                 "'" + v + "'" for v in sorted(_GENERATED_THREAD_SOURCES))
@@ -289,7 +293,7 @@ class CodexDesktopSource(DesktopSessionSource):
             # 只写诊断，不自动当 Desktop
             keys = row.keys()
             if "originator" in keys:
-                originator = str(row["originator"] or "").strip()
+                originator = str(row["originator"] or "").strip().casefold()
                 if originator and originator not in _DESKTOP_ORIGINATORS:
                     continue
             rollout = self._validate_rollout_path(row["rollout_path"])
