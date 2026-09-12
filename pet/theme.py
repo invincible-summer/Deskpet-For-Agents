@@ -34,8 +34,8 @@ class Theme:
     card_radius: int = 8
 
     # 字体族
-    font_family: str = "Segoe UI Variable Text"
-    font_fallbacks: tuple = ("Segoe UI", "Microsoft YaHei UI")
+    font_family: str = "Microsoft YaHei UI"
+    font_fallbacks: tuple = ("Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei")
     mono_family: str = "Consolas"
 
 
@@ -60,8 +60,17 @@ def pick_font(root, size: int = 10, bold: bool = False, mono: bool = False):
     """按主题字体族创建 tkfont；首个可用族生效（族列表进程内缓存）。"""
     import tkinter.font as tkfont
     theme = LIGHT
+    owner = root._root()
+    cache = getattr(owner, "_deskpet_fonts", None)
+    if cache is None:
+        cache = owner._deskpet_fonts = {}
+    key = (size, bold, mono)
+    if key in cache:
+        return cache[key]
     if mono:
-        return tkfont.Font(root=root, family=theme.mono_family, size=size)
+        font = tkfont.Font(root=root, family=theme.mono_family, size=size)
+        cache[key] = font
+        return font
     families = None
     try:
         available = _available_families(root)
@@ -71,11 +80,13 @@ def pick_font(root, size: int = 10, bold: bool = False, mono: bool = False):
                 break
     except Exception:
         families = None
-    return tkfont.Font(
+    font = tkfont.Font(
         root=root,
         family=families or theme.font_fallbacks[-1],
         size=size,
         weight="bold" if bold else "normal")
+    cache[key] = font
+    return font
 
 
 STATUS_COLOR = {
@@ -87,3 +98,37 @@ STATUS_COLOR = {
     "idle": LIGHT.unknown,
     "unknown": LIGHT.unknown,
 }
+
+
+def configure_dashboard_styles(root):
+    """Named ttk styles keep dashboard controls consistent without changing the app theme."""
+    from tkinter import ttk
+    style = ttk.Style(root)
+    font = pick_font(root, 10)
+    # Retain font objects for the lifetime of the window.
+    root._dashboard_control_font = font
+    for kind in ("TButton", "TCheckbutton", "TRadiobutton", "TCombobox", "TSpinbox"):
+        name = "Dashboard." + kind
+        style.configure(name, font=font, foreground=LIGHT.text,
+                        background=LIGHT.surface, padding=(10, 7))
+        style.map(name, foreground=[("disabled", LIGHT.text_secondary)],
+                  background=[("pressed", LIGHT.nav_active_bg),
+                              ("active", LIGHT.surface_subtle)])
+    style.configure("Dashboard.Horizontal.TScale", background=LIGHT.surface,
+                    troughcolor=LIGHT.surface_subtle, borderwidth=0,
+                    lightcolor=LIGHT.accent, darkcolor=LIGHT.accent)
+    # Native Windows scale ignores palette colors; use only clam's scale
+    # elements, preserving the native theme for all other application widgets.
+    if "clam" in style.theme_names():
+        for part in ("trough", "slider"):
+            name = "Dashboard.Horizontal.Scale." + part
+            if name not in style.element_names():
+                style.element_create(name, "from", "clam", "Horizontal.Scale." + part)
+        style.layout("Dashboard.Horizontal.TScale", [
+            ("Dashboard.Horizontal.Scale.trough", {"sticky": "ew", "children": [
+                ("Dashboard.Horizontal.Scale.slider", {"side": "left", "sticky": ""})]})])
+        style.configure("Dashboard.Horizontal.TScale", background=LIGHT.accent,
+                        bordercolor=LIGHT.accent, troughcolor=LIGHT.surface_subtle,
+                        sliderlength=16, sliderthickness=16, gripcount=0)
+        style.map("Dashboard.Horizontal.TScale",
+                  background=[("active", LIGHT.nav_active_fg)])

@@ -264,7 +264,7 @@ class ScrollableFrameAdaptiveTests(unittest.TestCase):
         self.assertTrue(frame.winfo_ismapped())
 
     def test_wraplength_binding_adapts_to_width(self):
-        """容器变窄 → wraplength 跟随；不低于最小可读宽度。"""
+        """容器变窄 → wraplength 跟随实际可用宽度，不裁字。"""
         tk = self.tk
         from pet.widgets import bind_wraplength
         holder = tk.Frame(self.root, width=240, height=30)
@@ -279,7 +279,8 @@ class ScrollableFrameAdaptiveTests(unittest.TestCase):
         holder.configure(width=360)
         self.root.update()
         self.assertGreater(int(label.cget("wraplength")), 240)
-        # 容器极窄 → 不低于最小可读宽度
+        # 容器极窄 → 仍不允许文字超出实际宽度
         holder.configure(width=60)
         self.root.update()
-        self.assertGreaterEqual(int(label.cget("wraplength")), 160)
+        self.assertGreater(int(label.cget("wraplength")), 0)
+        self.assertLessEqual(int(label.cget("wraplength")), 60)

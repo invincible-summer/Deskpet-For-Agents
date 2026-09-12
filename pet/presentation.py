@@ -473,6 +473,8 @@ class PresentationController:
             text = snap.waiting_detail or snap.summary or "等待处理"
         else:
             text = snap.summary or snap.goal or "等待新的任务"
+        from .labels import activity_text
+        text = activity_text(snap, bool(self._cfg("bubble.show_details", True)))
         if target.instance.distro:
             footer = f"WSL {target.instance.distro}"
         else:

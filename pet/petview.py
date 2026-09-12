@@ -484,6 +484,8 @@ class PetView:
                     m.footer = "Windows"
             m.accent = "#487f73" if snap.status == Status.DONE else (
                 "#a06060" if snap.status == Status.ERROR else "#487f73")
+        from .labels import activity_text
+        m.text = activity_text(snap, bool(self.view_config.get("bubble.show_details", True)))
         if snap.stale:
             m.footer += " · 状态可能延迟"
         return (m.visible, m.agent_key, m.status, m.text, m.footer,

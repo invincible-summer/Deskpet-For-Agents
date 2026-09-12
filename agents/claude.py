@@ -28,7 +28,7 @@ from .models import (
     Status,
     parse_mode,
 )
-from .summarize import fmt_command, shorten
+from .summarize import fmt_command, shorten, question_summary
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
@@ -173,6 +173,10 @@ class ClaudeFile(FileState):
                     phase = classify_phase(name, detail)
                     self.phase = phase if phase is not Phase.NONE else Phase.EXECUTING
                     self.open_tools[str(block.get("id") or "")] = summary
+                    if block.get("name") == "AskUserQuestion":
+                        self.input_pending = True
+                        self.input_summary = question_summary(block.get("input"), GOAL_MAX)
+                        self.phase = Phase.USER_INPUT
             return
 
         if t == "user":
@@ -180,7 +184,7 @@ class ClaudeFile(FileState):
             msg = obj.get("message") or {}
             content = msg.get("content")
             blocks = content if isinstance(content, list) else []
-            plain = []
+            plain = [content] if isinstance(content, str) else []
             for block in blocks:
                 if isinstance(block, dict):
                     if block.get("type") == "tool_result":

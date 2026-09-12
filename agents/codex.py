@@ -25,7 +25,7 @@ from .models import (
     Status,
     parse_mode,
 )
-from .summarize import CODEX_MODE, CODEX_SANDBOX, fmt_command, shorten
+from .summarize import CODEX_MODE, CODEX_SANDBOX, fmt_command, shorten, question_summary
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
@@ -96,6 +96,8 @@ class CodexFile(FileState):
         self.task_active = False
         self.input_pending = False
         self.input_summary = ""
+        self.input_call_id = ""
+        self.goal_mode = False
         self.error_text = ""
         self.error_ts = 0.0
         self.done_ts = 0.0
@@ -144,7 +146,7 @@ class CodexFile(FileState):
     def _set_input(self, payload: dict):
         self.input_pending = True
         value = payload.get("question") or payload.get("prompt") or payload.get("message")
-        self.input_summary = shorten(str(value or "等待输入"), GOAL_MAX)
+        self.input_summary = question_summary(payload, GOAL_MAX)
         self.phase = Phase.USER_INPUT
 
     def _set_assistant(self, text: str, ts: float):
@@ -156,6 +158,10 @@ class CodexFile(FileState):
             self.phase = Phase.ANSWERING
 
     def _set_tool(self, name: str, detail, ts: float):
+        self.turn_active = True
+        self.turn_known_over = False
+        self.done_ts = 0.0
+        self.error_ts = 0.0
         detail_s = fmt_command(detail, 100) if detail else ""
         self.last_cmd = detail_s or self.last_cmd
         self.last_tool = shorten(f"{name}: {detail_s}" if detail_s else str(name), SUMMARY_MAX)
@@ -333,7 +339,8 @@ class CodexFile(FileState):
             elif role == "assistant" and text:
                 self._set_assistant(text, ts)
         elif ptype in {"function_call", "tool_call", "local_shell_call", "custom_tool_call"}:
-            args = payload.get("arguments") or ""
+            args = payload.get("arguments") or payload.get("input") or payload.get("action") or ""
+            parsed = args if isinstance(args, dict) else {}
             command = args
             name = payload.get("name") or ptype
             if isinstance(args, str):
@@ -346,6 +353,19 @@ class CodexFile(FileState):
             elif isinstance(args, dict):
                 command = args.get("cmd") or args.get("command") or args.get("path") or str(args)
             self._set_tool(str(name), command, ts)
+            tool = str(name).split(".")[-1]
+            if tool in {"request_user_input", "request_user_input_async", "AskUserQuestion"}:
+                self._set_input(parsed if isinstance(parsed, dict) else {})
+                self.input_call_id = str(payload.get("call_id") or "")
+            elif tool == "create_goal":
+                self.goal_mode = True
+            elif tool == "update_goal" and isinstance(parsed, dict) and parsed.get("status") in {"complete", "blocked"}:
+                self.goal_mode = False
+        elif ptype in {"function_call_output", "custom_tool_call_output", "tool_result"}:
+            if self.input_call_id and payload.get("call_id") == self.input_call_id:
+                self.input_pending = False
+                self.input_call_id = ""
+                self.phase = Phase.THINKING
         elif ptype in {"input", "request_user_input"}:
             self._set_input(payload)
         elif ptype == "error":
@@ -369,7 +389,7 @@ class CodexFile(FileState):
 
     def observation(self, now: float, cfg: dict) -> Observation | None:
         obs = self.base_observation()
-        obs.mode = self.mode
+        obs.mode = Mode.GOAL if self.goal_mode else self.mode
         obs.mode_raw = self.mode_raw
         obs.goal = self.goal or self.title
 

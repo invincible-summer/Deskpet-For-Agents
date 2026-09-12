@@ -13,7 +13,7 @@ PHASE_LABELS = {
     Phase.USER_INPUT: "等待输入",
 }
 MODE_LABELS = {
-    Mode.NONE: "", Mode.DEFAULT: "Default", Mode.PLAN: "Plan",
+    Mode.NONE: "", Mode.DEFAULT: "Default", Mode.PLAN: "Plan", Mode.GOAL: "Goal",
     Mode.ACCEPT_EDITS: "Accept Edits", Mode.AUTO: "Auto",
     Mode.DONT_ASK: "Don't Ask", Mode.BYPASS: "Bypass",
     Mode.UNKNOWN: "Unknown",
@@ -55,3 +55,22 @@ def mode_text(snap) -> str:
     if isinstance(mode, Mode):
         return MODE_LABELS.get(mode, mode.value)
     return str(mode or "")
+
+
+def activity_text(snap, detail=True, limit=120):
+    """Shared bounded bubble content for single and aggregate views."""
+    from agents.summarize import fmt_command
+    label = status_text(snap)
+    if snap.status == Status.INPUT and "等待选择回复" in (snap.summary or ""):
+        label = "等待选择回复"
+    elif snap.status == Status.IDLE:
+        label = "已结束 · 等待新任务"
+    elif snap.status == Status.WORKING:
+        label = phase_text(snap) or label
+    mode = mode_text(snap)
+    if mode:
+        label = f"{mode} · {label}"
+    if not detail:
+        return fmt_command(label, limit)
+    body = snap.waiting_detail or snap.summary if snap.status in (Status.WAITING, Status.INPUT) else snap.summary
+    return fmt_command(body or label, limit)

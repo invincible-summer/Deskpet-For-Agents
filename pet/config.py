@@ -42,6 +42,7 @@ DEFAULTS = {
     "pet_pos": None,             # [x, y] 锚点（桌宠底部中心）
     "bubble": {
         "enabled": True,
+        "show_details": True,
         "font_family": "Microsoft YaHei UI",
         "font_size": 11,
         "font_color": "#1f2430",
@@ -218,6 +219,7 @@ def normalize(data: dict) -> dict:
                              and font.strip()
                              else DEFAULTS["bubble"]["font_family"])
     bubble["enabled"] = bool(bubble.get("enabled", True))
+    bubble["show_details"] = bool(bubble.get("show_details", True))
     bubble["always_visible"] = bool(bubble.get("always_visible", True))
     bubble["font_size"] = int(_clamp(bubble.get("font_size", 11), 8, 24))
     bubble["width"] = int(_clamp(bubble.get("width", 300), 160, 520))

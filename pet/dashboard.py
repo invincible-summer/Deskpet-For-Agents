@@ -17,7 +17,7 @@ from agents.models import Status, WindowBindingConfidence
 from . import autostart, skins
 from .labels import mode_text, phase_text, status_text
 from .presentation import PresentationMode
-from .theme import LIGHT, STATUS_COLOR, pick_font
+from .theme import LIGHT, STATUS_COLOR, pick_font, configure_dashboard_styles
 from .ui_coordinator import UiDirty
 from .version import APP_LABEL as APP_VERSION
 from .widgets import (
@@ -119,7 +119,23 @@ class DashboardPage:
             self.built = True
             self.holder = tk.Frame(parent, bg=LIGHT.page)
             self.build(self.holder)
+            self._polish(self.holder)
         return self.holder
+
+    def _polish(self, parent):
+        """Style lazy-built controls once; text wraps to its allocated width."""
+        for widget in parent.winfo_children():
+            kind = widget.winfo_class()
+            if kind in ("TButton", "TCheckbutton", "TRadiobutton", "TCombobox", "TSpinbox", "TScale"):
+                if not widget.cget("style"):
+                    widget.configure(style="Dashboard.Horizontal.TScale" if kind == "TScale"
+                                     else "Dashboard." + kind)
+            if isinstance(widget, tk.Label) and widget.winfo_manager() == "pack":
+                options = widget.pack_info()
+                if options.get("fill") in ("x", "both"):
+                    widget.configure(justify="left")
+                    bind_wraplength(widget, pad=12)
+            self._polish(widget)
 
 
 class OverviewPage(DashboardPage):
@@ -136,8 +152,8 @@ class OverviewPage(DashboardPage):
         grid = tk.Frame(body, bg=LIGHT.page)
         grid.pack(fill="x", pady=(0, SECTION_GAP))
         self._metric_cells = {}
-        for key, label in (("live", "Live"), ("working", "Working"),
-                           ("waiting", "Waiting"), ("terminal", "Terminal")):
+        for key, label in (("live", "在线 Agents"), ("working", "正在工作"),
+                           ("waiting", "需要关注"), ("terminal", "可打开终端")):
             panel = SurfacePanel(grid, padding=12)
             tk.Label(panel.body, text=label, bg=LIGHT.surface,
                      fg=LIGHT.text_secondary,
@@ -239,13 +255,16 @@ class OverviewPage(DashboardPage):
         frame = tk.Frame(self._rows_frame, bg=LIGHT.surface)
         title = tk.Label(frame, text="", bg=LIGHT.surface, fg=LIGHT.text,
                          font=pick_font(frame, 10, True), anchor="w")
-        title.pack(side="left", fill="x", expand=True)
+        frame.columnconfigure(0, weight=1)
+        title.grid(row=0, column=0, sticky="ew", pady=8)
+        bind_wraplength(title)
         chip = StatusChip(frame)
-        chip.pack(side="right", padx=(8, 0))
+        chip.grid(row=0, column=1, padx=8)
         open_btn = ttk.Button(frame, text="打开终端", width=10,
                               command=lambda k=key:
                               self.dash.app.activate_agent(k))
-        open_btn.pack(side="right", padx=(8, 0))
+        open_btn.configure(style="Dashboard.TButton")
+        open_btn.grid(row=0, column=2, padx=(8, 0))
         self._rows[key] = {"frame": frame, "title": title, "chip": chip}
 
     def _update_row(self, key, target):
@@ -299,7 +318,8 @@ class AgentsPage(DashboardPage):
                                       bg=LIGHT.surface, fg=LIGHT.text,
                                       font=pick_font(self._detail_head, 11,
                                                      True), anchor="w")
-        self._detail_title.pack(side="left")
+        self._detail_title.pack(side="left", fill="x", expand=True)
+        bind_wraplength(self._detail_title)
         self._detail_chip = StatusChip(self._detail_head)
         self._detail_chip.pack(side="left", padx=(8, 0))
         actions = tk.Frame(self._detail_panel.body, bg=LIGHT.surface)
@@ -366,9 +386,11 @@ class AgentsPage(DashboardPage):
                 title = tk.Label(frame, text="", bg=LIGHT.surface,
                                  fg=LIGHT.text, anchor="w",
                                  font=pick_font(frame, 10, True))
-                title.pack(side="left", fill="x", expand=True)
+                frame.columnconfigure(0, weight=1)
+                title.grid(row=0, column=0, sticky="ew", pady=8)
+                bind_wraplength(title)
                 chip = StatusChip(frame)
-                chip.pack(side="right")
+                chip.grid(row=0, column=1, padx=(8, 0))
                 # §10.1：StatusChip 是独立 child widget——点击 chip 区域
                 # 不会触发 parent frame 的 widget-level binding，必须
                 # 显式绑定同一 select_row，整行才是真实可点击区域。
@@ -472,7 +494,8 @@ class AgentsPage(DashboardPage):
             text="移出并发" if included is not False else "加入并发")
 
     def reflow(self, width: int):
-        wide = width >= 780
+        # Stacking preserves readable details and avoids a cramped action row.
+        wide = width >= 1040
         if wide:
             self._list_panel.pack_forget()
             self._detail_panel.pack_forget()
@@ -485,8 +508,7 @@ class AgentsPage(DashboardPage):
             self._list_panel.pack_forget()
             self._detail_panel.pack_forget()
             self._list_panel.pack(fill="x")
-            self._list_panel.pack_propagate(False)
-            self._list_panel.configure(height=210)
+            self._list_panel.pack_propagate(True)
             self._detail_panel.pack(fill="both", expand=True, pady=(
                 SECTION_GAP, 0))
 
@@ -907,6 +929,12 @@ class AppearancePage(DashboardPage):
                             "bubble.enabled", self.bubble_var.get())
                         ).pack(side="left")
         r.reflow("wide")
+        r = row(panel_bub.body, "工作详情", "开启显示精简命令或问题，关闭仅显示当前状态。")
+        self.bubble_details_var = tk.BooleanVar(value=bool(cfg.get("bubble.show_details", True)))
+        ttk.Checkbutton(r._control_cell, variable=self.bubble_details_var,
+                        command=lambda: app.appearance.set_global(
+                            "bubble.show_details", self.bubble_details_var.get())).pack(side="left")
+        r.reflow("wide")
         r = row(panel_bub.body, "气泡宽度")
         self.bw_slider = DiscreteSlider(
             r._control_cell, BUBBLE_W_STEPS,
@@ -1033,6 +1061,7 @@ class AppearancePage(DashboardPage):
             cfg.get("bubble.font_size", 11) or 11))
         self.animated_var.set(bool(cfg.get("animated", True)))
         self.bubble_var.set(bool(cfg.get("bubble.enabled", True)))
+        self.bubble_details_var.set(bool(cfg.get("bubble.show_details", True)))
         self.force_var.set(str(cfg.get("force_state") or "") or "自动")
         self.font_var.set(str(cfg.get("bubble.font_family",
                                       "Microsoft YaHei UI")))
@@ -1178,7 +1207,7 @@ class MonitorPage(DashboardPage):
         panel = SurfacePanel(body)
         panel.pack(fill="x")
         _section_title(panel.body, "高级节奏")
-        adv = Expander(panel.body, "扫描间隔（默认折叠）")
+        adv = Expander(panel.body, "扫描间隔")
         adv.pack(fill="x")
         arow = tk.Frame(adv.body, bg=LIGHT.surface)
         arow.pack(fill="x")
@@ -1190,17 +1219,19 @@ class MonitorPage(DashboardPage):
                 ("windows_scan_sec", "Windows 扫描", 1.0, 30.0),
                 ("wsl_scan_sec", "WSL 扫描", 1.0, 60.0),
                 ("file_poll_sec", "文件轮询", 0.2, 5.0)):
-            tk.Label(arow, text=label, bg=LIGHT.surface).pack(
-                side="left", padx=6)
+            interval_row = tk.Frame(adv.body, bg=LIGHT.surface)
+            interval_row.pack(fill="x", pady=6)
+            tk.Label(interval_row, text=label, bg=LIGHT.surface,
+                     fg=LIGHT.text, font=pick_font(panel, 10)).pack(side="left")
             var = tk.DoubleVar(value=float(
                 cfg.get(f"monitor.{path}", 3.0)))
             self.interval_vars[path] = var
-            spin = ttk.Spinbox(arow, from_=lo, to=hi, increment=0.5,
+            spin = ttk.Spinbox(interval_row, from_=lo, to=hi, increment=0.5,
                                textvariable=var, width=5,
                                command=lambda p=path: save(
                                    f"monitor.{p}",
                                    self.interval_vars[p].get()))
-            spin.pack(side="left", padx=2)
+            spin.pack(side="right", padx=2)
 
     def refresh(self, reason: UiDirty):
         available = self.dash.app.monitor.terminal_available()
@@ -1611,6 +1642,7 @@ class Dashboard(tk.Toplevel):
         super().__init__(app.root)
         self.title("DeskPet · 仪表盘")
         self.metrics = DashboardMetrics.for_window(self)
+        configure_dashboard_styles(self)
         self._apply_window_geometry()
         self.configure(bg=LIGHT.page)
         self.protocol("WM_DELETE_WINDOW", self.hide_dashboard)
@@ -1641,6 +1673,9 @@ class Dashboard(tk.Toplevel):
         self._register_pages()
         # 滚轮只在页面 canvas 内滚动（§11.5）
         self.bind("<MouseWheel>", self._on_wheel)
+        self.bind("<Button-4>", self._on_wheel)
+        self.bind("<Button-5>", self._on_wheel)
+        self.bind("<Escape>", lambda _e: self.tooltip.hide())
         self.bind("<Button-3>", self._on_context_menu)
         self.bind("<Menu>", self._on_context_menu)
         self.bind("<Shift-F10>", self._on_context_menu)
@@ -1683,7 +1718,7 @@ class Dashboard(tk.Toplevel):
                          font=pick_font(self, 13, True))
         brand.pack(fill="x",
                    ipady=(m.px(BRAND_HEIGHT) - brand.winfo_reqheight()) // 2)
-        tk.Frame(nav, bg=LIGHT.border, height=1).pack(fill="x")
+        tk.Frame(nav, bg=LIGHT.border, height=1).pack(fill="x", padx=16, pady=(0, 12))
         self._nav_buttons: dict[str, NavButton] = {}
         for page in (PAGE_OVERVIEW, PAGE_AGENTS, PAGE_PETS, PAGE_LOOK,
                      PAGE_MONITOR, PAGE_DIAG):
@@ -1741,7 +1776,7 @@ class Dashboard(tk.Toplevel):
     def _add_nav_item(self, nav, page: str):
         btn = NavButton(nav, page, command=lambda p=page: self._show_page(p))
         btn.configure(height=self.metrics.px(NAV_ITEM_HEIGHT))
-        btn.pack(fill="x")
+        btn.pack(fill="x", padx=10, pady=3)
         btn._label.configure(pady=max(2, self.metrics.px(
             NAV_ITEM_HEIGHT - 30) // 2))
         self._nav_buttons[page] = btn
@@ -1784,7 +1819,8 @@ class Dashboard(tk.Toplevel):
         self._current = target
         self.tooltip.hide()   # 切页关闭 tooltip（§11.2）
         target.on_show()
-        width = max(0, self._center.winfo_width())
+        width = max(0, self._center.winfo_width()
+                    - 2 * self.metrics.px(PAGE_PAD_X))
         if width > 1:
             target.reflow(width)
         self._last_reflow_width = width
@@ -1885,7 +1921,10 @@ class Dashboard(tk.Toplevel):
     # ================================================== 滚轮 / reflow
     def _on_wheel(self, event):
         if self._current is not None and self._current.built:
-            self.content.wheel_scroll(event.delta, event.x_root, event.y_root)
+            self.tooltip.hide()
+            delta = (120 if event.num == 4 else -120 if event.num == 5
+                     else event.delta)
+            self.content.wheel_scroll(delta, event.x_root, event.y_root)
 
     def _on_context_menu(self, event):
         if self._closing or self.app._closing or self._dialog_active:
@@ -1930,10 +1969,11 @@ class Dashboard(tk.Toplevel):
             # §8.6：DPI 变化后 960px 上限/padding 换算全部失效，先同步
             # 横向几何再重排当前页
             self._sync_center_geometry(self.content.winfo_width())
-        width = max(0, self.content.winfo_width()
+        width = max(0, self._center.winfo_width()
                     - 2 * self.metrics.px(PAGE_PAD_X))
-        crossed = (width >= SettingRow.COMPACT_BREAK) != (
-            self._last_reflow_width >= SettingRow.COMPACT_BREAK)
+        crossed = any((width >= breakpoint) !=
+                      (self._last_reflow_width >= breakpoint)
+                      for breakpoint in (SettingRow.COMPACT_BREAK, 1040))
         # §10.3：只有 DPI 变化或跨 breakpoint 才重排；像素级拖拽零工作
         if dpi_changed or crossed or self._last_reflow_width < 0:
             self._last_reflow_width = width

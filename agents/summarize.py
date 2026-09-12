@@ -38,7 +38,7 @@ def shorten(text: str, limit: int = 90) -> str:
         return ""
     if len(s) <= limit:
         return s
-    head = s[:limit]
+    head = s[:max(0, limit - 1)]
     for sep in ("。", "！", "？", ". ", "! ", "? ", "；", "; ", "，", ", "):
         i = head.rfind(sep)
         if i >= limit * 0.5:
@@ -135,3 +135,15 @@ CLAUDE_MODE = {
     "acceptEdits": "自动接受编辑",
     "bypassPermissions": "免审批",
 }
+
+
+def question_summary(payload, limit=120):
+    """Compact structured questions without dumping option dictionaries."""
+    if not isinstance(payload, dict):
+        return "等待你的回复"
+    questions = payload.get("questions")
+    question = next((q for q in questions if isinstance(q, dict)), {}) if isinstance(questions, list) else payload
+    text = question.get("question") or question.get("title") or question.get("prompt") or payload.get("message") or ""
+    options = question.get("options")
+    label = "等待选择回复" if options else "等待你的回复"
+    return shorten(f"{label}：{text}" if text else label, limit)

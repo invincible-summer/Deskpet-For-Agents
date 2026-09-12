@@ -89,6 +89,7 @@ class Mode(str, Enum):
     NONE = ""
     UNKNOWN = "unknown"
     DEFAULT = "default"
+    GOAL = "goal"
     PLAN = "plan"
     ACCEPT_EDITS = "acceptEdits"
     AUTO = "auto"
@@ -101,6 +102,7 @@ class Mode(str, Enum):
             "": "",
             "unknown": "Unknown",
             "default": "Default",
+            "goal": "Goal",
             "plan": "Plan",
             "acceptEdits": "Accept Edits",
             "auto": "Auto",
@@ -118,6 +120,7 @@ _MODE_ALIASES = {
     "custom": Mode.DEFAULT,
     "plan": Mode.PLAN,
     "planning": Mode.PLAN,
+    "goal": Mode.GOAL,
     "acceptedits": Mode.ACCEPT_EDITS,
     "accept_edits": Mode.ACCEPT_EDITS,
     "auto": Mode.AUTO,
@@ -131,6 +134,8 @@ _MODE_ALIASES = {
 
 def parse_mode(value) -> tuple[Mode, str]:
     """原始值 → (归一 Mode, 原始字符串)。未知非空值 → (UNKNOWN, 原始值)。"""
+    if isinstance(value, dict):
+        value = value.get("mode") or value.get("kind") or ""
     raw = str(value or "").strip()
     mode = _MODE_ALIASES.get(raw.lower(), None)
     if mode is not None:
