@@ -30,6 +30,8 @@ jobs:
         run: python tools/_fix_after_portable_patch.py
       - name: Keep Settings page compact
         run: python tools/_fix_dashboard_compact.py
+      - name: Suppress redundant Dashboard reflow
+        run: python tools/_fix_dashboard_reflow.py
       - name: Harden release build
         run: python tools/_fix_release_build.py
       - name: Remove staging patch machinery
@@ -38,6 +40,7 @@ jobs:
           Remove-Item tools/_apply_portable_patch.py
           Remove-Item tools/_fix_after_portable_patch.py
           Remove-Item tools/_fix_dashboard_compact.py
+          Remove-Item tools/_fix_dashboard_reflow.py
           Remove-Item tools/_fix_release_build.py
           Remove-Item .github/workflows/_apply-portable-patch.yml
       - name: Byte-compile
