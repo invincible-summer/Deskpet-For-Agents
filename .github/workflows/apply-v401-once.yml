@@ -6,6 +6,7 @@ on:
     paths:
       - '.deskpet/v401.part*'
       - '.deskpet/fix_anchor.py'
+      - '.deskpet/post_apply.py'
       - '.github/workflows/apply-v401-once.yml'
 
 permissions: {contents: write}
@@ -38,13 +39,14 @@ jobs:
           python -c "import base64,gzip,pathlib,sys; pathlib.Path(sys.argv[2]).write_bytes(gzip.decompress(base64.b64decode(pathlib.Path(sys.argv[1]).read_bytes())))" $b64 $script
           python .deskpet/fix_anchor.py $script
           python $script
+          python .deskpet/post_apply.py
       - name: Validate planned diff only
         shell: pwsh
         run: |
           git diff --check
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $changed = @((git diff --name-only) + (git ls-files --others --exclude-standard)) | Where-Object { $_ -notlike '.deskpet/*' } | Sort-Object -Unique
-          $allowed = @('agents/discovery.py','agents/models.py','agents/monitor.py','agents/paths.py','agents/zcode_desktop.py','agents/zcode_remote.py','pet/labels.py','pet/version.py','tools/desktop_source_probe.py','tests/test_zcode_wsl_remote.py','README.md','CHANGELOG.md','VERSIONING.md') | Sort-Object
+          $allowed = @('agents/discovery.py','agents/models.py','agents/monitor.py','agents/paths.py','agents/zcode_desktop.py','agents/zcode_remote.py','pet/labels.py','pet/version.py','tools/desktop_source_probe.py','tests/test_zcode_wsl_remote.py','tests/test_release_layout.py','README.md','CHANGELOG.md','VERSIONING.md') | Sort-Object
           if (@($changed | Where-Object { $_ -notin $allowed }).Count) { throw 'unexpected changed file' }
           if (@($allowed | Where-Object { $_ -notin $changed }).Count) { throw 'expected changed file missing' }
       - name: Install dependencies
@@ -101,7 +103,7 @@ jobs:
         if: success()
         shell: pwsh
         run: |
-          Remove-Item -Force .deskpet/v401.part00,.deskpet/v401.part01,.deskpet/v401.part02,.deskpet/fix_anchor.py
+          Remove-Item -Force .deskpet/v401.part00,.deskpet/v401.part01,.deskpet/v401.part02,.deskpet/fix_anchor.py,.deskpet/post_apply.py
           Remove-Item -Force .github/workflows/apply-v401-once.yml
           if (Test-Path .deskpet) { if (@(Get-ChildItem .deskpet -Force).Count -eq 0) { Remove-Item -Force .deskpet } }
           git add -A; git diff --cached --check
