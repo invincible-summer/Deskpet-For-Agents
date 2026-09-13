@@ -1,10 +1,12 @@
 name: release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing annotated stable tag to publish (vX.Y.Z)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -15,27 +17,34 @@ jobs:
     env:
       PYTHONUTF8: "1"
       GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Verify annotated stable SemVer tag and source version
+        shell: pwsh
+        run: |
+          $tag = "$env:RELEASE_TAG"
+          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw "release tag must be stable SemVer vX.Y.Z without leading zeroes: $tag"
+          }
+          $type = git cat-file -t $tag
+          if ($LASTEXITCODE -ne 0 -or $type.Trim() -ne "tag") {
+            throw "release tag must already exist and be an annotated Git tag: $tag"
+          }
+          $version = python -c "from pet.version import APP_VERSION; print(APP_VERSION)"
+          if ($tag -ne "v$version") { throw "tag $tag != v$version" }
+          gh release view "$tag" *> $null
+          if ($LASTEXITCODE -eq 0) { throw "GitHub Release already exists for $tag" }
       - name: Install runtime dependencies
         run: python -m pip install -r requirements.txt -c constraints.txt
       - name: Install build dependencies
         run: python -m pip install -r requirements-build.txt
-      - name: Verify stable SemVer tag and source version
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
-        run: |
-          $version = python -c "from pet.version import APP_VERSION; print(APP_VERSION)"
-          $tag = "${{ github.ref_name }}"
-          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
-            throw "release tag must be stable SemVer vX.Y.Z without leading zeroes: $tag"
-          }
-          if ($tag -ne "v$version") { throw "tag $tag != v$version" }
       - name: Byte-compile
         run: python -m compileall agents pet actions tools
       - name: Unit tests
@@ -62,23 +71,25 @@ jobs:
             desktop-source-benchmark.json
             presentation-benchmark.json
             ui-architecture-benchmark.json
-      - name: Upload portable artifact for manual dispatch
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload portable artifact
         uses: actions/upload-artifact@v4
         with:
           name: DeskPet-windows-x64-portable
           path: |
             .release/DeskPet-windows-x64-portable.zip
             .release/SHA256SUMS.txt
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Create draft GitHub Release
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = "$env:RELEASE_TAG"
           gh release create "$tag" `
             ".release/DeskPet-windows-x64-portable.zip" `
             ".release/SHA256SUMS.txt" `
             --verify-tag --generate-notes --draft
           if ($LASTEXITCODE -ne 0) { throw "failed to create draft release $tag" }
-          gh release edit "$tag" --draft=false
+      - name: Publish GitHub Release
+        shell: pwsh
+        run: |
+          $tag = "$env:RELEASE_TAG"
+          gh release edit "$tag" --draft=false --latest
           if ($LASTEXITCODE -ne 0) { throw "failed to publish release $tag" }
