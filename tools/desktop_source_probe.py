@@ -1,4 +1,4 @@
-"""DeskPet 4.0.1 Desktop source 实机只读探针。
+"""DeskPet 4.1.0 Desktop source 实机只读探针。
 
 用途：在一台真实机器上确认 Codex Desktop / ZCode Desktop 的本地数据面
 schema 与进程形态，为 capability 探测提供证据；输出全部脱敏：

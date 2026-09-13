@@ -1,4 +1,4 @@
-"""DeskPet 4.0.1 ZCode Desktop -> WSL Remote Development regression tests."""
+"""DeskPet 4.1.0 ZCode Desktop -> WSL Remote Development regression tests."""
 from __future__ import annotations
 
 import json
