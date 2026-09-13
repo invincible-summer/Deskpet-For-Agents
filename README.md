@@ -1,12 +1,12 @@
-# DeskPet V4.0.1
+# DeskPet V4.1.0
 
 DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的 AI 编码 Agent，并把当前任务、模式和工作状态显示成桌宠动画与气泡。
 
 支持 Windows / WSL 终端中的 Codex CLI、Claude Code、Kimi CLI、pi，以及 Codex Desktop / ChatGPT Desktop Codex 模式和 ZCode Desktop；ZCode Desktop 通过 Remote Development 连接到 WSL 时，也会从对应 WSL 用户环境读取会话状态。DeskPet 不接管 Agent，不要求 Hook、插件或 MCP，也不会自动审批。
 
-当前源码版本是 **4.0.1**。按本次维护要求没有创建 `v4.0.1` tag 或 GitHub Release，因此仓库的 latest Portable 下载仍然指向已经发布的 **v4.0.0**；这不影响从源码运行和验收 4.0.1。
+当前源码版本是 **4.1.0**。`v4.1.0` 是源码里程碑的标准 annotated Git tag，但本版本**不创建 GitHub Release，也不生成新的 Portable/EXE 发布文件**；仓库的 latest Portable 仍然是已经发布的 **v4.0.0**。
 
-源码版本与二进制 Release 分开推进：项目不会为每个源码 patch 自动发包，而是在积累到有重要功能和/或重要修复、值得重新分发 Portable 的版本里程碑时再创建正式 Release；紧急安全或严重可靠性修复可以例外提前发布。详细规则见 [VERSIONING.md](VERSIONING.md)。
+版本 tag 与二进制 Release 分开推进：tag 用于固定已经验收的源码里程碑，GitHub Release 只在确实值得重新分发 Portable 的版本上显式发布，不会再由 tag push 自动触发。历史 `v1.0.0`、`v2.0.0`、`v3.0.0` Release 用于按开发顺序补齐源码版本历史，不反向制造当时并不存在的 Portable 二进制。详细规则见 [VERSIONING.md](VERSIONING.md)。
 
 ## 下载与启动
 
@@ -139,18 +139,18 @@ Dashboard 的设置页可以直接查看并打开这个目录。
 
 ## 发布文件说明
 
-正式 Release 主要提供：
+从 v4.0.0 开始，正式二进制 Release 主要提供：
 
 ```text
 DeskPet-windows-x64-portable.zip   普通用户下载的完整程序
 SHA256SUMS.txt                     ZIP 的 SHA-256 校验值
 ```
 
-源码仓库中的 `.release/` 只是本地/CI 构建输出目录，不提交到 Git 历史。
+`v1.0.0`～`v3.0.0` 是补齐项目开发顺序的历史源码 Release，只指向当时的真实 tag/commit，不补造后来才建立的 Portable 资产。源码仓库中的 `.release/` 只是本地/CI 构建输出目录，不提交到 Git 历史。
 
 ## 项目资料
 
-- [VERSIONING.md](VERSIONING.md)：Semantic Versioning、源码版本与正式 Release 规则。
+- [VERSIONING.md](VERSIONING.md)：Semantic Versioning、源码 tag 与正式 Release 规则。
 - [CHANGELOG.md](CHANGELOG.md)：各版本新增功能、修复内容及历史版本映射。
 - [SourceLink.md](SourceLink.md)：Agent 监听、Windows/WSL、桌面端数据源等调研与依据。
 - [AGENTS.md](AGENTS.md)：仓库开发和验收约定。
