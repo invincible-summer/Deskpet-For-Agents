@@ -1,4 +1,4 @@
-# DeskPet 4.0.1 — SourceLink
+# DeskPet 4.1.0 — SourceLink
 
 > Research snapshot: 2026-09-13  
 > Main implementation commit: `44305feffe59b0495046a978fbbd01a9ee94d83b`  
@@ -7,9 +7,9 @@
 
 This file records evidence, not promises made by third-party products. Private paths, process names and database schemas are implementation observations and must remain capability-detected and fail closed. DeskPet's own safety contract is defined by the repository code, README and AGENTS.md.
 
-## DeskPet 4.0.1 implementation
+## DeskPet 4.1.0 implementation
 
-The following links pin the accepted ZCode WSL implementation on `main`.
+The following links pin the accepted ZCode WSL implementation on `main`. The implementation first landed in the immutable `44305fe` product commit; the later 4.1.0 promotion corrects the SemVer and release metadata without changing this data-plane architecture.
 
 - [agents/models.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/agents/models.py) — `RemoteRuntimeContext` and three-state `SourceProbeSnapshot.remote_runtimes`.
 - [agents/discovery.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/agents/discovery.py) — fresh WSL running-distro census, ZCode remote-runtime detection, uid/user/HOME metadata, authoritative/stale/tombstone semantics.
@@ -20,7 +20,7 @@ The following links pin the accepted ZCode WSL implementation on `main`.
 - [tests/test_zcode_wsl_remote.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/tests/test_zcode_wsl_remote.py) — path, discovery, transport, last-good, projection, cap and worker-gating regression coverage.
 - [tools/desktop_source_probe.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/tools/desktop_source_probe.py) — sanitized real-machine structure probe; no prompt/transcript/tool-argument/token output.
 
-### 4.0.1 architecture conclusions
+### 4.1.0 architecture conclusions
 
 - Windows `ZCode.exe` remains the Desktop host and activation target. WSL remote runtime is a separate observation/data plane and never becomes a Terminal Agent target.
 - A remote data plane is authorized only by the current fresh WSL process census. Failed WSL enumeration retains last-good state as non-authoritative; an authoritative stopped-distro result removes the plane.
@@ -42,7 +42,7 @@ The following links pin the accepted ZCode WSL implementation on `main`.
 These issue logs are empirical evidence of current runtime layout. They are deliberately matched narrowly and are covered by fail-closed tests because upstream may change them.
 
 - **Empirical issue** — [zai-org/feedback #162](https://github.com/zai-org/feedback/issues/162) — ZCode 3.4 Windows/WSL connection logs show `server/zcode-server.cjs` uploaded to `~/.zcode/server/zcode-server.cjs` and the server installed in the WSL environment.
-- **Empirical issue** — [zai-org/feedback #195](https://github.com/zai-org/feedback/issues/195) — remote-workspace failure logs reference the server path and an agent entry under `~/.zcode/server/agents/glm/zcode-agent`. DeskPet 4.0.1 accepts this exact current entry in addition to `zcode.cjs`.
+- **Empirical issue** — [zai-org/feedback #195](https://github.com/zai-org/feedback/issues/195) — remote-workspace failure logs reference the server path and an agent entry under `~/.zcode/server/agents/glm/zcode-agent`. DeskPet 4.1.0 accepts this exact current entry in addition to `zcode.cjs`.
 - **Empirical issue** — [zai-org/feedback #302](https://github.com/zai-org/feedback/issues/302) — ZCode 3.7.7 remote runtime/log evidence references `zcode.cjs` under the remote `~/.zcode/server/agents/glm/` tree and remote `~/.zcode/cli/log` activity.
 - **Empirical issue** — [zai-org/feedback #28](https://github.com/zai-org/feedback/issues/28) — Windows 11 + WSL2 logs independently show the remote ZCode CLI log root under `~/.zcode/cli/log/`.
 
@@ -62,7 +62,7 @@ DeskPet never treats these repositories as authority over ZCode. Their evidence 
 - **Official contract** — [SQLite WAL](https://sqlite.org/wal.html) — WAL requires shared-memory coordination among processes using the database and is not designed for ordinary network-filesystem access between different hosts.
 - **Official contract** — [SQLite Over a Network](https://sqlite.org/useovernet.html) — SQLite recommends keeping the database engine on the same machine as the database file when a network boundary exists. DeskPet follows this by executing `node:sqlite` inside WSL and sending only bounded JSON facts back to Windows.
 
-The 4.0.1 remote reader issues only a fixed schema probe and fixed `SELECT`/`WITH` facts queries. It performs no `INSERT`, `UPDATE`, `DELETE`, DDL, WAL checkpoint, repair, extension loading, or database migration.
+The 4.1.0 remote reader issues only a fixed schema probe and fixed `SELECT`/`WITH` facts queries. It performs no `INSERT`, `UPDATE`, `DELETE`, DDL, WAL checkpoint, repair, extension loading, or database migration.
 
 ## Microsoft WSL — passive running-distro boundary
 
@@ -73,7 +73,7 @@ DeskPet's existing WSL discovery therefore keeps the three-state distinction: au
 
 ## Codex / Windows sources retained by the project
 
-The ZCode 4.0.1 change does not alter the existing Codex Desktop/CLI safety boundary; these references remain part of the project evidence set.
+The ZCode 4.1.0 change does not alter the existing Codex Desktop/CLI safety boundary; these references remain part of the project evidence set.
 
 - **Official contract** — [Introducing the Codex app](https://openai.com/index/introducing-the-codex-app/) — product-level multi-agent desktop behavior and Windows availability.
 - **Official contract** — [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server) — thread/turn/item and approval-server-request concepts. DeskPet's current passive Desktop source does not attach to this live control plane.
@@ -93,4 +93,4 @@ The ZCode 4.0.1 change does not alter the existing Codex Desktop/CLI safety boun
 
 ## Acceptance boundary
 
-The 4.0.1 automated acceptance covers byte-compile, the full Windows unit suite, fresh/stale/tombstone discovery semantics, direct-argv read-only remote transport, state isolation, global session/plane bounds, and the existing Monitor/Desktop-source/Presentation/UI architecture benchmarks. It does **not** claim that GitHub-hosted CI is a real user's ZCode + WSL Remote Development machine. `tools/desktop_source_probe.py` exists for the final environment-specific read-only smoke check without exposing prompts, transcripts, tool arguments, credentials, or other sensitive payloads.
+The 4.1.0 automated acceptance covers byte-compile, the full Windows unit suite, fresh/stale/tombstone discovery semantics, direct-argv read-only remote transport, state isolation, global session/plane bounds, and the existing Monitor/Desktop-source/Presentation/UI architecture benchmarks. It does **not** claim that GitHub-hosted CI is a real user's ZCode + WSL Remote Development machine. `tools/desktop_source_probe.py` exists for the final environment-specific read-only smoke check without exposing prompts, transcripts, tool arguments, credentials, or other sensitive payloads.
