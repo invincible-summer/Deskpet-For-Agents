@@ -3,11 +3,14 @@ from pathlib import Path
 
 def replace_once(path: str, old: str, new: str) -> None:
     p = Path(path)
-    text = p.read_text(encoding="utf-8")
-    count = text.count(old)
+    data = p.read_bytes()
+    newline = "\r\n" if b"\r\n" in data else "\n"
+    old_b = old.replace("\n", newline).encode("utf-8")
+    new_b = new.replace("\n", newline).encode("utf-8")
+    count = data.count(old_b)
     if count != 1:
         raise SystemExit(f"{path}: expected one match, found {count}: {old!r}")
-    p.write_text(text.replace(old, new), encoding="utf-8")
+    p.write_bytes(data.replace(old_b, new_b, 1))
 
 
 replace_once(
