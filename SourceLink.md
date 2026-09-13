@@ -1,7 +1,7 @@
 # DeskPet 4.0.1 — SourceLink
 
 > Research snapshot: 2026-09-13  
-> Acceptance implementation tree: `8fe7461d46e60c31ff2da65c3983c28aa2ea0898`  
+> Main implementation commit: `44305feffe59b0495046a978fbbd01a9ee94d83b`  
 > Purpose: record the external contracts and implementation evidence used by DeskPet's passive Windows/WSL/Desktop Agent monitoring.  
 > Trust labels: **Official contract**, **Upstream implementation**, **Empirical issue**, **Third-party reverse evidence**.
 
@@ -9,16 +9,16 @@ This file records evidence, not promises made by third-party products. Private p
 
 ## DeskPet 4.0.1 implementation
 
-The following links pin the accepted ZCode WSL implementation tree. The final `main` squash commit is tree-equivalent; this header is updated to the final `main` SHA after merge.
+The following links pin the accepted ZCode WSL implementation on `main`.
 
-- [agents/models.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/models.py) — `RemoteRuntimeContext` and three-state `SourceProbeSnapshot.remote_runtimes`.
-- [agents/discovery.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/discovery.py) — fresh WSL running-distro census, ZCode remote-runtime detection, uid/user/HOME metadata, authoritative/stale/tombstone semantics.
-- [agents/paths.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/paths.py) — pure Linux-path helpers for `~/.zcode/cli` and `~/.zcode/server`; production remote DB access does not use WSL UNC.
-- [agents/zcode_remote.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/zcode_remote.py) — bounded direct-argv WSL transport and read-only `node:sqlite` facts reader.
-- [agents/zcode_desktop.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/zcode_desktop.py) — local Windows + remote WSL plane projection with one global admission cap.
-- [agents/monitor.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/monitor.py) — remote reads are owned by the existing `ProcessProbeWorker`; Monitor/UI polling never enters WSL.
-- [tests/test_zcode_wsl_remote.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/tests/test_zcode_wsl_remote.py) — path, discovery, transport, last-good, projection, cap and worker-gating regression coverage.
-- [tools/desktop_source_probe.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/tools/desktop_source_probe.py) — sanitized real-machine structure probe; no prompt/transcript/tool-argument/token output.
+- [agents/models.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/agents/models.py) — `RemoteRuntimeContext` and three-state `SourceProbeSnapshot.remote_runtimes`.
+- [agents/discovery.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/agents/discovery.py) — fresh WSL running-distro census, ZCode remote-runtime detection, uid/user/HOME metadata, authoritative/stale/tombstone semantics.
+- [agents/paths.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/agents/paths.py) — pure Linux-path helpers for `~/.zcode/cli` and `~/.zcode/server`; production remote DB access does not use WSL UNC.
+- [agents/zcode_remote.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/agents/zcode_remote.py) — bounded direct-argv WSL transport and read-only `node:sqlite` facts reader.
+- [agents/zcode_desktop.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/agents/zcode_desktop.py) — local Windows + remote WSL plane projection with one global admission cap.
+- [agents/monitor.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/agents/monitor.py) — remote reads are owned by the existing `ProcessProbeWorker`; Monitor/UI polling never enters WSL.
+- [tests/test_zcode_wsl_remote.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/tests/test_zcode_wsl_remote.py) — path, discovery, transport, last-good, projection, cap and worker-gating regression coverage.
+- [tools/desktop_source_probe.py @ `44305fe`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/44305feffe59b0495046a978fbbd01a9ee94d83b/tools/desktop_source_probe.py) — sanitized real-machine structure probe; no prompt/transcript/tool-argument/token output.
 
 ### 4.0.1 architecture conclusions
 
