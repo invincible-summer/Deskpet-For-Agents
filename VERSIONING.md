@@ -57,6 +57,20 @@ pre-release identifiers remain reserved for a future release-channel implementat
 until that exists, development candidates stay on branches and do not consume formal
 release tags.
 
+## Release cadence
+
+Source-version cadence and binary-Release cadence are intentionally separate. An
+accepted patch or intermediate source version can land on `main` without a tag,
+GitHub Release, Portable ZIP, or EXE build. DeskPet does **not** publish a binary
+Release for every source patch.
+
+A formal GitHub Release is normally cut when a meaningful release milestone has
+accumulated important user-facing functionality and/or substantial fixes that are
+worth distributing as a new Portable build. In normal development this will usually
+be a significant minor/intermediate version rather than every patch. An urgent
+security, data-safety, or severe reliability fix may justify an earlier patch Release.
+Source-only versions that were intentionally skipped do not need retroactive tags.
+
 ## Immutability
 
 Once a version has been published as a GitHub Release, its source contents, tag target
