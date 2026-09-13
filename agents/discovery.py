@@ -30,6 +30,7 @@ from .models import (
     AgentKind,
     AgentInstance,
     DesktopHost,
+    RemoteRuntimeContext,
     SourceProbeSnapshot,
     TerminalAttachment,
 )
@@ -647,8 +648,11 @@ def build_metadata_script(pids: list[int], env_names=ENV_ALLOWLIST) -> str:
         "  fi\n"
         "  u=$(ps -o uid= -p $p 2>/dev/null | tr -d ' ')\n"
         "  if [ -n \"$u\" ]; then\n"
-        "    h=$(getent passwd \"$u\" 2>/dev/null | cut -d: -f6)\n"
+        "    ent=$(getent passwd \"$u\" 2>/dev/null || true)\n"
+        "    h=$(printf '%s\\n' \"$ent\" | cut -d: -f6)\n"
+        "    n=$(printf '%s\\n' \"$ent\" | cut -d: -f1)\n"
         "    printf 'H\\t%s\\t%s\\n' \"$u\" \"${h:-}\"\n"
+        "    printf 'U\\t%s\\n' \"${n:-}\"\n"
         "  fi\n"
         "  tr '\\0' '\\n' < /proc/$p/environ 2>/dev/null |"
         " grep -E '" + pattern + "' | sed 's/^/E\\t/'\n"
@@ -674,7 +678,7 @@ def parse_metadata(text: str) -> dict[int, dict]:
                 cur = None
                 continue
             cur = out.setdefault(pid, {"cwd": "", "ticks": "", "uid": "",
-                                       "home": "", "env": {}})
+                                       "user": "", "home": "", "env": {}})
         elif cur is None:
             continue
         elif tag == "C":
@@ -685,6 +689,8 @@ def parse_metadata(text: str) -> dict[int, dict]:
             uid_s, _, home = value.partition("\t")
             cur["uid"] = uid_s.strip()
             cur["home"] = home.strip()
+        elif tag == "U":
+            cur["user"] = value.strip()
         elif tag == "E":
             name, _, val = value.partition("=")
             if name.strip() in ENV_ALLOWLIST:
@@ -763,6 +769,7 @@ class WslProcessProbe:
         self.last_error = ""
         # 每 distro 的最后成功结果，供扫描失败时保留缓存
         self._cache: dict[str, list[AgentInstance]] = {}
+        self._runtime_cache: dict[str, tuple[RemoteRuntimeContext, ...]] = {}
         self._distro_ok: dict[str, bool] = {}
         # 应用生命周期内见过（running 过）的 distro：停止后持续发空 tombstone
         self._known_distros: set[str] = set()
@@ -874,6 +881,22 @@ class WslProcessProbe:
         return rows
 
     @staticmethod
+    def _match_zcode_remote_runtime(comm: str, args: str) -> str | None:
+        """Recognize only ZCode's current WSL remote-service entry points.
+
+        The match is deliberately narrower than terminal Agent matching. These
+        processes are evidence that a Desktop data plane is live; they must never be
+        emitted as AgentSurface.TERMINAL targets.
+        """
+        low = str(args or "").lower().replace("\\", "/")
+        if ("/.zcode/server/agents/glm/zcode.cjs" in low
+                or "/.zcode/server/agents/glm/zcode-agent" in low):
+            return "agent"
+        if "/.zcode/server/zcode-server.cjs" in low:
+            return "server"
+        return None
+
+    @staticmethod
     def _match_agent(comm: str, args: str) -> AgentKind | None:
         low = args.lower()
         if re.search(r"(^|/)claude( |$|\.)", low) or "claude-code" in low or "@anthropic-ai/claude-code" in low:
@@ -925,8 +948,8 @@ class WslProcessProbe:
                     self.spawn_count += 1
                     for pid, extra in parse_metadata(text).items():
                         base = meta.setdefault(pid, {"cwd": "", "ticks": "", "uid": "",
-                                                     "home": "", "env": {}})
-                        for key in ("cwd", "ticks", "uid", "home"):
+                                                     "user": "", "home": "", "env": {}})
+                        for key in ("cwd", "ticks", "uid", "user", "home"):
                             if extra.get(key) and not base.get(key):
                                 base[key] = extra[key]
                         base["env"].update(extra.get("env", {}))
@@ -982,12 +1005,14 @@ class WslProcessProbe:
             # 已知 source 保留缓存实例并全部 authoritative=False。
             with self._lock:
                 cached = {d: list(v) for d, v in self._cache.items()}
+                cached_rt = dict(self._runtime_cache)
             for distro in self._known_distros:
                 out[f"wsl:{distro}"] = SourceProbeSnapshot(
                     source=f"wsl:{distro}", generation=gen,
                     observed_at=time.time(), authoritative=False,
                     instances=tuple(cached.get(distro, [])),
-                    error=inv.error)
+                    error=inv.error,
+                    remote_runtimes=tuple(cached_rt.get(distro, ())))
             self.last_ok = False
             self.scan_count += 1
             self.scan_ms = time.perf_counter() - t0
@@ -1004,6 +1029,7 @@ class WslProcessProbe:
                 authoritative=True, instances=())
             with self._lock:
                 self._cache.pop(distro, None)
+                self._runtime_cache.pop(distro, None)
                 self._distro_ok.pop(distro, None)
                 # 整个 distro 已停止：旧 Linux PID incarnation 的 fallback
                 # 代次没有保留意义（重启后 PID 从小整数重来也不继承旧 token）
@@ -1021,11 +1047,13 @@ class WslProcessProbe:
                 with self._lock:
                     self._distro_ok[distro] = False
                     cached = self._cache.get(distro)
+                    cached_rt = self._runtime_cache.get(distro, ())
                 self.last_error = str(exc)
                 out[source] = SourceProbeSnapshot(
                     source=source, generation=gen, observed_at=time.time(),
                     authoritative=False,
-                    instances=tuple(cached or ()), error=str(exc))
+                    instances=tuple(cached or ()), error=str(exc),
+                    remote_runtimes=tuple(cached_rt))
                 continue
             matched: list[tuple] = []
             for row in rows:
@@ -1036,6 +1064,21 @@ class WslProcessProbe:
                 kind = self._match_agent(comm, args)
                 if kind:
                     matched.append(row)
+            # ZCode Remote Development runtime is a Desktop data-plane signal, not
+            # a terminal Agent. Collapse server + agent child for the same Linux uid
+            # to one representative; prefer the actual agent child when both exist.
+            remote_by_uid: dict[int, tuple[tuple, str]] = {}
+            for row in rows:
+                role = self._match_zcode_remote_runtime(row[9], row[10])
+                if not role:
+                    continue
+                uid = int(row[6])
+                prev = remote_by_uid.get(uid)
+                if (prev is None
+                        or (role == "agent" and prev[1] != "agent")
+                        or (role == prev[1] and row[0] < prev[0][0])):
+                    remote_by_uid[uid] = (row, role)
+
             # 进程树 canonicalization：npm/node wrapper 只保留最深 runtime
             parent_by_pid = {row[0]: row[1] for row in rows}
             candidates = [ProcessCandidate(
@@ -1061,9 +1104,27 @@ class WslProcessProbe:
                 attachments[r[0]] = attachment
                 canonical_rows.append(r)
 
-            meta = self._metadata(distro, [r[0] for r in canonical_rows])
-            self.metadata_pid_count = len(canonical_rows)
+            metadata_pids = sorted({r[0] for r in canonical_rows}
+                                   | {item[0][0] for item in remote_by_uid.values()})
+            meta = self._metadata(distro, metadata_pids)
+            self.metadata_pid_count = len(metadata_pids)
             now = time.time()
+            remote_runtimes: list[RemoteRuntimeContext] = []
+            for uid, (row, role) in sorted(remote_by_uid.items()):
+                info = meta.get(row[0], {})
+                remote_runtimes.append(RemoteRuntimeContext(
+                    kind=AgentKind.ZCODE,
+                    transport="wsl-exec",
+                    source=source,
+                    distro=distro,
+                    pid=int(row[0]),
+                    uid=int(uid),
+                    user=str(info.get("user") or ""),
+                    home=str(info.get("home") or ""),
+                    runtime_role=role,
+                    observed_at=now,
+                    generation=gen,
+                ))
             instances = []
             for (pid, ppid, sid, pgid, tpgid, tty, uid, etimes,
                  stat, comm, args) in canonical_rows:
@@ -1083,6 +1144,7 @@ class WslProcessProbe:
                     ppid=ppid, sid=sid, pgid=pgid, tpgid=tpgid,
                     tty=tty if tty != "?" else "",
                     uid=uid,
+                    user=info.get("user", ""),
                     cwd=info.get("cwd", ""),
                     home=info.get("home", ""),
                     launcher_pids=launchers.get(pid, ()),
@@ -1097,8 +1159,6 @@ class WslProcessProbe:
                 inst.pi_session_dir = env.get("PI_CODING_AGENT_SESSION_DIR", "")
                 hints = [n for n in ("TMUX", "STY", "TERM_PROGRAM") if env.get(n)]
                 inst.terminal_hint = "·".join(hints[:1])
-                if info.get("home") and not inst.user:
-                    inst.user = os.path.basename(info["home"].rstrip("/")) or ""
                 instances.append(inst)
             # fallback 代次缓存只保留本轮见到的 PID
             seen = {(distro, r[0]) for r in canonical_rows}
@@ -1107,10 +1167,12 @@ class WslProcessProbe:
                     self._fallback.pop(key, None)
             with self._lock:
                 self._cache[distro] = instances
+                self._runtime_cache[distro] = tuple(remote_runtimes)
                 self._distro_ok[distro] = True
             out[source] = SourceProbeSnapshot(
                 source=source, generation=gen, observed_at=now,
-                authoritative=True, instances=tuple(instances))
+                authoritative=True, instances=tuple(instances),
+                remote_runtimes=tuple(remote_runtimes))
         self.last_ok = scan_ok
         if self.last_ok:
             self.last_error = ""

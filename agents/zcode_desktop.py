@@ -28,7 +28,7 @@
 """
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import paths
 from .base import classify_phase
@@ -88,6 +88,14 @@ class _ZcodeSession:
     db_updated_ms: int = 0
     last_status: Status | None = None
     last_activity_ts: float = 0.0
+
+
+@dataclass
+class _ZCodePlaneState:
+    plane_key: str
+    source: str
+    sessions: dict[str, _ZcodeSession] = field(default_factory=dict)
+    last_facts: dict | None = None
 
 
 class ZCodeSchemaAdapter:
@@ -237,7 +245,8 @@ class ZCodeStateProjector:
 class ZCodeDesktopSource(DesktopSessionSource):
     """ZCode root tasks 的被动 source（catalog + running/turn 投影）。"""
 
-    def __init__(self, cfg: dict | None = None, zcode_db: str | None = None):
+    def __init__(self, cfg: dict | None = None, zcode_db: str | None = None,
+                 remote_provider=None):
         self.kind = AgentKind.ZCODE
         self._cfg = dict(cfg or {})
         self._db_path = zcode_db or paths.zcode_db_path()
@@ -249,6 +258,10 @@ class ZCodeDesktopSource(DesktopSessionSource):
         self._retry_at = 0.0
         self._last_facts: dict | None = None
         self._sessions: dict[str, _ZcodeSession] = {}
+        self._local_plane = _ZCodePlaneState(
+            plane_key="windows", source="windows", sessions=self._sessions)
+        self._remote_provider = remote_provider
+        self._remote_planes: dict[str, _ZCodePlaneState] = {}
         self.db_query_count = 0
         self.db_busy_count = 0
         self.refresh_count = 0
@@ -256,6 +269,7 @@ class ZCodeDesktopSource(DesktopSessionSource):
     # ------------------------------------------------------------ 公共
     def close(self) -> None:
         self._sessions.clear()
+        self._remote_planes.clear()
         self._last_facts = None
         if self._ro is not None:
             self._ro.close()
@@ -264,14 +278,16 @@ class ZCodeDesktopSource(DesktopSessionSource):
         self._adapter = None
 
     def drop_host(self, host_key: str) -> None:
-        for sid in list(self._sessions):
-            sess = self._sessions[sid]
-            if not host_key or sess.bound_host_key == host_key:
-                self._sessions.pop(sid, None)
+        for sessions in self._session_maps():
+            for sid in list(sessions):
+                sess = sessions[sid]
+                if not host_key or sess.bound_host_key == host_key:
+                    sessions.pop(sid, None)
 
     def stats(self) -> dict:
         return {
-            "zcode_desktop_sessions": len(self._sessions),
+            "zcode_desktop_sessions": sum(len(s) for s in self._session_maps()),
+            "zcode_desktop_remote_planes": len(self._remote_planes),
             "zcode_desktop_db_queries": self.db_query_count,
             "zcode_desktop_db_busy": self.db_busy_count,
             "zcode_desktop_refreshes": self.refresh_count,
@@ -283,39 +299,108 @@ class ZCodeDesktopSource(DesktopSessionSource):
         diag: list[str] = []
         if not zcode_hosts:
             self._sessions.clear()
+            self._remote_planes.clear()
             return self._finish((), {}, zcode_hosts, diag)
-        if not os.path.isfile(self._db_path):
-            # host 活跃但 DB 缺失：不冒充 agent（plan2 §13 同 Codex）
+
+        all_instances: list[AgentInstance] = []
+        all_observations: dict[str, Observation] = {}
+        all_claims: set[SessionClaimKey] = set()
+        authoritative = True
+
+        # Local Windows plane: retain the existing ReadOnlySqlite/fingerprint path.
+        if os.path.isfile(self._db_path):
+            fingerprint = stat_fingerprint(self._db_path)
+            changed = fingerprints_differ(fingerprint, self._fingerprint)
+            refresh_due = now - self._last_sql >= _SAFETY_REFRESH_SEC
+            retry_due = bool(self._retry_at) and now >= self._retry_at
+            if changed or refresh_due or retry_due:
+                facts = self._query_facts(diag)
+                if facts is None:
+                    self._retry_at = now + _FAILURE_RETRY_SEC
+                    self._fingerprint = fingerprint
+                    authoritative = False
+                    facts = self._last_facts
+                else:
+                    self._fingerprint = fingerprint
+                    self._last_sql = now
+                    self._retry_at = 0.0
+                    self.refresh_count += 1
+                    self._last_facts = facts
+                    self._local_plane.last_facts = facts
+                    self._apply_catalog(facts["catalog"], zcode_hosts,
+                                        sessions=self._sessions)
+            else:
+                facts = self._last_facts
+            if facts:
+                items, observations, claims = self._collect(
+                    facts, zcode_hosts, claimed_sessions, now,
+                    sessions=self._sessions, source="windows")
+                all_instances.extend(items)
+                all_observations.update(observations)
+                all_claims.update(claims)
+        else:
+            # Local DB absence does not suppress a valid remote WSL data plane.
             diag.append("NO_STATE_DB")
             self._sessions.clear()
-            return self._finish((), {}, zcode_hosts, diag)
+            self._last_facts = None
+            self._local_plane.last_facts = None
 
-        fingerprint = stat_fingerprint(self._db_path)
-        changed = fingerprints_differ(fingerprint, self._fingerprint)
-        refresh_due = now - self._last_sql >= _SAFETY_REFRESH_SEC
-        retry_due = bool(self._retry_at) and now >= self._retry_at
-        if changed or refresh_due or retry_due:
-            facts = self._query_facts(diag)
-            if facts is None:
-                self._retry_at = now + _FAILURE_RETRY_SEC
-                self._fingerprint = fingerprint
-                return DesktopSourceSnapshot(
-                    authoritative=False,
-                    host_keys=frozenset(h.host_key for h in zcode_hosts),
-                    diagnostics=bounded_diagnostics(diag))
-            self._fingerprint = fingerprint
-            self._last_sql = now
-            self._retry_at = 0.0
-            self.refresh_count += 1
-            self._last_facts = facts
-            self._apply_catalog(facts["catalog"], zcode_hosts)
-        else:
-            facts = self._last_facts
+        # Remote WSL planes are already queried by ProcessProbeWorker. poll() only
+        # consumes the in-memory bounded snapshots and never executes wsl.exe.
+        remote_map = None
+        if self._remote_provider is not None:
+            try:
+                remote_map = dict(self._remote_provider() or {})
+            except Exception as exc:
+                authoritative = False
+                diag.append(f"REMOTE_PROVIDER_FAILED:{type(exc).__name__}")
+        if remote_map is not None:
+            active_keys: set[str] = set()
+            for plane_key in sorted(remote_map):
+                snap = remote_map[plane_key]
+                ctx = getattr(snap, "context", None)
+                if ctx is None or not str(getattr(ctx, "source", "")).startswith("wsl:"):
+                    continue
+                active_keys.add(plane_key)
+                plane = self._remote_planes.get(plane_key)
+                if plane is None:
+                    plane = _ZCodePlaneState(
+                        plane_key=plane_key, source=ctx.source)
+                    self._remote_planes[plane_key] = plane
+                for item in getattr(snap, "diagnostics", ()):
+                    diag.append(f"{ctx.source}:{item}")
+                facts = getattr(snap, "facts", None)
+                if getattr(snap, "authoritative", False) and facts is not None:
+                    plane.last_facts = facts
+                    self._apply_catalog(facts.get("catalog", ()), zcode_hosts,
+                                        sessions=plane.sessions)
+                else:
+                    authoritative = False
+                    facts = facts or plane.last_facts
+                if facts:
+                    items, observations, claims = self._collect(
+                        facts, zcode_hosts, claimed_sessions, now,
+                        sessions=plane.sessions, source=ctx.source)
+                    all_instances.extend(items)
+                    all_observations.update(observations)
+                    all_claims.update(claims)
+            # Provider omission is authoritative runtime disappearance; degraded
+            # sources remain present in the provider as non-authoritative snapshots.
+            for key in list(self._remote_planes):
+                if key not in active_keys:
+                    self._remote_planes.pop(key, None)
+        elif self._remote_provider is not None:
+            # Provider failure: retain plane state; Monitor will retain last-good
+            # source targets because this DesktopSourceSnapshot is non-authoritative.
+            authoritative = False
 
-        instances, observations, claims = self._collect(
-            facts, zcode_hosts, claimed_sessions, now)
-        return self._finish(instances, observations, zcode_hosts, diag,
-                            claims=claims)
+        return DesktopSourceSnapshot(
+            instances=tuple(all_instances),
+            observations=all_observations,
+            claims=frozenset(all_claims),
+            host_keys=frozenset(h.host_key for h in zcode_hosts),
+            authoritative=authoritative,
+            diagnostics=bounded_diagnostics(diag))
 
     # ------------------------------------------------------------ DB
     def _query_facts(self, diag: list[str]) -> dict | None:
@@ -359,8 +444,11 @@ class ZCodeDesktopSource(DesktopSessionSource):
             facts[key] = rows
         return facts
 
-    def _apply_catalog(self, rows, zcode_hosts):
-        host_key = zcode_hosts[0].host_key
+    def _apply_catalog(self, rows, zcode_hosts, sessions=None):
+        sessions = self._sessions if sessions is None else sessions
+        host = self._select_primary_host(zcode_hosts)
+        if host is None:
+            return
         for row in rows:
             try:
                 sid = str(row["id"] or "")
@@ -369,11 +457,11 @@ class ZCodeDesktopSource(DesktopSessionSource):
             if not sid:
                 continue
             keys = row.keys()
-            sess = self._sessions.get(sid)
+            sess = sessions.get(sid)
             if sess is None:
                 sess = _ZcodeSession(session_id=sid)
-                self._sessions[sid] = sess
-            sess.bound_host_key = host_key
+                sessions[sid] = sess
+            sess.bound_host_key = host.host_key
             try:
                 sess.db_updated_ms = int(row["time_updated"] or 0)
             except (KeyError, TypeError, ValueError):
@@ -386,7 +474,9 @@ class ZCodeDesktopSource(DesktopSessionSource):
                 sess.db_directory = str(row["directory"] or "")[:120]
 
     # ------------------------------------------------------------ 会话收集
-    def _collect(self, facts, zcode_hosts, claimed_sessions, now):
+    def _collect(self, facts, zcode_hosts, claimed_sessions, now,
+                 sessions=None, source: str = "windows"):
+        sessions = self._sessions if sessions is None else sessions
         instances: list[AgentInstance] = []
         observations: dict[str, Observation] = {}
         claims: set[SessionClaimKey] = set()
@@ -396,26 +486,24 @@ class ZCodeDesktopSource(DesktopSessionSource):
         now_ms = int(now * 1000)
         projector = ZCodeStateProjector(now_ms)
 
-        # 证据索引：root session id → 证据行（child 行经 parent_id 归并，
-        # plan2 §8.2：内部 agent activity 是父任务的工作证据）
-        model_by_root: dict[str, dict] = {}
-        for row in facts["models"]:
+        model_by_root: dict[str, object] = {}
+        for row in facts.get("models", ()):
             root = self._root_of(row[0], row[1])
             if root and root not in model_by_root:
                 model_by_root[root] = row
-        tool_by_root: dict[str, dict] = {}
-        for row in facts["tools"]:
+        tool_by_root: dict[str, object] = {}
+        for row in facts.get("tools", ()):
             root = self._root_of(row[0], row[1])
             if root and root not in tool_by_root:
                 tool_by_root[root] = row
-        turn_by_root: dict[str, dict] = {}
-        for row in facts["turns"]:
+        turn_by_root: dict[str, object] = {}
+        for row in facts.get("turns", ()):
             root = str(row[0] or "")
             if root and root not in turn_by_root:
-                turn_by_root[root] = row   # 行序即最新在前
+                turn_by_root[root] = row
 
-        for sid in list(self._sessions):
-            sess = self._sessions[sid]
+        for sid in list(sessions):
+            sess = sessions[sid]
             host = host_by_key.get(sess.bound_host_key)
             if host is None:
                 continue
@@ -430,14 +518,12 @@ class ZCodeDesktopSource(DesktopSessionSource):
                 if obs.turn_active or obs.status in (Status.DONE, Status.ERROR):
                     sess.last_activity_ts = max(sess.last_activity_ts, now)
             if self._lease_expired(sess, now):
-                self._sessions.pop(sid, None)
+                sessions.pop(sid, None)
                 continue
             if not sess.admitted and not self._admit(
                     sess, now, obs, sid in turn_by_root):
                 continue
             if obs is None:
-                # plan2 §8.3.6：session 确认存在（catalog 内且 admitted）
-                # 但无 active turn → IDLE
                 obs = Observation(source=EvidenceSource.SESSION,
                                   timestamp=now, status=Status.IDLE,
                                   phase=Phase.NONE,
@@ -447,7 +533,7 @@ class ZCodeDesktopSource(DesktopSessionSource):
             if claims_cover(claimed_sessions, "zcode", session_id=sid):
                 continue
             inst = AgentInstance(
-                kind=AgentKind.ZCODE, pid=0, source="windows",
+                kind=AgentKind.ZCODE, pid=0, source=source,
                 surface=AgentSurface.DESKTOP,
                 host_pid=host.pid, host_process_token=host.process_token,
                 host_key=host.host_key,
@@ -476,12 +562,27 @@ class ZCodeDesktopSource(DesktopSessionSource):
     def _db_updated_changed(self, sess: _ZcodeSession) -> bool:
         return sess.db_updated_ms > sess.first_seen_updated_ms
 
+    @staticmethod
+    def _select_primary_host(zcode_hosts):
+        if not zcode_hosts:
+            return None
+        return min(zcode_hosts, key=lambda h: (
+            float(getattr(h, "started_at", 0.0) or 0.0),
+            int(getattr(h, "pid", 0) or 0), str(h.host_key)))
+
+    def _session_maps(self):
+        return [self._sessions, *(p.sessions for p in self._remote_planes.values())]
+
+    def _admitted_count(self) -> int:
+        return sum(1 for sessions in self._session_maps()
+                   for sess in sessions.values() if sess.admitted)
+
     def _admit(self, sess: _ZcodeSession, now: float,
                obs: Observation | None,
                has_recent_turn: bool = False) -> bool:
         if sess.admitted:
             return True
-        admitted = sum(1 for s in self._sessions.values() if s.admitted)
+        admitted = self._admitted_count()
         if admitted >= _MAX_SESSIONS:
             return False
         reason = ""

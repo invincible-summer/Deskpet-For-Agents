@@ -1,138 +1,96 @@
-# DeskPet v4.4.0 — SourceLink
+# DeskPet 4.0.1 — SourceLink
 
-> Research snapshot: 2026-09-12  
-> DeskPet baseline: `main@9635e1bac225378fd120e32f0a6f89512da46069` (`4.3.1`)  
-> Purpose: sources used to design passive, zero-hook Codex Desktop / ZCode Desktop monitoring.  
-> Trust labels used below: **Official contract**, **Upstream implementation**, **Empirical issue**, **Third-party reverse evidence**.
+> Research snapshot: 2026-09-13  
+> Acceptance implementation tree: `8fe7461d46e60c31ff2da65c3983c28aa2ea0898`  
+> Purpose: record the external contracts and implementation evidence used by DeskPet's passive Windows/WSL/Desktop Agent monitoring.  
+> Trust labels: **Official contract**, **Upstream implementation**, **Empirical issue**, **Third-party reverse evidence**.
 
-## DeskPet current implementation baseline
+This file records evidence, not promises made by third-party products. Private paths, process names and database schemas are implementation observations and must remain capability-detected and fail closed. DeskPet's own safety contract is defined by the repository code, README and AGENTS.md.
 
-- [DeskPet current audited commit `9635e1b`](https://github.com/invincible-summer/Deskpet-For-Agents/commit/9635e1bac225378fd120e32f0a6f89512da46069) — v4.4.0 plan baseline.
-- [AGENTS.md @ `9635e1b`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/AGENTS.md) — project-wide passive-monitoring, safety/privacy, plan and acceptance contract.
-- [README.md @ `9635e1b`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/README.md) — current supported Agents/product behavior.
-- [agents/models.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/models.py) — current process-centric AgentInstance/Observation/AgentTarget model; v4.4 adds Desktop logical-session identity here.
-- [agents/discovery.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/discovery.py) — current one-pass Windows/WSL process discovery; current broad `codex*.exe` classification is the desktop/CLI ambiguity v4.4 must remove.
-- [agents/base.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/base.py) — current bounded file watcher, mutual-unique process/session binding and late-start fallback. Remains CLI-specific in v4.4.
-- [agents/codex.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/codex.py) — existing Codex rollout state parser reused by Codex Desktop exact rollout paths.
-- [agents/monitor.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/monitor.py) — current process/session/terminal evidence orchestration; v4.4 inserts DesktopSessionSource before StateReducer.
-- [agents/state.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/state.py) — state precedence/TTL; retained unchanged.
-- [agents/paths.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/paths.py) — canonical data roots / containment rules.
-- [agents/tailer.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/tailer.py) — bounded incremental file tailer.
-- [agents/process_watch.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/process_watch.py) — single blocking Windows process-exit watcher reused for DesktopHost leases.
-- [agents/terminal_uia.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/terminal_uia.py) — current single-MTA, event-driven UIA observer and bounded visible-text reads.
-- [agents/terminal_resolver.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/terminal_resolver.py) — terminal-only binding boundary retained by v4.4.
-- [agents/terminal_service.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/agents/terminal_service.py) — terminal observation/activation service; Desktop surface must not be routed here.
-- [actions/winkeys.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/actions/winkeys.py) — fail-closed HWND/PID/create-time validation and no input injection.
-- [pet/app.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/pet/app.py) — startup/shutdown and activation dispatch integration point.
-- [pet/config.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/pet/config.py) — config v5, runtime identity non-persistence, monitor cadence clamps, eligible kinds.
-- [pet/presentation.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/pet/presentation.py) — aggregate/fleet consumes AgentTarget and should remain surface-agnostic.
-- [pet/dashboard.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/pet/dashboard.py) — ZCode eligible-kind UI integration.
-- [.github/workflows/test.yml](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/.github/workflows/test.yml) — current Windows/Python 3.12 CI and blocking benchmarks.
-- [tests/benchmark_monitor.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/tests/benchmark_monitor.py) — existing monitor resource budget.
-- [tests/benchmark_presentation.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/tests/benchmark_presentation.py) — existing concurrent presentation budget.
-- [tests/benchmark_ui_architecture.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9635e1bac225378fd120e32f0a6f89512da46069/tests/benchmark_ui_architecture.py) — current UI scheduling/shutdown budget.
+## DeskPet 4.0.1 implementation
 
-## Codex Desktop — official product contracts
+The following links pin the accepted ZCode WSL implementation tree. The final `main` squash commit is tree-equivalent; this header is updated to the final `main` SHA after merge.
 
-- **Official contract** — [Introducing the Codex app](https://openai.com/index/introducing-the-codex-app/) — Codex app is designed to manage multiple agents in parallel; page includes the March 4, 2026 Windows availability update.
-- **Official contract** — [Using Codex with your ChatGPT plan](https://help.openai.com/en/articles/11369540) — current supported Codex clients include ChatGPT desktop app (Codex mode), CLI, IDE and web; Windows local Codex behavior is part of the same product family.
-- **Official contract** — [ChatGPT Work and Codex](https://help.openai.com/en/articles/20001275/) — current ChatGPT desktop app exposes Codex as a separate local desktop view; history is separate from ordinary ChatGPT history.
-- **Official contract** — [Codex App Server](https://learn.chatgpt.com/docs/app-server) — thread/turn/item model, initialize handshake, `thread/read`, `thread/list`, `thread/loaded/list`, runtime thread status, `thread/status/changed`, approvals/server requests and transport behavior. Important research source, but not used as a v4.4 production monitoring control plane because initialization is not side-effect-free in the current upstream implementation.
+- [agents/models.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/models.py) — `RemoteRuntimeContext` and three-state `SourceProbeSnapshot.remote_runtimes`.
+- [agents/discovery.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/discovery.py) — fresh WSL running-distro census, ZCode remote-runtime detection, uid/user/HOME metadata, authoritative/stale/tombstone semantics.
+- [agents/paths.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/paths.py) — pure Linux-path helpers for `~/.zcode/cli` and `~/.zcode/server`; production remote DB access does not use WSL UNC.
+- [agents/zcode_remote.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/zcode_remote.py) — bounded direct-argv WSL transport and read-only `node:sqlite` facts reader.
+- [agents/zcode_desktop.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/zcode_desktop.py) — local Windows + remote WSL plane projection with one global admission cap.
+- [agents/monitor.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/agents/monitor.py) — remote reads are owned by the existing `ProcessProbeWorker`; Monitor/UI polling never enters WSL.
+- [tests/test_zcode_wsl_remote.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/tests/test_zcode_wsl_remote.py) — path, discovery, transport, last-good, projection, cap and worker-gating regression coverage.
+- [tools/desktop_source_probe.py @ `8fe7461`](https://github.com/invincible-summer/Deskpet-For-Agents/blob/8fe7461d46e60c31ff2da65c3983c28aa2ea0898/tools/desktop_source_probe.py) — sanitized real-machine structure probe; no prompt/transcript/tool-argument/token output.
 
-## Codex — audited upstream implementation snapshot
+### 4.0.1 architecture conclusions
 
-The following links pin the upstream code audited for this plan to `openai/codex@654b0a77d0d2f81aa21f61caf7af4be88fe550bb`. These are implementation evidence, not immutable public API contracts.
+- Windows `ZCode.exe` remains the Desktop host and activation target. WSL remote runtime is a separate observation/data plane and never becomes a Terminal Agent target.
+- A remote data plane is authorized only by the current fresh WSL process census. Failed WSL enumeration retains last-good state as non-authoritative; an authoritative stopped-distro result removes the plane.
+- The remote database engine runs inside the same WSL environment as the database file. Windows does not open a live WSL SQLite/WAL file through `\\wsl.localhost`.
+- ZCode's private DB schema, runtime filenames and filesystem layout are feature-detected implementation evidence, not treated as stable public API.
+- Approval state is projected only from explicit session-scoped DB facts (`approval_status=requested` on a running tool). DeskPet does not synthesize approval from silence and does not approve automatically.
 
-- **Upstream implementation** — [state migration 0001: threads table](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/state/migrations/0001_threads.sql) — `id`, `rollout_path`, `updated_at`, `source`, `cwd`, `title`, `approval_mode`, `has_user_event`, `archived`, etc.
-- **Upstream implementation** — [state migration 0030: `thread_source`](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/state/migrations/0030_threads_thread_source.sql) — root/user vs generated thread filtering evidence.
-- **Upstream implementation** — [state migration 0053: `originator`](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/state/migrations/0053_threads_originator.sql) — client-origin metadata used as positive Desktop provenance when present.
-- **Upstream implementation** — [originator tags](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/otel/src/metrics/tags.rs) — current known originators include `codex_desktop`, CLI/TUI/VSCode families.
-- **Upstream implementation** — [default client/originator logic](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/login/src/auth/default_client.rs) — current first-party/originator behavior and desktop-related values.
-- **Upstream implementation** — [rollout persistence policy](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/rollout/src/policy.rs) — durable turn markers vs transient non-persisted approval/input events. This is the key reason v4.4 must not infer hidden approval from rollout silence.
-- **Upstream implementation** — [App Server thread data](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs) — thread object/status/source shapes.
-- **Upstream implementation** — [ThreadWatchManager](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server/src/thread_status.rs) — runtime `waitingOnApproval` / `waitingOnUserInput` facts and `thread/status/changed`.
-- **Upstream implementation** — [App Server transport routing](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server/src/transport.rs) — notifications broadcast to initialized connections unless opted out.
-- **Upstream implementation** — [App Server initialize processor](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server/src/request_processors/initialize_processor.rs) — critical safety finding: ordinary client initialize can mutate process-global client metadata / `USER_AGENT_SUFFIX`; only internal non-originating client names are exempt. Therefore DeskPet v4.4 does not attach as a live observer.
-- **Upstream implementation** — [control socket transport](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server-transport/src/transport/unix_socket.rs) — App Server control socket uses WebSocket over UDS.
-- **Upstream implementation** — [cross-platform UDS](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/uds/src/lib.rs) — Windows protected socket-directory DACL and peer-security implementation.
-- **Upstream implementation** — [App Server daemon/control socket](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/app-server-daemon/src/lib.rs) — control socket/daemon lifecycle evidence.
+## ZCode — product contracts
 
-## Codex — empirical multi-client / desktop issues
+- **Official contract** — [Remote Development](https://zcode.z.ai/en/docs/remote-development) — Remote Development supports WSL on the Windows desktop client. After connection, file reads, terminal commands, Git operations and ZCode Agent execution occur in the selected target environment, while the desktop client continues to provide account/model/task UI. The WSL flow can select a specific Linux user and prepares remote-side components on first connection.
+- **Official contract** — [Safety Confirmation](https://zcode.z.ai/en/docs/safety-confirm) — permission requests pause the affected task and remain task-scoped; this supports DeskPet's requirement that WAITING attribution be session-specific rather than globally guessed.
+- **Official contract** — [Hooks](https://zcode.z.ai/en/docs/hooks) — hooks are explicitly configured behavior and can participate in permissions. DeskPet therefore excludes hooks from the zero-configuration monitoring path.
+- **Official contract** — [Subagents](https://zcode.z.ai/en/docs/subagents) — ZCode may run subagents as work inside a task. DeskPet folds known child-session activity into the root task rather than creating a separate pet for each subagent.
+- **Official contract** — [Plugin](https://zcode.z.ai/en/docs/plugin) — plugins can bundle hooks/MCP/subagents. DeskPet monitoring does not require a plugin.
+- **Official contract** — [Usage Stats](https://zcode.z.ai/en/docs/usage-stats) — ZCode exposes usage derived from local session records, supporting the general existence of a persistent local session data plane; it does not make the private schema a public API.
 
-Issues are useful evidence of real behavior and capability gaps; they are not stable contracts.
+## ZCode — observed Remote Development implementation
 
-- **Empirical issue** — [openai/codex#40134 — Allow Codex Desktop to connect to an externally managed App Server](https://github.com/openai/codex/issues/40134) — illustrates that transport multi-connection and full Desktop multi-client ownership are not the same guarantee; approval/active-writer ownership needs explicit semantics.
-- **Empirical issue** — [openai/codex#37967 — Remote Control cannot attach reliably to an already-live CLI session](https://github.com/openai/codex/issues/37967) — further evidence that secondary-client semantics must not be assumed.
-- **Empirical issue** — [openai/codex#20864](https://github.com/openai/codex/issues/20864) — evidence around shared local session history / scaling cost when broad-scanning rollouts.
-- **Empirical issue** — [Windows Terminal #19783](https://github.com/microsoft/terminal/issues/19783) — still relevant to CLI activation: no reliable external `WT_SESSION -> exact existing tab` activation contract.
+These issue logs are empirical evidence of current runtime layout. They are deliberately matched narrowly and are covered by fail-closed tests because upstream may change them.
 
-## ZCode — official product contracts
+- **Empirical issue** — [zai-org/feedback #162](https://github.com/zai-org/feedback/issues/162) — ZCode 3.4 Windows/WSL connection logs show `server/zcode-server.cjs` uploaded to `~/.zcode/server/zcode-server.cjs` and the server installed in the WSL environment.
+- **Empirical issue** — [zai-org/feedback #195](https://github.com/zai-org/feedback/issues/195) — remote-workspace failure logs reference the server path and an agent entry under `~/.zcode/server/agents/glm/zcode-agent`. DeskPet 4.0.1 accepts this exact current entry in addition to `zcode.cjs`.
+- **Empirical issue** — [zai-org/feedback #302](https://github.com/zai-org/feedback/issues/302) — ZCode 3.7.7 remote runtime/log evidence references `zcode.cjs` under the remote `~/.zcode/server/agents/glm/` tree and remote `~/.zcode/cli/log` activity.
+- **Empirical issue** — [zai-org/feedback #28](https://github.com/zai-org/feedback/issues/28) — Windows 11 + WSL2 logs independently show the remote ZCode CLI log root under `~/.zcode/cli/log/`.
 
-- **Official contract** — [Install](https://zcode.z.ai/en/docs/install) — current ZCode desktop platform support including Windows.
-- **Official contract** — [ZCode Agent / Side Conversation](https://zcode.z.ai/en/docs/agents) — Side Conversation is desktop-only, fully capable, permission-aware, per-window, temporary and not part of normal task history.
-- **Official contract** — [Safety Confirmation](https://zcode.z.ai/en/docs/safety-confirm) — permission requests pause the task, are task-scoped, remain pending when navigating away, and can appear as waiting confirmation in the sidebar.
-- **Official contract** — [Usage Stats](https://zcode.z.ai/en/docs/usage-stats) — App Usage reads local ZCode session records on the current device; confirms the existence/usefulness of a local persistent session data plane.
-- **Official contract** — [Hooks](https://zcode.z.ai/en/docs/hooks) — Hooks are a configurable local subprocess protocol and require configuration such as `~/.zcode/cli/config.json` / `hooks.enabled`; permission hooks can affect behavior. Explicitly excluded from DeskPet's zero-configuration observer architecture.
-- **Official contract** — [Subagents](https://zcode.z.ai/en/docs/subagents) — ZCode can run foreground/background subagents in parallel; DeskPet treats these as internal work of the parent task, not user conversations/pets.
-- **Official contract** — [Plugin](https://zcode.z.ai/en/docs/plugin) — plugins can bundle hooks/MCP/subagents. DeskPet does not require a plugin for monitoring.
+## ZCode — private data-plane reverse evidence
 
-## ZCode — third-party reverse evidence
+These are not official compatibility contracts. They are retained because public ZCode documentation does not specify the internal DB schema or bundled runtime executable path.
 
-These sources demonstrate current implementation details but are not official ZCode API contracts. Production code must feature-detect and fail closed when the schema changes.
+- **Third-party reverse evidence** — [yiyanwannian/zcode-monitor @ `fe8857f`](https://github.com/yiyanwannian/zcode-monitor/tree/fe8857f23708e7b45b6bbb00a075021ddb799984) — independent read-only monitoring evidence for ZCode session/model/tool/turn records and approval-related fields.
+- **Third-party reverse evidence** — [xhwxt/zcode-token-usage-statusbar @ `42b64bc`](https://github.com/xhwxt/zcode-token-usage-statusbar/tree/42b64bc25a0aceaa473e70b791d0c11d4f9e953b) — evidence that current ZCode session data is read from `~/.zcode/cli/db/db.sqlite`, including remote environments.
+- **Third-party reverse evidence** — [windviki/zcode-webui @ `a9abc61`](https://github.com/windviki/zcode-webui/tree/a9abc6177e24bc94f97f4d6828f18e709d8b3d2a) — evidence for the bundled remote `~/.zcode/server/node` runtime and ZCode remote-agent layout.
 
-- **Third-party reverse evidence** — [yiyanwannian/zcode-monitor @ `fe8857f`](https://github.com/yiyanwannian/zcode-monitor/tree/fe8857f23708e7b45b6bbb00a075021ddb799984) — independent read-only ZCode local monitoring implementation.
-- **Third-party reverse evidence** — [zcode-monitor `server/db.js`](https://github.com/yiyanwannian/zcode-monitor/blob/fe8857f23708e7b45b6bbb00a075021ddb799984/server/db.js) — current `~/.zcode/cli/db/db.sqlite` location and observed session/model/tool/turn database usage.
-- **Third-party reverse evidence / negative design reference** — [zcode-monitor `server/zcode-runtime.js`](https://github.com/yiyanwannian/zcode-monitor/blob/fe8857f23708e7b45b6bbb00a075021ddb799984/server/zcode-runtime.js) — documents current WAL behavior but opens a writable connection after ZCode exit to checkpoint. DeskPet deliberately does **not** adopt that behavior.
-- **Third-party reverse evidence** — [zcode-acp](https://github.com/coder/zcode-acp) — evidence that private ZCode agent/app-server permission flows are bidirectional control requests. Useful for understanding why DeskPet must not attach to the private control plane as a silent observer.
+DeskPet never treats these repositories as authority over ZCode. Their evidence is used only to define conservative capability probes and is corroborated with official/empirical runtime evidence where possible.
 
-## SQLite read-only concurrency references
+## Node.js / SQLite — remote read-only transport
 
-- **Official contract** — [SQLite URI filenames](https://www.sqlite.org/uri.html) — `mode=ro`; also explains `nolock` risks. DeskPet uses read-only URI mode and does not use `nolock`.
-- **Official contract** — [SQLite `PRAGMA query_only`](https://www.sqlite.org/pragma.html#pragma_query_only) — defense-in-depth read-only connection behavior.
-- **Official contract** — [SQLite Write-Ahead Logging](https://www.sqlite.org/wal.html) — WAL readers/writers, checkpoint behavior and constraints. DeskPet reads a live WAL DB but never checkpoints or repairs it.
-- **Python contract** — [Python 3.12 `sqlite3`](https://docs.python.org/3.12/library/sqlite3.html) — stdlib database client used to avoid a new runtime dependency.
+- **Official contract** — [Node.js `node:sqlite`](https://nodejs.org/api/sqlite.html) — `DatabaseSync` was introduced in Node 22.5.0; it supports a read-only connection option, a bounded busy `timeout`, and extension loading disabled by default. DeskPet explicitly requests `readOnly: true`, `timeout: 40`, and `allowExtension: false` in ZCode's bundled WSL Node process.
+- **Official contract** — [SQLite WAL](https://sqlite.org/wal.html) — WAL requires shared-memory coordination among processes using the database and is not designed for ordinary network-filesystem access between different hosts.
+- **Official contract** — [SQLite Over a Network](https://sqlite.org/useovernet.html) — SQLite recommends keeping the database engine on the same machine as the database file when a network boundary exists. DeskPet follows this by executing `node:sqlite` inside WSL and sending only bounded JSON facts back to Windows.
 
-## Windows UI Automation / activation / process-liveness references
+The 4.0.1 remote reader issues only a fixed schema probe and fixed `SELECT`/`WITH` facts queries. It performs no `INSERT`, `UPDATE`, `DELETE`, DDL, WAL checkpoint, repair, extension loading, or database migration.
 
-- **Official contract** — [UI Automation threading](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading) — UIA clients should use a dedicated non-UI MTA thread and manage event handlers there.
-- **Official contract** — [UI Automation Event IDs](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-event-ids) — event-driven observer reference.
-- **Official contract** — [IUIAutomationElement::GetRuntimeId](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-getruntimeid) — runtime-only opaque identity; not persisted.
-- **Official contract** — [SetForegroundWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow) — foreground restrictions.
-- **Official contract** — [FlashWindowEx](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-flashwindowex) — non-invasive fallback when foreground activation is denied.
-- **Official contract** — [GetWindowThreadProcessId](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowthreadprocessid) — HWND owner verification.
-- **Official contract** — [GetClassNameW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclassnamew) — window-class identity evidence.
-- **Official contract** — [OpenProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess) — SYNCHRONIZE process-handle acquisition.
-- **Official contract** — [WaitForMultipleObjects](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects) — shared blocking process-exit watcher.
-- **Official contract** — [Terminating a Process](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process) — terminated process object becomes signaled.
+## Microsoft WSL — passive running-distro boundary
 
-## Windows Terminal / WSL references retained for mixed CLI + Desktop behavior
+- **Official contract** — [WSL interop](https://learn.microsoft.com/en-us/windows/dev-environment/wsl-interop) — Windows can access a distro through `\\wsl$` / `\\wsl.localhost`; Microsoft documents that `\\wsl.localhost` can auto-start a distro on Windows 11. This is why DeskPet never uses a stale cached distro name or a UNC file probe as authorization to inspect a stopped distribution.
+- **Official contract** — [WSL basic commands](https://learn.microsoft.com/en-us/windows/wsl/basic-commands) — `wsl --list --running` is the host-side inventory used as the fresh gate before any distro-specific `--exec` operation.
 
-- [Windows Terminal command-line arguments](https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments)
-- [microsoft/terminal#19783](https://github.com/microsoft/terminal/issues/19783)
-- [microsoft/terminal#19818](https://github.com/microsoft/terminal/issues/19818)
-- [microsoft/terminal#18692](https://github.com/microsoft/terminal/issues/18692)
-- [Default Terminal spec #492](https://github.com/microsoft/terminal/blob/main/doc/specs/%23492%20-%20Default%20Terminal/spec.md)
-- [`/proc/PID/stat`](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html)
-- [`/proc/PID/cwd`](https://man7.org/linux/man-pages/man5/proc_pid_cwd.5.html)
-- [`ps(1)`](https://man7.org/linux/man-pages/man1/ps.1.html)
-- [WSL basic commands](https://learn.microsoft.com/en-us/windows/wsl/basic-commands)
+DeskPet's existing WSL discovery therefore keeps the three-state distinction: authoritative presence, authoritative absence, and non-authoritative read failure. “Could not read” is never converted into “the Agent disappeared.”
 
-## Existing Agent upstream references retained
+## Codex / Windows sources retained by the project
 
-- [Codex protocol.rs](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/protocol.rs)
-- [anthropics/claude-code#53037](https://github.com/anthropics/claude-code/issues/53037)
-- [Kimi data locations](https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/configuration/data-locations.md)
-- [Kimi interactionOps.ts](https://github.com/MoonshotAI/kimi-code/blob/main/packages/agent-core-v2/src/agent/interaction/interactionOps.ts)
-- [Kimi promptOps.ts](https://github.com/MoonshotAI/kimi-code/blob/main/packages/agent-core-v2/src/agent/prompt/promptOps.ts)
-- [pi session format](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/session.md)
-- [pi AI types](https://github.com/badlogic/pi-mono/blob/main/packages/ai/src/types.ts)
+The ZCode 4.0.1 change does not alter the existing Codex Desktop/CLI safety boundary; these references remain part of the project evidence set.
 
-## Source interpretation rules for 4.4.0
+- **Official contract** — [Introducing the Codex app](https://openai.com/index/introducing-the-codex-app/) — product-level multi-agent desktop behavior and Windows availability.
+- **Official contract** — [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server) — thread/turn/item and approval-server-request concepts. DeskPet's current passive Desktop source does not attach to this live control plane.
+- **Upstream implementation** — [openai/codex state migrations](https://github.com/openai/codex/tree/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/state/migrations) — pinned implementation evidence used for capability-detected Codex Desktop state DB reads.
+- **Upstream implementation** — [Codex rollout persistence policy](https://github.com/openai/codex/blob/654b0a77d0d2f81aa21f61caf7af4be88fe550bb/codex-rs/rollout/src/policy.rs) — distinguishes durable rollout evidence from transient runtime events; DeskPet does not infer hidden approvals from rollout silence.
+- **Empirical issue** — [Windows Terminal #19783](https://github.com/microsoft/terminal/issues/19783) — illustrates the lack of a stable external mapping from an arbitrary process/session to an exact already-open Windows Terminal tab; DeskPet keeps terminal activation conservative.
 
-1. Official product/API documentation defines intended behavior.
-2. Upstream source at a pinned commit can justify an implementation strategy, but its private details must be capability-detected.
-3. GitHub issues provide empirical failure/compatibility evidence, not API guarantees.
-4. Third-party reverse-engineered ZCode schema is a probe target, not a compile-time contract.
-5. If an implementation detail conflicts with DeskPet's passive/no-side-effect contract, DeskPet must decline that path even if it exposes richer state.
-6. Ambiguous identity/status must degrade to UNKNOWN/WORKING rather than be guessed.
-7. No source justifies hooks, Agent configuration changes, input injection, DB writes, WAL checkpointing, memory injection, or automatic approval.
+## Evidence interpretation and safety rules
+
+1. **Official contract** may justify product/platform behavior, but it does not turn undocumented internal file layouts into APIs.
+2. **Upstream implementation** is pinned to a commit where possible and must be capability-detected if consumed.
+3. **Empirical issue** proves an observed runtime shape or failure mode, not a permanent guarantee.
+4. **Third-party reverse evidence** is used only to corroborate private implementation details and never as sole authority for a destructive/action path.
+5. Monitoring must remain passive: no hooks/plugin installation, no Agent config mutation, no input injection, no automatic approval, no private control-plane navigation, and no Agent-database writes.
+6. Runtime identity is bounded and ephemeral. Distro/user/session/runtime facts are not persisted as long-lived user configuration.
+7. A schema/runtime mismatch degrades to non-authoritative/UNKNOWN/last-good behavior instead of guessing.
+
+## Acceptance boundary
+
+The 4.0.1 automated acceptance covers byte-compile, the full Windows unit suite, fresh/stale/tombstone discovery semantics, direct-argv read-only remote transport, state isolation, global session/plane bounds, and the existing Monitor/Desktop-source/Presentation/UI architecture benchmarks. It does **not** claim that GitHub-hosted CI is a real user's ZCode + WSL Remote Development machine. `tools/desktop_source_probe.py` exists for the final environment-specific read-only smoke check without exposing prompts, transcripts, tool arguments, credentials, or other sensitive payloads.

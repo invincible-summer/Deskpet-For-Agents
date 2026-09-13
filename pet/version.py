@@ -4,5 +4,5 @@
 `v{APP_VERSION}`; version policy is documented in VERSIONING.md.
 """
 APP_NAME = "DeskPet"
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.0.1"
 APP_LABEL = f"{APP_NAME} V{APP_VERSION}"

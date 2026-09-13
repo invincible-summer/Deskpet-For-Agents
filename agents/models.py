@@ -371,6 +371,31 @@ class AgentInstance:
 
 
 @dataclass(frozen=True)
+class RemoteRuntimeContext:
+    """Fresh WSL-side runtime evidence for a Desktop Agent data plane.
+
+    This is observation-only identity. It never becomes a terminal Agent target and
+    is never persisted. A consumer may enter the distro only while handling the same
+    fresh authoritative process-probe generation that produced this context.
+    """
+    kind: AgentKind
+    transport: str
+    source: str
+    distro: str
+    pid: int
+    uid: int
+    user: str
+    home: str
+    runtime_role: str
+    observed_at: float
+    generation: int
+
+    @property
+    def plane_key(self) -> str:
+        return f"{self.source}|uid:{self.uid}"
+
+
+@dataclass(frozen=True)
 class SourceProbeSnapshot:
     """一个 process source 一轮探测的不可拆开结果（v4plan §3.2）。
 
@@ -387,6 +412,7 @@ class SourceProbeSnapshot:
     authoritative: bool
     instances: tuple[AgentInstance, ...] = ()
     error: str = ""
+    remote_runtimes: tuple[RemoteRuntimeContext, ...] = ()
 
 
 @dataclass(frozen=True)

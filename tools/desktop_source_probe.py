@@ -1,4 +1,4 @@
-"""DeskPet 4.4.0 Desktop source 实机只读探针（plan2 §14）。
+"""DeskPet 4.0.1 Desktop source 实机只读探针。
 
 用途：在一台真实机器上确认 Codex Desktop / ZCode Desktop 的本地数据面
 schema 与进程形态，为 capability 探测提供证据；输出全部脱敏：
@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from agents import paths  # noqa: E402
-from agents.discovery import scan_windows_inventory  # noqa: E402
+from agents.discovery import WslProcessProbe, scan_windows_inventory  # noqa: E402
 from agents.sqlite_ro import ReadOnlySqlite, stat_fingerprint  # noqa: E402
 
 
@@ -208,6 +208,26 @@ def probe_zcode() -> dict:
         con.close()
 
 
+def probe_zcode_wsl_runtime() -> dict:
+    """Fresh, sanitized WSL runtime evidence; never reads prompt/transcript data."""
+    probe = WslProcessProbe()
+    snapshots = probe.scan()
+    planes = []
+    for source, snap in sorted(snapshots.items()):
+        for ctx in snap.remote_runtimes:
+            planes.append({
+                "source": source,
+                "authoritative": snap.authoritative,
+                "generation": ctx.generation,
+                "pid": ctx.pid,
+                "uid": ctx.uid,
+                "user_resolved": bool(ctx.user),
+                "home_resolved": bool(ctx.home),
+                "runtime_role": ctx.runtime_role,
+            })
+    return {"planes": planes[:16], "wsl_spawn_count": probe.spawn_count}
+
+
 def probe_host_windows() -> dict:
     """宿主顶层窗口 class 名（结构信息；不含标题文本）。"""
     if os.name != "nt":
@@ -245,6 +265,7 @@ def main() -> int:
         "processes": probe_processes(),
         "codex": probe_codex(),
         "zcode": probe_zcode(),
+        "zcode_wsl_runtime": probe_zcode_wsl_runtime(),
         "host_windows": probe_host_windows(),
     }
     text = json.dumps(report, ensure_ascii=False, indent=2, default=str)
