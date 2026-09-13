@@ -2,7 +2,9 @@
 
 DeskPet 使用 Semantic Versioning 2.0.0。版本与 Release 的关系见
 [VERSIONING.md](VERSIONING.md)。本文件维护各个可识别版本新增了什么功能、
-修复了什么问题；源码版本可以先于 Git tag / GitHub Release 前进。
+修复了什么问题；源码版本可以先于 Git tag / GitHub Release 前进。项目不会为
+每个源码 patch 自动发布二进制，而是在重要功能/修复形成值得分发的版本里程碑时
+再创建正式 Release。
 
 ## 4.0.1 — ZCode WSL Remote Development 监听修复（源码版本，未发布）
 
@@ -16,9 +18,10 @@ Release，也不生成新的 Portable/EXE 发布文件**。最新已发布二进
   `%USERPROFILE%\.zcode\cli\db\db.sqlite`、因此看不到远端任务的问题。
 - 监听拓扑拆成两个事实面：Windows `ZCode.exe` 继续作为桌面宿主和激活目标；
   会话状态从实际运行 Agent 的 WSL distro + Linux uid/user/HOME 数据面读取。
-- `WslProcessProbe` 只识别已经运行的 `~/.zcode/server/zcode-server.cjs` /
-  `~/.zcode/server/agents/glm/zcode.cjs`，同一 uid 的 server + child 合并为一个
-  data plane；这些进程不会被错误显示成 Terminal Agent。
+- `WslProcessProbe` 只识别已经运行的 `~/.zcode/server/zcode-server.cjs`、
+  `~/.zcode/server/agents/glm/zcode.cjs` 与当前上游实机日志中出现的
+  `~/.zcode/server/agents/glm/zcode-agent`；同一 uid 的 server + agent child
+  合并为一个 data plane。这些进程不会被错误显示成 Terminal Agent。
 - 远端 SQLite 由 WSL 内 ZCode 自带的 `~/.zcode/server/node` + `node:sqlite`
   以 `readOnly: true` 打开；不通过 `\\wsl.localhost` 打开 live WAL，不执行
   checkpoint、repair、写入或依赖安装。
@@ -45,6 +48,18 @@ Release，也不生成新的 Portable/EXE 发布文件**。最新已发布二进
   “Running” 缓存去授权 `wsl -d` 远端读取。
 - 私有 ZCode 路径/schema 都按 capability 检测处理；上游变化时安全降级而不是
   猜测状态。
+
+### 自动验收
+
+- Windows/Python 3.12 全量单元回归：**812 项通过**。
+- `benchmark_monitor.py --ticks 5000`：通过。
+- `benchmark_desktop_sources.py --ticks 5000`：通过。
+- Presentation 与 UI architecture 两组 blocking benchmark：通过。
+- 提交前 changed-file 白名单与 `git diff --check`：通过；未引入无关文件或
+  CRLF/LF 全文件重写。
+- 自动验收覆盖合成/Mock 的 WSL runtime、只读传输、状态投影和资源边界；真实
+  用户机器上的 ZCode + WSL Remote Development 会话仍应使用只读 probe 做一次
+  环境相关 smoke check，不能把 CI 当作真实远端会话实测。
 
 ## 4.0.0 — Portable 正式发布基线
 
