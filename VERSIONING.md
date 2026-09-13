@@ -34,9 +34,10 @@ public compatibility promise.
 - **PATCH**: increment for backward-compatible correctness, reliability, security or
   performance fixes that do not add a new public capability.
 
-Internal refactors, CI changes, test additions, documentation fixes and development
-plan milestones do not receive versions by themselves. A version changes only when a
-release is intentionally prepared.
+Internal refactors, CI changes, test additions and documentation-only edits do not
+receive versions by themselves. An accepted source milestone may advance
+`pet/version.py::APP_VERSION` before a binary Release is created; that source version
+is not evidence that a tag or GitHub Release exists.
 
 Conventional Commit markers may inform the decision (`fix:` often maps to PATCH,
 `feat:` often maps to MINOR, `!` / `BREAKING CHANGE:` often maps to MAJOR), but the
@@ -46,8 +47,10 @@ public compatibility contract is authoritative.
 
 Stable releases use annotated tags named exactly `vX.Y.Z`, where `X.Y.Z` is a valid
 stable SemVer with no leading zeroes. `pet/version.py::APP_VERSION` is the single
-application-version source of truth and MUST exactly equal the tag without the `v`
-prefix.
+**source-version** truth. When a Release is actually published, its tag MUST exactly
+match the accepted source version without the `v` prefix. A newer source version may
+exist on `main` without a tag/Release while validation or release packaging is being
+deferred intentionally.
 
 The current automated release channel publishes stable versions only. SemVer
 pre-release identifiers remain reserved for a future release-channel implementation;
@@ -74,4 +77,5 @@ retired; their commits remain permanently in Git history and are mapped in
 
 The first release under this permanent policy is `v4.0.0`, which establishes the
 portable Windows distribution, `%LOCALAPPDATA%\DeskPet` mutable-data boundary, and the
-validated build/release contract.
+validated build/release contract. The current accepted source version may be newer;
+see `CHANGELOG.md` for whether that version has a corresponding Release.

@@ -24,7 +24,7 @@
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .base import BaseWatcher
 from .claude import ClaudeWatcher
@@ -144,6 +144,9 @@ class ProcessProbeWorker:
         self._wsl = WslProcessProbe(
             allow_root_metadata=bool(config.get(
                 "privacy.wsl_root_metadata_fallback", False)))
+        from .zcode_remote import ZCodeRemoteReader
+        self._zcode_remote = ZCodeRemoteReader()
+        self._zcode_remote_snapshots: dict[str, object] = {}
         self._last_windows = 0.0
         self._last_wsl = 0.0
         self.windows_scan_ms = 0.0
@@ -183,6 +186,11 @@ class ProcessProbeWorker:
             inv = self._inventory
         return bool(inv is not None and inv.authoritative)
 
+    def zcode_remote_snapshots(self) -> dict[str, object]:
+        """Latest bounded remote ZCode facts, produced only by this worker."""
+        with self._lock:
+            return dict(self._zcode_remote_snapshots)
+
     def set_wsl_root_metadata_fallback(self, enabled: bool) -> None:
         """DP43-R03：运行期切换 WSL root metadata 权限。O(1)、无 WSL
         call、无 Tk、线程安全（Event 承载）。"""
@@ -204,6 +212,72 @@ class ProcessProbeWorker:
                 pass
             elapsed = time.time() - t0
             self._wake.wait(max(0.3, 1.0 - elapsed))
+
+    def _mark_zcode_remote_stale(self, reason: str, now: float) -> None:
+        with self._lock:
+            current = dict(self._zcode_remote_snapshots)
+            self._zcode_remote_snapshots = {
+                key: self._zcode_remote.stale(snap, reason, now)
+                for key, snap in current.items()
+            }
+
+    def _refresh_zcode_remote(self, by_source: dict[str, SourceProbeSnapshot],
+                              now: float) -> None:
+        """Read remote DBs only from the same fresh WSL census generation.
+
+        No wsl.exe call is ever made from Monitor Core.  A non-authoritative Windows
+        or WSL source only marks last-good facts stale; authoritative runtime absence
+        removes that plane.  At most four WSL data planes are queried per scan.
+        """
+        cfg_m = self.config.get("monitor") or {}
+        agents_cfg = cfg_m.get("agents") or {}
+        if not bool(agents_cfg.get("zcode", True)):
+            with self._lock:
+                self._zcode_remote_snapshots.clear()
+            self._zcode_remote.drop_except(set())
+            return
+        with self._lock:
+            win_snap = self._snapshot.get("windows")
+            inv = self._inventory
+            previous = dict(self._zcode_remote_snapshots)
+        if win_snap is None or not win_snap.authoritative or inv is None:
+            self._mark_zcode_remote_stale("WINDOWS_HOST_NON_AUTHORITATIVE", now)
+            return
+        if not any(h.kind is AgentKind.ZCODE for h in inv.desktop_hosts):
+            with self._lock:
+                self._zcode_remote_snapshots.clear()
+            self._zcode_remote.drop_except(set())
+            return
+
+        next_map: dict[str, object] = {}
+        candidates = []
+        for source, sp in sorted(by_source.items()):
+            if not source.startswith("wsl:"):
+                continue
+            if not sp.authoritative:
+                # WslProcessProbe carries cached runtime contexts on degraded reads.
+                cached_keys = {ctx.plane_key for ctx in sp.remote_runtimes}
+                for key, old in previous.items():
+                    old_ctx = getattr(old, "context", None)
+                    if (old_ctx is not None and old_ctx.source == source
+                            and (not cached_keys or key in cached_keys)):
+                        next_map[key] = self._zcode_remote.stale(
+                            old, sp.error or "WSL_SOURCE_NON_AUTHORITATIVE", now)
+                continue
+            for ctx in sp.remote_runtimes:
+                if ctx.kind is AgentKind.ZCODE:
+                    candidates.append(ctx)
+
+        candidates.sort(key=lambda c: (c.source, c.uid, c.pid))
+        for ctx in candidates[:4]:
+            # Exact HOME/user are required; missing metadata degrades without a
+            # fallback to /home/*, UNC SQLite or root.
+            snap = self._zcode_remote.read(ctx)
+            next_map[ctx.plane_key] = snap
+        active = set(next_map)
+        self._zcode_remote.drop_except(active)
+        with self._lock:
+            self._zcode_remote_snapshots = next_map
 
     def _tick(self):
         cfg_m = self.config.get("monitor") or {}
@@ -252,6 +326,9 @@ class ProcessProbeWorker:
                 self._snapshot.pop("windows", None)
                 self._inventory = None
             self._windows_cache = ()
+            with self._lock:
+                self._zcode_remote_snapshots.clear()
+            self._zcode_remote.drop_except(set())
             self.windows_scan_ms = 0.0
             self.windows_probe_error = ""
         wsl_enabled = bool(cfg_m.get("wsl_enabled", True))
@@ -262,6 +339,7 @@ class ProcessProbeWorker:
                 by_source = self._wsl.scan()
                 with self._lock:
                     self._snapshot.update(by_source)
+                self._refresh_zcode_remote(by_source, now)
             except Exception:
                 # WslProcessProbe 内部已按 source 输出三态；这里只是防线
                 with self._lock:
@@ -271,12 +349,16 @@ class ProcessProbeWorker:
                             self._snapshot[source] = SourceProbeSnapshot(
                                 source=source, generation=sp.generation,
                                 observed_at=now, authoritative=False,
-                                instances=sp.instances, error="probe crashed")
+                                instances=sp.instances, error="probe crashed",
+                                remote_runtimes=sp.remote_runtimes)
+                self._mark_zcode_remote_stale("WSL_PROBE_CRASHED", now)
         elif not wsl_enabled:
             with self._lock:
                 for source in list(self._snapshot):
                     if source.startswith("wsl:"):
                         self._snapshot.pop(source, None)
+                self._zcode_remote_snapshots.clear()
+            self._zcode_remote.drop_except(set())
 
 
 class Monitor:
@@ -397,8 +479,9 @@ class Monitor:
                 CodexDesktopSource(cfg=dict(self._source_cfg)))
         if AgentKind.ZCODE in enabled:
             from .zcode_desktop import ZCodeDesktopSource
-            self._desktop_sources.append(
-                ZCodeDesktopSource(cfg=dict(self._source_cfg)))
+            self._desktop_sources.append(ZCodeDesktopSource(
+                cfg=dict(self._source_cfg),
+                remote_provider=self._probe.zcode_remote_snapshots))
 
     def _start_terminal(self):
         # 启动失败不锁存：backend.available() 是唯一可用性事实来源

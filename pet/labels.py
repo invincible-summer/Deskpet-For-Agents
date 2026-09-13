@@ -42,9 +42,11 @@ def environment_label(inst) -> str:
     from agents.models import AgentSurface
     kind = getattr(inst, "kind", None)
     base = kind.label if kind is not None else ""
-    if getattr(inst, "surface", AgentSurface.TERMINAL) is AgentSurface.DESKTOP:
-        return f"{base} · Desktop".strip(" ·")
     distro = getattr(inst, "distro", "") or ""
+    if getattr(inst, "surface", AgentSurface.TERMINAL) is AgentSurface.DESKTOP:
+        if distro:
+            return f"{base} · Desktop · WSL {distro}".strip(" ·")
+        return f"{base} · Desktop".strip(" ·")
     if distro:
         return f"{base} · WSL {distro}"
     return base

@@ -102,6 +102,33 @@ def zcode_log_root() -> str:
     return os.path.join(zcode_cli_root(), "log")
 
 
+def _zcode_wsl_child(home: str, *parts: str) -> str:
+    """Build a contained Linux path below one already-resolved WSL HOME."""
+    root = posixpath.normpath(str(home or "").strip())
+    if not root.startswith("/") or root == "/":
+        raise ValueError("zcode WSL HOME must be an absolute non-root path")
+    child = posixpath.normpath(posixpath.join(root, *parts))
+    if child != root and not child.startswith(root.rstrip("/") + "/"):
+        raise ValueError("zcode WSL path escaped HOME")
+    return child
+
+
+def zcode_wsl_cli_root(home: str) -> str:
+    return _zcode_wsl_child(home, ".zcode", "cli")
+
+
+def zcode_wsl_db_path(home: str) -> str:
+    return _zcode_wsl_child(home, ".zcode", "cli", "db", "db.sqlite")
+
+
+def zcode_wsl_server_root(home: str) -> str:
+    return _zcode_wsl_child(home, ".zcode", "server")
+
+
+def zcode_wsl_server_node(home: str) -> str:
+    return _zcode_wsl_child(home, ".zcode", "server", "node")
+
+
 def wsl_unc(distro: str, linux_path: str) -> str:
     """Linux 绝对路径 → Windows UNC 路径（plan.md §9）。
 

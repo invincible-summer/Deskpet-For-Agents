@@ -1,8 +1,10 @@
-# DeskPet V4.0.0
+# DeskPet V4.0.1
 
 DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的 AI 编码 Agent，并把当前任务、模式和工作状态显示成桌宠动画与气泡。
 
-支持 Windows / WSL 终端中的 Codex CLI、Claude Code、Kimi CLI、pi，以及 Codex Desktop / ChatGPT Desktop Codex 模式和 ZCode Desktop。DeskPet 不接管 Agent，不要求 Hook、插件或 MCP，也不会自动审批。
+支持 Windows / WSL 终端中的 Codex CLI、Claude Code、Kimi CLI、pi，以及 Codex Desktop / ChatGPT Desktop Codex 模式和 ZCode Desktop；ZCode Desktop 通过 Remote Development 连接到 WSL 时，也会从对应 WSL 用户环境读取会话状态。DeskPet 不接管 Agent，不要求 Hook、插件或 MCP，也不会自动审批。
+
+当前源码版本是 **4.0.1**。按本次维护要求没有创建 `v4.0.1` tag 或 GitHub Release，因此仓库的 latest Portable 下载仍然指向已经发布的 **v4.0.0**；这不影响从源码运行和验收 4.0.1。
 
 ## 下载与启动
 
@@ -146,10 +148,10 @@ SHA256SUMS.txt                     ZIP 的 SHA-256 校验值
 
 ## 项目资料
 
-- `VERSIONING.md`：Semantic Versioning 2.0.0 版本与正式 Release 规则。
-- `CHANGELOG.md`：正式版本历史和 2026-09-12 一次性旧 tag 归一化记录。
-- `SourceLink.md`：Agent 监听、Windows/WSL、桌面端数据源等调研与依据。
-- `AGENTS.md`：仓库开发和验收约定。
-- `THIRD_PARTY_NOTICES.md`：Portable 包中第三方组件说明。
+- [VERSIONING.md](VERSIONING.md)：Semantic Versioning、源码版本与正式 Release 规则。
+- [CHANGELOG.md](CHANGELOG.md)：各版本新增功能、修复内容及历史版本映射。
+- [SourceLink.md](SourceLink.md)：Agent 监听、Windows/WSL、桌面端数据源等调研与依据。
+- [AGENTS.md](AGENTS.md)：仓库开发和验收约定。
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)：Portable 包中第三方组件说明。
 
 源码测试与发布构建面向维护者，不影响普通用户通过 Portable ZIP 解压即用。
