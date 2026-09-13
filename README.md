@@ -6,6 +6,8 @@ DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的
 
 当前源码版本是 **4.0.1**。按本次维护要求没有创建 `v4.0.1` tag 或 GitHub Release，因此仓库的 latest Portable 下载仍然指向已经发布的 **v4.0.0**；这不影响从源码运行和验收 4.0.1。
 
+源码版本与二进制 Release 分开推进：项目不会为每个源码 patch 自动发包，而是在积累到有重要功能和/或重要修复、值得重新分发 Portable 的版本里程碑时再创建正式 Release；紧急安全或严重可靠性修复可以例外提前发布。详细规则见 [VERSIONING.md](VERSIONING.md)。
+
 ## 下载与启动
 
 DeskPet 提供两种使用方式。普通用户建议直接使用 Portable 版；需要改代码或调试时再使用 Python 源码方式。
