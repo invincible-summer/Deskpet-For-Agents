@@ -107,7 +107,8 @@ class FleetUiTests(unittest.TestCase):
             self._put(app, (a, snap(a)), (b, snap(b)))
             app._aggregate()
             self.assertEqual(len(app.pet_manager.views), 2)
-            self.assertEqual(len(app.monitor._watchers), 4)   # 唯一 Monitor
+            self.assertEqual(len(app.monitor._watchers), 6)   # 唯一 Monitor
+            # 4 个文件 watcher + DSH watcher + OpenCode watcher
             bound = {v.agent_key for v in app.pet_manager.views.values()}
             self.assertEqual(bound, {a.key, b.key})
             self.assertNotIn("pet-3", app.pet_manager.views)  # 无绑定不显示

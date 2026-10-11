@@ -63,7 +63,7 @@ DEFAULTS = {
     },
     "monitor": {
         "agents": {"claude": True, "codex": True, "kimi": True, "pi": True,
-                   "zcode": True},
+                   "zcode": True, "opencode": True, "dsh": True},
         "windows_enabled": True,
         "wsl_enabled": True,
         "windows_scan_sec": 3.0,
@@ -83,7 +83,8 @@ DEFAULTS = {
             # （session runtime state），不恢复上次退出时的选择。
             "max_targets": 3,        # 展示上限 1..8（不是 Monitor 发现上限）
             "eligible_kinds": {"codex": True, "claude": True,
-                               "kimi": True, "pi": True, "zcode": True},
+                               "kimi": True, "pi": True, "zcode": True,
+                               "opencode": True, "dsh": True},
             "slots": [
                 {"id": "pet-1", "selector": None,
                  "appearance": {"skin": None},
@@ -121,7 +122,7 @@ _LEGACY_KEYS = (
     "monitor.gone_grace_sec",
 )
 
-_KIND_KEYS = ("claude", "codex", "kimi", "pi", "zcode")
+_KIND_KEYS = ("claude", "codex", "kimi", "pi", "zcode", "opencode", "dsh")
 
 
 @dataclass(frozen=True)

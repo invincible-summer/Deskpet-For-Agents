@@ -19,9 +19,15 @@ from actions import winkeys
 
 # Desktop 宿主/同 app 进程的 exe basename 证据（plan2 §4.3/§4.4）；
 # Electron 渲染进程与主进程同 exe，因此窗口属主 exe 匹配即可信。
+# OpenCode Desktop：productName OpenCode / OpenCode Dev / OpenCode Beta
+# （electron-builder NSIS exe 与 productName 同名）。
+# DSH Desktop：productName "DeepSeek Harness"（apps/desktop 构建配置）。
 _HOST_EXE_BASENAMES = {
     AgentKind.CODEX: frozenset({"chatgpt.exe", "codex.exe"}),
     AgentKind.ZCODE: frozenset({"zcode.exe"}),
+    AgentKind.OPENCODE: frozenset({
+        "opencode.exe", "opencode dev.exe", "opencode beta.exe"}),
+    AgentKind.DSH: frozenset({"deepseek harness.exe"}),
 }
 
 

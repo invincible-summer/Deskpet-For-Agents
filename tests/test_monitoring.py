@@ -1602,5 +1602,90 @@ class DynamicPollTests(unittest.TestCase):
         config.set("monitor.file_poll_sec", 999)    # 异常低频值 → clamp
         self.assertAlmostEqual(monitor._poll_sec(), 5.0)
 
+class NewKindMonitorWiringTests(unittest.TestCase):
+    """无插件监听 plan §三：watcher 注册、kind toggle 清退、source 隔离。"""
+
+    def _config(self, **agents):
+        base = {"claude": False, "codex": False, "kimi": False, "pi": False,
+                "zcode": False, "opencode": True, "dsh": True}
+        base.update(agents)
+        return {"monitor": {"agents": base, "windows_enabled": False,
+                            "wsl_enabled": False}}
+
+    def test_watchers_include_new_kinds(self):
+        from agents.monitor import Monitor
+        monitor = Monitor(self._config())
+        self.assertIn(AgentKind.DSH, monitor._watchers)
+        self.assertIn(AgentKind.OPENCODE, monitor._watchers)
+        self.assertIsInstance(monitor._watchers[AgentKind.DSH],
+                              __import__("agents.dsh",
+                                         fromlist=["DshWatcher"]).DshWatcher)
+
+    def test_kind_disabled_clears_desktop_sessions_only_for_that_kind(self):
+        # plan §三陷阱：_poll_desktop_sources 按 kind 清理；关闭 opencode
+        # 不得影响同轮 dsh desktop 会话（一个 Kind 一个 source）
+        from agents.monitor import Monitor
+        from agents.dsh import DshDesktopSource
+
+        from agents.desktop import DesktopSourceSnapshot
+        from agents.models import AgentSurface, DesktopHost, Observation
+
+        class _FakeSource:
+            def __init__(self, kind, emit=()):
+                self.kind = kind
+                self.polled = 0
+                self._emit = tuple(emit)
+
+            def poll(self, hosts, claims, now):
+                self.polled += 1
+                return DesktopSourceSnapshot(
+                    instances=self._emit,
+                    observations={i.key: Observation(
+                        source=EvidenceSource.SESSION, timestamp=now)
+                        for i in self._emit},
+                    authoritative=True)
+
+            def drop_host(self, host_key):
+                pass
+
+            def close(self):
+                pass
+
+        cfg = self._config()
+        cfg["monitor"]["windows_enabled"] = True   # desktop 场景需要 Windows source
+        monitor = Monitor(cfg)
+        oc, dsh_src = _FakeSource(AgentKind.OPENCODE), _FakeSource(AgentKind.DSH)
+        monitor._desktop_sources = [oc, dsh_src]
+        from agents.models import AgentSurface, DesktopHost
+        dsh_inst = AgentInstance(
+            kind=AgentKind.DSH, pid=0, source="windows",
+            surface=AgentSurface.DESKTOP, host_pid=9,
+            host_process_token="9.0", host_key="windows|dsh|desktop-host|9|9.0",
+            logical_session_id="ses_dsh")
+        monitor.instances[dsh_inst.key] = dsh_inst
+        monitor._desktop_hosts[dsh_inst.host_key] = DesktopHost(
+            kind=AgentKind.DSH, source="windows", pid=9, process_token="9.0")
+        # dsh source 声明同一会话存活（authoritative 非空）
+        dsh_src._emit = (dsh_inst,)
+        monitor.config["monitor"]["agents"]["opencode"] = False
+        monitor._tick()
+        self.assertEqual(oc.polled, 0)      # 关闭的 kind 不再 poll
+        self.assertGreaterEqual(dsh_src.polled, 1)
+        self.assertIn(dsh_inst.key, monitor.instances)   # dsh 不被误删
+
+    def test_opencode_worker_refresh_respects_kind_toggle(self):
+        from agents.monitor import ProcessProbeWorker
+        worker = ProcessProbeWorker(self._config())
+        worker._refresh_opencode({}, time.time())
+        # kind 关闭后：WSL 数据面清空、HTTP 探针 reset（无注册文件时
+        # reason 为 NO_REGISTRATION 属正常降级）
+        worker.config["monitor"]["agents"]["opencode"] = False
+        worker._refresh_opencode({}, time.time())
+        self.assertEqual(worker.opencode_wsl_snapshots(), {})
+        snap = worker._opencode_http.snapshot()
+        self.assertFalse(snap.available)
+        self.assertEqual(snap.pending, {})
+
+
 if __name__ == "__main__":
     unittest.main()

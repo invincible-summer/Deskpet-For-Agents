@@ -19,6 +19,11 @@ class AgentKind(str, Enum):
     # v4.4：ZCode Desktop 逻辑会话 kind（plan2 §3.1）。Codex Desktop 不
     # 新增 kind——与 Codex CLI 同为 CODEX，通过 surface 区分。
     ZCODE = "zcode"
+    # 无插件监听 plan（2026-10）：OpenCode / DeepSeek Harness (DSH)。
+    # 两者都复用同一 Observation/Status/Mode/Phase 体系；CLI 为 TERMINAL
+    # surface，官方 Desktop 宿主为 DESKTOP surface。
+    OPENCODE = "opencode"
+    DSH = "dsh"
 
     @property
     def label(self) -> str:
@@ -28,6 +33,8 @@ class AgentKind(str, Enum):
             "kimi": "Kimi",
             "pi": "pi",
             "zcode": "ZCode",
+            "opencode": "OpenCode",
+            "dsh": "DSH",
         }[self.value]
 
 
@@ -287,6 +294,9 @@ class AgentInstance:
     kimi_code_home: str = ""
     # PI_CODING_AGENT_SESSION_DIR（allowlist env；runtime-only）
     pi_session_dir: str = ""
+    # 无插件监听 plan：DSH_HOME / OPENCODE_DB（allowlist 非机密路径覆盖）
+    dsh_home: str = ""
+    opencode_db: str = ""
 
     # 附加 hint（TMUX/STY/TERM_PROGRAM 归并显示，不持久化）
     terminal_hint: str = ""

@@ -2,7 +2,7 @@
 
 DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的 AI 编码 Agent，并把当前任务、模式和工作状态显示成桌宠动画与气泡。
 
-支持 Windows / WSL 终端中的 Codex CLI、Claude Code、Kimi CLI、pi，以及 Codex Desktop / ChatGPT Desktop Codex 模式和 ZCode Desktop；ZCode Desktop 通过 Remote Development 连接到 WSL 时，也会从对应 WSL 用户环境读取会话状态。DeskPet 不接管 Agent，不要求 Hook、插件或 MCP，也不会自动审批。
+支持 Windows / WSL 终端中的 Codex CLI、Claude Code、Kimi CLI、pi、OpenCode CLI 与 DSH（DeepSeek Harness）CLI，以及 Codex Desktop / ChatGPT Desktop Codex 模式、ZCode Desktop、OpenCode Desktop 和 DeepSeek Harness Desktop；ZCode Desktop 通过 Remote Development 连接到 WSL 时，也会从对应 WSL 用户环境读取会话状态。DeskPet 不接管 Agent，不要求 Hook、插件或 MCP，也不会自动审批。
 
 当前源码版本是 **4.1.0**。`v4.1.0` 是源码里程碑的标准 annotated Git tag，但本版本**不创建 GitHub Release，也不生成新的 Portable/EXE 发布文件**；仓库的 latest Portable 仍然是已经发布的 **v4.0.0**。
 
@@ -125,6 +125,37 @@ Dashboard 的设置页可以直接查看并打开这个目录。
 - 证据不足时不会把一个 Agent 的审批状态猜给另一个 Agent。
 
 等待审批时，DeskPet 负责提示和帮助你快速回到对应窗口，最终操作仍由用户在 Agent 自己的界面中完成。
+
+## OpenCode 与 DSH 的监听边界
+
+OpenCode 与 DSH（DeepSeek Harness）同样以无插件、只读方式接入：
+
+- **OpenCode** 读取本机（或对应 WSL 用户）`~/.local/share/opencode` 下的
+  `opencode.db` 会话索引，只提供标题、工作目录等元数据。OpenCode 的未决
+  审批保存在其运行进程内存中；只有当本机 OpenCode 托管服务的注册文件
+  （`~/.local/state/opencode/service.json`）指向的端口与一个存活的
+  OpenCode 进程吻合、且该服务的只读 `GET /api/permission/request` 可匿名
+  访问时，才显示"等待审批"。DeskPet 绝不读取该注册文件中的服务密码，
+  因此在 OpenCode 默认启用随机服务密码的当前版本里，待审批状态通常
+  显示为"状态暂不可读"（DEGRADED），绝不伪造。
+- **DSH** 直接读取 `$DSH_HOME/sessions`（默认 `~/.dsh/sessions`）下的
+  会话日志：明文 `session[.vN].jsonl` 直接解析；默认压缩格式
+  `session.vN.jsonl.zstd` 按上游逐帧追加的结构解码（只消费完整帧，
+  半帧等待写完整；每帧校验 checksum 并限制解压大小）。`turn/start`、
+  `turn/end`、`step/*`、`tool/*` 事件给出 Working/Done/Error 状态，
+  `approval/asked` 与 `approval/decided` 按请求 id 配对给出真实的
+  等待审批与解除。DeskPet 不读取 `$DSH_HOME/.credentials.yaml`，不参与
+  DSH Host 的任何私有 IPC。
+- 两个 Agent 的 CLI 进程（Windows 与 WSL）沿用与其他 CLI 相同的终端
+  唤醒；官方桌面宿主（OpenCode.exe / DeepSeek Harness.exe）提供应用级
+  恢复前置。同一工作目录下同时运行多个同类 CLI 时无法从外部区分会话
+  归属，此时诚实显示"未解析"而不是猜测绑定。
+
+以上两个 Agent 的数据面解析以合成 fixture 通过自动化回归（schema 能力
+探测、Zstandard 帧/校验/解压上限、审批配对、路径遍历防护、同 cwd 多实例
+不绑定、旧配置迁移等）；针对真实安装的 OpenCode / DSH（Windows、WSL 与
+官方桌面端）的实机验收尚未执行（NOT_TESTED），逐表面验收状态以
+`tools/desktop_source_probe.py` 的脱敏探测结果为准。
 
 ## 更新 Portable 版
 

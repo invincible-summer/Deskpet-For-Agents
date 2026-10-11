@@ -88,9 +88,17 @@ def build_terminal_claims(watchers: dict,
 
     只有 watcher 已绑定会话文件的 TERMINAL 实例才产生 claim；
     session_id 缺失时退回路径派生的 file_id（仍是 exact 文件身份）。
+    DB 索引型 watcher（OpenCode）没有文件绑定，可实现 terminal_claims()
+    返回自己的 exact session claim（无插件监听 plan §三）。
     """
     claims: set[SessionClaimKey] = set()
     for kind, watcher in watchers.items():
+        custom = getattr(watcher, "terminal_claims", None)
+        if callable(custom):
+            try:
+                claims.update(custom() or frozenset())
+            except Exception:
+                pass
         bound = getattr(watcher, "_instance_files", None) or {}
         for key, path in bound.items():
             inst = instances.get(key)

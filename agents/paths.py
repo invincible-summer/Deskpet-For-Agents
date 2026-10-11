@@ -21,6 +21,8 @@ import time
 from .models import AgentKind
 
 # /proc/<pid>/environ 中允许进入 Python 的变量（plan.md §7）
+# OPENCODE_DB / DSH_HOME 是上游官方的数据根覆盖（非机密路径；
+# SourceLink 2026-10-11 §2/§3）；认证类变量一律不进 allowlist。
 ENV_ALLOWLIST = (
     "WT_SESSION",
     "WT_PROFILE_ID",
@@ -29,6 +31,8 @@ ENV_ALLOWLIST = (
     "CLAUDE_CONFIG_DIR",
     "KIMI_CODE_HOME",
     "PI_CODING_AGENT_SESSION_DIR",
+    "OPENCODE_DB",
+    "DSH_HOME",
     "TMUX",
     "STY",
     "TERM_PROGRAM",
@@ -129,6 +133,111 @@ def zcode_wsl_server_node(home: str) -> str:
     return _zcode_wsl_child(home, ".zcode", "server", "node")
 
 
+# --------------------------------------- OpenCode / DSH 数据根（无插件监听 plan）
+#
+# 上游事实（SourceLink 2026-10-11，OpenCode 0d61729b / DSH d743267）：
+#   * OpenCode data root = XDG 风格：<XDG_DATA_HOME|~/.local/share>/opencode；
+#     DB 名 opencode.db（latest/dev/beta/next/prod 渠道）或 opencode-<channel>.db
+#     （cli/src/database-path.ts）。Windows 同样落在 %USERPROFILE% 下
+#     （util/global-roots.ts 使用 os.homedir()）。
+#   * OpenCode service 注册文件 = <XDG_STATE_HOME|~/.local/state>/opencode/
+#     service.json{version,url,pid,...}（service-registration.ts）。
+#   * DSH home = $DSH_HOME || ~/.dsh（util/home-paths）；sessions root =
+#     dshHomePath('sessions')（bundle/base/cordis.patch.yml）。
+# 只做正向有界探测：绝不扫描整个 HOME，不读 OPENCODE_PASSWORD 等任何
+# 认证变量，不读 $DSH_HOME/.credentials.yaml。
+
+_OPENCODE_DB_MAX_CANDIDATES = 4
+_OPENCODE_SERVICE_MAX = 4
+
+
+def opencode_data_root() -> str:
+    """OpenCode Windows 数据根（XDG_DATA_HOME 覆盖优先）。"""
+    env = os.environ.get("XDG_DATA_HOME") or ""
+    base = env.strip() if env.strip() else os.path.join(
+        _user_home(), ".local", "share")
+    return os.path.normpath(os.path.join(base, "opencode"))
+
+
+def opencode_state_root() -> str:
+    """OpenCode Windows state 根（service 注册文件所在目录）。"""
+    env = os.environ.get("XDG_STATE_HOME") or ""
+    base = env.strip() if env.strip() else os.path.join(
+        _user_home(), ".local", "state")
+    return os.path.normpath(os.path.join(base, "opencode"))
+
+
+def opencode_db_candidates(data_root: str | None = None) -> list[str]:
+    """OpenCode DB 候选（有界、正向）：opencode.db 优先，之后渠道后缀。
+
+    不扫描 HOME；只在确认的数据根内列出白名单文件名；返回存在的候选，
+    opencode.db 在最前，其余按 mtime 新→旧（当前活跃渠道通常最新）。
+    """
+    import re
+    root = data_root or opencode_data_root()
+    out: list[tuple[float, str]] = []
+    canonical = os.path.join(root, "opencode.db")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    pat = re.compile(r"^opencode-[A-Za-z0-9._-]+\.db$")
+    for name in names:
+        if name == "opencode.db":
+            continue
+        if pat.match(name):
+            path = os.path.join(root, name)
+            try:
+                out.append((os.stat(path).st_mtime, path))
+            except OSError:
+                continue
+    out.sort(reverse=True)
+    tail = [p for _m, p in out[: _OPENCODE_DB_MAX_CANDIDATES - 1]]
+    try:
+        os.stat(canonical)
+        return [canonical, *tail]
+    except OSError:
+        return tail
+
+
+def opencode_service_files(state_root: str | None = None) -> list[str]:
+    """OpenCode service 注册文件候选（service.json + 渠道后缀，有界）。"""
+    import re
+    root = state_root or opencode_state_root()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    pat = re.compile(r"^service(-[A-Za-z0-9._-]+)?\.json$")
+    matched = [n for n in names if pat.match(n)]
+    # service.json（默认渠道）优先，其余按名字稳定排序
+    matched.sort(key=lambda n: (n != "service.json", n))
+    return [os.path.join(root, n) for n in matched[:_OPENCODE_SERVICE_MAX]]
+
+
+def dsh_home_root() -> str:
+    """DSH Windows home：$DSH_HOME 覆盖，否则 ~/.dsh。"""
+    env = os.environ.get("DSH_HOME") or ""
+    root = env.strip() if env.strip() else os.path.join(_user_home(), ".dsh")
+    return os.path.normpath(root)
+
+
+def dsh_sessions_root() -> str:
+    return os.path.join(dsh_home_root(), "sessions")
+
+
+def opencode_wsl_data_root(home: str) -> str:
+    return _zcode_wsl_child(home, ".local", "share", "opencode")
+
+
+def opencode_wsl_state_root(home: str) -> str:
+    return _zcode_wsl_child(home, ".local", "state", "opencode")
+
+
+def dsh_wsl_sessions_root(home: str) -> str:
+    return _zcode_wsl_child(home, ".dsh", "sessions")
+
+
 def wsl_unc(distro: str, linux_path: str) -> str:
     """Linux 绝对路径 → Windows UNC 路径（plan.md §9）。
 
@@ -168,14 +277,29 @@ def unc_to_linux(path: str) -> str:
     return "/" + tail.replace("\\", "/")
 
 
+# 旧四类文件 watcher 的数据根映射；OpenCode/DSH 有专用 adapter
+# （无插件监听 plan §三），绝不能误入该映射。
+_LEGACY_FILE_KINDS = (AgentKind.CLAUDE, AgentKind.CODEX,
+                      AgentKind.KIMI, AgentKind.PI)
+_LEGACY_DIR_BY_KIND = {
+    AgentKind.CLAUDE: ".claude",
+    AgentKind.CODEX: ".codex",
+    AgentKind.KIMI: ".kimi-code",
+    AgentKind.PI: ".pi",
+}
+_LEGACY_SCAN_DEPTH = {
+    AgentKind.CLAUDE: 2,   # projects/<proj>/<uuid>.jsonl
+    AgentKind.CODEX: 4,    # sessions/Y/M/D/rollout-*.jsonl
+    AgentKind.KIMI: 5,     # sessions/<key>/<id>/agents/main/wire.jsonl
+    AgentKind.PI: 2,       # sessions/<proj>/<file>.jsonl
+}
+
+
 def default_root(kind: AgentKind, home: str = "") -> str:
     """Agent 默认数据根（Linux 侧相对 HOME 的目录）。"""
-    sub = {
-        AgentKind.CLAUDE: ".claude",
-        AgentKind.CODEX: ".codex",
-        AgentKind.KIMI: ".kimi-code",
-        AgentKind.PI: ".pi",
-    }[kind]
+    if kind not in _LEGACY_FILE_KINDS:
+        raise ValueError(f"kind {kind} has no legacy file-watcher root")
+    sub = _LEGACY_DIR_BY_KIND[kind]
     base = home or _user_home()
     if base.startswith("\\\\wsl.localhost\\") or base.startswith("\\\\wsl$\\"):
         return base.rstrip("\\") + "\\" + sub.replace("/", os.sep)
@@ -188,6 +312,8 @@ def default_root(kind: AgentKind, home: str = "") -> str:
 def instance_roots(inst, kind: AgentKind | None = None) -> list[str]:
     """某个 AgentInstance 的会话数据根（Windows 路径列表，供扫描）。
 
+    仅服务旧四类文件 watcher；OpenCode/DSH 由各自 adapter 定位数据根。
+
     WSL 实例：优先 env 覆盖根（allowlisted），其次该 uid 的真实 HOME；
     数据根必须由 wsl_unc 转换，绝不遍历 \\home\\*。
     Windows 实例：当前用户 HOME（无法读取其他进程 env，无覆盖根）。
@@ -197,6 +323,8 @@ def instance_roots(inst, kind: AgentKind | None = None) -> list[str]:
     不从 `~/.pi` 整根递归——比放大 depth 更省目录枚举、缩小隐私扫描面。
     """
     kind = kind or inst.kind
+    if kind not in _LEGACY_FILE_KINDS:
+        return []
     source = getattr(inst, "source", "")
     if source.startswith("wsl:"):
         distro = source.split(":", 1)[1]
@@ -215,12 +343,7 @@ def instance_roots(inst, kind: AgentKind | None = None) -> list[str]:
             if env_root:
                 candidates.append(env_root)
             if home:
-                default = home.rstrip("/") + "/" + {
-                    AgentKind.CLAUDE: ".claude",
-                    AgentKind.CODEX: ".codex",
-                    AgentKind.KIMI: ".kimi-code",
-                    AgentKind.PI: ".pi",
-                }[kind]
+                default = home.rstrip("/") + "/" + _LEGACY_DIR_BY_KIND[kind]
                 if default not in candidates:
                     candidates.append(default)
         for cand in candidates:
@@ -234,12 +357,15 @@ def instance_roots(inst, kind: AgentKind | None = None) -> list[str]:
 
 
 def session_subdir(kind: AgentKind) -> str:
-    return {
-        AgentKind.CLAUDE: os.path.join(".claude", "projects"),
-        AgentKind.CODEX: os.path.join(".codex", "sessions"),
-        AgentKind.KIMI: os.path.join(".kimi-code", "sessions"),
-        AgentKind.PI: os.path.join(".pi", "agent", "sessions"),
-    }[kind]
+    if kind not in _LEGACY_FILE_KINDS:
+        raise ValueError(f"kind {kind} has no legacy file-watcher layout")
+    return os.path.join(_LEGACY_DIR_BY_KIND[kind],
+                        {
+                            AgentKind.CLAUDE: "projects",
+                            AgentKind.CODEX: "sessions",
+                            AgentKind.KIMI: "sessions",
+                            AgentKind.PI: os.path.join("agent", "sessions"),
+                        }[kind])
 
 
 def windows_roots(kind: AgentKind) -> list[str]:
@@ -488,9 +614,14 @@ def session_files(kind: AgentKind, roots: list[str],
                   window_sec: float | None) -> list[tuple[float, str]]:
     """在根目录下找会话文件，按 mtime 新→旧返回 [(mtime, path)]。
 
+    仅服务旧四类文件 watcher；OpenCode/DSH 的会话发现由各自 adapter
+    负责（无插件监听 plan §三），进入这里直接拒绝。
+
     window_sec=None 时不过滤 mtime（late-start fallback 用，仍只取最新
     MAX_SCAN_CANDIDATES 个）；symlink 不跟随（plan §35）。
     """
+    if kind not in _LEGACY_FILE_KINDS:
+        raise ValueError(f"kind {kind} has no legacy file-watcher layout")
     try:
         window = None if window_sec is None else max(0.0, float(window_sec))
     except (TypeError, ValueError):
@@ -514,12 +645,7 @@ def session_files(kind: AgentKind, roots: list[str],
         except OSError:
             return
 
-    depth = {
-        AgentKind.CLAUDE: 2,   # projects/<proj>/<uuid>.jsonl
-        AgentKind.CODEX: 4,    # sessions/Y/M/D/rollout-*.jsonl
-        AgentKind.KIMI: 5,     # sessions/<key>/<id>/agents/main/wire.jsonl
-        AgentKind.PI: 2,       # sessions/<proj>/<file>.jsonl
-    }[kind]
+    depth = _LEGACY_SCAN_DEPTH[kind]
     for r in roots:
         walk_jsonl(r, depth)
 

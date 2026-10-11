@@ -118,6 +118,25 @@ class PsParsingTests(unittest.TestCase):
         self.assertIsNone(kinds[4])
         self.assertIsNone(kinds[5])
 
+    def test_match_agent_opencode_dsh_strict(self):
+        # 无插件监听 plan：OpenCode/DSH 严格 argv0 形态匹配
+        self.assertEqual(WslProcessProbe._match_agent(
+            "opencode", "/home/u/.local/share/opencode/opencode"),
+            AgentKind.OPENCODE)
+        self.assertEqual(WslProcessProbe._match_agent(
+            "opencode", "opencode run"), AgentKind.OPENCODE)
+        self.assertEqual(WslProcessProbe._match_agent(
+            "dsh", "/home/u/.dsh/bin/dsh"), AgentKind.DSH)
+        self.assertEqual(WslProcessProbe._match_agent(
+            "dsh", "dsh agent"), AgentKind.DSH)
+        # 包含关键词但不构成 Agent 的命令不得误报
+        self.assertIsNone(WslProcessProbe._match_agent(
+            "vim", "vim opencode-notes.txt"))
+        self.assertIsNone(WslProcessProbe._match_agent(
+            "grep", "grep dsh log"))
+        self.assertIsNone(WslProcessProbe._match_agent(
+            "sh", "sh -c ./deploy-opencode.sh"))
+
 
 class InstanceIdentityTests(unittest.TestCase):
     def test_pid_reuse_changes_key(self):
@@ -990,6 +1009,123 @@ class WindowsInventoryTests(unittest.TestCase):
                                  return_value=_proc_rows(rows)):
             insts = scan_windows()
         self.assertEqual([i.pid for i in insts], [101])
+
+
+class OpenCodeDshInventoryTests(unittest.TestCase):
+    """无插件监听 plan §三：OpenCode / DSH 的 CLI 与桌面宿主严格区分。"""
+
+    def _scan(self, rows):
+        from agents.discovery import scan_windows_inventory
+        with unittest.mock.patch(
+                "psutil.process_iter",
+                return_value=_proc_rows(rows)):
+            return scan_windows_inventory()
+
+    # ---- OpenCode CLI ----
+
+    def test_opencode_cli_in_terminal(self):
+        inv = self._scan([
+            (100, _EXPLORER, "WindowsTerminal.exe", ["wt"], 1000.0, ""),
+            (101, 100, "opencode.exe", ["opencode"], 1001.5,
+             "C:/Users/u/.local/bin/opencode.exe"),
+        ])
+        self.assertEqual([i.kind for i in inv.terminal_instances],
+                         [AgentKind.OPENCODE])
+        self.assertEqual(inv.desktop_hosts, ())
+
+    def test_opencode_exe_unknown_ancestry_not_terminal(self):
+        inv = self._scan([
+            (400, _EXPLORER, "opencode.exe", ["opencode"], 4000.0,
+             "C:/Users/u/.local/bin/opencode.exe"),
+        ])
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertEqual(inv.desktop_hosts, ())
+        self.assertTrue(any("unattributed" in d for d in inv.diagnostics))
+
+    def test_opencode_npm_wrapper_matched_by_package_mark(self):
+        inv = self._scan([
+            (100, _EXPLORER, "WindowsTerminal.exe", ["wt"], 1000.0, ""),
+            (101, 100, "node.exe",
+             ["node", "C:/Users/u/AppData/Roaming/npm//"
+              "node_modules/opencode-ai/bin/opencode"], 1001.5, ""),
+        ])
+        self.assertEqual([i.kind for i in inv.terminal_instances],
+                         [AgentKind.OPENCODE])
+
+    # ---- OpenCode Desktop（Electron 佐证消解 opencode.exe 二义性）----
+
+    def test_opencode_desktop_host_with_electron_helpers(self):
+        inv = self._scan([
+            (500, _EXPLORER, "OpenCode.exe", ["OpenCode.exe"], 5000.0,
+             "C:/Users/u/AppData/Local/Programs//"
+             "OpenCode/OpenCode.exe"),
+            (501, 500, "OpenCode.exe",
+             ["OpenCode.exe", "--type=renderer"], 5001.0,
+             "C:/Users/u/AppData/Local/Programs//"
+             "OpenCode/OpenCode.exe"),
+            (502, 500, "opencode-cli.exe", ["opencode-cli", "serve"],
+             5002.0, ""),
+        ])
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertEqual(len(inv.desktop_hosts), 1)
+        host = inv.desktop_hosts[0]
+        self.assertIs(host.kind, AgentKind.OPENCODE)
+        self.assertEqual(host.pid, 500)
+        self.assertIn(501, host.helper_pids)
+        self.assertIn(502, host.helper_pids)
+
+    def test_opencode_dev_exe_unambiguous_host(self):
+        inv = self._scan([
+            (510, _EXPLORER, "OpenCode Dev.exe", ["OpenCode Dev.exe"],
+             5100.0, "C:/Users/u/AppData/Local/Programs//"
+             "OpenCode Dev/OpenCode Dev.exe"),
+        ])
+        self.assertEqual(len(inv.desktop_hosts), 1)
+        self.assertIs(inv.desktop_hosts[0].kind, AgentKind.OPENCODE)
+
+    # ---- DSH ----
+
+    def test_dsh_cli_in_terminal(self):
+        inv = self._scan([
+            (100, _EXPLORER, "WindowsTerminal.exe", ["wt"], 1000.0, ""),
+            (111, 100, "dsh.exe", ["dsh"], 1101.0,
+             "C:/Users/u/.dsh/bin/dsh.exe"),
+        ])
+        self.assertEqual([i.kind for i in inv.terminal_instances],
+                         [AgentKind.DSH])
+        self.assertEqual(inv.desktop_hosts, ())
+
+    def test_dsh_desktop_host_with_runasnode_child(self):
+        # 官方 Electron：RunAsNode Host 与主进程同 exe（不同 cmdline）
+        inv = self._scan([
+            (600, _EXPLORER, "DeepSeek Harness.exe",
+             ["DeepSeek Harness.exe"], 6000.0,
+             "C:/Users/u/AppData/Local/Programs//"
+             "DeepSeek Harness/DeepSeek Harness.exe"),
+            (601, 600, "DeepSeek Harness.exe",
+             ["DeepSeek Harness.exe", "--run-as-node", "host.cjs"], 6001.0,
+             "C:/Users/u/AppData/Local/Programs//"
+             "DeepSeek Harness/DeepSeek Harness.exe"),
+            (602, 600, "node.exe", ["node", "pnpm.mjs"], 6002.0, ""),
+        ])
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertEqual(len(inv.desktop_hosts), 1)
+        host = inv.desktop_hosts[0]
+        self.assertIs(host.kind, AgentKind.DSH)
+        self.assertEqual(host.pid, 600)
+        # 同 exe RunAsNode Host 收敛为 helper；node/pnpm 不是 helper
+        self.assertEqual(set(host.helper_pids), {601})
+
+    def test_two_hosts_two_desktop_hosts(self):
+        # 两个 GUI host（OpenCode + DSH 并存）：各自成 host，互不覆盖
+        inv = self._scan([
+            (510, _EXPLORER, "OpenCode Dev.exe", ["OpenCode Dev.exe"],
+             5100.0, ""),
+            (600, _EXPLORER, "DeepSeek Harness.exe",
+             ["DeepSeek Harness.exe"], 6000.0, ""),
+        ])
+        kinds = sorted(h.kind for h in inv.desktop_hosts)
+        self.assertEqual(kinds, [AgentKind.DSH, AgentKind.OPENCODE])
 
 
 if __name__ == "__main__":

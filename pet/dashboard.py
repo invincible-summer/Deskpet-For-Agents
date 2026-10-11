@@ -575,7 +575,8 @@ class PetsPage(DashboardPage):
         for i, (kind, label) in enumerate(
                 (("codex", "Codex"), ("claude", "Claude"),
                  ("kimi", "Kimi"), ("pi", "pi"),
-                 ("zcode", "ZCode"))):
+                 ("zcode", "ZCode"), ("opencode", "OpenCode"),
+                 ("dsh", "DSH"))):
             var = tk.BooleanVar(value=bool(app.config.get(
                 f"presentation.concurrent.eligible_kinds.{kind}", True)))
             self.eligible_vars[kind] = var
@@ -1127,7 +1128,8 @@ class MonitorPage(DashboardPage):
         for i, (kind, label) in enumerate(
                 (("codex", "Codex"), ("claude", "Claude"),
                  ("kimi", "Kimi"), ("pi", "pi"),
-                 ("zcode", "ZCode"))):
+                 ("zcode", "ZCode"), ("opencode", "OpenCode"),
+                 ("dsh", "DSH"))):
             var = tk.BooleanVar(
                 value=bool(cfg.get(f"monitor.agents.{kind}", True)))
             self.kind_vars[kind] = var
@@ -1315,7 +1317,8 @@ class DiagnosticsPage(DashboardPage):
             lines.append(f"  {key:<14} "
                          f"{'OK' if sp.authoritative else 'FAIL'}")
         lines.append("Session")
-        for kind in ("codex", "claude", "kimi", "pi", "zcode"):
+        for kind in ("codex", "claude", "kimi", "pi", "zcode",
+                    "opencode", "dsh"):
             for t in targets.values():
                 if t.snapshot.kind.value == kind:
                     lines.append(f"  {kind:<14} "

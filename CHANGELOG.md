@@ -4,6 +4,63 @@ DeskPet 使用 Semantic Versioning 2.0.0。版本 tag 与 GitHub Release 的关�
 [VERSIONING.md](VERSIONING.md)。本文件维护每个可识别版本新增了什么功能、
 修复了什么问题，以及其分发状态。
 
+## Unreleased — OpenCode / DSH 无插件只读监听
+
+状态：**源码已实现并通过全量自动化回归（886 unit tests + 4 项阻塞
+benchmark）；真实机器上的 OpenCode / DSH 实机验收未执行（NOT_TESTED）。**
+按 SemVer 属于向后兼容的 MINOR 功能，发布时版本号升为 4.2.0。
+
+### 新增
+
+- 新增 `OpenCode` / `DSH` 两个 Agent 类型，默认开启；旧 `config.json`
+  自动补齐 `monitor.agents` 与 `presentation.concurrent.eligible_kinds`
+  的新键。Dashboard 的类型开关、参与展示、健康诊断同步支持两类。
+- OpenCode 数据面：`~/.local/share/opencode/opencode.db`（含渠道后缀
+  候选）只读 SQLite 会话索引；`agents/opencode.py` 复用
+  `agents/sqlite_ro.py` 合同（mode=ro + query_only + 40ms busy + 固定
+  SELECT + 行数上限），并在读连接前后对比 `-shm` sidecar 实现 WAL
+  零写入门禁（无法证明纯读即降级停用）。`session_pending` 是输入队列，
+  绝不当作审批。
+- OpenCode 待审批补充：仅当 `~/.local/state/opencode/service.json` 的
+  loopback url+pid 与 census 中存活 OpenCode 进程吻合且 `GET /api/info`
+  自报 pid 一致时，读取 `GET /api/permission/request`；绝不读取注册文件
+  中的服务密码。401/403 → "状态暂不可读"（长退避，不重试风暴）。
+- OpenCode WSL：由既有 ProcessProbeWorker 在同一 fresh census 代次内经
+  发行版内 `python3` 只读脚本查询；发行版无读取器即降级，绝不向 WSL
+  安装任何组件。
+- DSH 数据面：`agents/dsh.py` 精确移植上游 `projectKey`/`encodeSegment`
+  路径编码、`session[.vN].jsonl[.zstd]` 世代选择（最高版本、双编码并存
+  拒绝、未来版本拒绝）与 `scanZstdFrames` 结构扫描；压缩日志逐完整帧
+  解码（checksum 校验、解压输出硬上限、半帧等待、损坏拒绝）。新增
+  `zstandard` 依赖（懒加载，缺失时压缩日志明示降级）。
+- DSH 状态机：turn/start / turn/end（completed/error/interrupted 等
+  reason.kind）→ Working/短暂 Done/Error/Idle；打开的 turn 静默超限
+  判 UNKNOWN（crash orphan 不是 Working）；approval/asked 与
+  approval/decided 同会话按 id 配对给出 WAITING/解除，回放预算外的
+  旧 asked 不伪装等待；未知必需事件按上游语义拒绝重构。
+- 进程识别：`opencode.exe` CLI（需终端 ancestry/conhost 佐证）与
+  OpenCode Desktop（Electron --type= 后代或 opencode-cli.exe 后代
+  佐证）严格区分；`dsh.exe` CLI；`DeepSeek Harness.exe` 宿主与同 exe
+  RunAsNode Host helper 收敛；WSL 侧 opencode/dsh 严格 argv0 匹配。
+- CLI 与桌面会话跨 surface 去重：watcher 暴露 exact session claims，
+  被终端实例绑定的会话不再重复生成桌面 target；每 Kind 只注册一个
+  Desktop source。
+- `tools/desktop_source_probe.py` 新增 OpenCode（DB schema/零写入门禁/
+  注册文件结构）与 DSH（sessions 布局/世代文件/帧头）脱敏实机探测。
+
+### 边界
+
+- OpenCode 当前版本的服务端总是启用随机密码；在不读取密码的硬约束下，
+  待审批/用户问题实时状态不可用，显示"状态暂不可读"（DEGRADED），
+  绝不伪造状态。
+- 同一 cwd 多个同类 CLI 进程无法从外部区分会话归属，全部显示"未解析"。
+- 真实 OpenCode/DSH 安装（Windows/WSL/官方桌面）的实机验收 NOT_TESTED；
+  完成后按表面公布 PASS/FAIL/DEGRADED。
+
+DeskPet 使用 Semantic Versioning 2.0.0。版本 tag 与 GitHub Release 的关系见
+[VERSIONING.md](VERSIONING.md)。本文件维护每个可识别版本新增了什么功能、
+修复了什么问题，以及其分发状态。
+
 ## 4.1.0 — ZCode WSL Remote Development 被动监听
 
 状态：**已验收源码里程碑；创建标准 annotated `v4.1.0` tag，但不创建 GitHub

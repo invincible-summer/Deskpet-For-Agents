@@ -398,5 +398,43 @@ class GitIgnoreTests(unittest.TestCase):
                           f".gitignore 缺少 {pattern}")
 
 
+class NewKindDefaultsTests(unittest.TestCase):
+    """无插件监听 plan §四 P1：OpenCode/DSH 默认开关与旧配置迁移。"""
+
+    def test_defaults_include_new_kinds(self):
+        data = normalize(json.loads(json.dumps(cfgmod.DEFAULTS)))
+        self.assertTrue(data["monitor"]["agents"]["opencode"])
+        self.assertTrue(data["monitor"]["agents"]["dsh"])
+        self.assertTrue(
+            data["presentation"]["concurrent"]["eligible_kinds"]["opencode"])
+        self.assertTrue(
+            data["presentation"]["concurrent"]["eligible_kinds"]["dsh"])
+
+    def test_old_config_migrates_new_kind_keys(self):
+        old = {
+            "config_version": 5,
+            "monitor": {"agents": {"claude": True, "codex": True,
+                                   "kimi": True, "pi": True, "zcode": True}},
+            "presentation": {"concurrent": {
+                "eligible_kinds": {"codex": True, "claude": True,
+                                   "kimi": True, "pi": True,
+                                   "zcode": True}}},
+        }
+        data, _migrated = cfgmod.migrate(old)   # slots 补齐可能置位，无关紧要
+        data = normalize(cfgmod._deep_merge(cfgmod.DEFAULTS, data))
+        self.assertTrue(data["monitor"]["agents"]["opencode"])
+        self.assertTrue(data["monitor"]["agents"]["dsh"])
+        self.assertTrue(
+            data["presentation"]["concurrent"]["eligible_kinds"]["dsh"])
+
+    def test_kind_toggle_persists_off(self):
+        data = normalize({
+            "config_version": 5,
+            "monitor": {"agents": {"opencode": False, "dsh": False}},
+        })
+        self.assertFalse(data["monitor"]["agents"]["opencode"])
+        self.assertFalse(data["monitor"]["agents"]["dsh"])
+
+
 if __name__ == "__main__":
     unittest.main()

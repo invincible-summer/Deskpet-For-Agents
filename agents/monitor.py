@@ -41,6 +41,7 @@ from .discovery import (
     WindowsRuntimeInventory,
     scan_windows_inventory,
 )
+from .dsh import DshWatcher
 from .kimi import KimiWatcher
 from .models import (
     ActivationCode,
@@ -68,6 +69,7 @@ WATCHERS = {
     AgentKind.CODEX: CodexWatcher,
     AgentKind.KIMI: KimiWatcher,
     AgentKind.PI: PiWatcher,
+    AgentKind.DSH: DshWatcher,
 }
 
 LOG_MAX = 300
@@ -147,6 +149,10 @@ class ProcessProbeWorker:
         from .zcode_remote import ZCodeRemoteReader
         self._zcode_remote = ZCodeRemoteReader()
         self._zcode_remote_snapshots: dict[str, object] = {}
+        from .opencode import OpenCodeHttpProbe, OpenCodeWslReader
+        self._opencode_wsl = OpenCodeWslReader()
+        self._opencode_wsl_snapshots: dict[str, object] = {}
+        self._opencode_http = OpenCodeHttpProbe()
         self._last_windows = 0.0
         self._last_wsl = 0.0
         self.windows_scan_ms = 0.0
@@ -191,6 +197,15 @@ class ProcessProbeWorker:
         with self._lock:
             return dict(self._zcode_remote_snapshots)
 
+    def opencode_wsl_snapshots(self) -> dict[str, object]:
+        """Latest bounded remote OpenCode facts, produced only by this worker."""
+        with self._lock:
+            return dict(self._opencode_wsl_snapshots)
+
+    def opencode_http_snapshot(self):
+        """Latest trusted-instance OpenCode pending facts (worker-owned)."""
+        return self._opencode_http.snapshot()
+
     def set_wsl_root_metadata_fallback(self, enabled: bool) -> None:
         """DP43-R03：运行期切换 WSL root metadata 权限。O(1)、无 WSL
         call、无 Tk、线程安全（Event 承载）。"""
@@ -220,6 +235,75 @@ class ProcessProbeWorker:
                 key: self._zcode_remote.stale(snap, reason, now)
                 for key, snap in current.items()
             }
+
+    def _refresh_opencode(self, by_source: dict[str, SourceProbeSnapshot],
+                          now: float) -> None:
+        """OpenCode 辅助数据面（无插件监听 plan §三）：全部在本 Worker 执行。
+
+        * HTTP pending：只有 Windows census 确认的 live OpenCode 进程 pid
+          才可能触发注册文件归属门禁；快照供 Monitor 线程只读消费。
+        * WSL SQLite：只在同一 fresh census generation 内、经发行版内
+          python3 只读脚本查询；缺读取器即降级（绝不安装）。
+        """
+        cfg_m = self.config.get("monitor") or {}
+        agents_cfg = cfg_m.get("agents") or {}
+        if not bool(agents_cfg.get("opencode", True)):
+            with self._lock:
+                self._opencode_wsl_snapshots.clear()
+            self._opencode_wsl.drop_except(set())
+            self._opencode_http.reset()
+            return
+        win_snap = self._snapshot.get("windows")
+        live_pids: set[int] = set()
+        opencode_planes: dict[str, tuple] = {}
+        if win_snap is not None and win_snap.authoritative:
+            for inst in win_snap.instances:
+                if inst.kind is AgentKind.OPENCODE:
+                    live_pids.add(int(inst.pid))
+            inv = self._inventory
+            if inv is not None:
+                for host in inv.desktop_hosts:
+                    if host.kind is AgentKind.OPENCODE:
+                        live_pids.add(int(host.pid))
+                        live_pids.update(int(p) for p in host.helper_pids)
+        try:
+            self._opencode_http.refresh(live_pids, now)
+        except Exception:
+            pass
+        with self._lock:
+            previous = dict(self._opencode_wsl_snapshots)
+        next_map: dict[str, object] = {}
+        for source, sp in sorted(by_source.items()):
+            if not source.startswith("wsl:") or not sp.authoritative:
+                continue
+            for inst in sp.instances:
+                if inst.kind is not AgentKind.OPENCODE:
+                    continue
+                home = inst.home or ""
+                if not home or inst.uid is None:
+                    continue
+                plane = f"{source}|uid:{inst.uid}|{home}"
+                opencode_planes.setdefault(plane, (
+                    source.split(":", 1)[1], inst.user or "", home,
+                    inst.opencode_db or ""))
+        for plane, (distro, user, home, db_override) in sorted(
+                opencode_planes.items())[:4]:
+            next_map[plane] = self._opencode_wsl.read(
+                distro, user, home, db_override=db_override)
+        # 未授权/降级 source 的 last-good 标 stale；权威消失移除 plane
+        for key, old in previous.items():
+            if key in next_map:
+                continue
+            source = key.split("|")[0]
+            sp = by_source.get(source)
+            if sp is None:
+                continue
+            if not sp.authoritative:
+                next_map[key] = self._opencode_wsl.stale(
+                    old, sp.error or "WSL_SOURCE_NON_AUTHORITATIVE", now)
+        self._opencode_wsl.drop_except(set(next_map))
+        with self._lock:
+            self._opencode_wsl_snapshots = next_map
 
     def _refresh_zcode_remote(self, by_source: dict[str, SourceProbeSnapshot],
                               now: float) -> None:
@@ -340,6 +424,7 @@ class ProcessProbeWorker:
                 with self._lock:
                     self._snapshot.update(by_source)
                 self._refresh_zcode_remote(by_source, now)
+                self._refresh_opencode(by_source, now)
             except Exception:
                 # WslProcessProbe 内部已按 source 输出三态；这里只是防线
                 with self._lock:
@@ -358,7 +443,9 @@ class ProcessProbeWorker:
                     if source.startswith("wsl:"):
                         self._snapshot.pop(source, None)
                 self._zcode_remote_snapshots.clear()
+                self._opencode_wsl_snapshots.clear()
             self._zcode_remote.drop_except(set())
+            self._opencode_wsl.drop_except(set())
 
 
 class Monitor:
@@ -385,6 +472,15 @@ class Monitor:
         watcher_cfg.setdefault("summary_max_chars", privacy.get("summary_max_chars", 160))
         self._watchers: dict[AgentKind, BaseWatcher] = {
             k: v(dict(watcher_cfg)) for k, v in WATCHERS.items()}
+        # OpenCode watcher 不走 WATCHERS 工厂：需要注入共享 runtime
+        # （Worker 缓存的 WSL/HTTP 数据面 provider，plan §三）
+        from .opencode import OpenCodeRuntime, OpenCodeWatcher
+        self._opencode_runtime = OpenCodeRuntime(
+            cfg=dict(watcher_cfg),
+            remote_provider=self._probe.opencode_wsl_snapshots,
+            http_provider=self._probe.opencode_http_snapshot)
+        self._watchers[AgentKind.OPENCODE] = OpenCodeWatcher(
+            dict(watcher_cfg), self._opencode_runtime)
         # Desktop source 共享 watcher 配置（grace/隐私截断/活跃窗口）
         self._source_cfg = dict(watcher_cfg)
         # 终端观察/解析/激活统一由 TerminalService 收口（v4plan §5.8）
@@ -465,6 +561,9 @@ class Monitor:
     def _register_desktop_sources(self):
         """按启用 kind 注册生产 Desktop sources（plan2 §5/§11）。
 
+        每个 Kind 只注册一个权威 source（无插件监听 plan §三：
+        Monitor._poll_desktop_sources 按 kind 清理，多条同 kind source
+        会互相误删）。OpenCode/DSH 与 Codex/ZCode 同一注册路径。
         只在 start() 执行一次；单元测试直接 _tick 不经过这里，
         由测试注入 fake source。不在 __init__ 注册是为了让 Monitor
         构造保持零 IO。不新增 desktop 专属开关（plan2 §11）：kind
@@ -482,6 +581,15 @@ class Monitor:
             self._desktop_sources.append(ZCodeDesktopSource(
                 cfg=dict(self._source_cfg),
                 remote_provider=self._probe.zcode_remote_snapshots))
+        if AgentKind.OPENCODE in enabled:
+            from .opencode import OpenCodeDesktopSource
+            self._desktop_sources.append(OpenCodeDesktopSource(
+                cfg=dict(self._source_cfg),
+                runtime=self._opencode_runtime))
+        if AgentKind.DSH in enabled:
+            from .dsh import DshDesktopSource
+            self._desktop_sources.append(DshDesktopSource(
+                cfg=dict(self._source_cfg)))
 
     def _start_terminal(self):
         # 启动失败不锁存：backend.available() 是唯一可用性事实来源
@@ -563,6 +671,10 @@ class Monitor:
                 source.close()
             except Exception:
                 pass
+        try:
+            self._opencode_runtime.close()
+        except Exception:
+            pass
         return exited
 
     def stop(self):

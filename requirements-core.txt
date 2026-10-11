@@ -1,3 +1,6 @@
 psutil>=5.9
 Pillow>=10.0
 comtypes>=1.4; platform_system=="Windows"
+# 无插件监听 plan：DSH session.vN.jsonl.zstd 完整帧解码（懒加载；
+# 缺失时 DSH zstd 日志明示降级，其余功能不受影响）
+zstandard>=0.23

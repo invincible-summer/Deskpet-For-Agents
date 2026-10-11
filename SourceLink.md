@@ -142,3 +142,32 @@ The 4.1.0 automated acceptance covers byte-compile, the full Windows unit suite,
 
 
 **追加的 SQLite 只读验证细节**：[官方 WAL 只读行为](https://www.sqlite.org/wal.html#readonly) 允许 WAL 的 read-only 打开依赖现存 `-wal`/`-shm` 或目录写权限；故 `mode=ro` 不代表进程绝对不可能创建 `-shm`。DeskPet 的“零 Agent-owned 写入”需要在打开前后检查 sidecar、数据库目录与文件元数据，若不能证明纯读则放弃该数据源。不可把 `immutable=1` 用在仍更新的 OpenCode 数据库，参见 [SQLite URI](https://www.sqlite.org/uri.html)。
+
+---
+
+## 2026-10-11 实现状态：OpenCode / DSH adapter 已落地（实机 NOT_TESTED）
+
+上一节的方案已按 [plan.md](plan.md) 实现为源码（实现文件与自动化验收如下）。**真实机器上的 OpenCode / DSH 实机探测仍未执行；按 plan §四 P0/§七 的判定规则，所有实机相关能力保持 NOT_TESTED，实机证据以 `tools/desktop_source_probe.py` 的脱敏输出为准。**
+
+实现（本工作树，尚未打 tag；合并时在本节回填 commit 链接）：
+
+- [agents/opencode.py](agents/opencode.py) — `session_v2` capability 探测 + 固定白名单 SELECT；WAL `-shm` sidecar 零写入门禁（读连接前后对比）；`service.json` 只取 url/pid/version（password 字段显式丢弃）；`GET /api/info` + `GET /api/permission/request` 只读补充（401/403 → 合法不可用降级）；WSL 侧由 ProcessProbeWorker 经发行版内 `python3` 只读脚本查询。
+- [agents/dsh.py](agents/dsh.py) — 上游 `projectKey`/`encodeSegment`（UTF-16 code unit 语义精确移植）、`session[.vN].jsonl[.zstd]` 世代选择（最高版本 / 双编码拒绝 / >v4 拒绝）、`scanZstdFrames` 结构扫描与逐完整帧解码（checksum + 解压硬上限 + 半帧等待）；`turn/*`、`step/*`、`tool/*`、`approval/asked|decided` 状态机（id 配对、回放预算、crash orphan 不判 Working、未知必需事件拒绝）。
+- [agents/monitor.py](agents/monitor.py) — `OpenCodeWatcher`（注入共享 runtime，消费 Worker 缓存的 WSL/HTTP 事实）与 `DshWatcher` 进入既有 WATCHERS；每 Kind 注册唯一 Desktop source（`OpenCodeDesktopSource` / `DshDesktopSource`）。
+- [agents/discovery.py](agents/discovery.py) — `opencode.exe` CLI 与 OpenCode Desktop（Electron 佐证）二义消解；`dsh.exe` CLI；`DeepSeek Harness.exe` 宿主 + 同 exe RunAsNode helper 收敛；WSL 严格 argv0 匹配；`OPENCODE_DB`/`DSH_HOME` 进入 env allowlist。
+- [agents/paths.py](agents/paths.py) — OpenCode data/state 根与 DB/service 候选（有界正向）；DSH `~/.dsh/sessions`；WSL containment helper；旧四类文件 watcher 映射对新 Kind 显式拒绝。
+- [agents/desktop.py](agents/desktop.py) — `build_terminal_claims` 增加 `terminal_claims()` 钩子（DB 索引型 watcher 暴露 exact session claim）。
+- [agents/desktop_window.py](agents/desktop_window.py) — GUI APP_ONLY 激活白名单加入 OpenCode（OpenCode/OpenCode Dev/OpenCode Beta.exe）与 DeepSeek Harness.exe。
+- [tests/test_opencode_source.py](tests/test_opencode_source.py) / [tests/test_dsh_source.py](tests/test_dsh_source.py) — schema/零写入门禁/session_pending 负样例/审批配对/帧扫描与解码上限/路径遍历中和/同 cwd 多实例不绑定/世代与双编码拒绝/claims 去重/子会话折叠等 59 项回归。
+- [tools/desktop_source_probe.py](tools/desktop_source_probe.py) — 新增 OpenCode 与 DSH 脱敏实机探测项。
+
+自动化验收（本机 Windows Python 3.12）：`python -m compileall -q agents pet tools tests` PASS；`python -m unittest discover -s tests` 886 tests PASS；monitor / desktop-sources / presentation / ui-architecture 四项阻塞 benchmark PASS；`git diff --check` PASS。
+
+已知的诚实降级（非缺陷）：OpenCode 服务端在当前上游版本恒设随机密码，硬约束禁止读取密码，因此待审批/用户问题实时状态实际不可用（显示“状态暂不可读”，DEGRADED）；DSH 压缩日志解码依赖 `zstandard` 库（懒加载，缺失时明示降级）；同一 cwd 多个同类 CLI 无法外部区分会话归属，全部不绑定。
+
+### 实机结构证据（2026-10-11，本机 Windows，脱敏）
+
+- **DSH 文件格式 PASS（结构级）**：本机真实安装的 DSH 在 `~/.dsh/sessions` 下存在 `--C-Users-...-deepseek-harness-default-workspace--` project 目录（与 `dsh_project_key` 移植输出逐字符一致）、`session.v4.jsonl.zstd`（v4+zstd）、5 个完整 Zstandard 帧（无 torn）、全部帧 checksum 解码通过；首行 header 通过 `parse_header_line` 结构校验（version=4、cwd 与真实项目路径一致、root 会话）；事件类型（permission/preset、sandbox/mode、approval/policy、session/end-seed、agent-preset/selected）全部属于上游 KNOWN_SESSION_EVENT_TYPES。该会话为旧空会话（无 turn 事件），状态机正确输出"无状态"（不伪造）。
+- **DSH LIVE 语义 / 官方 Desktop 宿主：NOT_TESTED**（探测时无运行中的 dsh 进程与 DeepSeek Harness.exe）。
+- **OpenCode：NOT_TESTED**（本机未安装；`~/.local/share/opencode` 与 state 根均不存在）。
+- 探针同时确认 `$DSH_HOME/.credentials.yaml` 存在且从未被读取（仅存在性检查）。

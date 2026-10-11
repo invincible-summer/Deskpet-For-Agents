@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -253,6 +254,145 @@ def probe_host_windows() -> dict:
     return {"window_classes": interesting}
 
 
+def probe_opencode() -> dict:
+    """OpenCode 数据面结构探测（无插件监听 plan §四 P0；全部脱敏）。
+
+    * DB 候选与 WAL/sidecar 现状 + 读连接前后 sidecar 对比
+      （零写入门禁证据）；
+    * session_v2/session_pending 表列 capability（不含任何行内容）；
+    * service 注册文件：只输出 url 是否 loopback/pid/version 与
+      password 字段是否存在（绝不输出值）。
+    """
+    out: dict = {}
+    data_root = paths.opencode_data_root()
+    cands = paths.opencode_db_candidates(data_root)
+    out["data_root_exists"] = os.path.isdir(data_root)
+    out["db_candidates"] = [os.path.basename(c) for c in cands]
+    out["pre_db_shm_exists"] = os.path.exists(
+        os.path.join(data_root, "opencode.db-shm"))
+    if cands:
+        db = cands[0]
+        con = ReadOnlySqlite(db)
+        try:
+            if not con.open():
+                out["open_error"] = con.last_error
+            else:
+                out["schema"] = _table_columns(
+                    con, ["session_v2", "session_message",
+                          "session_pending", "session_inbox"])
+                try:
+                    rows = con.query(
+                        "SELECT parent_id IS NULL, COUNT(*) FROM session_v2 "
+                        "GROUP BY 1", max_rows=4)
+                    if rows:
+                        out["session_root_counts"] = {
+                            str(r[0]): r[1] for r in rows}
+                except Exception:
+                    pass
+        finally:
+            con.close()
+        out["post_db_shm_exists"] = os.path.exists(db + "-shm")
+        out["zero_write_gate"] = (
+            "OK" if (not out["pre_db_shm_exists"]
+                     and not out["post_db_shm_exists"])
+            else "SIDECAR_PRESENT_OR_CREATED")
+    state_root = paths.opencode_state_root()
+    registrations = []
+    for path in paths.opencode_service_files(state_root):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(obj, dict):
+            registrations.append({
+                "file": os.path.basename(path),
+                "url_loopback": str(obj.get("url") or "").startswith(
+                    "http://127.0.0.1:"),
+                "pid": obj.get("pid"),
+                "version": obj.get("version"),
+                "password_field_present": "password" in obj,
+            })
+    out["service_registrations"] = registrations[:4]
+    return out
+
+
+def probe_dsh() -> dict:
+    """DSH sessions 根结构探测（无插件监听 plan §四 P0；全部脱敏）。
+
+    * sessions 根存在性 + project 目录数（只计数）；
+    * 最近活跃 session 目录的世代文件名/compression/大小/mtime；
+    * zstd 头部结构帧扫描（不解码内容）；
+    * $DSH_HOME/.credentials.yaml 只输出存在性（绝不读内容）。
+    """
+    from agents.dsh import parse_generation_filename, scan_zstd_frames
+
+    root = paths.dsh_sessions_root()
+    out: dict = {
+        "sessions_root_exists": os.path.isdir(root),
+        "credentials_file_exists": os.path.exists(
+            os.path.join(paths.dsh_home_root(), ".credentials.yaml")),
+    }
+    if not out["sessions_root_exists"]:
+        return out
+    try:
+        projects = [e for e in os.scandir(root) if e.is_dir()]
+    except OSError:
+        out["scan_error"] = "SESSIONS_ROOT_UNREADABLE"
+        return out
+    out["project_dir_count"] = len(projects)
+    now = time.time()
+    dirs = []
+    for e in projects[:64]:
+        try:
+            dirs.append((e.stat().st_mtime, e.path))
+        except OSError:
+            continue
+    dirs.sort(reverse=True)
+    recent: list[dict] = []
+    for _m, project in dirs[:4]:
+        try:
+            sessions = [s for s in os.scandir(project)
+                        if s.is_dir(follow_symlinks=False)]
+        except OSError:
+            continue
+        for s in sessions[:4]:
+            try:
+                files = [f for f in os.scandir(s.path)
+                         if f.is_file(follow_symlinks=False)]
+            except OSError:
+                continue
+            for f in files:
+                parsed = parse_generation_filename(f.name)
+                if parsed is None:
+                    continue
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                item = {
+                    "generation": f.name,
+                    "version": parsed[0],
+                    "compression": parsed[1],
+                    "size": st.st_size,
+                    "age_sec": int(now - st.st_mtime),
+                    "session_dir": _hash(s.name),
+                }
+                if parsed[1] == "zstd" and st.st_size >= 8:
+                    try:
+                        with open(f.path, "rb") as fh:
+                            head = fh.read(512)
+                        frames, torn = scan_zstd_frames(head, max_frames=8)
+                        item["head_frames_complete"] = len(frames)
+                        item["head_torn"] = torn is not None
+                    except (OSError, ValueError) as exc:
+                        item["head_scan_error"] = type(exc).__name__
+                recent.append(item)
+    recent.sort(key=lambda i: i.get("age_sec", 1 << 30))
+    out["recent_generation_files"] = recent[:8]
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", dest="json_out", default="",
@@ -266,6 +406,8 @@ def main() -> int:
         "codex": probe_codex(),
         "zcode": probe_zcode(),
         "zcode_wsl_runtime": probe_zcode_wsl_runtime(),
+        "opencode": probe_opencode(),
+        "dsh": probe_dsh(),
         "host_windows": probe_host_windows(),
     }
     text = json.dumps(report, ensure_ascii=False, indent=2, default=str)

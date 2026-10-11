@@ -164,12 +164,20 @@ def _match_kind(name: str, cmd: str) -> AgentKind | None:
         return AgentKind.CLAUDE
     if base == "kimi.exe" or base == "kimi":
         return AgentKind.KIMI
+    if base == "opencode.exe" or base == "dsh.exe":
+        # CLI 二进制本体（桌面宿主已在角色分类中按 Electron 佐证分派；
+        # DSH 桌面 exe 名为 deepseek harness.exe，与 CLI 无同名冲突）
+        return (AgentKind.OPENCODE if base == "opencode.exe"
+                else AgentKind.DSH)
     if "claude-code" in cmd or "@anthropic-ai/claude-code" in cmd or "@anthropic-ai\\claude-code" in cmd:
         return AgentKind.CLAUDE
     if "kimi-cli" in cmd or "kimi_cli" in cmd or "/kimi" in cmd or "\\kimi" in cmd:
         return AgentKind.KIMI
     if "pi-coding-agent" in cmd:
         return AgentKind.PI
+    if _OPENCODE_PKG_MARK in cmd:
+        # npm 全局 shim（node.exe ...node_modules\opencode-ai\...）
+        return AgentKind.OPENCODE
     if base == "node.exe" or base == "python.exe" or base == "pythonw.exe":
         # node/python 的判定依赖命令行，已在上面处理
         return None
@@ -192,6 +200,11 @@ ROLE_CODEX_DESKTOP_HOST = "codex_desktop_host"
 ROLE_CODEX_APP_SERVER_HELPER = "codex_app_server_helper"
 ROLE_ZCODE_DESKTOP_HOST = "zcode_desktop_host"
 ROLE_ZCODE_AGENT_HELPER = "zcode_agent_helper"
+# 无插件监听 plan §三：OpenCode / DSH 桌面宿主与 helper
+ROLE_OPENCODE_DESKTOP_HOST = "opencode_desktop_host"
+ROLE_OPENCODE_HELPER = "opencode_helper"
+ROLE_DSH_DESKTOP_HOST = "dsh_desktop_host"
+ROLE_DSH_HELPER = "dsh_helper"
 ROLE_OTHER = "other"
 
 # Electron 多进程标记（renderer/gpu/utility/crashpad 均以 --type= 开头）
@@ -217,6 +230,20 @@ _CODEX_HELPER_ARGS = frozenset({"app-server", "app-server-daemon", "daemon"})
 # ZCode helper：zcode.cjs 入口 + CLI/host-local 辅助进程名
 _ZCODE_HELPER_CMD_MARKS = ("zcode.cjs",)
 _ZCODE_HELPER_BASENAMES = frozenset({"zcode-cli.exe", "zcode-host-local.exe"})
+# OpenCode Desktop（electron-builder productName：OpenCode / OpenCode Dev /
+# OpenCode Beta；NSIS exe 与 productName 同名）与捆绑 CLI（resources/
+# opencode-cli.exe，Electron RunAsNode 子进程）。CLI 二进制同样叫
+# opencode.exe —— 桌面宿主必须有 Electron 佐证（同 exe --type= 后代或
+# opencode-cli.exe 后代），否则按 CLI/OTHER 处理，绝不冒充。
+_OPENCODE_GUI_BASENAMES = frozenset({
+    "opencode.exe", "opencode dev.exe", "opencode beta.exe"})
+_OPENCODE_UNAMBIGUOUS_GUI = frozenset({"opencode dev.exe", "opencode beta.exe"})
+_OPENCODE_HELPER_BASENAMES = frozenset({"opencode-cli.exe"})
+# DSH 官方 Desktop：productName "DeepSeek Harness"；Electron RunAsNode
+# Host 与主进程同 exe（cmdline 不同），helper 按同 exe 后代收敛。
+_DSH_GUI_BASENAMES = frozenset({"deepseek harness.exe"})
+# npm 包名佐证（CLI shim 可能叫 node.exe；只在命令行包含包路径时采信）
+_OPENCODE_PKG_MARK = "opencode-ai"
 
 _MAX_ANCESTRY_HOPS = 16
 _DIAG_MAX = 8
@@ -287,6 +314,9 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
     zcode_mains: list[int] = []
     chatgpt_mains: list[int] = []
     codex_gu: list[int] = []
+    opencode_candidates: list[int] = []   # opencode.exe（CLI/桌面二义）
+    opencode_mains: list[int] = []
+    dsh_mains: list[int] = []
     for pid, inf in info_by_pid.items():
         args = _args_of(inf)
         base = _basename_of(inf)
@@ -304,8 +334,36 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
                    for a in _ancestor_chain(pid, parent_by_pid)):
                 continue
             chatgpt_mains.append(pid)
+        elif base in _DSH_GUI_BASENAMES:
+            if _is_electron_helper(args):
+                continue
+            if any(basename(a) in _DSH_GUI_BASENAMES
+                   for a in _ancestor_chain(pid, parent_by_pid)):
+                continue
+            dsh_mains.append(pid)
+        elif base in _OPENCODE_GUI_BASENAMES:
+            if _is_electron_helper(args):
+                continue
+            if any(basename(a) in _OPENCODE_GUI_BASENAMES
+                   for a in _ancestor_chain(pid, parent_by_pid)):
+                continue
+            if base in _OPENCODE_UNAMBIGUOUS_GUI:
+                opencode_mains.append(pid)
+            else:
+                opencode_candidates.append(pid)
         elif base.startswith(_CODEX_PROC_MARK[0]) and base.endswith(_CODEX_PROC_MARK[1]):
             codex_gu.append(pid)
+
+    # OpenCode.exe 二义消解（无插件监听 plan §三：通用进程不能冒充桌面宿主）：
+    # 桌面宿主必须有 Electron 佐证——同 exe --type= 后代或 opencode-cli.exe
+    # 后代；否则交给终端 CLI 判定（terminal ancestry / conhost），都不满足
+    # 保持 OTHER（fail closed）。
+    for pid in opencode_candidates:
+        if _has_electron_helper_descendant(pid, parent_by_pid, info_by_pid,
+                                           _OPENCODE_GUI_BASENAMES) \
+                or _has_basename_descendant(pid, parent_by_pid, info_by_pid,
+                                            _OPENCODE_HELPER_BASENAMES):
+            opencode_mains.append(pid)
 
     # ChatGPT Desktop 的 Codex 正向证据（plan2 §4.3）：包族目录或树内
     # codex*.exe 后代；否则绝不把 ChatGPT.exe 当 Codex。
@@ -358,6 +416,10 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
         host_root_by_pid[root] = (ROLE_CODEX_DESKTOP_HOST, root)
     for root in zcode_mains:
         host_root_by_pid[root] = (ROLE_ZCODE_DESKTOP_HOST, root)
+    for root in opencode_mains:
+        host_root_by_pid[root] = (ROLE_OPENCODE_DESKTOP_HOST, root)
+    for root in dsh_mains:
+        host_root_by_pid[root] = (ROLE_DSH_DESKTOP_HOST, root)
 
     def _host_of(pid: int) -> tuple[str, int] | None:
         if pid in host_root_by_pid:
@@ -389,11 +451,24 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
                 or _is_codex_helper_cmd(_args_of(info(pid))))
             roles[pid] = (ROLE_CODEX_APP_SERVER_HELPER if is_codex_proc
                           else ROLE_OTHER)
-        else:
+        elif role == ROLE_ZCODE_DESKTOP_HOST:
             is_zcode_proc = (base in _ZCODE_GUI_BASENAMES
                              or base in _ZCODE_HELPER_BASENAMES
                              or _is_zcode_helper_cmd(_args_of(info(pid))))
             roles[pid] = (ROLE_ZCODE_AGENT_HELPER if is_zcode_proc
+                          else ROLE_OTHER)
+        elif role == ROLE_OPENCODE_DESKTOP_HOST:
+            # OpenCode 家族：GUI exe 本体（Electron helper/RunAsNode）与
+            # 捆绑 opencode-cli.exe；树内其他进程保持 OTHER
+            is_opencode_proc = (base in _OPENCODE_GUI_BASENAMES
+                                or base in _OPENCODE_HELPER_BASENAMES)
+            roles[pid] = (ROLE_OPENCODE_HELPER if is_opencode_proc
+                          else ROLE_OTHER)
+        else:
+            # DSH：Electron 主进程与 RunAsNode Host 同 exe；node/pnpm
+            # 等 profile runner 子进程不单独成 target
+            is_dsh_proc = base in _DSH_GUI_BASENAMES
+            roles[pid] = (ROLE_DSH_HELPER if is_dsh_proc
                           else ROLE_OTHER)
 
     # ---- 3) 终端 CLI 判定（未被宿主树认领的进程） ----
@@ -420,7 +495,17 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
                 roles[pid] = ROLE_OTHER
                 note(f"codex.exe pid={pid} unattributed: no terminal ancestry")
             continue
-        # claude/kimi/pi 保持 4.3.1 name/cmdline 匹配（无桌面宿主冲突；
+        if base == "opencode.exe":
+            # 与 Codex 相同的严格 CLI 判定；桌面宿主候选已在前面按
+            # Electron 佐证归类，这里的 opencode.exe 只可能是 CLI 形态
+            if _terminal_ancestry(pid) or _has_conhost_child(
+                    pid, parent_by_pid, info_by_pid):
+                roles[pid] = ROLE_TERMINAL_AGENT
+            else:
+                roles[pid] = ROLE_OTHER
+                note(f"opencode.exe pid={pid} unattributed: no terminal ancestry")
+            continue
+        # claude/kimi/pi/dsh 保持 name/cmdline 匹配（无桌面宿主冲突；
         # ZCode/终端集成 shell 内的真实 CLI 不因宿主树而被吞）
         cmd = " ".join(_args_of(inf)).lower()
         kind = _match_kind(base, cmd)
@@ -433,6 +518,45 @@ def _tree_has_terminal_ancestor(pid: int, parent_by_pid: dict[int, int],
                                 info_by_pid: dict[int, dict]) -> bool:
     for anc in _ancestor_chain(pid, parent_by_pid):
         if _basename_of(info_by_pid.get(anc) or {}) in _TERMINAL_HOST_BASENAMES:
+            return True
+    return False
+
+
+def _descendants_of(root: int, parent_by_pid: dict[int, int],
+                    limit: int = 512) -> set[int]:
+    """有界遍历 root 的后代 pid 集合（含 root；环/超限保护）。"""
+    seen = {root}
+    stack = [root]
+    while stack:
+        cur = stack.pop()
+        for child, ppid in parent_by_pid.items():
+            if ppid == cur and child not in seen:
+                seen.add(child)
+                stack.append(child)
+                if len(seen) > limit:
+                    return seen
+    return seen
+
+
+def _has_electron_helper_descendant(root: int, parent_by_pid: dict[int, int],
+                                    info_by_pid: dict[int, dict],
+                                    exe_names: frozenset) -> bool:
+    """root 是否有同 exe 名的 Electron helper（--type=）后代。"""
+    for pid in _descendants_of(root, parent_by_pid):
+        if pid == root:
+            continue
+        inf = info_by_pid.get(pid) or {}
+        if (_basename_of(inf) in exe_names
+                and _is_electron_helper(_args_of(inf))):
+            return True
+    return False
+
+
+def _has_basename_descendant(root: int, parent_by_pid: dict[int, int],
+                             info_by_pid: dict[int, dict],
+                             exe_names: frozenset) -> bool:
+    for pid in _descendants_of(root, parent_by_pid):
+        if pid != root and _basename_of(info_by_pid.get(pid) or {}) in exe_names:
             return True
     return False
 
@@ -537,17 +661,24 @@ def scan_windows_inventory() -> WindowsRuntimeInventory:
         out.append(inst)
 
     # 桌面宿主：每个 host root 一个 DesktopHost，helper 收敛、不单独成 target
+    _HOST_ROLE_KIND = {
+        ROLE_CODEX_DESKTOP_HOST: AgentKind.CODEX,
+        ROLE_ZCODE_DESKTOP_HOST: AgentKind.ZCODE,
+        ROLE_OPENCODE_DESKTOP_HOST: AgentKind.OPENCODE,
+        ROLE_DSH_DESKTOP_HOST: AgentKind.DSH,
+    }
+    _HELPER_ROLES = (ROLE_CODEX_APP_SERVER_HELPER, ROLE_ZCODE_AGENT_HELPER,
+                     ROLE_OPENCODE_HELPER, ROLE_DSH_HELPER)
     hosts: list[DesktopHost] = []
     for pid, role in sorted(roles.items()):
-        if role not in (ROLE_CODEX_DESKTOP_HOST, ROLE_ZCODE_DESKTOP_HOST):
+        if role not in _HOST_ROLE_KIND:
             continue
         info = info_by_pid.get(pid, {})
-        kind = (AgentKind.CODEX if role == ROLE_CODEX_DESKTOP_HOST
-                else AgentKind.ZCODE)
+        kind = _HOST_ROLE_KIND[role]
         created = float(info.get("create_time") or 0.0)
         helpers = tuple(sorted(
             other for other, orole in roles.items()
-            if orole in (ROLE_CODEX_APP_SERVER_HELPER, ROLE_ZCODE_AGENT_HELPER)
+            if orole in _HELPER_ROLES
             and _host_root_for(other, roles, parent_by_pid) == pid))
         hosts.append(DesktopHost(
             kind=kind, source="windows", pid=pid,
@@ -568,10 +699,12 @@ def scan_windows_inventory() -> WindowsRuntimeInventory:
 def _host_root_for(pid: int, roles: dict[int, str],
                    parent_by_pid: dict[int, int]) -> int | None:
     """pid 所属的桌面宿主 root pid（自身或祖先链上的 host 角色）。"""
-    if roles.get(pid) in (ROLE_CODEX_DESKTOP_HOST, ROLE_ZCODE_DESKTOP_HOST):
+    host_roles = (ROLE_CODEX_DESKTOP_HOST, ROLE_ZCODE_DESKTOP_HOST,
+                  ROLE_OPENCODE_DESKTOP_HOST, ROLE_DSH_DESKTOP_HOST)
+    if roles.get(pid) in host_roles:
         return pid
     for anc in _ancestor_chain(pid, parent_by_pid):
-        if roles.get(anc) in (ROLE_CODEX_DESKTOP_HOST, ROLE_ZCODE_DESKTOP_HOST):
+        if roles.get(anc) in host_roles:
             return anc
     return None
 
@@ -907,6 +1040,15 @@ class WslProcessProbe:
             return AgentKind.KIMI
         if "pi-coding-agent" in low or re.search(r"(^|/)pi( |$)", low):
             return AgentKind.PI
+        # 无插件监听 plan：OpenCode / DSH CLI（严格 argv0 形态，避免把
+        # 恰好包含这些词的其他命令当 Agent）
+        if (re.search(r"(^|/)opencode( |$|\.)", low)
+                or low.startswith("opencode ")
+                or "/.opencode/bin/opencode" in low):
+            return AgentKind.OPENCODE
+        if (re.search(r"(^|/)dsh( |$|\.)", low) or low.startswith("dsh ")
+                or "/.dsh/" in low):
+            return AgentKind.DSH
         return None
 
     # ---- root metadata 权限（v4.3.1 DP43-R03：运行期可撤权） ----
@@ -1157,6 +1299,8 @@ class WslProcessProbe:
                 inst.claude_config_dir = env.get("CLAUDE_CONFIG_DIR", "")
                 inst.kimi_code_home = env.get("KIMI_CODE_HOME", "")
                 inst.pi_session_dir = env.get("PI_CODING_AGENT_SESSION_DIR", "")
+                inst.dsh_home = env.get("DSH_HOME", "")
+                inst.opencode_db = env.get("OPENCODE_DB", "")
                 hints = [n for n in ("TMUX", "STY", "TERM_PROGRAM") if env.get(n)]
                 inst.terminal_hint = "·".join(hints[:1])
                 instances.append(inst)
