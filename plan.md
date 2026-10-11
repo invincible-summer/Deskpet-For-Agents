@@ -191,3 +191,11 @@ DeskPet 被动识别 **OpenCode Windows CLI、OpenCode WSL CLI、OpenCode Window
 - 安全回归：无审批批准/拒绝、无按键注入/Hook 自动安装/POST 控制命令/Agent DB 写入/秘钥提取；日志与诊断不输出完整消息/凭证；不扫描任意端口、根目录或 stopped WSL distro。
 
 **完成判据**：每个对象标记 PASS / FAIL / DEGRADED / NOT TESTED；只有所有适用的“必”通过，才能在 README 认定“像 Codex 一样完整接入”。L0 可作为安全的阶段性里程碑，**不能**拿来抵扣完整接入。现阶段所有 P0–P5 的新 Agent 实测项仍为 NOT TESTED，文档更新不构成功能已实现。版本/Release 是否推进仍严格遵循 `VERSIONING.md`。
+
+
+### 12.1 新增子 Agent / 短运行进程 / 同名宿主验收
+
+- **root/child/subagent**：OpenCode 官方 `GET /session/:id/children`、DSH SessionHeader 的 `parentSession` 和 subagent 元信息可作为 lineage 证据。子 Agent 产生的活动、WAITING/INPUT 不能错误归属于不相干 root；与 ZCode root-task 合并的既有行为一致，默认应将子任务活动折叠回 root 而不是为每层嵌套多生一只宠。lineage 缺失时不猜亲子关系。
+- **短任务**：DSH 官方 headless/sdk/acp 与 web 运行 profile 不同，短于现有 3s 进程扫描周期的一次性 headless 可能漏检。P0 必须定量测窗口；若无法从合法只读事件/持久化捕捉，准确标记为该 profile 的未覆盖限制，不擅自加高频扫描。
+- **多宿主**：两个同 Kind 桌面进程在毫秒级相近创建、重复 logical session id、一个后台 Host 复用两个 frontend 的情况下，验证 `AgentInstance.key`、`host_key`、claim 与 source ownership 一一对应。现有 Desktop key 使用 host token + session id；只有测试证明确有碰撞才改公共 key 生成，不能因新增 provider 破坏旧 Codex/ZCode 稳定 key。
+- **优先级**：将本小节作为 P5 阻塞条件，并补 `tests/test_desktop_sources.py`、`tests/test_discovery.py`、`tests/test_opencode_source.py`、`tests/test_dsh_source.py` 的 fixtures（后者仅在 DSH L1 实装时创建）。
