@@ -215,3 +215,11 @@ The 4.1.0 automated acceptance covers byte-compile, the full Windows unit suite,
 5. 目前尚未得到用户机器上的 Windows CLI、WSL、OpenCode Desktop、官方 DSH Desktop 的真实 PID/端口/会话/窗口 fixture；任何精确支持声明须经该环节验证。
 
 本节上游主分支证据分别参考 DeepSeek Harness `master` tree `d743267388641bc76f17c45ce8b4c231aed1d32c`、OpenCode `dev` tree `0d61729b3fa005cec9aa754c075a809663c736a4`。这些是**代码树 SHA，不是发布版本号**，版本漂移仍须目标安装实测。
+
+
+### 补充身份边界：子任务与短生命周期
+
+- **OpenCode 官方 API**：[Server](https://opencode.ai/docs/server/) 的 `GET /session/:id/children` 可辨识 session parent/child。**不得把子 Agent 的 child session 与 root session 同时自动生成两个重复宠物**；如果产品选择 root 聚合，child 的活动只更新 root 的 phase/summary，审批仍保留可核对的 child request ID，且绝不可串给另一个 root。
+- **DSH 官方 SessionHeader**：[Persistence](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/persistence.md) 的 `parentSession` 和 subagent child classification 可确定 lineage。旧版或不完整历史 lineage 未证实就不猜；状态归属规则必须与既有 ZCode 的 root/child 会话聚合语义一致。
+- **DSH CLI 不都是长驻交互端**：[官方架构](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/architecture.md) 列出 web/headless/sdk/acp profiles。headless one-shot 可能在现有约 3s census 之间结束，**进程扫描无法保证一定抓到**。要将短任务“完整监听”列为独立 P0/P5 gate；不得通过高频 process polling 人为补齐，只有合法低开销事件/持久化证据才能补足。
+- **多桌面宿主 key 防碰撞**：`AgentInstance.__post_init__` 的 Desktop key 当前由 host token 与 session id 组成，host token 有时只取精度有限的创建时间；在多实例同 session id 的合成测试中必须确认不会碰撞，若真的碰撞再以最小局部修复纳入 host PID/incarnation。现有稳定实例 key 不为想象中的缺陷盲改。
