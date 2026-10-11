@@ -7,7 +7,7 @@
 
 ## 1. 目标、范围及完成定义
 
-DeskPet 被动识别 **OpenCode Windows CLI、OpenCode WSL CLI、OpenCode Windows Desktop**，以及 **DSH CLI、DSH Web 与经确认的 Windows 社区桌面发行版**；尽可能呈现真实任务的 Working / Thinking / Reading / Coding / Testing / Waiting / Done / Idle / Error / Unknown，模式与状态独立；允许原有双击唤醒对应宿主窗口，但不负责具体 tab 或会话导航。支持同时多实例、同用户/跨 WSL 发行版、同一 backend 被 CLI 和 GUI 同时使用。
+DeskPet 被动识别 **OpenCode Windows CLI、OpenCode WSL CLI、OpenCode Windows Desktop**，以及 **DSH CLI、DSH Web、上游官方 Electron Desktop 和经单独验证的社区桌面发行版**；尽可能呈现真实任务的 Working / Thinking / Reading / Coding / Testing / Waiting / Done / Idle / Error / Unknown，模式与状态独立；允许原有双击唤醒对应宿主窗口，但不负责具体 tab 或会话导航。支持同时多实例、同用户/跨 WSL 发行版、同一 backend 被 CLI 和 GUI 同时使用。
 
 功能有两层验收：**L0 进程在场**（可识别真实运行的终端 Agent / desktop host，未知会话状态显示 Unknown）；**L1 精确会话状态**（确凿、当前、可重放的 session/turn/permission 事实）。不得用进程存在推断为 Working/Idle，不得用“日志停止更新”推断 Waiting。若某一 DSH 发行版没有可合法读取的结构化数据源，L0 合格、L1 标记“待证据/暂不支持”，不得伪装 L1 全覆盖。
 
@@ -44,9 +44,9 @@ DeskPet 被动识别 **OpenCode Windows CLI、OpenCode WSL CLI、OpenCode Window
 
 [官方 Persistence 文档](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/persistence.md)及 [JSONL backend](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/session/session-persistence-jsonl/README.md)确认：日志的逻辑格式为 JSONL，**默认物理编码是 Zstandard frames**；还支持其他持久化 provider。不能凭 `~/.dsh` 猜测所有日志都可普通 `readline()`；不能每次扫完整历史压缩数据；不应强加 zstd 常驻解析依赖。
 
-DSH Desktop 并非当前已证实的统一官方 Windows 可执行产品；[xingj404-lab/dsh-desktop](https://github.com/xingj404-lab/dsh-desktop)、[tscodeplus/dsh-desktop](https://github.com/tscodeplus/dsh-desktop) 等均是社区 Tauri 封装，通常启动原生 `dsh web`。DeskPet 应把实际 `dsh` 引擎进程作为事实源，将经过验证的 Tauri 宿主只作为 surface/窗口前置，不能复制单一社区分支的名称表去推断其他发行版。
+**版本更正：DSH 官方 Electron Desktop 已存在。** [DeepSeek 下载页](https://www.deepseek.com/en/download/) 与 [upstream Desktop 实现](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/desktop/README.md) 明确提供官方产品（RunAsNode Host、认证连接、当前默认 OS 随机端口）；此前“只有社区版”的判断过时；[xingj404-lab/dsh-desktop](https://github.com/xingj404-lab/dsh-desktop)、[tscodeplus/dsh-desktop](https://github.com/tscodeplus/dsh-desktop) 等均是社区 Tauri 封装，通常启动原生 `dsh web`。DeskPet 应把实际 `dsh` 引擎进程作为事实源，将经过验证的 Tauri 宿主只作为 surface/窗口前置，不能复制单一社区分支的名称表去推断其他发行版。
 
-**硬性功能门槛**：首次只保证 DSH L0；若 P0 找到官方/当前版本具备稳定只读 session API，才开发 L1。若不存在，用户继续使用零配置只读 L0；可单独评估**用户主动安装的只读 Cordis 插件**（同一 DSH 进程内采集脱敏事件，单向向 DeskPet 发布，不返回任何操作），但不把该插件列入本次默认实现或自动安装路径。
+**硬性功能门槛：L0 只是阶段基础，不代表完成用户最新提出的完整功能等价要求。** 首次只保证 DSH L0；若 P0 找到官方/当前版本具备稳定只读 session API，才开发 L1。若不存在，用户继续使用零配置只读 L0；可单独评估**用户主动安装的只读 Cordis 插件**（同一 DSH 进程内采集脱敏事件，单向向 DeskPet 发布，不返回任何操作），但不把该插件列入本次默认实现或自动安装路径。
 
 ## 4. 建议实施架构（少改、少线程、不拆双架构）
 
@@ -96,7 +96,7 @@ DSH Desktop 并非当前已证实的统一官方 Windows 可执行产品；[xing
 
 **F. 性能预算**（在同一 Windows 主机、相同宠物数/实例数/动画设置进行 A/B，记录 P50/P95/P99）：无人运行 Agent、1 OpenCode、4 OpenCode SSE、1 DSH、Windows+双 WSL、网络中断/恢复；10 分钟稳态及 30 次启停循环。对照历史 `tests/benchmark_monitor.py` 等；目标闲置 CPU 增幅 ≤0.5 个百分点、额外 RSS ≤20 MiB，新增网络/WSL 调用不随 UI tick 增长；新增后台线程优先 ≤1，子进程常驻 0，单连接消息上限 64 KiB、队列上限 256、无泄漏的 socket/handle/线程。以上都是目标，**不是当前测量结果**。
 
-**G. 自动化和实机**：仓库根运行 `python -m compileall -q agents pet tools tests`、`python -m unittest discover -s tests -v`、现有 monitor/desktop/presentation/UI 架构基准、`git diff --check`；Windows CI 对 Python 3.12 验证。实机至少 Windows CLI、WSL CLI、Desktop OpenCode，DSH CLI/Web 和**所选定的一个社区 Desktop 发行版**；结果写测试矩阵并录截图但禁止公开会话原文。CI mock 通过不等于真实机器通过。
+**G. 自动化和实机**：仓库根运行 `python -m compileall -q agents pet tools tests`、`python -m unittest discover -s tests -v`、现有 monitor/desktop/presentation/UI 架构基准、`git diff --check`；Windows CI 对 Python 3.12 验证。实机至少 Windows CLI、WSL CLI、Desktop OpenCode，DSH CLI/Web、**上游官方 Electron Desktop** 和拟宣称支持的具体社区发行版；结果写测试矩阵并录截图但禁止公开会话原文。CI mock 通过不等于真实机器通过。
 
 **验收宣告约束**：最终在 README 为每个支持对象标明 L0 / L1 / stale / not tested；不以“有启动进程”宣告“会话/审批完整监听”；无稳定只读数据面的 DSH 不伪装支持 L1。未达到基准、未过回归或无法证明 session 身份时，拒绝合并相关功能，并保持先前已验收的五种 Agent 路径不变。
 
@@ -110,3 +110,84 @@ DSH Desktop 并非当前已证实的统一官方 Windows 可执行产品；[xing
 - DeskPet 实现：[models](agents/models.py)、[discovery](agents/discovery.py)、[monitor](agents/monitor.py)、[desktop](agents/desktop.py)、[state](agents/state.py)、[config](pet/config.py)、[tests](tests/test_desktop_sources.py)
 - OpenCode：[Server](https://opencode.ai/docs/server/)、[Plugins](https://opencode.ai/docs/plugins/)、[Windows/WSL](https://opencode.ai/docs/windows-wsl/)
 - DSH：[Official repository](https://github.com/deepseek-ai/deepseek-harness)、[Events](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/framework/events.md)、[Session](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/session.md)、[Approval audit](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/approval.md)、[Persistence](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/persistence.md)
+
+
+
+---
+
+## 9. 功能同等齐全：强制完整接入矩阵（2026-10-11 增量）
+
+> 目标是两种新增 Agent 和现有 Codex、Claude 等**使用同一套 DeskPet 产品能力**，而非只会出现在进程列表。未经过目标机实测，不得宣称本矩阵通过。标记：**必**＝必须有可实测功能；**证**＝需要上游明确事实，有证据时映射，无证据只可显示 Unknown/None；**不适用**＝产品本来没有对应终端/GUI。DSH 只实现进程 L0 不满足本节所说的完整功能。
+
+| 产品能力 | OpenCode CLI（Windows/WSL） | OpenCode Desktop | DSH CLI/Web | DSH 官方 Desktop | 必测行为 |
+| --- | --- | --- | --- | --- | --- |
+| Windows/WSL 运行进程自动发现、退出 | 必 | 必 | 必 | 必 | PID 复用/WSL distro 停止后不幽灵 |
+| 正确区分 CLI/GUI/helper | 必 | 必 | 必 | 必 | Node/Bun/renderer 不独立生成目标 |
+| 当前活跃 session、不把冷历史生成宠物 | 必 | 必 | 必 | 必 | 活跃或近期且 host 归属真实 |
+| Working/Done/Idle/Error/Unknown | 必 | 必 | 必 | 必 | active turn、完成、idle/error 事实及过期 |
+| Thinking/Reading/Coding/Testing/Executing/Answering | 证 | 证 | 证 | 证 | tool/step 分类，无证据 Phase.NONE |
+| WAITING 审批提醒及及时解除 | 必 | 必 | 必 | 必 | 同 session + request id 精确配对 |
+| INPUT 要求用户输入（与审批不同） | 必 | 必 | 必 | 必 | question/answer 或等价可靠证据 |
+| Plan 等 Mode 独立状态 | 证 | 证 | 证 | 证 | 不凭 Thinking 猜 Plan |
+| 当前 Goal、Summary、Title、CWD | 必 | 必 | 必 | 必 | 长度、隐私和准确会话归属 |
+| Windows Terminal / WSL window 唤醒 | 必 | 不适用 | CLI 必 | 不适用 | WindowIdentity 校验；不能乱切 Tab |
+| Desktop APP_ONLY 窗口唤醒 | 不适用 | 必 | Web 仅可证实 GUI host | 必 | 最小化、隐藏、驻留及退出一致 |
+| SINGLE、AGGREGATE、FLEET 模式 | 必 | 必 | 必 | 必 | 新 agent 同等参与 slots、overflow |
+| 聚焦/注意力/WAITING 抢占优先级 | 必 | 必 | 必 | 必 | 不覆盖用户手动 focus |
+| 默认宠物/皮肤动画/状态气泡 | 必 | 必 | 必 | 必 | 动画映射与已有 Status 一致 |
+| Dashboard Agents/筛选/监听与隐私 | 必 | 必 | 必 | 必 | enable kind、sources、parser 健康 |
+| 托盘 Agents 子菜单、双击唤醒 | 必 | 必 | 必 | 必 | 同一 AgentTarget、不丢新种类 |
+| 多实例、WSL 多发行版/UID、CLI+GUI 去重 | 必 | 必 | 必 | 必 | 相同目录和相同 session id 不串 |
+| source stale、重连、缺失、显式禁用 | 必 | 必 | 必 | 必 | non-authoritative ≠ authoritative absence |
+| 低资源、安全无侵入、退出彻底 | 必 | 必 | 必 | 必 | no controller, no injection, no leaked thread |
+
+**严格结论**：以上“必”如果因为目标 DSH 版本没有合法只读事件接口而暂时实现不了，应该明示未完成并保留 L0 基础检测，但**绝不能以 L0 通过完整 parity 验收**。某个上游确实没有 Plan 模式则显示 Mode.UNKNOWN/NONE 是正确而非缺陷；不能凭想象制造相同内容。
+
+## 10. 现有代码的新增触点，按数据和 UI 调用闭环逐项实施
+
+| 文件 / 现有事实 | 必需变更或保留 |
+| --- | --- |
+| `agents/models.py` | 增加 OPENCODE/DSH Enum、label。沿用 AgentInstance/Host/Observation/Snapshot/Target 和现有 Status/Phase/Mode，**不建立新 reducer** |
+| `agents/discovery.py` | 在单次 psutil inventory、WSL ps 中验证 CLI/GUI/helper 角色与进程代次；官方 DSH Electron + 私有 Host 是一组，OpenCode TUI + server 也是一组；不要把通用 node/bun/Electron 或固定端口当识别条件 |
+| `agents/paths.py` | 新 Kind 需要独立正确 root/capability，防止现有 default_root/session_subdir 查字典 KeyError 或随意扫描整个用户 HOME |
+| `agents/monitor.py` | 现在 WATCHERS 只有 Claude/Codex/Kimi/pi，_register_desktop_sources 只有 Codex/ZCode。OpenCode/DSH 必须加入**CLI session observation** 与桌面逻辑会话观察，两者都由同一套 Snapshot/reduce 处理；网络/WSL 慢 IO 必须交现有 worker 或一个有界后台 IO owner，不许进 0.5s tick/Tk |
+| `agents/desktop.py` | 复用 DesktopSessionSource / claims，但当前 `Monitor._poll_desktop_sources` 按 kind 删除 desktop target，会导致同 kind 多 source 相互清退。必须一个 kind 一个权威 source，或加 source owner identity 后成套改同步/清理/测试 |
+| `agents/terminal_uia.py` | DEFAULT_RECOGNIZERS 只涵盖 Codex/Claude/Kimi；新 Agent 真实审批 UIA 必须采集脱敏 fixture 后才能加严格 recognizer，否则优先 API/日志事件，不能留下一个表面有 Waiting 实际无此能力的假接入 |
+| `agents/terminal_resolver.py` | 终端标题 kind/cwd/distro 与观察绑定需跑 OpenCode/DSH 多 Pane、同工作区、切换 Tab 误归属回归；窗口唤醒仍经原有 TerminalService |
+| `agents/desktop_window.py` | 桌面 exe allowlist 目前只有 chatgpt.exe/codex.exe/zcode.exe；依据实机签名与父子链加入 OpenCode GUI、DSH 官方 GUI（社区版单独 profile），绝不假装能定位某 tab |
+| `pet/config.py` | 三处一致：DEFAULTS.monitor.agents、presentation.concurrent.eligible_kinds、_KIND_KEYS；normalize/migrate 支持旧 config，新增 kind 默认启用，Windows/WSL 总开关沿用 |
+| `pet/dashboard.py` | 约 576、1128、1318 行存在 Agent Kind 硬编码元组/循环：完整扩充 OpenCode/DSH 的过滤、配置、统计、诊断。`pet/labels.py` 补齐展示标签 |
+| `pet/presentation.py`、`pet/app.py`、`pet/tray.py`、`pet/petview.py`、`pet/ui_coordinator.py` | 已有 AgentTarget → 单宠/聚合/多宠/托盘/动画/唤醒链是成熟架构，**优先保留**；通过端到端 fixture 检查新 Kind，不因“接入”重新造 UI |
+| `agents/state.py`、`agents/process_watch.py` | 当前证据分层/安全退出机制已合适，保持；仅必要 bugfix 及回归 |
+
+**CLI 完整会话状态不可漏掉**：新增发现后如果只依靠 Terminal UIA “有文字变化”产生工作状态，那不等于现有 Codex/Kimi 的精确 session watcher。建议 `agents/opencode.py`、`agents/dsh.py` 通过明确的只读事实源对 CLI 与 Desktop 同时产出标准 Observation；无法获得可信数据时只能显示 UNKNOWN 并把对应 L1 gate 标成待完成。
+
+## 11. 上游真实协议和版本变更：最关键的实现门槛
+
+**OpenCode**：[官方 Server API](https://opencode.ai/docs/server/)确认 `GET /session`、`GET /session/status`、`GET /event`、`GET /global/event`；TUI 端口随机，不能用 4096 扫所有本地 Agent。[官方插件事件](https://opencode.ai/docs/plugins/)有 `permission.asked/replied` 与 `question.asked/replied/rejected`。DeskPet 的 Status.WAITING 对应 permission；Status.INPUT 对应 question，必须 session/request ID 强关联、处理 revoke、去重、断流、重建 pending。特定版本支持 `GET /permission` 和 `GET /question` 的证据见 [上游 issue #11616](https://github.com/anomalyco/opencode/issues/11616)，但**不保证所有版本**，连接真实实例后依 `/doc`/GET 探测能力，再决定能否完整 reconcile。历史 session 列表绝不能全部变成 active targets。Desktop 连 WSL server 时，GUI 窗口是 Windows Host，后端 session authority 仍属于原 WSL UID/process，不重复当一只 CLI 宠。
+
+**DSH 官方 Desktop**：[上游官方 apps/desktop README](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/desktop/README.md) 说明 Electron+RunAsNode private Host，GUI 前端使用 `dsh-app://app/`，Host 端口目前默认由 OS 分配，旧 19387 不再是稳定默认值。[DeepSeek 官方下载](https://www.deepseek.com/en/download/)已列 Harness Desktop，优先正式支持官方发行版，再按实际分发单独测试社区壳。窗口关闭可能隐藏而非停止，引擎 PID 才是 liveness 权威。[上游 Connection README](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/connection/README.md)明确全部 Host RPC/WebSocket 有浏览器会话认证，不能从 loopback 假设有无认证 SSE，也不得窃取启动 token、cookie、`.credentials.yaml` 或调用 Electron 私有 IPC。CLI 与 Desktop 共享产品目录不代表 session 所有权相同。
+
+**DSH 完整状态**：[Cordis events](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/framework/events.md) 中 `session/event` 是进程内事件；`turn/start/end`、`step/start/end`、`tool/call/result` 是 session log 的 event.type；`approval/asked/decided` 才是待审配对事件，而 `approval/request` 是带执行后果的回答者 waterfall、绝对禁止注册。[Session persistence backend](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/session/session-persistence-jsonl/README.md) 默认 zstd 帧，不可无界解压或直接 readline。选择当前官方版本已有合法只读 SessionQuery/增量读取路径为首选；若不存在且用户坚持 L1 对等，**唯一可讨论的增强**是用户手工为具体 DSH profile 安装只订阅 session/event / read-only agent status 的 Cordis observer，单向传输脱敏最小 facts，不能改变 Agent、审批或其数据。这个方案仍是“只监听”，但不是“零配置”，必须先征得用户同意，不自动安装。
+
+## 12. 完整 parity 阶段验收（新增 P5 阻塞步骤）
+
+**P0 真实能力矩阵**：工具优先扩现有 `tools/desktop_source_probe.py` 而不是另造重复 probe。对 OpenCode Windows TUI / WSL TUI / Desktop（含连 WSL backend）、DSH Windows/WSL CLI / Web / **官方 Electron Desktop** 实测进程 exe+启动 token、宿主父子链、端口进程归属、版本、host auth、会话 ID、当前 pending、窗口 HWND、启动/退出驻留方式；所有输出对用户密钥/原始 prompt/命令进行脱敏，未测即 NOT TESTED。社区分发只有实测该版本才宣称支持。
+
+**P1 身份与控制台**：新增 Kind 和 strict classifier、WSL 用户/发行版、canonical launcher、desktop helper、既有终端 UIA 边界与窗口评分。两实例同 cwd、PID/端口重复利用、终端与 GUI 相同 backend 均不能串身份。
+
+**P2 OpenCode 双表面 L1**：在后台有界 IO lane GET/SSE → immutable session facts → CLI Observation + 单个 DesktopSource。验证 Working/Done/Error、approval WAITING、question INPUT、Mode 独立、current Goal/Title、重连 stale/reconcile、host 退出、混合 AGENT。
+
+**P3 DSH 官方 Desktop 与 CLI/Web L1**：证明合法 read-only 会话与 Waiting/Input 事实来源才能宣告完工；若暂无公开跨进程只读源，暂只交付 L0，向用户明确只读插件选择，禁止自动安装和破解 Host 认证。社区 Desktop 另行兼容。
+
+**P4 产品闭环**：Config 默认与迁移、Dashboard 三处硬编码、labels、desktop APP_ONLY 白名单、terminal title scorer、窗口唤醒、tray、三种展示模式、slot、attention、state anim、诊断/隐私、shutdown 的互通测试。已好的 Presenter、reducer、animation 和事件驱动 UI 无需改动。
+
+**P5 端到端签字**：
+- 新增 `tests/test_opencode_source.py`、`tests/test_dsh_discovery.py`；如实现 DSH L1 则新增 `tests/test_dsh_source.py`。
+- 扩展 `tests/test_discovery.py`、`tests/test_desktop_sources.py`、`tests/test_monitoring.py`、`tests/test_terminal_uia.py`、`tests/test_terminal_window_resolver.py`、`tests/test_desktop_activation.py`、`tests/test_config.py`、`tests/test_presentation.py`、`tests/test_dashboard_v43.py`、`tests/test_ui_coordinator.py` 和既有 blocking benchmarks。
+- 必测时间线：`busy→tool→WAITING→reply→working→done→idle`，`question→INPUT→answer`，`error→new turn`，`SSE lose→stale→reconnect + pending reconcile`，以及旧回合/冷历史、不完整 JSON、拒绝认证、多 session/session ID 重叠/多 distro/host 退出、配置禁用、30 次启停和 10 分钟稳态。
+- 构建验收命令：`python -m compileall -q agents pet tools tests`、`python -m unittest discover -s tests -v`、`git diff --check`、monitor/desktop/presentation/UI 架构基准；**必须在 Windows Python 3.12 + 真实 Agent 机器**验证。目标新增常驻进程 0、额外工作线程优先 ≤1、额外 RSS ≤20 MiB、idle CPU 增幅 ≤0.5 百分点（均为目标，非已测）。
+- UI 操作：SINGLE/AGGREGATE/FLEET，Pet 皮肤五状态、气泡详情、聚焦和 attention、托盘唤醒、WSL 标签、Desktop minimize/hide/restore，必须逐 Agent 实测。任何没有可靠 exact window 的场景必须 fail closed（不能错误唤醒他人窗口）。
+- 安全回归：无审批批准/拒绝、无按键注入/Hook 自动安装/POST 控制命令/Agent DB 写入/秘钥提取；日志与诊断不输出完整消息/凭证；不扫描任意端口、根目录或 stopped WSL distro。
+
+**完成判据**：每个对象标记 PASS / FAIL / DEGRADED / NOT TESTED；只有所有适用的“必”通过，才能在 README 认定“像 Codex 一样完整接入”。L0 可作为安全的阶段性里程碑，**不能**拿来抵扣完整接入。现阶段所有 P0–P5 的新 Agent 实测项仍为 NOT TESTED，文档更新不构成功能已实现。版本/Release 是否推进仍严格遵循 `VERSIONING.md`。
