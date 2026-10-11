@@ -134,11 +134,11 @@ The 4.1.0 automated acceptance covers byte-compile, the full Windows unit suite,
 3. **Official contract** — [Session](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/session.md)：每条日志带 `type/seq/time/data`，`session/event` 是完成 append 后的事件回调。尚未证明公共、只读、可安全绑定到 CLI/Web/Desktop 的订阅入口。
 4. **Official contract** — [Approval](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/approval.md)：`approval/asked` 和 `approval/decided` 是审计事件，`ApprovalRequestId` 只与对应审批配对，不能代替 agent/session/tool-call ID。DeskPet 仅用配对事件提示/解除 Waiting，**不订阅决策瀑布流 `approval/request`、不注册 answerer、不回写 outcome**。
 5. **Official contract** — [Session Persistence](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/persistence.md)、[JSONL backend README](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/session/session-persistence-jsonl/README.md)：`dsh-session-persistence-jsonl` 逻辑日志按 session 持久化，**物理编码默认是校验后的 Zstandard 帧**，而非可直接 `readline()` 的纯 JSONL；`compression: none` 才使用裸文本。持久化后端还可替换，不能推断 `~/.dsh` 下每个文件均为可 tail 的标准 JSONL。严禁无界扫描历史 logs、解压整个仓库来推断当前进程。
-6. **Community distribution, not official DeepSeek desktop** — [xingj404-lab/dsh-desktop](https://github.com/xingj404-lab/dsh-desktop) 与 [tscodeplus/dsh-desktop](https://github.com/tscodeplus/dsh-desktop)：社区 Tauri 壳可启动本地 `dsh web`；不同发行版各自管理 backend/端口/数据目录，DeskPet 不能把其中任一桌面包名当作官方统一标准。
+6. **官方 Desktop 与社区发行版应分别适配** — [deepseek-ai/deepseek-harness/apps/desktop](https://github.com/deepseek-ai/deepseek-harness/tree/master/apps/desktop) 已提供**官方 Electron Desktop**；[官方 README](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/desktop/README.md) 确认 Electron RunAsNode Host、私有 IPC/HTTP bridge，**当前版本默认由 OS 分配端口**。 [DeepSeek 官方下载站](https://www.deepseek.com/en/download/)亦已提供 Harness Desktop。[xingj404-lab/dsh-desktop](https://github.com/xingj404-lab/dsh-desktop) 与 [tscodeplus/dsh-desktop](https://github.com/tscodeplus/dsh-desktop) 等属于兼容范围单独确认的社区版，不代表官方产品。
 7. **Community issue/evidence** — [DSH web 403 / Origin troubleshooting](https://github.com/deepseek-ai/deepseek-harness/discussions/313)、[configurable port](https://github.com/deepseek-ai/deepseek-harness/discussions/1868)：这类 issue 证明本地 host/port/trust 规则存在差异，并不授权 DeskPet 仿造浏览器令牌或重放内部 RPC。
 8. **Third-party, optional and untrusted contract** — [kelemiao/dsh-api](https://github.com/kelemiao/dsh-api)：社区桥可提供独立 API，但不是 DSH 官方稳定只读监听面；第一阶段不安装、不将其读写 RPC 原样接入。
 
-**DSH 接入决策门槛**：P0 首先寻找当期安装版本中受支持且受限的只读事件/API；若没有：默认只报告确切进程存在（Unknown 或 idle 需独立证据），不声称能精确显示 Waiting；若后续确实需要待审细节，单独讨论**用户手动安装**的 in-process 只读事件插件，其功能仅限投射脱敏状态、不可改变 Agent 生命周期与审批策略。
+**DSH 接入决策门槛**：先审查当期官方 CLI/Web/**Electron Desktop** 的合法只读接口与会话持久化。只有 L0 时不得宣称与 Codex 功能同样齐全；若确实没有零配置只读事件数据面，应明确提出**用户主动安装的纯观察 Cordis 插件**作为可选 L1 方案，不注册审批 answerer，不修改会话与授权。
 
 ### D. 调研结果与未证实点矩阵
 
@@ -149,7 +149,8 @@ The 4.1.0 automated acceptance covers byte-compile, the full Windows unit suite,
 | OpenCode Windows Desktop | Desktop 可连接独立/WSL 后端 | GUI 宿主与 server 子树、窗口前置、前端 session 归属 | 仅前置已验证 GUI 宿主，或只显示运行存在 |
 | DSH CLI | 进程内 Cordis event 与 Session 类型 | CLI 真实进程入口及有效事件输出路径 | 只显示进程运行 Unknown |
 | DSH Web | 默认本地 web UI、会话日志 | 是否提供受支持的**只读**会话与 pending 接口 | 进程运行 Unknown，不探测有权限写 RPC |
-| DSH Desktop（社区多发行） | Tauri 壳常复用 dsh web | 所用分发版、主/sidecar/token/端口及数据所有权 | 单宿主状态；无会话身份不建多个 pet |
+| DSH 官方 Desktop | 官方 Electron + RunAsNode Host + 认证 Web/IPC 桥接，默认随机端口 | GUI 与 backend PID/代次、合法只读能力、会话归属、隐藏与退出 | 无会话身份只报告宿主，禁止误报完整支持 |
+| DSH 社区 Desktop | 各发行版有不同 Tauri/Electron 壳 | 具体发行版进程、端口、数据源与宿主绑定 | 逐发行版声明支持，不假定通用入口 |
 
 ### E. 最小接入取舍与禁止项
 
@@ -159,3 +160,58 @@ The 4.1.0 automated acceptance covers byte-compile, the full Windows unit suite,
 - **会话身份和 stale**：key 至少包含 provider + Windows/WSL plane/uid + server process incarnation + exact session ID；权威删除与读取失败严格分离；断线/未知 pending 立即撤销“确定 WAITING”展示（可改为 stale 提示），历史已完成 session 不复活成活跃 target。
 - **待完成证据**：对两类 Agent 的每个目标环境采集不含对话/命令/token 的 fixture（process family、server health/version、event name、session id 的哈希、source authority）；把结果与使用的上游 commit/version 补回本文和 [plan.md](plan.md)。无实机，不得声称全部接入已通过。
 
+
+
+
+---
+
+## 2026-10-11 追加：功能对等审计与官方 Desktop 更正
+
+> 本节是针对“OpenCode、DSH 要像现有 Codex 等 Agent 一样接入桌宠全部功能”的静态审计增量；**不是实现已完成声明**。DeskPet 审计基线 `81ed56c9f6d39511dbe33fabb08b875d5d70df91`。当前仅完成代码与公开官方文档核验，Windows/WSL 上真实 GUI/Agent 尚未测。
+
+### 新 Agent 必须经过的代码路径
+
+| 当前源码（均为仓库 main） | 已有事实与新增遗漏 |
+| --- | --- |
+| [agents/models.py](agents/models.py) | AgentKind 现有 Claude/Codex/Kimi/pi/ZCode；须统一扩展 OpenCode/DSH 的 label、instance key、DesktopHost、Observation、Target，无第二套状态模型 |
+| [agents/discovery.py](agents/discovery.py) | 一次 psutil census 与 WSL ProcessProbeWorker；两种新 Agent 在 Windows CLI/WSL CLI/Desktop host/helper 的严格分类还未实现；generic node/bun/Electron 不能认作 Agent |
+| [agents/paths.py](agents/paths.py) | 默认会话根/子目录只列出四种 CLI；不能单加 WATCHERS 造成 KeyError 或扫描全部用户 HOME，必须为新数据面独立路径及严格 containment |
+| [agents/monitor.py](agents/monitor.py) | WATCHERS 只有 Claude、Codex、Kimi、pi；desktop source 只注册 Codex/ZCode；网络/WSL 慢 IO 不可塞进 0.5s tick，须只读内存事实缓存 |
+| [agents/desktop.py](agents/desktop.py) | DesktopSessionSource 与 CLI exact claims 保留。**多个相同 kind 的 source 当前会在 Monitor 依 kind 清退时互相误删**；需要单个 kind 所有者或 source ownership 修正及回归 |
+| [agents/state.py](agents/state.py) | Status.WAITING 与 Status.INPUT 不同、Mode/Phase 正交，结构化证据优先；已足够好，保留 |
+| [agents/terminal_uia.py](agents/terminal_uia.py) | DEFAULT_RECOGNIZERS **只有 Codex/Claude/Kimi**。新 Agent 不能自动识别终端审批弹层，结构化原生 events 优先；真实 UIA 文本录样才允许增加严格 recognizer |
+| [agents/terminal_resolver.py](agents/terminal_resolver.py) | 标题的 Kind/CWD/WSL 评分与 observation/window 双绑定复用；需新 kind 的终端标题和多 pane 的准确性验收，不得因同目录把不同实例互绑 |
+| [agents/desktop_window.py](agents/desktop_window.py) | 现只 allowlist chatgpt.exe、codex.exe、zcode.exe；官方 DSH Electron 与 OpenCode GUI 的真实 exe/祖先链须做严格验证和白名单，保留 APP_ONLY 不导航私有 session |
+| [pet/config.py](pet/config.py) | DEFAULTS.monitor.agents、presentation.concurrent.eligible_kinds、_KIND_KEYS 必须同时新增两类，并保留旧配置迁移、source 开关、privacy policy |
+| [pet/dashboard.py](pet/dashboard.py) | **至少三处写死的 Kind 循环/元组**（约 576、1128、1318 行）用于呈现筛选、监听设置和按 Kind 计数；必须同步，否则 Agent 被发现但不完整出现在 Dashboard |
+| [pet/presentation.py](pet/presentation.py)、[pet/labels.py](pet/labels.py) | focused/attention、SINGLE/AGGREGATE/FLEET、slot selector、overflow、DONE/WAITING 动画、Windows/WSL/Desktop 标签须对新种类同等有效 |
+| [pet/tray.py](pet/tray.py)、[pet/app.py](pet/app.py)、[pet/ui_coordinator.py](pet/ui_coordinator.py) | 经统一 AgentTarget 的托盘、双击唤醒、UI dirty revision、show/hide、shutdown 必须有实际交互回归，不建议重写稳定 UI |
+| [tests/test_discovery.py](tests/test_discovery.py)、[tests/test_desktop_sources.py](tests/test_desktop_sources.py)、[tests/test_terminal_uia.py](tests/test_terminal_uia.py) | 加入上述入口的逐项身份、Waiting、stale、退出、切换、负样例，而非只测 Enum 或首次发现 |
+
+### OpenCode 状态覆盖需要细分的两个请求族
+
+- **Official**：[Server](https://opencode.ai/docs/server/) 提供只读 session/status、SSE；TUI 随机端口、`opencode serve` 默认 4096，只能根据确切进程端口对应识别，不能扫描全端口。
+- **Official**：[Plugins](https://opencode.ai/docs/plugins/) 有 `permission.asked` / `permission.replied` 及 `question.asked` / `question.replied` / `question.rejected`。应分别映射 DeskPet **WAITING（审批）** 与 **INPUT（要求用户提供信息）**，不能混淆。同一后端其他 session 的事件不能污染现有 target。
+- **Upstream code evidence**：[TUI context/sync.tsx @ dev](https://github.com/anomalyco/opencode/blob/dev/packages/tui/src/context/sync.tsx) 分开维护 permission、question 和 session_status；实际 JSON id/sessionID/property 字段版本可能变。
+- **Empirical**：[OpenCode issue #11616](https://github.com/anomalyco/opencode/issues/11616) 指出特定版本有 `GET /permission/` / `GET /question/` pending 列表；**不是稳定官方承诺**，必须在目标实例 /doc/GET 安全探测后才用。否则断线不应继续声称准确 Waiting/Input。
+- **产品同等要求**：除进程在场之外，必须覆盖项目/会话标题、当前 turn、阶段、完成、待确认、错误、窗口/终端唤醒、多个 session、Mode 正交、重启与 stale、聚合/多宠/托盘/诊断与配置；无可靠数据则 L0，不能标为“全功能”。
+
+### DSH 的官方发行版、认证与只读事实获取（更正）
+
+- **Official product**：[DeepSeek 下载页](https://www.deepseek.com/en/download/) 和 [Harness 官网](https://www.deepseek.com/en/harness/) 已包含官方 Desktop。
+- **Upstream implementation**：[official apps/desktop README](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/desktop/README.md)：Electron 主进程 + RunAsNode 私有 Host；GUI 入口 `dsh-app://app/`；后端 HTTP 请求走授权桥，WebSocket 凭证仅归官方应用。**当前 Desktop 默认 OS 分配随机端口**（历史资料中 19387 已不适合作为无版本区分的规则），另一个常见 Web 3080 亦不决定实例身份。关闭窗口可能隐藏/驻留，不能直接视为 Host 已退出。
+- **Upstream implementation**：[architecture](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/architecture.md)：CLI 与 Desktop 共享 `$DSH_HOME` 的产品数据但 profile/插件/运行时不同，不得把共享会话目录当作 CLI/Desktop 同时运行的会话所有权证明。
+- **Official**：[client connection](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/connection/README.md)：Host RPC 和 WebSocket event-stream 由浏览器会话认证，launch token 只用于首页兑换 cookie；无“localhost 自动只读 tier”。严禁 DeskPet 读取进程环境/浏览器 cookie/`.credentials.yaml`、伪造 IPC 或拦截官方桥。
+- **Official**：[session persistence JSONL](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/session/session-persistence-jsonl/README.md)：日志逻辑 JSONL，但默认 zstd 校验帧、文件版本不断变化，`sessionPersistence.open(id,'read')` 是进程内服务，不是现成的外部 API；大范围解压整个历史数据不是轻量监听。
+- **Official**：[approval](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/approval.md)：`approval/asked`/`approval/decided` 是 session-scoped 审计事件；`approval/request` 是会做决议的 waterfall，监听绝不能订阅 answerer 或返回 outcome。
+- **L1 取舍**：先验当前安装版是否有可合法无副作用读取的 SessionQuery/会话状态；不具备时，可评估仅由用户手动安装的、**只订阅 `session/event`/只读 Agent status 并向 DeskPet 单向输出脱敏状态的 Cordis 插件**。它不提交任何审批决议，也不得修改 session/Agent 数据。无 L1 路径时 DSH 只能声明 L0，**不能计入全功能验收**。
+
+### 审查中发现的必要修正
+
+1. 旧的 `19387` 固定 Desktop 端口说法、只有社区 DSH Desktop 的说法被上游新资料推翻；代码必须遵从精确版本+本机端点归属。
+2. 新 Kind 只增加进程发现无法接入现有 UIA recognizer / GUI 激活白名单 / Dashboard 硬编码展示入口。
+3. OpenCode 的 `question` 与 `permission` 两种等待必须分离，只有明确事件/当前未决集合才能声称待审批。
+4. DSH 只做 L0 虽安全但**不满足用户最新提出的完整功能对等**；必须标记为未通过，而不是当作同等完成。
+5. 目前尚未得到用户机器上的 Windows CLI、WSL、OpenCode Desktop、官方 DSH Desktop 的真实 PID/端口/会话/窗口 fixture；任何精确支持声明须经该环节验证。
+
+本节上游主分支证据分别参考 DeepSeek Harness `master` tree `d743267388641bc76f17c45ce8b4c231aed1d32c`、OpenCode `dev` tree `0d61729b3fa005cec9aa754c075a809663c736a4`。这些是**代码树 SHA，不是发布版本号**，版本漂移仍须目标安装实测。
