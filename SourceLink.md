@@ -95,29 +95,67 @@ The ZCode 4.1.0 change does not alter the existing Codex Desktop/CLI safety boun
 
 The 4.1.0 automated acceptance covers byte-compile, the full Windows unit suite, fresh/stale/tombstone discovery semantics, direct-argv read-only remote transport, state isolation, global session/plane bounds, and the existing Monitor/Desktop-source/Presentation/UI architecture benchmarks. It does **not** claim that GitHub-hosted CI is a real user's ZCode + WSL Remote Development machine. `tools/desktop_source_probe.py` exists for the final environment-specific read-only smoke check without exposing prompts, transcripts, tool arguments, credentials, or other sensitive payloads.
 
-
 ---
 
-## 2026-10-11 — OpenCode CLI/Desktop 与 DeepSeek Harness (DSH) 接入调研
+## 2026-10-11 — OpenCode / DeepSeek Harness 纯监听调研（替代之前的审批集成草案）
 
-> **状态：研究与设计，尚未实现。** 本节不可作为已完成接入或审批支持的证据。详细实施及验收方案另见本次生成的 `plan.md`。
+> **审计状态**：仅完成仓库静态审阅与可公开文档核验；尚未完成目标机器上的 CLI / Desktop / Windows / WSL 运行验证。本节是待实现的接入依据，不是当前 DeskPet 已支持 OpenCode / DSH 的功能说明。
+>
+> **用户确认的范围**：只读监控（运行、会话、活动、完成、待用户确认/审批的提示）。**不实现**允许/拒绝、审批 API POST、模拟按键、自动控制、插件自动安装、注入、修改 Agent 配置和会话数据。现有「双击唤醒原窗口」属于 DeskPet 原有的窗口前置行为，不是审批能力。
 
-### OpenCode 官方事件及能力探测
+### A. 2026-10-11 仓库实现基线（代码事实）
 
-- [OpenCode 官方 Plugins](https://docs.opencode.ai/docs/plugins/)：公开 `permission.asked`、`permission.replied`、`session.status`、`session.idle`、`message.part.updated`、`session.error` 等事件；插件可装在 `~/.config/opencode/plugins/`。插件不宜成为 DeskPet 默认零配置只读监听的强依赖。
-- [OpenCode Server API](https://dev.opencode.ai/docs/server/)：`/global/event` 和 `/event` SSE、`/session`、`/session/status` 及经典版本的 `POST /session/:id/permissions/:permissionID`；实际实例须依版本及 `/doc` 发现，不能假设端口固定。
-- [OpenCode v2 API（实验性）](https://dev.opencode.ai/v2/docs/api/)：另有 `/api/permission/request`、`/api/session/{sessionID}/permission/{requestID}/reply`、`/api/event`，与经典 API 并非同一路由契约。
-- [OpenCode 上游 issue #28037](https://github.com/anomalyco/opencode/issues/28037)：存在过回复 API 返回成功但 pending 未解除的报告，故审批必须用对应 request 后续状态校验，不以 HTTP 200 视为通过。
-- [OpenCode Web 官方安全说明](https://docs.opencode.ai/docs/web/)：本地服务可启用 `OPENCODE_SERVER_PASSWORD`，远端暴露须认证；DeskPet 只应连到进程所有权明确的可信本地 endpoint。
+本次审核的基线：\`main\` / \`9a019bf5b14fd282304d9d4371105bd19f7ac86e\`（仓库名称已由 \`DeskPet\` 重定向为 \`Deskpet-For-Agents\`）。\`pet/version.py\` 仍为 **4.1.0**；\`tests/ACCEPTANCE-4.5.0.md\` 是历史测试记录，不能代替当前 app 版本，也不能证明本轮测试已经在真实目标环境通过。
 
-### DeepSeek Harness 官方插件及审批边界
+- **代码事实** — [agents/models.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/agents/models.py)：\`AgentKind\` 现有 \`CLAUDE/CODEX/KIMI/PI/ZCODE\`；\`AgentSurface\` 有 \`TERMINAL/DESKTOP\`；\`Observation\` 与 \`Snapshot\` 已分开状态、阶段、模式；实际待审枚举是 \`Status.WAITING\`（不是 \`WAITING_APPROVAL\`）。
+- **代码事实** — [agents/discovery.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/agents/discovery.py)：\`scan_windows_inventory\` 对单次 psutil inventory 分类 terminal 与 desktop；\`WslProcessProbe\` 按运行中的 distro 和 PID/uid 获取受限身份信息；当前两种新 Agent 都**未纳入分类**。新进程名只做严格正向匹配、确认父子关系，不能因 \`node.exe\`、\`bun.exe\`、\`tauri\`、\`WebView2\` 等通用进程出现就认为属于某 Agent。
+- **代码事实** — [agents/monitor.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/agents/monitor.py)：现有 \`ProcessProbeWorker\`（慢速 Windows/WSL 发现）、\`Monitor\`（周期融合）、\`WATCHERS\`（四类终端文件 watcher）、\`_register_desktop_sources\`、\`_poll_desktop_sources\`、\`_commit_exit\` 和 UI revision。网络/SSE 不能直接插入每次 \`_tick\`；断连不能以 \`authoritative empty\` 清空已知实例。
+- **代码事实** — [agents/desktop.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/agents/desktop.py)：\`DesktopSessionSource.poll(hosts, claimed_sessions, now)\`、\`DesktopSourceSnapshot\` 与 CLI \`SessionClaimKey\`。**重要兼容陷阱**：Monitor 目前按 \`source.kind\` 退出同类型 desktop targets；不应把同种 Agent 的不同桌面实现做成两条各自会清理另一条会话的 source。应每个 kind 仅注册一个桌面聚合 source，或在明确修改 Monitor 所有权匹配规则并补测后支持多 source。
+- **代码事实** — [agents/state.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/agents/state.py)：待审批只凭精确会话证据；纯文本滚动不能越权覆盖已知 Done/Idle；活动 TTL 超时转 Unknown。保持原样。
+- **代码事实** — [agents/zcode_remote.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/agents/zcode_remote.py)、[agents/codex_desktop.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/agents/codex_desktop.py)、[agents/zcode_desktop.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/agents/zcode_desktop.py)：复用结构化 observation、bounded sessions、host lease、last-good/stale；**不要**照搬 ZCode 私有 SQLite 表到 OpenCode/DSH。
+- **代码事实** — [pet/config.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/pet/config.py)、[pet/presentation.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/pet/presentation.py)、[pet/dashboard.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/pet/dashboard.py)：\`_KIND_KEYS\`、默认 monitor agents、eligible_kinds、Dashboard 的开关和选择器均须同步；单靠新增 Enum 不会使 UI 完整工作。
+- **代码事实** — [tests/test_desktop_sources.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/tests/test_desktop_sources.py)、[tests/test_discovery.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/tests/test_discovery.py)、[tests/test_state.py](https://github.com/invincible-summer/Deskpet-For-Agents/blob/9a019bf5b14fd282304d9d4371105bd19f7ac86e/tests/test_state.py)：沿用 snapshot 三态、进程代次/WSL 多用户、跨界面会话 claim、stale 与 Waiting 精确归属测试。
 
-- [DeepSeek Harness 官方仓库](https://github.com/deepseek-ai/deepseek-harness)：`dsh` 仍为开发预览版，Cordis 一切皆插件，存在 breaking changes 风险。
-- [DSH 官方 User Approval](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/approval.md)：`ctx.approval.request`、`approval/request` waterfall、`approval/asked`、`approval/decided`；仅 `allowed-once` 放行，`rejected`、`cancelled`、`unavailable` 必须 fail closed。approval id 与 tool-call/session id 不可互换。
-- [DSH Desktop 实现](https://github.com/xingj404-lab/dsh-desktop)：Tauri v2 启动本地 `dsh web` backend；会话数据需从后端而非前台窗口表象确认。
-- [第三方 dsh-api 插件](https://github.com/kelemiao/dsh-api)：示例证明可在本地通过 token+loopback 暴露 session SSE 与 `/api/events.mux`，但非官方稳定 API，不应默认安装或直接拿其 raw passthrough 做审批。
+### B. OpenCode — 稳定公开契约、可变数据面及安全限制
 
-### DeskPet 推荐落点
+1. **Official contract** — [OpenCode Server](https://opencode.ai/docs/server/)：TUI 运行时启动 HTTP Server；\`opencode serve\` 默认 \`127.0.0.1:4096\`，而 TUI 可使用**随机端口**；\`GET /global/health\` 返回健康与版本；\`GET /global/event\`、\`GET /event\` 是 SSE；\`GET /session\`、\`GET /session/status\` 是只读会话 API；\`/doc\` 提供实例级 OpenAPI。**不能把 4096 当作发现规则；不能因为发现本地 HTTP 端口就信任其为 OpenCode。**
+2. **Official contract** — [OpenCode Plugins](https://opencode.ai/docs/plugins/)：列出 \`permission.asked\`、\`permission.replied\`、\`session.created/updated/deleted/idle/status/error\`、\`message.part.updated\`、\`question.asked\`（版本相关）等订阅事件。插件是**可选扩展**，零配置路径不安装它；事件是否被当前运行实例通过 SSE 广播，需要对照实例 OpenAPI/实测验证。
+3. **Official contract** — [OpenCode Windows / WSL](https://opencode.ai/docs/windows-wsl/)：原生 Windows 与 WSL 均可运行；Desktop 支持连接 WSL 后端；WSL 的配置和 session 保存在该 WSL 用户环境的 \`~/.local/share/opencode/\`。官方的 \`0.0.0.0\` 示例伴随密码防护警告：DeskPet **不得为了监听而启动服务、改监听地址或打开网络暴露**。
+4. **Official contract** — [OpenCode Server Authentication](https://opencode.ai/docs/server/#authentication)：\`OPENCODE_SERVER_PASSWORD\` 启用 HTTP Basic Auth，用户名可用 \`OPENCODE_SERVER_USERNAME\` 设置。DeskPet 不枚举/读取环境里的明文密码，不绕过访问控制；未能合法、安全读取的接口标为 unavailable。
+5. **Upstream implementation, version-specific** — [OpenCode TUI sync](https://github.com/anomalyco/opencode/blob/dev/packages/tui/src/context/sync.tsx)：上游前端按 \`sessionID\` 缓存 status/permission，收到 \`permission.replied\` 后移除同 ID pending。此为开发分支实现佐证，而非不可变跨版本协议；使用前须用目标实例 \`/doc\` 或 fixture 验证具体字段。
+6. **Experimental/variant, NOT baseline** — [OpenCode v2 API](https://dev.opencode.ai/v2/docs/api/)：\`/api/session/{sessionID}/permission/{requestID}\` 等路由属于另一接口族。当前目标**只读**，不实施或保存任何 \`reply\` 路由，不同时叠加经典/v2 写入方案。
+7. **Implementation gate** — 精确等待审批必须有 \`(server incarnation, session ID, permission request ID)\` 且收到当前有效 \`asked\`，并能够以对应 \`replied\` 或权威 pending 状态撤销；如断流、重启或只读接口不提供当前 pending 快照，应显示 stale/Unknown，不永久保留 Waiting。
+8. **OpenCode Desktop** — official docs support desktop app, but **host executable/process tree, spawned backend process, active tab mapping, multi-window data ownership** are NOT specified as guaranteed stable detection contracts. These must be gathered from sanitized local probe before permitting precise terminal/desktop de-duplication.
 
-保持 `agents/discovery.py` / `agents/models.py` / `agents/monitor.py` / `agents/desktop.py` / `pet/config.py` 现有分层；事件来源通过有限后台 worker + session-scoped last-good/reconcile 接入。监听仍默认只读；远程手动审批作为显式 opt-in 第二阶段，必须校验准确实例/会话/请求 id 和不变的操作摘要，不走模拟按键。Windows、WSL 与桌面端每个版本真实 API 和窗口归属仍须本地无敏感数据的 capability probe 验证。
+### C. DSH — 官方进程内事件与持久化，不等于公开只读远程 API
+
+1. **Official contract** — [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)：DSH 处于 developer preview，官方明确提示 breaking changes；\`dsh web\` 通常监听 \`127.0.0.1:3080\`，但端口可配置。只能以进程所有权 + 后端身份绑定，**不能把端口 3080 当唯一身份**。
+2. **Official contract** — [Cordis events](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/framework/events.md)：\`session/event\` 为 Cordis 内部回调；持久会话事件 \`turn/start\`、\`turn/end\`、\`step/start\`、\`step/end\`、\`tool/call\`、\`tool/result\` 是 log event.type，**不是 SSE 事件名或现成跨进程订阅 URL**。
+3. **Official contract** — [Session](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/session.md)：每条日志带 \`type/seq/time/data\`，\`session/event\` 是完成 append 后的事件回调。尚未证明公共、只读、可安全绑定到 CLI/Web/Desktop 的订阅入口。
+4. **Official contract** — [Approval](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/approval.md)：\`approval/asked\` 和 \`approval/decided\` 是审计事件，\`ApprovalRequestId\` 只与对应审批配对，不能代替 agent/session/tool-call ID。DeskPet 仅用配对事件提示/解除 Waiting，**不订阅决策瀑布流 \`approval/request\`、不注册 answerer、不回写 outcome**。
+5. **Official contract** — [Session Persistence](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/persistence.md)、[JSONL backend README](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/session/session-persistence-jsonl/README.md)：\`dsh-session-persistence-jsonl\` 逻辑日志按 session 持久化，**物理编码默认是校验后的 Zstandard 帧**，而非可直接 \`readline()\` 的纯 JSONL；\`compression: none\` 才使用裸文本。持久化后端还可替换，不能推断 \`~/.dsh\` 下每个文件均为可 tail 的标准 JSONL。严禁无界扫描历史 logs、解压整个仓库来推断当前进程。
+6. **Community distribution, not official DeepSeek desktop** — [xingj404-lab/dsh-desktop](https://github.com/xingj404-lab/dsh-desktop) 与 [tscodeplus/dsh-desktop](https://github.com/tscodeplus/dsh-desktop)：社区 Tauri 壳可启动本地 \`dsh web\`；不同发行版各自管理 backend/端口/数据目录，DeskPet 不能把其中任一桌面包名当作官方统一标准。
+7. **Community issue/evidence** — [DSH web 403 / Origin troubleshooting](https://github.com/deepseek-ai/deepseek-harness/discussions/313)、[configurable port](https://github.com/deepseek-ai/deepseek-harness/discussions/1868)：这类 issue 证明本地 host/port/trust 规则存在差异，并不授权 DeskPet 仿造浏览器令牌或重放内部 RPC。
+8. **Third-party, optional and untrusted contract** — [kelemiao/dsh-api](https://github.com/kelemiao/dsh-api)：社区桥可提供独立 API，但不是 DSH 官方稳定只读监听面；第一阶段不安装、不将其读写 RPC 原样接入。
+
+**DSH 接入决策门槛**：P0 首先寻找当期安装版本中受支持且受限的只读事件/API；若没有：默认只报告确切进程存在（Unknown 或 idle 需独立证据），不声称能精确显示 Waiting；若后续确实需要待审细节，单独讨论**用户手动安装**的 in-process 只读事件插件，其功能仅限投射脱敏状态、不可改变 Agent 生命周期与审批策略。
+
+### D. 调研结果与未证实点矩阵
+
+| 对象 | 可确认依据 | 尚需实机/版本验证 | 失败时行为 |
+| --- | --- | --- | --- |
+| OpenCode Windows CLI | CLI 启动 server；官方 GET/SSE/会话 API | exe/node/bun 进程名、随机端口归属、鉴权、pending 快照 | 保留进程 Unknown；不伪造 Waiting |
+| OpenCode WSL CLI | WSL 官方支持；同源用户存储 | distro+uid+server PID 对应、跨 WSL 访问、后端调用路径 | WSL 不可读 → stale；不唤醒 distro |
+| OpenCode Windows Desktop | Desktop 可连接独立/WSL 后端 | GUI 宿主与 server 子树、窗口前置、前端 session 归属 | 仅前置已验证 GUI 宿主，或只显示运行存在 |
+| DSH CLI | 进程内 Cordis event 与 Session 类型 | CLI 真实进程入口及有效事件输出路径 | 只显示进程运行 Unknown |
+| DSH Web | 默认本地 web UI、会话日志 | 是否提供受支持的**只读**会话与 pending 接口 | 进程运行 Unknown，不探测有权限写 RPC |
+| DSH Desktop（社区多发行） | Tauri 壳常复用 dsh web | 所用分发版、主/sidecar/token/端口及数据所有权 | 单宿主状态；无会话身份不建多个 pet |
+
+### E. 最小接入取舍与禁止项
+
+- **推荐**：OpenCode 优先同一现有 server 上的只读 SSE/GET + 有界后台连接，DSH 先 process-only、寻找真实只读 API；如果无法得到明确会话/审批证据，则**接受功能降级**，不为“显示一个状态”追加高资源后台服务。
+- **线程和性能**：复用一次 Windows process census 与现有 WSL ProcessProbeWorker；给多个 OpenCode endpoint 分配一个有界 IO 管理 worker 而非每会话起线程；Monitor 每 tick 只复制内存快照，Tk 禁止网络、数据库/WSL 读。只有检测到可证实活跃进程/后端，才建立事件连接。
+- **安全只读**：API 仅 allowlisted GET/SSE；**不执行 POST/PUT/PATCH/DELETE**；即使上游某个只读 RPC 使用 POST，也不可未经审核自动纳入。禁止 Agent 插件自动安装/配置改写、HTTP 端口暴力探测、WSL root fallback、新增后台解压守护、任何审批按钮。
+- **会话身份和 stale**：key 至少包含 provider + Windows/WSL plane/uid + server process incarnation + exact session ID；权威删除与读取失败严格分离；断线/未知 pending 立即撤销“确定 WAITING”展示（可改为 stale 提示），历史已完成 session 不复活成活跃 target。
+- **待完成证据**：对两类 Agent 的每个目标环境采集不含对话/命令/token 的 fixture（process family、server health/version、event name、session id 的哈希、source authority）；把结果与使用的上游 commit/version 补回本文和 [plan.md](plan.md)。无实机，不得声称全部接入已通过。
 
