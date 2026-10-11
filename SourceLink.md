@@ -94,3 +94,30 @@ The ZCode 4.1.0 change does not alter the existing Codex Desktop/CLI safety boun
 ## Acceptance boundary
 
 The 4.1.0 automated acceptance covers byte-compile, the full Windows unit suite, fresh/stale/tombstone discovery semantics, direct-argv read-only remote transport, state isolation, global session/plane bounds, and the existing Monitor/Desktop-source/Presentation/UI architecture benchmarks. It does **not** claim that GitHub-hosted CI is a real user's ZCode + WSL Remote Development machine. `tools/desktop_source_probe.py` exists for the final environment-specific read-only smoke check without exposing prompts, transcripts, tool arguments, credentials, or other sensitive payloads.
+
+
+---
+
+## 2026-10-11 — OpenCode CLI/Desktop 与 DeepSeek Harness (DSH) 接入调研
+
+> **状态：研究与设计，尚未实现。** 本节不可作为已完成接入或审批支持的证据。详细实施及验收方案另见本次生成的 `plan.md`。
+
+### OpenCode 官方事件及能力探测
+
+- [OpenCode 官方 Plugins](https://docs.opencode.ai/docs/plugins/)：公开 `permission.asked`、`permission.replied`、`session.status`、`session.idle`、`message.part.updated`、`session.error` 等事件；插件可装在 `~/.config/opencode/plugins/`。插件不宜成为 DeskPet 默认零配置只读监听的强依赖。
+- [OpenCode Server API](https://dev.opencode.ai/docs/server/)：`/global/event` 和 `/event` SSE、`/session`、`/session/status` 及经典版本的 `POST /session/:id/permissions/:permissionID`；实际实例须依版本及 `/doc` 发现，不能假设端口固定。
+- [OpenCode v2 API（实验性）](https://dev.opencode.ai/v2/docs/api/)：另有 `/api/permission/request`、`/api/session/{sessionID}/permission/{requestID}/reply`、`/api/event`，与经典 API 并非同一路由契约。
+- [OpenCode 上游 issue #28037](https://github.com/anomalyco/opencode/issues/28037)：存在过回复 API 返回成功但 pending 未解除的报告，故审批必须用对应 request 后续状态校验，不以 HTTP 200 视为通过。
+- [OpenCode Web 官方安全说明](https://docs.opencode.ai/docs/web/)：本地服务可启用 `OPENCODE_SERVER_PASSWORD`，远端暴露须认证；DeskPet 只应连到进程所有权明确的可信本地 endpoint。
+
+### DeepSeek Harness 官方插件及审批边界
+
+- [DeepSeek Harness 官方仓库](https://github.com/deepseek-ai/deepseek-harness)：`dsh` 仍为开发预览版，Cordis 一切皆插件，存在 breaking changes 风险。
+- [DSH 官方 User Approval](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/approval.md)：`ctx.approval.request`、`approval/request` waterfall、`approval/asked`、`approval/decided`；仅 `allowed-once` 放行，`rejected`、`cancelled`、`unavailable` 必须 fail closed。approval id 与 tool-call/session id 不可互换。
+- [DSH Desktop 实现](https://github.com/xingj404-lab/dsh-desktop)：Tauri v2 启动本地 `dsh web` backend；会话数据需从后端而非前台窗口表象确认。
+- [第三方 dsh-api 插件](https://github.com/kelemiao/dsh-api)：示例证明可在本地通过 token+loopback 暴露 session SSE 与 `/api/events.mux`，但非官方稳定 API，不应默认安装或直接拿其 raw passthrough 做审批。
+
+### DeskPet 推荐落点
+
+保持 `agents/discovery.py` / `agents/models.py` / `agents/monitor.py` / `agents/desktop.py` / `pet/config.py` 现有分层；事件来源通过有限后台 worker + session-scoped last-good/reconcile 接入。监听仍默认只读；远程手动审批作为显式 opt-in 第二阶段，必须校验准确实例/会话/请求 id 和不变的操作摘要，不走模拟按键。Windows、WSL 与桌面端每个版本真实 API 和窗口归属仍须本地无敏感数据的 capability probe 验证。
+
