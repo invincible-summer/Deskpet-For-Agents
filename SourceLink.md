@@ -139,3 +139,6 @@ The 4.1.0 automated acceptance covers byte-compile, the full Windows unit suite,
 **最终选择**：现有单进程进程 census + 新增 OpenCode SQLite adapter / DSH append-log adapter + 可确认实例的 OpenCode GET/SSE 辅助 + 统一 Observation、DesktopSessionSource、窗口绑定与 Presentation。没有任何 Agent-side plugin 或附带 Node 服务；不安装东西进 DSH/WSL，不改变认证边界。不能为显示状态牺牲低 CPU/RSS 或误报 WAITING。
 
 **仍需实机证据**：Windows、WSL、官方 OpenCode GUI、DSH 官方 Electron GUI，进程/文件根、session ownership、zstd 多代格式、权限对消时效、窗口恢复、混合多实例、启动/退出，及对现有 Codex/Claude/Kimi/pi/ZCode 零回归。每项必须 PASS/FAIL/DEGRADED/NOT_TESTED 四态；只看到进程（L0）不能宣称与现有 Codex 完全对等。详细完整矩阵与文件接口见 [plan.md](plan.md)。
+
+
+**追加的 SQLite 只读验证细节**：[官方 WAL 只读行为](https://www.sqlite.org/wal.html#readonly) 允许 WAL 的 read-only 打开依赖现存 `-wal`/`-shm` 或目录写权限；故 `mode=ro` 不代表进程绝对不可能创建 `-shm`。DeskPet 的“零 Agent-owned 写入”需要在打开前后检查 sidecar、数据库目录与文件元数据，若不能证明纯读则放弃该数据源。不可把 `immutable=1` 用在仍更新的 OpenCode 数据库，参见 [SQLite URI](https://www.sqlite.org/uri.html)。
