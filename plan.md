@@ -108,3 +108,6 @@
 **验收命令和签字**：^python -m compileall -q agents pet tools tests^；^python -m unittest discover -s tests -v^；上述阻塞 benchmarks；^git diff --check^；Windows Python 3.12 + OpenCode Windows/WSL/Desktop + DSH CLI/Web/官方 Desktop 的无敏感信息实机 probe。README 逐 surface 公布 PASS、FAIL、DEGRADED、NOT_TESTED，写清无法读取的等待态。CI 的 mock 不等于实机；此前 ^tests/ACCEPTANCE-4.5.0.md^ 不属于此次完成证据。
 
 **清理**：当两种 adapter 定型后，清除早期计划里曾考虑过的 Cordis 观察插件、审批控制 API、sidecar 的未实现接口/配置、实验性多套 reader；代码只保留 ^agents/opencode.py^、^agents/dsh.py^ 两个专用 adapter 及现有 Monitor/Presentation 的最小接线。保持本项目“轻量、被动、无侵入”的原始开发契约。
+
+
+**SQLite WAL 零写入补充门槛**：`mode=ro` 并不在所有环境保证不会由 SQLite 创建 `-shm` sidecar。按照 [SQLite 官方 WAL 说明](https://www.sqlite.org/wal.html#readonly)，P0 应检查 WAL/SHM 现状、目录权限及读连接前后文件元数据；若无法证明不产生新 sidecar 或其他 Agent-owned 写入，则跳过此 DB 数据源并降级。不能用 `immutable=1` 规避，因为数据库正在变化会出现错误结果。
