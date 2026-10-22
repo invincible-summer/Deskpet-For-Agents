@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 from unittest.mock import Mock
 
-from agents.base import parse_ts
+from agents.base import LARGE_FILE_BYTES, parse_ts
 from agents.claude import ClaudeFile, ClaudeWatcher
 from agents.codex import CodexFile, CodexWatcher
 from agents.kimi import KimiFile, KimiWatcher
@@ -1685,6 +1685,232 @@ class NewKindMonitorWiringTests(unittest.TestCase):
         snap = worker._opencode_http.snapshot()
         self.assertFalse(snap.available)
         self.assertEqual(snap.pending, {})
+
+
+class LargeFileIdentityTests(unittest.TestCase):
+    """v4.4.1：>512KB 的会话文件从近端起步时仍保留绑定身份。
+
+    实机取证（2026-10）：11.5MB 的 rollout 若只从 size-256KB 起读，
+    session_meta 不在增量里 → session_id/cwd 全空 → 绑定评分 1000→0，
+    Agent 显示"未解析"。修复：打开时做一次有界头部身份预读。
+    """
+
+    def _make_rollout(self, root, filler_bytes, cwd, session_id):
+        sub = os.path.join(root, ".codex", "sessions", "2026", "10", "19")
+        os.makedirs(sub, exist_ok=True)
+        path = os.path.join(
+            sub, "rollout-2026-10-19T08-00-00-%s.jsonl" % session_id)
+        meta_ts = "2026-10-19T08:00:00.000Z"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "session_meta", "timestamp": meta_ts,
+                "payload": {"id": session_id, "session_id": session_id,
+                            "cwd": cwd, "timestamp": meta_ts}}) + "\n")
+            f.write(json.dumps({
+                "type": "event_msg", "timestamp": meta_ts,
+                "payload": {"type": "task_started",
+                            "turn_id": "t1"}}) + "\n")
+            written = 0
+            pad = {"type": "response_item", "timestamp": meta_ts,
+                   "payload": {"type": "reasoning", "text": "x" * 400}}
+            while written < filler_bytes:
+                line = json.dumps(pad) + "\n"
+                f.write(line)
+                written += len(line)
+            f.write(json.dumps({
+                "type": "event_msg", "timestamp": "2026-10-19T08:00:03.000Z",
+                "payload": {"type": "agent_message",
+                            "message": "done"}}) + "\n")
+        os.utime(path, (time.time(), time.time()))
+        return path
+
+    def _watcher(self):
+        return CodexWatcher({
+            "activity_grace_sec": 10.0, "session_scan_sec": 0.0,
+            "active_file_window_sec": 180.0})
+
+    def test_large_rollout_keeps_identity_and_binds(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = os.path.join(tmp.name, "home")
+        os.makedirs(os.path.join(root, ".codex", "sessions"), exist_ok=True)
+        cwd = "C:\\work\\proj"
+        sid = "01a14f8f-888a-7a20-bd7c-5e5fd64497c1"
+        self._make_rollout(root, 700 * 1024, cwd, sid)
+        with patch("agents.paths._user_home", lambda: root):
+            watcher = self._watcher()
+            inst = AgentInstance(
+                kind=AgentKind.CODEX, pid=4242, source="windows",
+                started_at=time.time() - 60, cwd=cwd,
+                process_token="ct", key="w|codex|4242|ct")
+            out = watcher.poll([inst])
+        (key, obs), = out.items()
+        st = list(watcher.files.values())[0]
+        # 近端起步：tailer 不从 0 开始
+        self.assertGreater(st.tailer.pos, 0)
+        # 但身份通过有界预读恢复
+        self.assertEqual(st.identity_session_id, sid)
+        self.assertEqual(st.identity_cwd, cwd)
+        # 因而成功绑定并给出真实 session id
+        self.assertTrue(obs.session_bound)
+        self.assertEqual(obs.session_id, sid)
+        self.assertEqual(obs.cwd, cwd)
+
+    def test_small_rollout_binds_without_identity_read(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = os.path.join(tmp.name, "home")
+        os.makedirs(os.path.join(root, ".codex", "sessions"), exist_ok=True)
+        cwd = "C:\\work\\proj"
+        sid = "01a14f8f-888a-7a20-bd7c-5e5fd64497c2"
+        self._make_rollout(root, 0, cwd, sid)
+        with patch("agents.paths._user_home", lambda: root):
+            watcher = self._watcher()
+            inst = AgentInstance(
+                kind=AgentKind.CODEX, pid=4243, source="windows",
+                started_at=time.time() - 60, cwd=cwd,
+                process_token="ct", key="w|codex|4243|ct")
+            out = watcher.poll([inst])
+        (key, obs), = out.items()
+        st = list(watcher.files.values())[0]
+        # 小文件不需要头部预读（tailer 从 0 起读，事件流自带 session_meta）
+        self.assertLess(os.path.getsize(st.path), LARGE_FILE_BYTES)
+        self.assertFalse(st.identity_scanned)
+        self.assertTrue(obs.session_bound)
+        self.assertEqual(obs.session_id, sid)
+
+    def test_identity_read_is_bounded_and_fail_closed(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = os.path.join(tmp.name, "home")
+        os.makedirs(os.path.join(root, ".codex", "sessions"), exist_ok=True)
+        cwd = "C:\\work\\proj"
+        sid = "01a14f8f-888a-7a20-bd7c-5e5fd64497c3"
+        path = self._make_rollout(root, 700 * 1024, cwd, sid)
+        from agents.codex import CodexFile
+        st = CodexFile(path)
+        st.scan_identity(limit=64)   # 极小上限：读不到完整记录
+        # 预读失败不得抛错，也不得伪造身份
+        self.assertEqual(st.identity_session_id, "")
+        self.assertTrue(st.identity_scanned)
+        # 正常上限可以读到
+        st2 = CodexFile(path)
+        st2.scan_identity()
+        self.assertEqual(st2.identity_session_id, sid)
+
+    def test_missing_file_identity_scan_is_safe(self):
+        from agents.codex import CodexFile
+        st = CodexFile(os.path.join(tempfile.gettempdir(),
+                                   "definitely-missing-xyz.jsonl"))
+        self.assertFalse(st.scan_identity())
+
+
+class BoundSlotStabilityTests(unittest.TestCase):
+    """v4.4.1：bound 会话不被 MAX_TRACKED_FILES 挤出后反复重建。"""
+
+    def _make_rollout(self, root, name, cwd, session_id, mtime=None):
+        sub = os.path.join(root, ".codex", "sessions", "2026", "10", "19")
+        os.makedirs(sub, exist_ok=True)
+        path = os.path.join(sub, "rollout-2026-10-19T08-00-00-%s.jsonl"
+                            % session_id)
+        meta_ts = "2026-10-19T08:00:00.000Z"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "session_meta", "timestamp": meta_ts,
+                "payload": {"id": session_id, "session_id": session_id,
+                            "cwd": cwd, "timestamp": meta_ts}}) + "\n")
+            f.write(json.dumps({
+                "type": "event_msg", "timestamp": meta_ts,
+                "payload": {"type": "task_started"}}) + "\n")
+        when = mtime if mtime is not None else time.time()
+        os.utime(path, (when, when))
+        return path
+
+    def test_bound_rollout_survives_newer_candidates(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = os.path.join(tmp.name, "home")
+        os.makedirs(os.path.join(root, ".codex", "sessions"), exist_ok=True)
+        cwd = "C:\\work\\proj"
+        sid = "01a14f8f-888a-7a20-bd7c-5e5fd64497c1"
+        self._make_rollout(root, "bound", cwd, sid)
+        created = 0
+        with patch("agents.paths._user_home", lambda: root):
+            watcher = CodexWatcher({
+                "activity_grace_sec": 10.0, "session_scan_sec": 0.0,
+                "active_file_window_sec": 180.0})
+            inst = AgentInstance(
+                kind=AgentKind.CODEX, pid=500, source="windows",
+                started_at=time.time() - 60, cwd=cwd,
+                process_token="ct", key="w|codex|500|ct")
+            orig_make = watcher.make_state
+
+            def make(path):
+                nonlocal created
+                created += 1
+                return orig_make(path)
+
+            watcher.make_state = make
+            first_round_created = None
+            for round_no in range(8):
+                # 每轮出现更新的历史 session（更容易抢占 tracked 名额）
+                for k in range(3):
+                    self._make_rollout(
+                        root, "hist%d_%d" % (round_no, k), "C:\\other",
+                        "01bbbbbb-888a-7a20-bd7c-5e5fd64497c%02d" % k,
+                        mtime=time.time() + round_no + k)
+                (key, obs), = watcher.poll([inst]).items()
+                self.assertEqual(obs.session_id, sid)
+                if first_round_created is None:
+                    first_round_created = created
+                else:
+                    # 首轮填充之后，bound rollout 绝不再被重新打开
+                    self.assertEqual(created, first_round_created,
+                                     "bound rollout must not be recreated")
+
+
+class ApprovalVisibilityTests(unittest.TestCase):
+    """v4.4.1：rollout 看不到审批请求时必须诚实声明，而不是伪造 WAITING。"""
+
+    def test_active_turn_declares_approval_unavailable(self):
+        state = CodexFile("codex.jsonl")
+        state.session_id = "s1"
+        state.task_active = True
+        state.turn_active = True
+        state.turn_known_over = False
+        state.last_event_ts = time.time()
+        state.last_arrival_ts = time.time()
+        obs = state.observation(time.time(), {})
+        self.assertIs(obs.status, Status.WORKING)
+        # 不伪造 WAITING，但明确告知审批状态不可见
+        self.assertEqual(obs.approval_visibility, "unavailable")
+
+    def test_completed_turn_has_no_approval_claim(self):
+        state = CodexFile("codex.jsonl")
+        state.session_id = "s1"
+        state.turn_active = False
+        state.turn_known_over = True
+        state.done_ts = 0.0
+        state.last_event_ts = time.time()
+        state.last_arrival_ts = time.time()
+        obs = state.observation(time.time(), {})
+        self.assertIs(obs.status, Status.IDLE)
+        self.assertEqual(obs.approval_visibility, "")
+
+    def test_reducer_projects_visibility_without_changing_status(self):
+        from agents.state import reduce_state
+        inst = AgentInstance(AgentKind.CODEX, 1, "windows", cwd="/w",
+                             process_token="t")
+        now = time.time()
+        session = Observation(
+            source=EvidenceSource.SESSION, timestamp=now,
+            status=Status.WORKING, phase=Phase.THINKING,
+            confidence=Confidence.HIGH, turn_active=True,
+            session_bound=True, session_id="s1",
+            approval_visibility="unavailable")
+        snap = reduce_state(inst, session, None, None, now)
+        self.assertIs(snap.status, Status.WORKING)
+        self.assertEqual(snap.approval_visibility, "unavailable")
 
 
 if __name__ == "__main__":

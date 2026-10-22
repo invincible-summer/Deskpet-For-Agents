@@ -437,6 +437,12 @@ class CodexFile(FileState):
             obs.turn_active = True
             obs.confidence = Confidence.HIGH
             obs.summary = fmt_command(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            # v4.4.1：上游 rollout policy 把 ExecApprovalRequest /
+            # RequestUserInput 列为 transient 不落盘，rollout 读者永远看不到
+            # 当前是否有未决审批。不伪造 WAITING，但要诚实告知"审批状态
+            # 不可见"，避免用户看到一个没有上下文的 WORKING 空壳。
+            if not self.turn_known_over:
+                obs.approval_visibility = "unavailable"
             return obs
         if self.turn_known_over:
             # 已知 turn 结束：立即 IDLE（plan §27），不被活动宽限拖回 WORKING。

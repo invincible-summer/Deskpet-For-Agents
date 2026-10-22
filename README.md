@@ -141,11 +141,17 @@ OpenCode 与 DSH（DeepSeek Harness）同样以无插件、只读方式接入：
 - **DSH** 直接读取 `$DSH_HOME/sessions`（默认 `~/.dsh/sessions`）下的
   会话日志：明文 `session[.vN].jsonl` 直接解析；默认压缩格式
   `session.vN.jsonl.zstd` 按上游逐帧追加的结构解码（只消费完整帧，
-  半帧等待写完整；每帧校验 checksum 并限制解压大小）。`turn/start`、
+  半帧等待写完整；每帧校验 checksum 并限制解压大小）。大日志从帧边界
+  起步，header 由有界引导读取恢复。`turn/start`、
   `turn/end`、`step/*`、`tool/*` 事件给出 Working/Done/Error 状态，
   `approval/asked` 与 `approval/decided` 按请求 id 配对给出真实的
   等待审批与解除。DeskPet 不读取 `$DSH_HOME/.credentials.yaml`，不参与
   DSH Host 的任何私有 IPC。
+- **审批可见性**：Codex 的 rollout 把审批请求列为 transient 不落盘，
+  因此 rollout 数据面无法判断当前是否有未决审批。这类会话工作时会明确
+  标注"审批状态不可见"，而不是伪造等待审批；DSH 的
+  `approval/asked` 与 `approval/decided` 是落盘事件，可以给出真实的
+  等待审批与解除。
 - 两个 Agent 的 CLI 进程（Windows 与 WSL）沿用与其他 CLI 相同的终端
   唤醒；官方桌面宿主（OpenCode.exe / DeepSeek Harness.exe）提供应用级
   恢复前置。同一工作目录下同时运行多个同类 CLI 时无法从外部区分会话
@@ -153,9 +159,10 @@ OpenCode 与 DSH（DeepSeek Harness）同样以无插件、只读方式接入：
 
 以上两个 Agent 的数据面解析以合成 fixture 通过自动化回归（schema 能力
 探测、Zstandard 帧/校验/解压上限、审批配对、路径遍历防护、同 cwd 多实例
-不绑定、旧配置迁移等）；针对真实安装的 OpenCode / DSH（Windows、WSL 与
-官方桌面端）的实机验收尚未执行（NOT_TESTED），逐表面验收状态以
-`tools/desktop_source_probe.py` 的脱敏探测结果为准。
+不绑定、旧配置迁移等）。Codex 的 WSL `app-server` 常驻形态识别、
+DSH 压缩日志帧对齐起步与 header 引导已在本机实机复现取证并修复；
+针对真实安装的 OpenCode / DSH（Windows、WSL 与官方桌面端）的逐表面
+实机验收状态以 `tools/desktop_source_probe.py` 的脱敏探测结果为准。
 
 ## 更新 Portable 版
 

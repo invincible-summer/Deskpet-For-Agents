@@ -198,6 +198,11 @@ class Observation:
     agent_kind: AgentKind | None = None
     # Mode 为 UNKNOWN 时保留的原始值（仅诊断展示，不进普通气泡）
     mode_raw: str = ""
+    # v4.4.1：审批可见性声明。"available" = 本 reader 能看见未决审批；
+    # "unavailable" = 上游把审批请求列为 transient 不落盘，本数据面无法
+    # 判断是否有未决审批（Codex rollout）。空 = 不适用。
+    # 仅用于诚实展示，绝不参与状态合成。
+    approval_visibility: str = ""
 
     # 会话侧身份信息（由 watcher 填写；终端观察不需要）
     session_file: str = ""
@@ -555,6 +560,10 @@ class Snapshot:
     parser_detail: str = ""
     # WSL/终端扫描退化时提示"状态可能延迟"（按实例真实 source 判定）
     stale: bool = False
+    # v4.4.1：审批可见性声明（Observation.approval_visibility 投影）。
+    # "unavailable" = 上游把审批请求列为 transient 不落盘，本数据面无法
+    # 判断是否有未决审批；仅用于诚实展示，绝不参与状态合成。
+    approval_visibility: str = ""
 
     def bubble_text(self) -> str:
         candidates = (self.goal, self.summary, self.title)

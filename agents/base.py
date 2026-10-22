@@ -36,6 +36,14 @@ BOUND_RESAN_SEC = 15.0        # 全部绑定后的目录重扫周期
 FALLBACK_RETRY_SEC = 15.0     # late-start fallback 的重试周期
 GOAL_MAX = 120
 SUMMARY_MAX = 160
+# v4.4.1：近端起步（≥LARGE_FILE_BYTES 从 size-LARGE_FILE_TAIL 起读）会
+# 丢掉文件头部的 session_meta / DSH header 行，使 session_id/cwd/started_at
+# 全部为空、绑定评分归零、DSH 帧 magic 校验失败。因此每个新打开的文件
+# 额外做一次**有界头部身份预读**（只读，不进 tailer 位置）。
+LARGE_FILE_BYTES = 512 * 1024
+LARGE_FILE_TAIL = 256 * 1024
+IDENTITY_PREFIX_BYTES = 64 * 1024
+IDENTITY_LINE_LIMIT = 1024 * 1024     # 单行上限；异常长行不应占满内存
 
 
 def parse_ts(value) -> float:
@@ -104,6 +112,12 @@ class FileState:
         self.turn_id = ""
         self.cwd = ""
         self.title = ""
+        # v4.4.1：近端起步时从头部有界预读的身份事实（不替代 tailer 的
+        # 增量位置；只补齐 session_id/cwd/started_at 三类绑定证据）。
+        self.identity_scanned = False
+        self.identity_session_id = ""
+        self.identity_cwd = ""
+        self.identity_started_at = 0.0
         self.phase = Phase.NONE
         self.mode = Mode.NONE
         self.mode_raw = ""
@@ -124,6 +138,56 @@ class FileState:
 
     def feed(self, line: str):
         raise NotImplementedError
+
+    # ---- v4.4.1 有界头部身份预读 ----
+    def scan_identity(self, limit: int = IDENTITY_PREFIX_BYTES) -> bool:
+        """读一次文件头部，提取 session_id / cwd / started_at 绑定证据。
+
+        大文件从近端起步时头部记录不进 tailer，身份字段会全部为空；
+        这里只做**一次**有界读取（默认 64KB），绝不改变 tailer 位置，
+        也不回放历史。JSON 单行解析失败/超长行一律跳过（fail closed）。
+        返回是否有新证据写入。
+        """
+        if self.identity_scanned:
+            return False
+        self.identity_scanned = True
+        changed = False
+        try:
+            with open(self.path, "rb") as f:
+                raw = f.read(max(1, int(limit)))
+        except OSError:
+            return False
+        for line in raw.splitlines():
+            if len(line) > IDENTITY_LINE_LIMIT:
+                continue
+            try:
+                obj = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            containers = [obj]
+            for key in ("payload", "params", "thread", "turn", "message", "item"):
+                value = obj.get(key)
+                if isinstance(value, dict):
+                    containers.append(value)
+            for item in containers:
+                sid = _as_text(item.get("session_id") or item.get("sessionId")
+                               or item.get("id"))
+                if sid and not self.identity_session_id:
+                    self.identity_session_id = sid
+                    changed = True
+                cwd = _as_text(item.get("cwd") or item.get("workingDirectory"))
+                if cwd and not self.identity_cwd:
+                    self.identity_cwd = cwd
+                    changed = True
+                started = parse_ts(
+                    item.get("started_at") or item.get("startTime")
+                    or item.get("created_at") or item.get("createdAt"))
+                if started and not self.identity_started_at:
+                    self.identity_started_at = started
+                    changed = True
+        return changed
 
     # ---- 解析器兼容性 ----
     def _record_type(self, obj: dict) -> str:
@@ -222,9 +286,12 @@ class FileState:
         return Observation(
             source=EvidenceSource.SESSION,
             timestamp=self.last_event_ts or self.last_arrival_ts,
-            session_id=self.session_id,
+            # v4.4.1：近端起步时事件流里可能没有 session_meta，退回有界
+            # 头部预读拿到的身份，避免已绑定会话丢失 session_id/cwd。
+            session_id=(self.session_id
+                        or getattr(self, "identity_session_id", "")),
             session_file=self.path,
-            cwd=self.cwd,
+            cwd=(self.cwd or getattr(self, "identity_cwd", "")),
             title=self.title,
         )
 
@@ -361,13 +428,23 @@ class BaseWatcher:
             if path and os.path.isfile(path):
                 manual_paths.add(path)
 
+        # v4.4.1：bound 文件永远占一个 tracked 名额。此前它们与候选共用
+        # MAX_TRACKED_FILES 名额，被更新的历史 session 挤出后会在下一轮被
+        # pop、再被 late-start fallback 拉回 → 反复重建 FileState（重复
+        # 打开文件 + 重复身份预读 + 重复从头解析）。
         wanted: dict[str, str] = {}
-        for source in sources:
-            candidates = self._source_files.get(source, [])
-            for _mtime, path in candidates[:MAX_TRACKED_FILES]:
-                wanted[path] = source
         for path in bound_paths | manual_paths:
             wanted[path] = self._file_source.get(path, "")
+        for source in sources:
+            candidates = self._source_files.get(source, [])
+            room = max(0, MAX_TRACKED_FILES - len(wanted))
+            for _mtime, path in candidates:
+                if room <= 0:
+                    break
+                if path in wanted:
+                    continue
+                wanted[path] = source
+                room -= 1
 
         for path in list(self.files):
             if path not in wanted:
@@ -385,10 +462,18 @@ class BaseWatcher:
             st.file_id = st.file_id or _path_session_id(path)
             try:
                 size = os.path.getsize(path)
-                st.tailer.pos = 0 if size < 512 * 1024 else _near_end(path)
+                st.tailer.pos = (0 if size < LARGE_FILE_BYTES
+                                 else max(0, size - LARGE_FILE_TAIL))
                 st.last_mtime = os.stat(path).st_mtime
             except OSError:
                 st.tailer.pos = 0
+            # v4.4.1：近端起步会丢掉头部身份记录；打开时补一次有界预读，
+            # 让 session_id/cwd/started_at 仍能参与绑定评分。
+            try:
+                if st.tailer.pos:
+                    st.scan_identity()
+            except Exception:
+                pass
             self.files[path] = st
             self._file_source[path] = source
 
@@ -405,23 +490,28 @@ class BaseWatcher:
         if runtime:
             if _same_path(runtime, st.path):
                 score += 10000
+        # v4.4.1：近端起步的文件其 session_id/cwd 可能仍在头部预读结果里，
+        # 身份证据以 "已解析事件值 or 有界头部预读值" 合并后参与评分。
+        st_sid = _as_text(st.session_id or getattr(
+            st, "identity_session_id", ""))
+        st_cwd = _norm_cwd(st.cwd or self._file_cwd_hint.get(st.path, "")
+                            or getattr(st, "identity_cwd", ""))
+        st_start = _number(getattr(st, "started_at", 0.0) or getattr(
+            st, "identity_started_at", 0.0))
         sid = _as_text(getattr(inst, "session_id", ""))
-        if sid and sid in {st.session_id, st.file_id}:
+        if sid and sid in {st_sid, st.file_id}:
             score += 5000
         hint = self.instance_hints(inst)
         hint_sid = _as_text(hint.get("session_id"))
-        if hint_sid and hint_sid in {st.session_id, st.file_id}:
+        if hint_sid and hint_sid in {st_sid, st.file_id}:
             # PID registry 是强 hint 但非真值：要求 cwd 兼容（plan §12）。
             inst_cwd = _norm_cwd(getattr(inst, "cwd", ""))
-            st_cwd = _norm_cwd(st.cwd or self._file_cwd_hint.get(st.path, ""))
             if not inst_cwd or not st_cwd or inst_cwd == st_cwd:
                 score += 4000
         inst_cwd = _norm_cwd(getattr(inst, "cwd", ""))
-        st_cwd = _norm_cwd(st.cwd or self._file_cwd_hint.get(st.path, ""))
         if inst_cwd and st_cwd and inst_cwd == st_cwd:
             score += 1000
         inst_start = _number(getattr(inst, "started_at", 0.0))
-        st_start = _number(getattr(st, "started_at", 0.0))
         if inst_start and st_start and abs(inst_start - st_start) <= 180:
             score += 500
         return score
@@ -577,19 +667,32 @@ class BaseWatcher:
                 continue
             obs = st.observation(now, self.cfg)
             if obs is None:
+                # v4.4.1：文件已绑定只是当前没有可解释的状态证据时，仍要
+                # 保留 session 身份（否则 Dashboard/气泡丢掉 title/cwd，
+                # 用户看到的是一个没有上下文的空壳）。
                 placeholder.summary = "状态暂不可读"
+                placeholder.session_bound = True
+                placeholder.session_file = st.path
+                placeholder.session_id = _as_text(
+                    st.session_id or getattr(st, "identity_session_id", ""))
+                placeholder.cwd = _as_text(
+                    st.cwd or getattr(st, "identity_cwd", ""))
+                placeholder.title = _as_text(st.title)
                 out[key] = placeholder
             else:
-                obs.session_id = obs.session_id or st.session_id
+                st_sid = st.session_id or getattr(
+                    st, "identity_session_id", "")
+                obs.session_id = obs.session_id or st_sid
                 obs.session_file = obs.session_file or st.path
-                obs.cwd = obs.cwd or st.cwd
+                obs.cwd = obs.cwd or st.cwd or getattr(
+                    st, "identity_cwd", "")
                 obs.title = obs.title or st.title
                 obs.session_bound = True
                 out[key] = obs
                 # 回填实例 session_id，供下轮绑定评分使用。
-                if st.session_id and not getattr(inst, "session_id", ""):
+                if st_sid and not getattr(inst, "session_id", ""):
                     try:
-                        inst.session_id = st.session_id
+                        inst.session_id = st_sid
                     except Exception:
                         pass
         return out

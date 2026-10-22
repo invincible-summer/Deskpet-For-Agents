@@ -134,6 +134,9 @@ def reduce_state(instance: AgentInstance,
     snap.status = winner.status or Status.UNKNOWN
     snap.evidence = winner.source
     snap.confidence = winner.confidence
+    # v4.4.1：审批可见性声明只做投影，绝不参与上面的状态合成。
+    if winner.approval_visibility:
+        snap.approval_visibility = winner.approval_visibility
     # 优先级：Session structured Mode → winner explicit Mode → NONE。
     # 必须显式比较枚举，不用 truthiness（Status 胜者无权擦除独立 Mode）。
     if winner.mode is not Mode.NONE:

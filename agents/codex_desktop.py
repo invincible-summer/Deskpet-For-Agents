@@ -374,6 +374,12 @@ class CodexDesktopSource(DesktopSessionSource):
             claimed = claims_cover(
                 claimed_sessions, "codex", session_id=thread_id,
                 canonical_path=sess.rollout_path)
+            if claimed and sess.file is None:
+                # v4.4.1：terminal 已精确绑定同一会话时，desktop source
+                # **完全不打开** rollout tailer——否则同一文件会被两份
+                # parser 重复增量读取与重复身份解析（重复监听的 CPU/IO
+                # 来源）。已打开过的保留状态供 reclaim，不再增量读。
+                continue
             obs = self._read_rollout(sess, now)
             if obs is not None:
                 sess.last_status = obs.status

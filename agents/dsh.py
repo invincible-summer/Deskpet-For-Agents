@@ -63,7 +63,16 @@ MAX_TAIL_CHUNK = 4 * 1024 * 1024        # 单轮最多读 4MB 增量
 MAX_FRAME_DECOMPRESSED = 8 * 1024 * 1024  # 单帧解压输出上限
 MAX_PENDING_FRAME_BYTES = 8 * 1024 * 1024  # 半帧缓冲上限（超限视为损坏）
 MAX_EVENT_LINE = 1024 * 1024            # 单行 JSON 上限
-MAX_EVENTS_PER_POLL = 512               # 单轮最多消化事件数
+# v4.4.1：单轮事件消化上限。512 在实机上让 853 帧的会话只前进到 2438 秒
+# 前的事件（其余留在 _buffer 等下一轮），turn 状态因此滞后数轮；提高到
+# 2048 仍是有界上限（防单轮解压/解析预算失控），剩余帧照旧留在缓冲。
+MAX_EVENTS_PER_POLL = 2048              # 单轮最多消化事件数
+# v4.4.1：近端起步参数与 agents/base.py 对齐。
+MAX_NEAR_END_TAIL = 256 * 1024          # 近端起步的回读窗口
+MAX_NEAR_END_SCAN = 256 * 1024          # 向前找帧边界的最大扫描量
+_ZSTD_MAGIC_BYTES = (0xFD2FB528).to_bytes(4, "little")
+MAX_HEADER_READ_BYTES = 4 * 1024        # header 引导读取上限（有界）
+MAX_TRACKED_DSH_FILES = 8               # CLI watcher 同时跟踪的日志上限
 MAX_SESSION_DIRS = 16                   # 每个 project 目录最多考察的 session 目录
 MAX_PROJECT_DIRS = 32                   # desktop source 最多考察的 project 目录
 APPROVAL_REPLAY_SEC = 600.0             # asked 事件回放预算
@@ -322,6 +331,52 @@ class DshHeaderInfo:
     valid: bool = False
 
 
+def _line_aligned_start(path: str, size: int,
+                        back: int = MAX_NEAR_END_TAIL) -> int:
+    """明文日志的近端起步：回退到第一个换行符之后，避免半行起点。"""
+    target = max(0, size - max(0, int(back)))
+    if target == 0:
+        return 0
+    try:
+        with open(path, "rb") as f:
+            f.seek(target)
+            data = f.read(min(size - target, MAX_NEAR_END_SCAN))
+    except OSError:
+        return 0
+    idx = data.find(b"\n")
+    if idx < 0:
+        return 0
+    return target + idx + 1
+
+
+def frame_aligned_start(path: str, size: int,
+                         back: int = MAX_NEAR_END_TAIL) -> int:
+    """近端起步的**帧对齐**偏移（v4.4.1）。
+
+    上游每个追加批次是一个独立完整 Zstandard 帧。若直接从
+    ``size-back`` 起读，起点几乎必然落在某个帧的内部：首 4 字节不是
+    magic，``scan_zstd_frames`` 立刻抛 CORRUPT，整个会话降级 UNKNOWN。
+    因此从目标偏移**向前**回退到最近的帧边界（magic），并丢弃该残帧。
+    找不到边界（回退窗口内无 magic）时退回 0 —— 宁可多读也绝不伪造。
+    """
+    if size <= 0:
+        return 0
+    target = max(0, size - max(0, int(back)))
+    if target == 0:
+        return 0
+    window = min(size - target, MAX_NEAR_END_TAIL)
+    try:
+        with open(path, "rb") as f:
+            f.seek(target)
+            data = f.read(window)
+    except OSError:
+        return 0
+    idx = data.find(_ZSTD_MAGIC_BYTES)
+    if idx < 0:
+        return 0
+    return target + idx
+
+
 def parse_header_line(obj) -> DshHeaderInfo:
     """首行 JSON → 头部身份（上游 isHeaderLine 结构校验移植）。
 
@@ -561,6 +616,9 @@ class DshLogConsumer:
     header: DshHeaderInfo = field(default_factory=DshHeaderInfo)
     header_seen: bool = False
     refused: str = ""          # 非 zstd 损坏类拒绝原因（unknown/版本/双编码）
+    # v4.4.1：header 已由外部有界引导提供（近端起步跳过文件首部时）。
+    # 为 True 时主流首行不是 header 不再判 HEADER_INVALID。
+    _header_bootstrapped: bool = False
     # file_pos 只由读取方（DshFile._tail_pos / DshDesktopSource）推进；
     # _buffer 是尚未解码成事件的原始字节（zstd 半帧 / 明文残行）。
     file_pos: int = 0
@@ -631,7 +689,10 @@ class DshLogConsumer:
         if not self.header_seen:
             info = parse_header_line(obj)
             if not info.valid:
-                self.refused = "HEADER_INVALID"
+                # v4.4.1：bootstrap 已提供合法 header 时，主流的首行不是
+                # header 只是"近端起步跳过了 header"的正常形态，不是损坏。
+                if not self._header_bootstrapped:
+                    self.refused = "HEADER_INVALID"
                 return
             self.header = info
             self.header_seen = True
@@ -737,6 +798,52 @@ class DshFile(FileState):
         self.consumer = DshLogConsumer(compression=self.compression)
         self._tail_pos = 0
         self._last_sig: tuple | None = None
+        self._header_bootstrapped = False
+
+    def start_at(self, size: int) -> None:
+        """设置初始读取位置（v4.4.1）。
+
+        大日志必须从**帧边界**开始，否则起点落在帧中段时第一 4 字节不是
+        magic，scan_zstd_frames 立刻抛 CORRUPT，整个会话降级 UNKNOWN。
+        明文日志的近端起步按行对齐（回退到最近的换行符）以避免撕裂行。
+        """
+        if size <= 0:
+            self._tail_pos = 0
+            return
+        if size < MAX_NEAR_END_TAIL:
+            self._tail_pos = 0
+            return
+        if self.compression == "zstd":
+            self._tail_pos = frame_aligned_start(self.path, size)
+        else:
+            self._tail_pos = _line_aligned_start(self.path, size)
+        self._bootstrap_header()
+
+    def _bootstrap_header(self) -> None:
+        """有界读取文件首部 header（v4.4.1）。
+
+        近端起步会跳过文件首部的 header 行。用一次性 DshLogConsumer 只喂
+        前 MAX_HEADER_READ_BYTES 字节取 header（身份/格式版本），绝不把
+        header 之外的事件灌进主 tracker，也不改变 _tail_pos。
+        """
+        try:
+            with open(self.path, "rb") as f:
+                head = f.read(MAX_HEADER_READ_BYTES)
+        except OSError:
+            return
+        if not head:
+            return
+        probe = DshLogConsumer(compression=self.compression)
+        try:
+            probe.consume(head, time.time())
+        except Exception:
+            return
+        if probe.header_seen and probe.header.valid:
+            self.consumer.header = probe.header
+            self.consumer.header_seen = True
+            self._header_bootstrapped = True
+            self.session_id = probe.header.session_id
+            self.cwd = probe.header.cwd
 
     def _record_type(self, obj: dict) -> str:
         return str(obj.get("type") or "?")
@@ -890,12 +997,20 @@ class DshWatcher(BaseWatcher):
             self._source_last_scan[source] = now
         bound_paths = {p for key, p in self._instance_files.items()
                        if key in current_keys and p in self.files}
+        # v4.4.1：bound 文件永远占一个 tracked 名额，避免被更新的历史
+        # session 挤出后反复 pop/重建（重复打开 + 重复帧对齐起步）。
         wanted: dict[str, str] = {}
-        for source in sources:
-            for _mtime, path in self._source_files.get(source, [])[:8]:
-                wanted[path] = source
         for path in bound_paths:
             wanted[path] = self._file_source.get(path, "")
+        for source in sources:
+            room = max(0, MAX_TRACKED_DSH_FILES - len(wanted))
+            for _mtime, path in self._source_files.get(source, []):
+                if room <= 0:
+                    break
+                if path in wanted:
+                    continue
+                wanted[path] = source
+                room -= 1
         for path in list(self.files):
             if path not in wanted:
                 self.files.pop(path, None)
@@ -907,8 +1022,9 @@ class DshWatcher(BaseWatcher):
             st.source = source
             try:
                 size = os.path.getsize(path)
-                st._tail_pos = 0 if size < 512 * 1024 else max(
-                    0, size - 256 * 1024)
+                # v4.4.1：从帧边界/行边界起步，绝不能从帧中段起读
+                # （会触发 CORRUPT magic 校验失败 → 会话整体 UNKNOWN）。
+                st.start_at(size)
                 st.last_mtime = os.stat(path).st_mtime
             except OSError:
                 st._tail_pos = 0
@@ -1039,7 +1155,7 @@ class DshDesktopSource(DesktopSessionSource):
         window = float(self._cfg.get("active_file_window_sec", 180))
         if now - self._last_scan >= 3.0:
             self._last_scan = now
-            self._scan_sessions(now, window, diag)
+            self._scan_sessions(now, window, diag, claimed_sessions)
         instances: list[AgentInstance] = []
         observations: dict[str, Observation] = {}
         claims: set[SessionClaimKey] = set()
@@ -1095,7 +1211,8 @@ class DshDesktopSource(DesktopSessionSource):
             diagnostics=bounded_diagnostics(diag))
 
     # ------------------------------------------------------------ 内部
-    def _scan_sessions(self, now: float, window: float, diag: list[str]):
+    def _scan_sessions(self, now: float, window: float, diag: list[str],
+                        claimed_sessions=frozenset()):
         self.refresh_count += 1
         try:
             project_dirs = list(os.scandir(self._root))
@@ -1120,6 +1237,12 @@ class DshDesktopSource(DesktopSessionSource):
         for _m, log in cands[:24]:
             consumer = self._logs.get(log)
             if consumer is None:
+                # v4.4.1：被 terminal claim 覆盖的会话不再创建 consumer——
+                # 否则同一份 zstd 日志会被 CLI watcher 与 desktop source
+                # 两份解码器重复解压（重复监听的 CPU/IO 来源）。
+                if claims_cover(claimed_sessions, "dsh",
+                                canonical_path=log):
+                    continue
                 consumer = DshLogConsumer(
                     path=log,
                     compression=parse_generation_filename(

@@ -48,6 +48,38 @@ benchmark）；真实机器上的 OpenCode / DSH 实机验收未执行（NOT_TES
 - `tools/desktop_source_probe.py` 新增 OpenCode（DB schema/零写入门禁/
   注册文件结构）与 DSH（sessions 布局/世代文件/帧头）脱敏实机探测。
 
+### 修复（v4.4.1 监听可靠性）
+
+以下问题均在本机复现取证后修复；**没有放宽任何 fail-closed 语义**，也
+没有新增轮询频率或常驻线程。
+
+- **Codex 完全监听不到**：`codex app-server --remote-control` 常驻形态
+  刻意脱离 controlling TTY（`tty=?` / `tpgid=-1`），被 terminal attachment
+  判定为 DETACHED 而从 authoritative snapshot 整组过滤。现在同一进程组
+  内存在官方 daemon 自证据（`app-server` / `pid-update-loop` /
+  `--remote-control` / `--listen` / `--managed-daemon`）时提升为
+  UNKNOWN 保留观察；无 daemon 证据的 DETACHED 仍按孤儿过滤。Windows 侧
+  对称修复：daemon 形态的 `codex.exe` 不再要求 terminal ancestry。
+- **大文件显示“状态暂不可读 / 未解析”**：≥512KB 的会话文件从
+  `size-256KB` 起步会跳过文件头，Codex 因此读不到 `session_meta`
+  （`session_id`/`cwd` 全空，绑定评分 1000→0），DSH 则因起点落在
+  zstd 帧中段而 magic 校验失败（`CORRUPT`）。现在：Codex 系打开时做一次
+  有界 64KB 头部身份预读；DSH 改为**帧对齐**起步（明文按行对齐），并用
+  一次性 consumer 有界引导 header。已绑定但当前无状态证据时会话仍保留
+  session 身份（不再退化成没有上下文的空壳）。
+- **重复监听 / 状态滞后**：① 被 terminal claim 覆盖的会话，desktop
+  source 现在**完全不创建** tailer/解码器（此前仍会先读再判 claimed，
+  同一份日志被两份解码器重复解压）；② bound 文件永久占用一个 tracked
+  名额，不再被更新的历史 session 挤出后反复 pop/重建；③ DSH 单轮事件
+  消化上限 512→2048，实机上 1215 帧的日志不再只前进到 2438 秒前的事件。
+- **路径解析缺陷**：`paths.default_root()` 曾把 Linux HOME
+  （`/home/<user>`）在 Windows 上替换成反斜杠形式，导致 `wsl_unc()`
+  拒绝、该 source 永远 0 候选。现在按路径形态（而非 `os.name`）判断布局。
+- **审批可见性诚实化**：上游 rollout policy 把审批请求列为 transient
+  不落盘，rollout 读者无法判断是否有未决审批。现在 Codex active turn
+  显式携带 `approval_visibility="unavailable"`（仅展示，绝不参与状态
+  合成），不再给用户一个没有任何说明的 WORKING 空壳。
+
 ### 边界
 
 - OpenCode 当前版本的服务端总是启用随机密码；在不读取密码的硬约束下，

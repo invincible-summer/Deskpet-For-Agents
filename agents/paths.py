@@ -296,7 +296,14 @@ _LEGACY_SCAN_DEPTH = {
 
 
 def default_root(kind: AgentKind, home: str = "") -> str:
-    """Agent 默认数据根（Linux 侧相对 HOME 的目录）。"""
+    """Agent 默认数据根（Linux 侧相对 HOME 的目录）。
+
+    区分"Windows HOME"与"Linux HOME"只能看路径形态，绝不能看 os.name：
+    在 Windows 上运行的 DeskPet 也会拿到 WSL 实例的 Linux HOME
+    （/home/<user>），把它 replace("/", os.sep) 会得到 \\home\\x 这种
+    既不是合法 Windows 路径、也不是合法 Linux 路径的结果，随后被
+    wsl_unc() 拒绝 → 该 source 永远 0 候选（监听静默失效）。
+    """
     if kind not in _LEGACY_FILE_KINDS:
         raise ValueError(f"kind {kind} has no legacy file-watcher root")
     sub = _LEGACY_DIR_BY_KIND[kind]
@@ -304,7 +311,10 @@ def default_root(kind: AgentKind, home: str = "") -> str:
     if base.startswith("\\\\wsl.localhost\\") or base.startswith("\\\\wsl$\\"):
         return base.rstrip("\\") + "\\" + sub.replace("/", os.sep)
     linux = base.rstrip("/") + "/" + sub
-    if os.name == "nt" and not base.startswith("\\\\"):
+    if base.startswith("/") or base.startswith("\\"):
+        # Linux/UNC 布局：保持 posix 分隔符，供 wsl_unc() 原样接受。
+        return linux
+    if os.name == "nt":
         return linux.replace("/", os.sep)
     return linux
 

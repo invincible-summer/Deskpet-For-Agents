@@ -525,6 +525,215 @@ class DshDesktopSourceTests(unittest.TestCase):
         self.assertEqual(snap.instances, ())
         self.assertEqual(src.stats()["dsh_desktop_sessions"], 0)
 
+class NearEndStartTests(unittest.TestCase):
+    """v4.4.1：大日志从近端起步时的帧对齐/行对齐/header 引导。
+
+    实机取证（2026-10）：1MB 的 session.v4.jsonl.zstd 若直接从
+    size-256KB 起读，起点落在帧中段，第一 4 字节不是 magic，
+    scan_zstd_frames 抛 CORRUPT → 整个会话降级 UNKNOWN。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self._tmp.name, "sessions")
+        os.makedirs(self.root, exist_ok=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_zstd(self, cwd, session_id, filler_bytes):
+        project = dsh.dsh_project_dir(self.root, cwd)
+        sdir = os.path.join(project, dsh.dsh_encode_segment(session_id))
+        os.makedirs(sdir, exist_ok=True)
+        path = os.path.join(sdir, "session.v4.jsonl.zstd")
+        with open(path, "wb") as f:
+            f.write(_compress(_header_line(session_id=session_id, cwd=cwd)))
+            f.write(_compress(_event_line("turn/start", 1, {"turn": 1})))
+            written = 0
+            while written < filler_bytes:
+                chunk = _compress(_event_line(
+                    "step/start", 2, {"turn": 1, "step": 1}))
+                f.write(chunk)
+                written += len(chunk)
+            f.write(_compress(_event_line(
+                "turn/end", 9,
+                {"turn": 1, "reason": {"kind": "completed"}})))
+        return path
+
+    def _write_plain(self, cwd, session_id, filler_bytes):
+        project = dsh.dsh_project_dir(self.root, cwd)
+        sdir = os.path.join(project, dsh.dsh_encode_segment(session_id))
+        os.makedirs(sdir, exist_ok=True)
+        path = os.path.join(sdir, "session.v4.jsonl")
+        with open(path, "wb") as f:
+            f.write(_header_line(session_id=session_id, cwd=cwd))
+            f.write(_event_line("turn/start", 1, {"turn": 1}))
+            written = 0
+            while written < filler_bytes:
+                line = _event_line("step/start", 2,
+                                   {"turn": 1, "step": 1,
+                                    "pad": "x" * 200})
+                f.write(line)
+                written += len(line)
+            f.write(_event_line(
+                "turn/end", 9,
+                {"turn": 1, "reason": {"kind": "completed"}}))
+        return path
+
+    @unittest.skipUnless(_HAVE_ZSTD, "zstandard unavailable")
+    def test_large_zstd_starts_on_frame_boundary_not_corrupt(self):
+        path = self._write_zstd("/repo", "ses_big", 700 * 1024)
+        size = os.path.getsize(path)
+        self.assertGreater(size, dsh.MAX_NEAR_END_TAIL)
+        f = dsh.DshFile(path)
+        f.start_at(size)
+        with open(path, "rb") as fh:
+            fh.seek(f._tail_pos)
+            self.assertEqual(fh.read(4), dsh._ZSTD_MAGIC_BYTES)
+        f.last_mtime = 0
+        f.poll_lines()
+        self.assertEqual(f.consumer.refused, "")
+        self.assertTrue(f._header_bootstrapped)
+        self.assertEqual(f.session_id, "ses_big")
+        self.assertEqual(f.cwd, "/repo")
+
+    def test_large_plain_starts_on_line_boundary_with_header(self):
+        path = self._write_plain("/repo", "ses_plain", 700 * 1024)
+        size = os.path.getsize(path)
+        self.assertGreater(size, dsh.MAX_NEAR_END_TAIL)
+        f = dsh.DshFile(path)
+        f.start_at(size)
+        with open(path, "rb") as fh:
+            fh.seek(f._tail_pos - 1)
+            self.assertEqual(fh.read(1), b"\n")
+        f.last_mtime = 0
+        f.poll_lines()
+        self.assertEqual(f.consumer.refused, "")
+        self.assertEqual(f.session_id, "ses_plain")
+
+    def test_small_log_starts_from_zero(self):
+        path = self._write_plain("/repo", "ses_small", 10)
+        size = os.path.getsize(path)
+        self.assertLess(size, dsh.MAX_NEAR_END_TAIL)
+        f = dsh.DshFile(path)
+        f.start_at(size)
+        self.assertEqual(f._tail_pos, 0)
+
+
+class WatcherSlotStabilityTests(unittest.TestCase):
+    """v4.4.1：bound 文件不被 MAX_TRACKED_FILES 挤出后反复重建。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self._tmp.name, "sessions")
+        os.makedirs(self.root, exist_ok=True)
+        self._old = paths.dsh_sessions_root
+        paths.dsh_sessions_root = lambda: self.root
+
+    def tearDown(self):
+        paths.dsh_sessions_root = self._old
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _inst(pid, cwd, key=None):
+        return AgentInstance(kind=AgentKind.DSH, pid=pid, source="windows",
+                             cwd=cwd, key=key or f"w|dsh|{pid}|t{pid}")
+
+    def _write_log(self, cwd, session_id, events):
+        project = dsh.dsh_project_dir(self.root, cwd)
+        sdir = os.path.join(project, dsh.dsh_encode_segment(session_id))
+        os.makedirs(sdir, exist_ok=True)
+        path = os.path.join(sdir, "session.v4.jsonl")
+        with open(path, "wb") as f:
+            f.write(_header_line(session_id=session_id, cwd=cwd))
+            for line in events:
+                f.write(line)
+        return path
+
+    def test_bound_file_survives_newer_candidates(self):
+        cwd = "C:\\work\\proj"
+        self._write_log(cwd, "ses_bound", [
+            _event_line("turn/start", 1, {"turn": 1}),
+            _event_line("approval/asked", 2,
+                        {"id": "apr_1", "toolName": "bash"}),
+        ])
+        watcher = dsh.DshWatcher({})
+        (key, obs), = watcher.poll([self._inst(101, cwd)]).items()
+        self.assertEqual(obs.session_id, "ses_bound")
+        self.assertIs(obs.status, Status.WAITING)
+        created = 0
+        orig_make = watcher.make_state
+
+        def make(path):
+            nonlocal created
+            created += 1
+            return orig_make(path)
+
+        watcher.make_state = make
+        for i in range(6):
+            self._write_log("C:\\other\\%d" % i, "ses_hist_%d" % i, [
+                _event_line("turn/start", 1, {"turn": 1})])
+            (key, obs), = watcher.poll(
+                [self._inst(101, cwd)]).items()
+            self.assertEqual(obs.session_id, "ses_bound")
+            self.assertIs(obs.status, Status.WAITING)
+        self.assertEqual(created, 0, "bound file must not be recreated")
+
+
+class ClaimsSkipTailerTests(unittest.TestCase):
+    """v4.4.1：被 terminal claim 覆盖的会话不再被 desktop source 解码。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self._tmp.name, "sessions")
+        os.makedirs(self.root, exist_ok=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _inst(pid, cwd, key=None):
+        return AgentInstance(kind=AgentKind.DSH, pid=pid, source="windows",
+                             cwd=cwd, key=key or f"w|dsh|{pid}|t{pid}")
+
+    def _write_zstd(self, cwd, session_id):
+        project = dsh.dsh_project_dir(self.root, cwd)
+        sdir = os.path.join(project, dsh.dsh_encode_segment(session_id))
+        os.makedirs(sdir, exist_ok=True)
+        path = os.path.join(sdir, "session.v4.jsonl.zstd")
+        with open(path, "wb") as f:
+            f.write(_compress(_header_line(session_id=session_id, cwd=cwd)))
+            f.write(_compress(_event_line("turn/start", 1, {"turn": 1})))
+            f.write(_compress(_event_line(
+                "approval/asked", 2, {"id": "a1", "toolName": "bash"})))
+        return path
+
+    @unittest.skipUnless(_HAVE_ZSTD, "zstandard unavailable")
+    def test_claimed_session_gets_no_consumer(self):
+        cwd = "C:\\work\\proj"
+        log = self._write_zstd(cwd, "ses_claim")
+        claims = frozenset({SessionClaimKey(
+            kind="dsh", session_id="ses_claim", canonical_session_path=log)})
+        host = DesktopHost(kind=AgentKind.DSH, pid=1, process_token="t",
+                           started_at=time.time())
+        src = dsh.DshDesktopSource(sessions_root=self.root)
+        snap = src.poll((host,), claims, time.time())
+        self.assertEqual(src._logs, {})
+        self.assertEqual(snap.instances, ())
+        self.assertTrue(snap.authoritative)
+
+    @unittest.skipUnless(_HAVE_ZSTD, "zstandard unavailable")
+    def test_unclaimed_session_still_tracked(self):
+        cwd = "C:\\work\\proj"
+        self._write_zstd(cwd, "ses_free")
+        host = DesktopHost(kind=AgentKind.DSH, pid=1, process_token="t",
+                           started_at=time.time())
+        src = dsh.DshDesktopSource(sessions_root=self.root)
+        snap = src.poll((host,), frozenset(), time.time())
+        self.assertEqual(len(snap.instances), 1)
+        self.assertEqual(snap.instances[0].logical_session_id,
+                         "ses_free")
+
 
 if __name__ == "__main__":
     unittest.main()

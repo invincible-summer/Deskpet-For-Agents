@@ -45,6 +45,23 @@ _PS_FORMAT = "pid=,ppid=,sid=,pgid=,tpgid=,tty=,uid=,etimes=,stat=,comm=,args="
 # 绝不作为 live Agent（v4plan §4.4）。S/T/D/R/I 等只说明当前没跑 CPU。
 _DEAD_STATES = frozenset("ZXx")
 
+# 官方“常驻服务形态”的进程自证据（2026-10 实机取证）：
+#   Codex `codex app-server --remote-control --listen unix://…` 与
+#   `codex app-server daemon pid-update-loop` 是官方 remote-control
+#   常驻 runtime（.research/codex-upstream.md §8.3 记录了
+#   $CODEX_HOME/app-server-control / app-server-daemon 官方路径），
+#   刻意脱离 controlling TTY（tty=? / tpgid=-1）。这类进程的 DETACHED
+#   是设计意图而非孤儿，必须保留为可观察 Agent；没有任何 daemon 自证据
+#   的 DETACHED 仍按孤儿过滤。
+_DAEMON_FORM_MARKS = (
+    "app-server",
+    "app-server-daemon",
+    "pid-update-loop",
+    "--remote-control",
+    "--listen",
+    "--managed-daemon",
+)
+
 
 class ProbeUnavailable(RuntimeError):
     """进程枚举整体不可用：本轮结果 authoritative=False，不得判死旧实例。"""
@@ -81,6 +98,17 @@ def classify_ps_terminal_attachment(tty: str, tpgid: int) -> TerminalAttachment:
     return TerminalAttachment.UNKNOWN
 
 
+def is_daemon_form(args) -> bool:
+    """命令行是否声明官方常驻服务形态（2026-10 实机取证）。
+
+    这类进程刻意脱离 controlling TTY，因此它的 DETACHED 不是孤儿证据。
+    只用明确的自证据标记，绝不按进程名猜——普通 CLI 被 detach 时
+    仍然要按孤儿过滤。
+    """
+    low = str(args or "").lower()
+    return any(mark in low for mark in _DAEMON_FORM_MARKS)
+
+
 def canonical_terminal_attachment(
         canonical_pid: int,
         launcher_pids: tuple[int, ...],
@@ -91,17 +119,26 @@ def canonical_terminal_attachment(
     Codex Node wrapper + Rust runtime 等同 kind 多层进程必须整组判断：
     任一成员 ATTACHED 即保留；全部 DETACHED 才过滤；矛盾/缺失 → UNKNOWN。
     rows_by_pid 值为 _ps_scan 的行元组（pid,ppid,sid,pgid,tpgid,tty,...）。
+
+    v4.4.1 例外：同一 canonical group 内任一成员带官方 daemon 自证据时，
+    "全部 DETACHED"不再判孤儿——把整组提升为 UNKNOWN 保留观察
+    （`codex app-server --remote-control` 常驻形态脱离 TTY 是设计意图）。
     """
     states = []
+    daemon_evidence = False
     for pid in (canonical_pid, *launcher_pids):
         row = rows_by_pid.get(pid)
         if row is None:
             continue
         # 行布局：pid,ppid,sid,pgid,tpgid,tty,uid,etimes,stat,comm,args
         states.append(classify_ps_terminal_attachment(row[5], row[4]))
+        if is_daemon_form(row[10]):
+            daemon_evidence = True
     if any(s is TerminalAttachment.ATTACHED for s in states):
         return TerminalAttachment.ATTACHED
     if states and all(s is TerminalAttachment.DETACHED for s in states):
+        if daemon_evidence:
+            return TerminalAttachment.UNKNOWN
         return TerminalAttachment.DETACHED
     return TerminalAttachment.UNKNOWN
 
@@ -484,11 +521,17 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
         if roles.get(pid) not in (None, ROLE_OTHER):
             continue
         base = _basename_of(inf)
+        args = _args_of(inf)
         if base.startswith("codex") and base.endswith(".exe"):
             # CLI 判定严格于 4.3.1 的宽 name 匹配：必须终端 ancestry 或
             # 控制台宿主证据；explorer/未知 ancestry 的 codex.exe 不再
-            # 冒充 CLI（避免桌面宿主 runtime 误报）
-            if _terminal_ancestry(pid) or _has_conhost_child(
+            # 冒充 CLI（避免桌面宿主 runtime 误报）。
+            # v4.4.1 例外：官方 daemon/app-server 常驻形态自带确凿自证据
+            # （刻意脱离控制台），不再要求 terminal ancestry——否则
+            # `codex app-server --remote-control` 整组 Agent 会被漏报。
+            if is_daemon_form(args):
+                roles[pid] = ROLE_TERMINAL_AGENT
+            elif _terminal_ancestry(pid) or _has_conhost_child(
                     pid, parent_by_pid, info_by_pid):
                 roles[pid] = ROLE_TERMINAL_AGENT
             else:
@@ -498,7 +541,9 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
         if base == "opencode.exe":
             # 与 Codex 相同的严格 CLI 判定；桌面宿主候选已在前面按
             # Electron 佐证归类，这里的 opencode.exe 只可能是 CLI 形态
-            if _terminal_ancestry(pid) or _has_conhost_child(
+            if is_daemon_form(args):
+                roles[pid] = ROLE_TERMINAL_AGENT
+            elif _terminal_ancestry(pid) or _has_conhost_child(
                     pid, parent_by_pid, info_by_pid):
                 roles[pid] = ROLE_TERMINAL_AGENT
             else:

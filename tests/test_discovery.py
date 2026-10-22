@@ -23,7 +23,7 @@ from agents.discovery import (
     filter_env_line,
     _decode_wsl_output,
 )
-from agents.models import AgentKind, AgentInstance
+from agents.models import AgentKind, AgentInstance, TerminalAttachment
 
 
 class MetadataScriptTests(unittest.TestCase):
@@ -1126,6 +1126,91 @@ class OpenCodeDshInventoryTests(unittest.TestCase):
         ])
         kinds = sorted(h.kind for h in inv.desktop_hosts)
         self.assertEqual(kinds, [AgentKind.DSH, AgentKind.OPENCODE])
+
+
+class DaemonFormAgentTests(unittest.TestCase):
+    """v4.4.1：官方 daemon/app-server 常驻形态必须仍是可观察 Agent。
+
+    实机取证（2026-10）：WSL 中 `codex app-server --remote-control
+    --listen unix://…` 与 `codex app-server daemon pid-update-loop`
+    的 tty=? / tpgid=-1，被 classify_ps_terminal_attachment() 判为
+    DETACHED，整组从 authoritative snapshot 过滤 → Agent 彻底消失。
+    脱离 TTY 是这类常驻 runtime 的设计意图，不是孤儿证据。
+    """
+
+    def _row(self, pid, ppid, tty, tpgid, comm, args):
+        # _ps_scan 行布局：pid,ppid,sid,pgid,tpgid,tty,uid,etimes,stat,comm,args
+        return (pid, ppid, 1, 1, tpgid, tty, 1000, 100, "S", comm, args)
+
+    def test_daemon_form_marks_detected(self):
+        self.assertTrue(discovery_mod.is_daemon_form(
+            "/home/u/.codex/packages/standalone/bin/codex app-server "
+            "--remote-control --listen unix://"))
+        self.assertTrue(discovery_mod.is_daemon_form(
+            "/bin/codex app-server daemon pid-update-loop"))
+        self.assertFalse(discovery_mod.is_daemon_form("/bin/codex"))
+        self.assertFalse(discovery_mod.is_daemon_form(""))
+
+    def test_detached_daemon_promoted_to_unknown_not_filtered(self):
+        rows = {
+            10: self._row(10, 1, "?", -1, "codex",
+                          "/bin/codex app-server --remote-control"),
+        }
+        state = discovery_mod.canonical_terminal_attachment(10, (), rows)
+        self.assertIs(state, TerminalAttachment.UNKNOWN)
+
+    def test_detached_without_daemon_evidence_still_filtered(self):
+        rows = {
+            11: self._row(11, 1, "?", -1, "codex", "/bin/codex"),
+        }
+        state = discovery_mod.canonical_terminal_attachment(11, (), rows)
+        self.assertIs(state, TerminalAttachment.DETACHED)
+
+    def test_daemon_sibling_makes_whole_group_unknown(self):
+        # launcher 也是 daemon：整组提升，canonical 不再被过滤
+        rows = {
+            20: self._row(20, 1, "?", -1, "codex", "/bin/codex"),
+            21: self._row(21, 20, "?", -1, "codex",
+                          "/bin/codex app-server daemon pid-update-loop"),
+        }
+        state = discovery_mod.canonical_terminal_attachment(21, (20,), rows)
+        self.assertIs(state, TerminalAttachment.UNKNOWN)
+
+    def test_attached_still_wins_over_daemon_evidence(self):
+        rows = {
+            30: self._row(30, 1, "/dev/pts/0", 400, "codex",
+                          "/bin/codex app-server"),
+        }
+        state = discovery_mod.canonical_terminal_attachment(30, (), rows)
+        self.assertIs(state, TerminalAttachment.ATTACHED)
+
+    def test_windows_daemon_form_is_terminal_agent(self):
+        # Windows 侧：无 terminal ancestry 的 codex.exe，带 daemon 自证据
+        # 时仍应成为 terminal agent（app-server 刻意脱离控制台）
+        from agents.discovery import scan_windows_inventory
+        rows = [
+            (700, _EXPLORER, "codex.exe",
+             ["codex.exe", "app-server", "--remote-control"],
+             7000.0, "C:/Users/u/.codex/bin/codex.exe"),
+        ]
+        with unittest.mock.patch("psutil.process_iter",
+                                 return_value=_proc_rows(rows)):
+            inv = scan_windows_inventory()
+        self.assertEqual([i.kind for i in inv.terminal_instances],
+                         [AgentKind.CODEX])
+
+    def test_windows_unattributed_codex_still_dropped(self):
+        # 无 daemon 自证据、无 terminal ancestry 的 codex.exe 仍被拒绝
+        from agents.discovery import scan_windows_inventory
+        rows = [
+            (710, _EXPLORER, "codex.exe", ["codex.exe"],
+             7100.0, "C:/Users/u/.codex/bin/codex.exe"),
+        ]
+        with unittest.mock.patch("psutil.process_iter",
+                                 return_value=_proc_rows(rows)):
+            inv = scan_windows_inventory()
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertTrue(any("unattributed" in d for d in inv.diagnostics))
 
 
 if __name__ == "__main__":
