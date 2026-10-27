@@ -204,6 +204,47 @@ class InstanceIdentityTests(unittest.TestCase):
         self.assertEqual(win.environment_label, "Windows")
 
 
+class DataRootOverrideTests(unittest.TestCase):
+    """用户自选数据根（Windows 平面）：优先级、派生、WSL 不受影响。"""
+
+    def setUp(self):
+        paths.set_data_root_overrides({})
+
+    tearDown = setUp
+
+    def test_override_beats_env_and_default(self):
+        with unittest.mock.patch.dict(os.environ,
+                                      {"CODEX_HOME": "D:\\env\\codex"}):
+            self.assertTrue(paths.codex_home_root().endswith("codex"))
+            paths.set_data_root_overrides({"codex": "D:\\pick\\codex"})
+            self.assertEqual(paths.codex_home_root(), "D:\\pick\\codex")
+            self.assertEqual(paths.default_data_root_hint("codex"),
+                             "D:\\env\\codex")
+
+    def test_windows_roots_derive_session_child(self):
+        paths.set_data_root_overrides({
+            "claude": "D:\\pick\\claude",
+            "pi": "D:\\pick\\pi"})
+        self.assertEqual(paths.windows_roots(AgentKind.CLAUDE),
+                         ["D:\\pick\\claude\\projects"])
+        self.assertEqual(paths.windows_roots(AgentKind.PI),
+                         ["D:\\pick\\pi\\agent\\sessions"])
+
+    def test_invalid_values_and_unknown_keys_ignored(self):
+        paths.set_data_root_overrides(
+            {"codex": "relative/x", "nope": "D:\\x", "dsh": "  "})
+        self.assertEqual(paths.data_root_overrides(), {})
+
+    def test_wsl_instance_roots_ignore_overrides(self):
+        paths.set_data_root_overrides({"codex": "D:\\pick\\codex"})
+        inst = AgentInstance(
+            kind=AgentKind.CODEX, pid=5, source="wsl:Ubuntu",
+            cwd="/w/p", key="k", uid=1000, user="u", home="/home/u")
+        roots = paths.instance_roots(inst)
+        self.assertTrue(roots and roots[0].startswith("\\\\wsl.localhost"))
+        self.assertNotIn("pick", roots[0])
+
+
 class WslUncTests(unittest.TestCase):
     def test_conversion_normalization_rejection_and_roundtrip(self):
         self.assertEqual(paths.wsl_unc("Ubuntu", "/home/foo/.codex"),

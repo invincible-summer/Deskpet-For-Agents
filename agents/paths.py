@@ -46,16 +46,101 @@ def _user_home() -> str:
     return os.path.expanduser("~")
 
 
-# ------------------------------------------------ v4.4 Desktop 数据根（plan2 §14）
+# ------------------------------------------- 用户自选数据根（Windows 平面）
+# 来自用户配置（%LOCALAPPDATA%\DeskPet\config.json 的 monitor.data_roots），
+# 空值 = 默认（环境变量 → 内置路径）。自定义选择优先于环境变量。
+# 仅影响 Windows 监听平面；WSL 平面永远跟随每个运行时进程的真实 HOME
+# （隐私合同：不按用户选择扫描任意 WSL 路径）。值只进用户配置文件，
+# 绝不进入仓库。
+DATA_ROOT_KINDS = ("codex", "claude", "kimi", "pi",
+                   "zcode", "opencode", "dsh")
+_DATA_ROOT_OVERRIDES: dict[str, str] = {}
+_LEGACY_ROOT_KEY = {
+    "claude": "claude", "codex": "codex", "kimi": "kimi", "pi": "pi",
+}
+# 自定义根之下的会话子目录（与内置布局一一对应）。
+_ROOT_CHILD = {
+    "codex": "sessions", "claude": "projects",
+    "kimi": "sessions", "pi": os.path.join("agent", "sessions"),
+}
 
-def codex_home_root() -> str:
-    """Codex Desktop 状态根：CODEX_HOME env 优先，否则 ~/.codex。
 
-    只做本机定位，不做网络路径；返回未展开的规范 Windows 路径。
-    """
+def set_data_root_overrides(overrides) -> None:
+    """注入用户自选数据根；非绝对路径与未知键一律忽略。"""
+    clean: dict[str, str] = {}
+    source = overrides if isinstance(overrides, dict) else {}
+    for key in DATA_ROOT_KINDS:
+        value = str(source.get(key) or "").strip()
+        if value and os.path.isabs(value):
+            clean[key] = os.path.normpath(os.path.expanduser(value))
+    _DATA_ROOT_OVERRIDES.clear()
+    _DATA_ROOT_OVERRIDES.update(clean)
+
+
+def data_root_overrides() -> dict[str, str]:
+    return dict(_DATA_ROOT_OVERRIDES)
+
+
+def _root_override(key: str) -> str:
+    return _DATA_ROOT_OVERRIDES.get(key, "")
+
+
+def _legacy_root_override(kind: AgentKind) -> str:
+    return _root_override(_LEGACY_ROOT_KEY.get(getattr(kind, "value", ""), ""))
+
+
+def _codex_default() -> str:
     env = os.environ.get("CODEX_HOME") or ""
     root = env.strip() if env.strip() else os.path.join(_user_home(), ".codex")
     return os.path.normpath(root)
+
+
+def _zcode_cli_default() -> str:
+    env = os.environ.get("ZCODE_CLI_DIR") or ""
+    root = env.strip() if env.strip() else os.path.join(
+        _user_home(), ".zcode", "cli")
+    return os.path.normpath(root)
+
+
+def _opencode_data_default() -> str:
+    env = os.environ.get("XDG_DATA_HOME") or ""
+    base = env.strip() if env.strip() else os.path.join(
+        _user_home(), ".local", "share")
+    return os.path.normpath(os.path.join(base, "opencode"))
+
+
+def _dsh_home_default() -> str:
+    env = os.environ.get("DSH_HOME") or ""
+    root = env.strip() if env.strip() else os.path.join(_user_home(), ".dsh")
+    return os.path.normpath(root)
+
+
+def default_data_root_hint(key: str) -> str:
+    """该 Agent 未自定义时的默认根（env → 内置；忽略用户覆盖与环境无关）。
+
+    仅供设置页展示；与各 root 函数的默认分支保持同一来源。
+    """
+    home = _user_home()
+    return {
+        "codex": _codex_default,
+        "zcode": _zcode_cli_default,
+        "opencode": _opencode_data_default,
+        "dsh": _dsh_home_default,
+        "claude": lambda: os.path.join(home, ".claude"),
+        "kimi": lambda: os.path.join(home, ".kimi-code"),
+        "pi": lambda: os.path.join(home, ".pi"),
+    }.get(key, lambda: "")()
+
+
+# ------------------------------------------------ v4.4 Desktop 数据根（plan2 §14）
+
+def codex_home_root() -> str:
+    """Codex Desktop 状态根：用户自选根 > CODEX_HOME env > ~/.codex。
+
+    只做本机定位，不做网络路径；返回未展开的规范 Windows 路径。
+    """
+    override = _root_override("codex")
+    return override or _codex_default()
 
 
 def codex_state_db_candidates(codex_home: str | None = None) -> list[str]:
@@ -127,10 +212,8 @@ def codex_rollout_roots(codex_home: str | None = None) -> list[str]:
 
 def zcode_cli_root() -> str:
     """ZCode CLI 数据根（官方 Hooks 文档证实 ~/.zcode/cli 布局）。"""
-    override = os.environ.get("ZCODE_CLI_DIR") or ""
-    root = override.strip() if override.strip() else os.path.join(
-        _user_home(), ".zcode", "cli")
-    return os.path.normpath(root)
+    override = _root_override("zcode")
+    return override or _zcode_cli_default()
 
 
 def zcode_db_path() -> str:
@@ -187,11 +270,9 @@ _OPENCODE_SERVICE_MAX = 4
 
 
 def opencode_data_root() -> str:
-    """OpenCode Windows 数据根（XDG_DATA_HOME 覆盖优先）。"""
-    env = os.environ.get("XDG_DATA_HOME") or ""
-    base = env.strip() if env.strip() else os.path.join(
-        _user_home(), ".local", "share")
-    return os.path.normpath(os.path.join(base, "opencode"))
+    """OpenCode Windows 数据根（用户自选根 > XDG_DATA_HOME 覆盖）。"""
+    override = _root_override("opencode")
+    return override or _opencode_data_default()
 
 
 def opencode_state_root() -> str:
@@ -251,10 +332,9 @@ def opencode_service_files(state_root: str | None = None) -> list[str]:
 
 
 def dsh_home_root() -> str:
-    """DSH Windows home：$DSH_HOME 覆盖，否则 ~/.dsh。"""
-    env = os.environ.get("DSH_HOME") or ""
-    root = env.strip() if env.strip() else os.path.join(_user_home(), ".dsh")
-    return os.path.normpath(root)
+    """DSH Windows home：用户自选根 > $DSH_HOME 覆盖 > ~/.dsh。"""
+    override = _root_override("dsh")
+    return override or _dsh_home_default()
 
 
 def dsh_sessions_root() -> str:
@@ -343,6 +423,11 @@ def default_root(kind: AgentKind, home: str = "") -> str:
         raise ValueError(f"kind {kind} has no legacy file-watcher root")
     sub = _LEGACY_DIR_BY_KIND[kind]
     base = home or _user_home()
+    if not home:
+        # Windows 平面：用户自选根直接作为该 Agent 的根目录。
+        override = _legacy_root_override(kind)
+        if override:
+            return override
     if base.startswith("\\\\wsl.localhost\\") or base.startswith("\\\\wsl$\\"):
         return base.rstrip("\\") + "\\" + sub.replace("/", os.sep)
     linux = base.rstrip("/") + "/" + sub
@@ -415,6 +500,10 @@ def session_subdir(kind: AgentKind) -> str:
 
 def windows_roots(kind: AgentKind) -> list[str]:
     """兼容旧测试调用：当前 Windows 用户的会话根。"""
+    override = _legacy_root_override(kind)
+    if override:
+        child = _ROOT_CHILD[_LEGACY_ROOT_KEY[kind.value]]
+        return [os.path.normpath(os.path.join(override, child))]
     return [os.path.join(_user_home(), session_subdir(kind))]
 
 
@@ -462,6 +551,9 @@ def kimi_index_roots(inst) -> list[str]:
                 continue
         return out
     home = _user_home()
+    override = _root_override("kimi")
+    if override:
+        return [override]
     for sub in (".kimi-code", ".kimi"):
         out.append(os.path.join(home, sub))
     return out
@@ -715,6 +807,9 @@ def claude_pid_registry_files(inst) -> list[str]:
         return out
     home = _user_home()
     roots = []
+    override = _root_override("claude")
+    if override:
+        roots.append(override)
     env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     if env_dir:
         roots.append(env_dir)

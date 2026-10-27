@@ -74,6 +74,10 @@ DEFAULTS = {
         "activity_grace_sec": 10.0,   # 活动型 WORKING 证据的宽限（活 Agent）
         "active_file_window_sec": 180,
         "terminal_observer": True,
+        # 用户自选数据根（Windows 监听平面）：空 = 默认（env → 内置）。
+        # 值是绝对路径，只写入用户配置文件（%LOCALAPPDATA%），绝不进入仓库。
+        "data_roots": {"codex": "", "claude": "", "kimi": "", "pi": "",
+                       "zcode": "", "opencode": "", "dsh": ""},
         # V4.1 删除：gone_grace_sec（authoritative absence 立即退出）、
         # pinned（runtime focus 不持久化）
     },
@@ -265,6 +269,14 @@ def normalize(data: dict) -> dict:
         monitor.get("activity_grace_sec", 10.0), 1.0, 60.0)
     monitor["active_file_window_sec"] = _clamp(
         monitor.get("active_file_window_sec", 180), 30, 3600)
+    # 用户自选数据根：仅接受空串或绝对路径，长度有界；其余丢弃回默认。
+    roots_raw = monitor.get("data_roots")
+    roots_raw = roots_raw if isinstance(roots_raw, dict) else {}
+    clean_roots = {}
+    for key in DEFAULTS["monitor"]["data_roots"]:
+        value = str(roots_raw.get(key) or "").strip()[:512]
+        clean_roots[key] = value if (value == "" or os.path.isabs(value)) else ""
+    monitor["data_roots"] = clean_roots
     presentation = _ensure_mapping(
         data, "presentation", DEFAULTS["presentation"])
     concurrent = _ensure_mapping(

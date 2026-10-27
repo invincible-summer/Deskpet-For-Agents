@@ -59,7 +59,12 @@ class PetApp:
         self.root.withdraw()   # controller root：不是宠物窗口（v4plan §8.1）
         self.root.configure(bg="#101011")
 
+        from agents import paths as agent_paths
         from agents.monitor import Monitor
+        # 用户自选监听数据根（monitor.data_roots）在 Monitor 构建前注入，
+        # 后续各 source/watcher 解析 Windows 根时即时生效。
+        agent_paths.set_data_root_overrides(
+            config.get("monitor.data_roots") or {})
         self.monitor = Monitor(config)
         self.presentation = PresentationController(config)
         self.pet_manager = PetViewManager(self.root, config,

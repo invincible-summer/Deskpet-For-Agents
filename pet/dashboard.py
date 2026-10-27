@@ -5,6 +5,7 @@ have separate responsibilities. Viewport width drives page layout; hover and
 runtime updates never renegotiate control metrics or rebuild the current page.
 """
 from __future__ import annotations
+import os
 import tkinter as tk
 import threading
 import time
@@ -1090,6 +1091,76 @@ class MonitorPage(DashboardPage):
                 row=i // 2, column=i % 2, sticky="w", padx=(0, 24), pady=2)
         r.reflow("wide")
         r.pack(fill="x")
+        # C 监听目标路径（数据根）
+        panel = SurfacePanel(body)
+        panel.pack(fill="x", pady=(0, SECTION_GAP))
+        _section_title(panel.body, "监听目标路径（数据根）")
+        tk.Label(panel.body, text="各 Agent 的会话数据根。留空使用默认"
+                 "（环境变量 → 内置路径）；填入或选择自定义目录后立即"
+                 "生效并重新扫描。自定义只影响 Windows 监听，WSL 始终跟随"
+                 "各发行版内进程的真实 HOME。路径仅保存在本机用户配置"
+                 "（%LOCALAPPDATA% 下），不写入其他任何位置。",
+                 bg=LIGHT.surface, fg=LIGHT.text_secondary, justify="left",
+                 wraplength=560,
+                 font=pick_font(panel, 9)).pack(fill="x")
+        from agents import paths as agent_paths
+
+        def _apply_roots():
+            agent_paths.set_data_root_overrides(
+                cfg.get("monitor.data_roots") or {})
+            app.monitor.rescan()
+
+        self.data_root_vars: dict[str, tk.StringVar] = {}
+        self.data_root_entries: dict[str, ttk.Entry] = {}
+        self.data_root_savers: dict[str, object] = {}
+        for key, label in (("codex", "Codex"), ("claude", "Claude"),
+                           ("kimi", "Kimi"), ("pi", "pi"),
+                           ("zcode", "ZCode"), ("opencode", "OpenCode"),
+                           ("dsh", "DSH")):
+            hint = agent_paths.default_data_root_hint(key)
+            r = SettingRow(panel.body, label,
+                           f"默认：{hint}" if hint else "", self.dash.tooltip)
+            cell = tk.Frame(r._control_cell)
+            cell.pack(fill="x")
+            var = tk.StringVar(
+                value=str(cfg.get(f"monitor.data_roots.{key}", "") or ""))
+            self.data_root_vars[key] = var
+            entry = ttk.Entry(cell, textvariable=var)
+            entry.pack(side="left", fill="x", expand=True)
+            self.data_root_entries[key] = entry
+
+            def _save(key=key, var=var, label=label):
+                value = var.get().strip()
+                if value and not os.path.isabs(value):
+                    app.toast("监听目标需要绝对路径，未保存")
+                    return
+                if cfg.set(f"monitor.data_roots.{key}", value) is False:
+                    return
+                app.config_saver.request_save()
+                _apply_roots()
+                app.toast(f"{label} 已恢复默认监听目标" if not value
+                          else f"{label} 监听目标已更新")
+
+            def _browse(key=key, var=var, label=label, _save=_save):
+                initial = var.get().strip() or \
+                    agent_paths.default_data_root_hint(key)
+                chosen = filedialog.askdirectory(
+                    initialdir=initial, title=f"选择 {label} 数据根")
+                if chosen:
+                    var.set(os.path.normpath(chosen))
+                    _save()
+
+            self.data_root_savers[key] = _save
+            entry.bind("<Return>", lambda _e, _s=_save: _s())
+            entry.bind("<FocusOut>", lambda _e, _s=_save: _s())
+            ttk.Button(cell, text="浏览…", style="Dashboard.TButton",
+                       command=lambda _f=_browse: _f(),
+                       ).pack(side="left", padx=(8, 0))
+            ttk.Button(cell, text="默认", style="Dashboard.TButton",
+                       command=lambda _f=_save, _v=var: (_v.set(""), _f()),
+                       ).pack(side="left", padx=(6, 0))
+            r.reflow("wide")
+            r.pack(fill="x")
         # C 终端观察
         panel = SurfacePanel(body)
         panel.pack(fill="x", pady=(0, SECTION_GAP))

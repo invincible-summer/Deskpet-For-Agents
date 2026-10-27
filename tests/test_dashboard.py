@@ -406,6 +406,47 @@ class DashboardActionSemanticsTests(unittest.TestCase):
                                  f"{widget_name} 点击必须选中 exact key")
 
 
+class DataRootSettingsTests(unittest.TestCase):
+    def test_monitor_page_data_roots_build_save_and_apply(self):
+        import os
+        import tempfile
+        from agents import paths as agent_paths
+        app = _make_app()
+        try:
+            from pet.dashboard import PAGE_MONITOR
+            app.open_dashboard()
+            dash = app.dashboard
+            dash._show_page(PAGE_MONITOR)
+            app.root.update()
+            page = dash._pages[PAGE_MONITOR]
+            self.assertTrue(page.built)
+            vars_ = page.data_root_vars
+            self.assertEqual(set(vars_), {"codex", "claude", "kimi", "pi",
+                                          "zcode", "opencode", "dsh"})
+            self.assertTrue(all(v.get() == "" for v in vars_.values()))
+            custom = os.path.join(tempfile.gettempdir(), "codex-root")
+            vars_["codex"].set(custom)
+            page.data_root_savers["codex"]()
+            self.assertEqual(
+                app.config.get("monitor.data_roots.codex"), custom)
+            self.assertEqual(agent_paths.data_root_overrides().get("codex"),
+                             custom)
+            self.assertEqual(agent_paths.codex_home_root(), custom)
+            # 相对路径被拒绝，保持原值
+            vars_["codex"].set("relative/path")
+            page.data_root_savers["codex"]()
+            self.assertEqual(
+                app.config.get("monitor.data_roots.codex"), custom)
+            # 清空 = 恢复默认
+            vars_["codex"].set("")
+            page.data_root_savers["codex"]()
+            self.assertEqual(app.config.get("monitor.data_roots.codex"), "")
+            self.assertNotIn("codex", agent_paths.data_root_overrides())
+        finally:
+            agent_paths.set_data_root_overrides({})
+            app.root.destroy()
+
+
 class ControllerWiringTests(unittest.TestCase):
     def test_settings_delegate_to_controllers_without_sync_writes(self):
         app = _make_app()
