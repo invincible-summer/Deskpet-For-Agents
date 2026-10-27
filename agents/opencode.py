@@ -1,11 +1,14 @@
 """OpenCode 无插件只读监听 adapter（无插件监听 plan §三/P2）。
 
-上游事实（SourceLink 2026-10-11 §2，OpenCode dev 0d61729b）：
+上游事实（packages/core/src/session/sql.ts、store.ts，dev 86976449c40d）：
   * 数据根：``<XDG_DATA_HOME|~/.local/share>/opencode``；DB 名
     ``opencode.db``（或渠道后缀 ``opencode-<channel>.db``）。
   * schema：``session_v2``（id/parent_id/directory/title/time_created/
-    time_updated/time_idle/time_suspended/…）+ ``session_message``；
-    ``session_pending`` 是输入 inbox 队列，**不是审批请求**。
+    time_updated/time_idle/time_suspended/idle_outcome/…）+
+    ``session_message``（turn 内持续写入，time_created 建索引）+
+    ``session_inbox``（输入 inbox 队列，**不是审批请求**）。
+  * ``time_suspended`` 是执行 claim（store.ts：turn 开始置位、终止事件
+    提交时清空）——durable turn 证据；崩溃可残留，用有界孤儿 TTL 兜底。
   * 未决审批只存在运行进程内存（permission.ts 的 Map）；官方只读接口：
     GET ``/api/permission/request``、``/api/session/:id/permission``、
     SSE ``/api/event``；``/api/info`` 返回 version/pid/urls。
@@ -14,10 +17,9 @@
     **绝不读取、保存或使用 password**。
 
 状态语义（plan §六）：
-  * SQLite 只是会话索引：DB 行存在 ≠ WORKING；无运行时确认时状态一律
-    UNKNOWN，只提供 title/cwd 等有界元数据；
-  * ``time_suspended`` 是执行 claim 的持久痕迹，崩溃后可残留，只作
-    冷启动线索，绝不单独推断 Working；
+  * SQLite 是会话索引 + durable 生命周期事实：DB 行存在 ≠ WORKING；
+    WORKING 只来自 HTTP active 集合、新鲜 session_message 或仍持有的
+    执行 claim（晚于 claim 的 time_idle 压住 claim）；否则 UNKNOWN；
   * WAITING 仅来自可信实例的只读 pending 证据（GET），401/403/断链 →
     状态不可用（UNKNOWN），绝不伪造；
   * SQLite 只读合同完全复用 ``agents/sqlite_ro.py``（mode=ro +
@@ -26,7 +28,9 @@
     跳过该数据源并降级（plan §SQLite WAL 零写入补充门槛）。
 """
 import json
+import ntpath
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -58,20 +62,29 @@ from .sqlite_ro import (
     fingerprints_differ,
     stat_fingerprint,
 )
+from .summarize import summarize_text
 
 _MAX_SESSIONS = 8
 _CATALOG_LIMIT = 32
 _SAFETY_REFRESH_SEC = 7.5
 _FAILURE_RETRY_SEC = 1.0
-_ACTVITY_WINDOW_SEC = 180.0
+_ACTIVITY_WINDOW_SEC = 180.0
+_IDLE_LEASE_SEC = 600.0
 _HTTP_SNAPSHOT_TTL_SEC = 10.0
 _HTTP_AUTH_BACKOFF_SEC = 60.0
 _HTTP_ERROR_BACKOFF_SEC = 5.0
 _HTTP_TIMEOUT_SEC = 1.0
+# 上游 store.ts（anomalyco/opencode dev）：session_v2.time_suspended 是
+# turn 执行 claim——执行开始置位、终止事件提交时清空；session_message
+# 行在 turn 内持续写入。两者给出不依赖 HTTP active 集合的稳定 WORKING
+# 证据（与 ZCode live part / DSH open_turn 同一 durable-turn 合同）。
+_LIVE_MESSAGE_FRESH_SEC = 90.0
+_CLAIM_ORPHAN_SEC = 600.0
 
 _REQUIRED_SESSION_COLUMNS = ("id", "directory", "time_created", "time_updated")
 _OPTIONAL_SESSION_COLUMNS = ("title", "parent_id", "time_idle",
-                             "time_suspended")
+                             "time_suspended", "time_archived",
+                             "idle_outcome")
 
 
 @dataclass(frozen=True)
@@ -80,9 +93,18 @@ class OpenCodeFactsSnapshot:
     source: str                       # "windows" 或 "wsl:<distro>"
     plane_key: str
     authoritative: bool
-    catalog: tuple = ()               # (id, directory, title, parent_id, time_updated_ms)
+    catalog: tuple = ()               # (id, directory, title, parent_id, time_updated_ms, ...)
+    messages: tuple = ()              # (session_id, max_time_updated_ms, role, text)
     diagnostics: tuple[str, ...] = ()
     observed_at: float = 0.0
+
+    def latest_message(self, sid: str) -> tuple | None:
+        """该 session 最新一条消息事实（None = 无新鲜消息证据）。"""
+        best = None
+        for row in self.messages:
+            if str(row[0]) == sid and (best is None or row[1] > best[1]):
+                best = row
+        return best
 
     def sessions_by_directory(self) -> dict[str, tuple]:
         """normalized directory → 最新 root session 行（子会话归并父任务）。"""
@@ -121,11 +143,29 @@ def _row_updated(row) -> int:
         return 0
 
 
+def _row_lifecycle(row) -> tuple[int, int, str]:
+    """Return optional idle/archive facts without changing row[4] identity."""
+    def _int_at(index: int) -> int:
+        try:
+            return int(row[index] or 0)
+        except (TypeError, ValueError, IndexError):
+            return 0
+    try:
+        outcome = str(row[7] or "")[:40]
+    except IndexError:
+        outcome = ""
+    return _int_at(5), _int_at(6), outcome
+
+
 def normalize_opencode_directory(directory: str) -> str:
     """DB 里的 directory（Windows 上游存 ``C:/x`` 正斜杠形态）→ 规范键。"""
     text = str(directory or "").strip()
     if not text:
         return ""
+    if re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith("\\\\"):
+        # Keep Windows semantics even when fixtures/remote facts are normalized
+        # by a POSIX DeskPet test process.
+        return ntpath.normcase(ntpath.normpath(text.replace("/", "\\")))
     normalized = os.path.normcase(os.path.normpath(text))
     return normalized.replace("/", os.sep)
 
@@ -149,8 +189,27 @@ class OpenCodeSchemaAdapter:
         for opt in _OPTIONAL_SESSION_COLUMNS:
             if opt in self.columns:
                 cols.append(opt)
-        return (f"SELECT {', '.join(cols)} FROM session_v2 "
+        where = " WHERE (time_archived IS NULL OR time_archived = 0)" \
+            if "time_archived" in self.columns else ""
+        return (f"SELECT {', '.join(cols)} FROM session_v2{where} "
                 f"ORDER BY time_updated DESC LIMIT {_CATALOG_LIMIT}")
+
+    def messages_sql(self) -> str | None:
+        """新鲜 session_message 行（流式活跃证据；上游按 time_created 建索引）。"""
+        if not (self.caps.has_table("session_message")
+                and self.caps.has_columns(
+                    "session_message", ("session_id", "time_created",
+                                        "time_updated"))):
+            return None
+        if self.caps.has_columns("session_message", ("data",)):
+            role_expr = "substr(json_extract(data, '$.role'), 1, 24)"
+            text_expr = "substr(json_extract(data, '$.text'), 1, 256)"
+        else:
+            role_expr = text_expr = "NULL"
+        return (f"SELECT session_id, time_updated, {role_expr} AS role, "
+                f"{text_expr} AS text FROM session_message "
+                "WHERE time_created >= ? "
+                "ORDER BY time_created DESC LIMIT 16")
 
 
 def _normalize_catalog_rows(rows, columns: tuple[str, ...]) -> tuple:
@@ -172,14 +231,55 @@ def _normalize_catalog_rows(rows, columns: tuple[str, ...]) -> tuple:
             updated = int(values.get("time_updated") or 0)
         except (TypeError, ValueError):
             updated = 0
+        try:
+            idle = int(values.get("time_idle") or 0)
+        except (TypeError, ValueError):
+            idle = 0
+        try:
+            archived = int(values.get("time_archived") or 0)
+        except (TypeError, ValueError):
+            archived = 0
+        try:
+            suspended = int(values.get("time_suspended") or 0)
+        except (TypeError, ValueError):
+            suspended = 0
         out.append((
             sid,
             directory,
             str(values.get("title") or "")[:120],
             str(values.get("parent_id") or ""),
             updated,
+            idle,
+            archived,
+            str(values.get("idle_outcome") or "")[:40],
+            suspended,
         ))
     return tuple(out[:_CATALOG_LIMIT])
+
+
+def _normalize_message_rows(rows) -> tuple:
+    """session_message 新鲜行 → 每 session 最新一条 (sid, updated_ms, role, text)。"""
+    best: dict[str, list] = {}
+    for row in rows or ():
+        try:
+            sid = str(row[0] or "")
+            updated = int(row[1] or 0)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not sid or not updated:
+            continue
+        try:
+            role = str(row[2] or "")[:24]
+        except IndexError:
+            role = ""
+        try:
+            text = str(row[3] or "")[:256]
+        except IndexError:
+            text = ""
+        cur = best.get(sid)
+        if cur is None or updated > cur[1]:
+            best[sid] = [sid, updated, role, text]
+    return tuple(tuple(v) for v in best.values())
 
 
 class OpenCodeLocalReader:
@@ -275,7 +375,7 @@ class OpenCodeLocalReader:
                 observed_at=now)
         try:
             if self._caps is None:
-                caps = self._ro.read_schema(["session_v2"])
+                caps = self._ro.read_schema(["session_v2", "session_message"])
                 if caps is None:
                     return OpenCodeFactsSnapshot(
                         source="windows", plane_key="windows",
@@ -303,6 +403,20 @@ class OpenCodeLocalReader:
                     observed_at=now)
             columns = _catalog_columns(adapter)
             catalog = _normalize_catalog_rows(rows, columns)
+            messages = ()
+            msg_sql = adapter.messages_sql()
+            if msg_sql is not None:
+                fresh_ms = int(now * 1000) - int(
+                    _LIVE_MESSAGE_FRESH_SEC * 1000)
+                msg_rows = self._ro.query(msg_sql, (fresh_ms,), max_rows=16)
+                if msg_rows is None:
+                    return OpenCodeFactsSnapshot(
+                        source="windows", plane_key="windows",
+                        authoritative=False,
+                        diagnostics=(self._ro.last_error
+                                     or "message query failed",),
+                        observed_at=now)
+                messages = _normalize_message_rows(msg_rows)
         finally:
             # 短连接：读完立即关闭，缩小任何 sidecar 生命周期
             self._ro.close()
@@ -319,7 +433,7 @@ class OpenCodeLocalReader:
                 observed_at=now)
         return OpenCodeFactsSnapshot(
             source="windows", plane_key="windows", authoritative=True,
-            catalog=catalog, diagnostics=(), observed_at=now)
+            catalog=catalog, messages=messages, diagnostics=(), observed_at=now)
 
 
 def _catalog_columns(adapter: OpenCodeSchemaAdapter) -> tuple[str, ...]:
@@ -335,9 +449,9 @@ def _catalog_columns(adapter: OpenCodeSchemaAdapter) -> tuple[str, ...]:
 # WSL 无读取器则降级，不安装 Python/SQLite 到 WSL）。
 
 _WSL_SCRIPT = r"""
-import json, os, sqlite3, sys, urllib.parse
+import json, os, sqlite3, sys, time, urllib.parse
 db = sys.argv[1]
-out = {"error": "", "sidecar_created": False, "rows": []}
+out = {"error": "", "sidecar_created": False, "rows": [], "messages": []}
 def sidecar_exists():
     return os.path.exists(db + "-shm")
 before = sidecar_exists()
@@ -357,22 +471,56 @@ try:
             out["error"] = "SESSION_V2_COLUMNS"
         else:
             sel = ["id", "directory"] + [
-                c for c in ("title", "parent_id") if c in cols]
-            if "time_updated" in cols:
-                sel.append("time_updated")
+                c for c in ("title", "parent_id", "time_idle",
+                            "time_suspended", "idle_outcome") if c in cols]
+            sel.append("time_updated")
             sql = ("SELECT " + ", ".join(sel) +
                    " FROM session_v2 ORDER BY time_updated DESC LIMIT 32")
-            title_at = 2 if "title" in cols else -1
-            parent_at = (3 if "title" in cols else 2) if "parent_id" in cols else -1
-            updated_at = len(sel) - 1 if "time_updated" in cols else -1
+            def idx(name):
+                return sel.index(name) if name in sel else -1
+            at = {name: idx(name) for name in
+                  ("title", "parent_id", "time_idle", "time_suspended",
+                   "idle_outcome", "time_updated")}
             for row in con.execute(sql):
-                def text(idx):
-                    if idx < 0 or idx >= len(row) or row[idx] is None:
+                def text(name):
+                    i = at[name]
+                    if i < 0 or i >= len(row) or row[i] is None:
                         return ""
-                    return str(row[idx])
+                    return str(row[i])
+                def num(name):
+                    try:
+                        return int(text(name) or 0)
+                    except ValueError:
+                        return 0
                 out["rows"].append([
-                    text(0), text(1), text(title_at), text(parent_at),
-                    text(updated_at)])
+                    text("id"), text("directory"),
+                    text("title")[:120], text("parent_id"),
+                    num("time_updated"), num("time_idle"),
+                    0, text("idle_outcome")[:40], num("time_suspended")])
+        if "session_message" in tables and not out["error"]:
+            mcols = {r[1] for r in con.execute(
+                "PRAGMA table_info(session_message)")}
+            if {"session_id", "time_created", "time_updated"} <= mcols:
+                if "data" in mcols:
+                    extras = (", substr(json_extract(data, '$.role'), 1, 24)"
+                              ", substr(json_extract(data, '$.text'), 1, 256)")
+                else:
+                    extras = ", NULL, NULL"
+                msql = ("SELECT session_id, time_updated" + extras +
+                        " FROM session_message WHERE time_created >= ?"
+                        " ORDER BY time_created DESC LIMIT 16")
+                fresh = int(time.time() * 1000) - 90000
+                best = {}
+                for row in con.execute(msql, (fresh,)):
+                    sid, updated = str(row[0] or ""), int(row[1] or 0)
+                    if not sid or not updated:
+                        continue
+                    cur = best.get(sid)
+                    if cur is None or updated > cur[1]:
+                        best[sid] = [sid, updated,
+                                     str(row[2] or "")[:24],
+                                     str(row[3] or "")[:256]]
+                out["messages"] = list(best.values())[:16]
 except Exception as exc:
     out["error"] = type(exc).__name__
 finally:
@@ -464,16 +612,23 @@ class OpenCodeWslReader:
             if not isinstance(row, list) or len(row) < 3:
                 continue
             try:
-                catalog.append((str(row[0]), str(row[1]),
-                                str(row[2] if len(row) > 2 else "")[:120],
-                                str(row[3] if len(row) > 3 else ""),
-                                int(row[4] if len(row) > 4 else 0) or 0))
+                catalog.append((
+                    str(row[0]), str(row[1]),
+                    str(row[2] if len(row) > 2 else "")[:120],
+                    str(row[3] if len(row) > 3 else ""),
+                    int(row[4] if len(row) > 4 else 0) or 0,
+                    int(row[5] if len(row) > 5 else 0) or 0,
+                    int(row[6] if len(row) > 6 else 0) or 0,
+                    str(row[7] if len(row) > 7 else "")[:40],
+                    int(row[8] if len(row) > 8 else 0) or 0,
+                ))
             except (TypeError, ValueError):
                 continue
+        messages = _normalize_message_rows(payload.get("messages") or ())
         snap = OpenCodeFactsSnapshot(
             source=f"wsl:{distro}", plane_key=plane, authoritative=True,
-            catalog=tuple(catalog[:_CATALOG_LIMIT]), diagnostics=(),
-            observed_at=now)
+            catalog=tuple(catalog[:_CATALOG_LIMIT]), messages=messages,
+            diagnostics=(), observed_at=now)
         self._last_good[plane] = snap
         return snap
 
@@ -498,6 +653,7 @@ class OpenCodeHttpSnapshot:
     authoritative: bool = False
     reason: str = ""
     pending: dict = field(default_factory=dict)   # sessionID -> 有界描述
+    active: frozenset = frozenset()                # V2 /api/session/active ids
     server_pid: int = 0
     url: str = ""
     observed_at: float = 0.0
@@ -561,12 +717,31 @@ class OpenCodeHttpProbe:
                 reason="INFO_PID_MISMATCH", url=url, server_pid=pid,
                 observed_at=now)
             return self._last
+        # V2 exposes active execution sessions separately from the SQLite
+        # catalog.  The endpoint is optional: 404/older servers simply yield
+        # an empty set, while a trusted 200 response prevents stale
+        # time_updated rows from being treated as idle.
+        active_raw = self._get_json(url, "/api/session/active", now)
+        active_ids: set[str] = set()
+        active_items = (active_raw.get("data") if isinstance(active_raw, dict)
+                        else active_raw)
+        if isinstance(active_raw, dict) and not isinstance(active_items, list):
+            active_items = active_raw.get("sessions")
+        if isinstance(active_items, list):
+            for item in active_items[:64]:
+                if isinstance(item, dict):
+                    sid = str(item.get("sessionID") or item.get("sessionId")
+                              or item.get("id") or "")
+                else:
+                    sid = str(item or "")
+                if sid:
+                    active_ids.add(sid)
         pending = self._get_json(url, "/api/permission/request", now)
         if pending is None:
             if self._last.reason not in ("AUTH_REQUIRED", "FORBIDDEN"):
                 self._last = OpenCodeHttpSnapshot(
                     reason="PENDING_UNAVAILABLE", url=url, server_pid=pid,
-                    observed_at=now)
+                    active=frozenset(active_ids), observed_at=now)
             return self._last
         data = pending.get("data") if isinstance(pending, dict) else None
         items = data if isinstance(data, list) else (
@@ -582,7 +757,8 @@ class OpenCodeHttpProbe:
             out[sid] = action or "等待批复"
         self._last = OpenCodeHttpSnapshot(
             available=True, authoritative=True, pending=out,
-            server_pid=pid, url=url, observed_at=now)
+            active=frozenset(active_ids), server_pid=pid, url=url,
+            observed_at=now)
         return self._last
 
     # ------------------------------------------------------------ 内部
@@ -691,10 +867,27 @@ class OpenCodeRuntime:
             return {}, False
         return snap.pending, True
 
+    def _http_active(self, now: float) -> tuple[frozenset, bool]:
+        snap = self.http_snapshot()
+        fresh = (snap.available and snap.authoritative
+                 and now - snap.observed_at <= _HTTP_SNAPSHOT_TTL_SEC)
+        if not fresh:
+            return frozenset(), False
+        return snap.active, True
+
     def observation_for_session(self, session_row, now: float,
-                                want_title: bool = True) -> Observation:
-        """session 行 → 有界元数据观察；状态默认 UNKNOWN（plan §六）。"""
-        _sid, directory, title, _parent, _updated = session_row
+                                want_title: bool = True,
+                                message: tuple | None = None) -> Observation:
+        """session 行 → 有界元数据观察。
+
+        状态阶梯（上游 store.ts/sql.ts 对齐）：可信 pending → WAITING；
+        HTTP active / 新鲜 session_message → WORKING；仍持有的执行 claim
+        （time_suspended）→ WORKING（有界孤儿 TTL）；idle_outcome →
+        DONE/ERROR 展示窗口；否则 UNKNOWN。DB 行存在本身不是 WORKING。
+        """
+        _sid = session_row[0]
+        directory = session_row[1]
+        title = session_row[2]
         obs = Observation(
             source=EvidenceSource.SESSION, timestamp=now,
             status=Status.UNKNOWN, confidence=Confidence.UNKNOWN,
@@ -704,7 +897,23 @@ class OpenCodeRuntime:
             obs.title = str(title)
             obs.goal = str(title)
         pending, pending_ok = self._http_pending(now)
+        active, active_ok = self._http_active(now)
         sid = str(session_row[0])
+        idle_ms, _archived_ms, outcome = _row_lifecycle(session_row)
+        try:
+            claim_ms = int(session_row[8] or 0)
+        except (TypeError, ValueError, IndexError):
+            claim_ms = 0
+        msg_ms = int(message[1] or 0) if message else 0
+        now_ms = int(now * 1000)
+        msg_fresh = bool(msg_ms) and 0 <= now_ms - msg_ms <= int(
+            _LIVE_MESSAGE_FRESH_SEC * 1000)
+        # time_idle 是 turn 结束事实：晚于 claim / 最新消息的 idle 压住
+        # 活跃证据（崩溃残留的 claim 不能越过其后的 idle）。
+        if idle_ms and idle_ms >= max(claim_ms, msg_ms):
+            claim_ms = 0
+            msg_fresh = False
+        text = str(message[3] or "") if message else ""
         if pending_ok and sid in pending:
             # 可信实例的只读 pending 证据：唯一允许 WAITING 的来源
             obs.status = Status.WAITING
@@ -713,7 +922,50 @@ class OpenCodeRuntime:
             obs.turn_active = True
             obs.expires_at = 0.0
             obs.waiting_detail = pending[sid][:160]
-            obs.summary = obs.waiting_detail
+        elif active_ok and sid in active:
+            obs.status = Status.WORKING
+            obs.phase = Phase.THINKING
+            obs.turn_active = True
+            obs.confidence = Confidence.HIGH
+            obs.summary = summarize_text(text, 160) if text else "任务进行中"
+        elif msg_fresh:
+            obs.status = Status.WORKING
+            obs.phase = Phase.THINKING
+            obs.turn_active = True
+            obs.confidence = Confidence.HIGH
+            obs.summary = summarize_text(text, 160) if text else "生成中"
+        elif (claim_ms and 0 <= now_ms - claim_ms
+              <= int(_CLAIM_ORPHAN_SEC * 1000)):
+            obs.status = Status.WORKING
+            obs.phase = Phase.THINKING
+            obs.turn_active = True
+            obs.confidence = Confidence.MEDIUM
+            obs.summary = "任务进行中"
+        if obs.status in (Status.WAITING, Status.WORKING):
+            return obs
+        # The V2 catalog carries a bounded lifecycle outcome alongside
+        # the session row.  Preserve explicit completion/failure
+        # reminders even when the active endpoint has already removed
+        # the session.  A stale catalog row alone still remains UNKNOWN.
+        outcome = str(outcome or "").casefold().replace("_", "-")
+        anchor_ms = idle_ms or _row_updated(session_row)
+        age = (now * 1000 - anchor_ms) / 1000.0 if anchor_ms else -1
+        if outcome in {"completed", "complete", "success", "succeeded",
+                        "done", "finished"} and 0 <= age < 8:
+            obs.status = Status.DONE
+            obs.confidence = Confidence.EXACT
+            obs.summary = "回合完成"
+        elif outcome in {"error", "failed", "failure", "aborted",
+                          "cancelled", "canceled", "interrupted",
+                          "blocked"} and 0 <= age < 30:
+            obs.status = Status.ERROR
+            obs.confidence = Confidence.EXACT
+            labels = {"aborted": "任务已中断",
+                      "cancelled": "任务已取消",
+                      "canceled": "任务已取消",
+                      "interrupted": "任务被中断",
+                      "blocked": "任务被阻塞"}
+            obs.summary = labels.get(outcome, "任务异常结束")
         return obs
 
 
@@ -793,7 +1045,9 @@ class OpenCodeWatcher(BaseWatcher):
                 row = by_directory.get(cwd_key)
             if row is not None:
                 self._bindings[key] = str(row[0])
-                out[key] = self.runtime.observation_for_session(row, now)
+                out[key] = self.runtime.observation_for_session(
+                    row, now, message=snapshot.latest_message(str(row[0]))
+                    if snapshot is not None else None)
                 out[key].session_id = str(row[0])
             else:
                 self._bindings.pop(key, None)
@@ -816,6 +1070,8 @@ class _OpenCodeDesktopSession:
     bound_host_key: str = ""
     admitted: bool = False
     last_activity_ts: float = 0.0
+    last_revision_ts: float = 0.0
+    last_pending_ts: float = 0.0
 
 
 class OpenCodeDesktopSource(DesktopSessionSource):
@@ -859,6 +1115,7 @@ class OpenCodeDesktopSource(DesktopSessionSource):
                     (snapshot.diagnostics if snapshot else ("NO_FACTS",))))
         window = float(self._cfg.get("active_file_window_sec", 180))
         pending, _ok = self.runtime._http_pending(now)
+        active_ids, _active_ok = self.runtime._http_active(now)
         now_ms = int(now * 1000)
         catalog = _root_rows(snapshot.catalog)
         live: set[str] = set()
@@ -868,21 +1125,54 @@ class OpenCodeDesktopSource(DesktopSessionSource):
         for row in catalog[:_MAX_SESSIONS * 2]:
             sid = str(row[0])
             updated_ms = _row_updated(row)
+            idle_ms, archived_ms, idle_outcome = _row_lifecycle(row)
+            if archived_ms:
+                continue
             live.add(sid)
+            try:
+                claim_ms = int(row[8] or 0)
+            except (TypeError, ValueError, IndexError):
+                claim_ms = 0
+            message = snapshot.latest_message(sid)
+            msg_ms = int(message[1] or 0) if message else 0
             sess = self._sessions.get(sid)
             if sess is None:
                 sess = _OpenCodeDesktopSession(session_id=sid)
                 self._sessions[sid] = sess
             active = (updated_ms and 0 <= now_ms - updated_ms
                       <= int(window * 1000))
+            # time_idle/idle_outcome are lifecycle facts; a stale DB row is
+            # not evidence of a currently running turn.
+            if idle_ms and idle_ms >= max(updated_ms, claim_ms, msg_ms):
+                active = False
+            # 执行 claim（time_suspended）与新鲜 session_message 是
+            # durable-turn 证据：admission 不依赖 HTTP active 集合。
+            if claim_ms and 0 <= now_ms - claim_ms <= int(
+                    _CLAIM_ORPHAN_SEC * 1000):
+                active = True
+            if msg_ms and 0 <= now_ms - msg_ms <= int(
+                    _LIVE_MESSAGE_FRESH_SEC * 1000):
+                active = True
             if sid in pending:
+                active = True
+                sess.last_pending_ts = now
+            if sid in active_ids:
                 active = True
             if not sess.admitted and not active:
                 continue
+            sess.last_revision_ts = max(sess.last_revision_ts,
+                                        max(updated_ms, msg_ms) / 1000.0)
             sess.admitted = True
             sess.bound_host_key = host.host_key
             sess.last_activity_ts = max(
-                sess.last_activity_ts, updated_ms / 1000.0)
+                sess.last_activity_ts,
+                max(updated_ms, msg_ms, claim_ms) / 1000.0)
+            if (sess.admitted and not active and sid not in pending
+                    and sess.last_activity_ts
+                    and now - max(sess.last_activity_ts,
+                                   sess.last_pending_ts) > _IDLE_LEASE_SEC):
+                self._sessions.pop(sid, None)
+                continue
             if claims_cover(claimed_sessions, "opencode", session_id=sid):
                 continue
             inst = AgentInstance(
@@ -890,7 +1180,8 @@ class OpenCodeDesktopSource(DesktopSessionSource):
                 surface=AgentSurface.DESKTOP,
                 host_pid=host.pid, host_process_token=host.process_token,
                 host_key=host.host_key, logical_session_id=sid)
-            obs = self.runtime.observation_for_session(row, now)
+            obs = self.runtime.observation_for_session(
+                row, now, message=message)
             obs.session_id = sid
             observations[inst.key] = obs
             claims.add(SessionClaimKey(kind="opencode", session_id=sid))

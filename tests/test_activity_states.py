@@ -3,6 +3,7 @@ import unittest
 
 from agents.codex import CodexFile
 from agents.claude import ClaudeFile
+from agents.kimi import KimiFile
 from agents.models import AgentKind, Mode, Status, parse_mode, Snapshot
 from agents.summarize import shorten, fmt_command
 from pet.labels import activity_text
@@ -37,6 +38,7 @@ def test_goal_and_structured_collaboration_mode():
     state = CodexFile('unused')
     feed(state, dict(type='function_call', name='create_goal', arguments='{"objective":"Build"}'))
     assert state.observation(1000, {}).mode == Mode.GOAL
+    assert state.observation(1000, {}).goal == 'Build'
     feed(state, dict(type='function_call', name='update_goal', arguments='{"status":"complete"}'))
     assert state.observation(1000, {}).mode != Mode.GOAL
 
@@ -96,23 +98,74 @@ def test_claude_question_only_matching_result_or_completion_clears():
     assert state.observation(101, {}).status == Status.DONE
 
 
-def test_goal_is_visible_in_both_display_modes_and_bounded():
+def test_claude_aborted_result_is_error_reminder():
+    state = ClaudeFile('unused')
+    state.feed(json.dumps({'type': 'assistant', 'timestamp': 100,
+                           'message': {'content': [{'type': 'text',
+                                                     'text': 'working'}]}}))
+    state.feed(json.dumps({'type': 'result', 'timestamp': 101,
+                           'subtype': 'aborted', 'result': 'cancelled'}))
+    assert state.observation(102, {}).status == Status.ERROR
+
+
+def test_kimi_turn_cancel_is_error_reminder():
+    state = KimiFile('unused')
+    state.feed(json.dumps({'type': 'turn.started', 'timestamp': 100}))
+    state.feed(json.dumps({'type': 'turn.cancel', 'timestamp': 101}))
+    assert state.observation(102, {}).status == Status.ERROR
+
+
+def test_kimi_scalar_abort_and_codex_structured_abort_are_error_reminders():
+    kimi = KimiFile("wire.jsonl")
+    kimi.feed(json.dumps({"type": "turn.started", "timestamp": 100}))
+    kimi.feed(json.dumps({"type": "turn.ended", "timestamp": 101,
+                          "reason": {"kind": "aborted"}}))
+    assert kimi.observation(102, {}).status == Status.ERROR
+
+    codex = CodexFile("rollout.jsonl")
+    codex.feed(json.dumps({"type": "event_msg", "timestamp": 100,
+                           "payload": {"type": "task_started"}}))
+    codex.feed(json.dumps({"type": "event_msg", "timestamp": 101,
+                           "payload": {"type": "task_complete",
+                                       "reason": {"kind": "aborted"}}}))
+    assert codex.observation(102, {}).status == Status.ERROR
+
+
+def test_activity_is_current_fact_without_mode_or_goal_substitution():
     snap = Snapshot(key='test', kind=AgentKind.CODEX, source='windows', pid=1,
                     status=Status.WORKING, mode=Mode.GOAL,
                     summary='rg foo_bar /tmp/my_path ' + 'x' * 200)
     for detail in (False, True):
-        assert 'Goal' in activity_text(snap, detail)
+        assert 'Goal' not in activity_text(snap, detail)
+        assert snap.mode is Mode.GOAL
         for limit in (1, 2, 20, 80, 120):
             assert len(activity_text(snap, detail, limit)) <= limit
+    snap.goal = '这是用户目标，不能冒充当前命令'
+    snap.title = '这只是会话标题'
+    for summary in ('', 'Bash', '执行'):
+        snap.summary = summary
+        assert snap.goal not in activity_text(snap)
+        assert snap.title not in activity_text(snap)
+        assert 'Bash' not in activity_text(snap)
+    snap.summary = '执行：rg live_snapshot agents/monitor.py'
+    rendered = activity_text(snap)
+    assert rendered.count('：') == 1
+    assert 'rg live_snapshot agents/monitor.py' in rendered
 
 
 def test_codex_wrapper_displays_literal_command_without_executing_code():
     state = CodexFile('unused')
-    feed(state, dict(type='custom_tool_call', name='functions.exec',
-                    input='text(await tools.exec_command({cmd: "rg foo_bar /tmp/my_path", max_output_tokens: 1000}));'))
-    summary = state.observation(1000, {}).summary
-    assert 'rg foo_bar /tmp/my_path' in summary
-    assert 'max_output_tokens' not in summary
+    for code in (
+        'text(await tools.exec_command({cmd: "rg foo_bar /tmp/my_path", max_output_tokens: 1000}));',
+        "text(await tools.exec_command({workdir: '/work', cmd: 'rg foo_bar /tmp/my_path', max_output_tokens: 1000}));",
+    ):
+        feed(state, dict(type='custom_tool_call', name='functions.exec', input=code))
+        summary = state.observation(1000, {}).summary
+        assert 'rg foo_bar /tmp/my_path' in summary
+        assert 'max_output_tokens' not in summary
+    feed(state, dict(type='message', role='user', content=[{
+        'text': '{"objective":"修复监听生命周期","metadata":{"revision":42}}'}]))
+    assert state.observation(1000, {}).goal == '修复监听生命周期'
 
 
 def load_tests(loader, tests, pattern):

@@ -469,6 +469,10 @@ class DashboardEntryTests(unittest.TestCase):
             app.open_dashboard()
             dash = app.dashboard
             dash._show_page(PAGE_PETS)
+            dash.event_generate("<FocusIn>")
+            dash.event_generate("<FocusOut>")
+            app.root.update()
+            self.assertTrue(dash.is_open())
             for _ in range(20):
                 self._invoke_context(app, "关闭仪表盘")
                 self.assertEqual(dash.state(), "withdrawn")

@@ -1,4 +1,4 @@
-"""StateReducer 测试：优先级、TTL、宽限、完成窗口（plan.md §26-§28）。"""
+"""StateReducer 测试：优先级、TTL、宽限、完成窗口。"""
 from __future__ import annotations
 import unittest
 

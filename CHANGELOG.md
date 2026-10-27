@@ -4,13 +4,51 @@ DeskPet 使用 Semantic Versioning 2.0.0。版本 tag 与 GitHub Release 的关�
 [VERSIONING.md](VERSIONING.md)。本文件维护每个可识别版本新增了什么功能、
 修复了什么问题，以及其分发状态。
 
-## Unreleased — OpenCode / DSH 无插件只读监听
+## Unreleased — v4.2.0 OpenCode / DSH 无插件只读监听
 
-状态：**源码已实现并通过全量自动化回归（886 unit tests + 4 项阻塞
-benchmark）；真实机器上的 OpenCode / DSH 实机验收未执行（NOT_TESTED）。**
-按 SemVer 属于向后兼容的 MINOR 功能，发布时版本号升为 4.2.0。
+状态：**2026-10-27 的监听生命周期、ZCode WSL、仪表盘与气泡修订完成源码验收。
+Windows Python 3.12 完整套件 916 项通过（此前 951 项，净减少 35 项）；最终审查
+和截图发现问题的相关模块复验、四项阻塞 benchmark、compileall 与 diff 检查通过。
+宽/紧凑窗口和气泡三种尺寸已检查合成数据截图。当前没有 ZCode 远程活跃实例，
+真实 WSL 连接交互保持 NOT_TESTED。具体证据见
+[本轮验收记录](tests/ACCEPTANCE-monitoring-dashboard.md)。**
+此前用户确认 Codex、DSH、ZCode 从应用自身托盘隐藏后均可正常唤起交互；反复
+真实托盘、P95/RSS/CPU 专项与编译产物验收仍需完成。
+按 SemVer 属于向后兼容的 MINOR 功能；源码版本已调整为 4.2.0，GitHub Release
+仍待真实机器验收后单独决定。
 
 ### 新增
+
+- 监听适配器按当前上游能力探测更新：Kimi Code 的 session-owned
+  `state.json`/main wire 回退、OpenCode active-session facts、DSH 当前
+  generation 事件和 pi/Claude 的空会话过滤；未知 schema 继续降级为
+  UNKNOWN，不写入 Agent 数据。
+
+### 修复（v4.2.0 监听与桌面唤起可靠性）
+
+- 进程权威退出后阻止旧 census/宿主缓存重新引入同一代次；Windows/WSL 与
+  Agent 类型开关在实例、宿主、会话合并处统一生效。同一会话保持唯一所有权。
+- ZCode 本地/远程读取分开清退；缓存连接失败不再给旧会话续租，远程读取器
+  按发行版、UID、HOME 和进程代次隔离，避免断连后持续显示旧活动。
+- 仪表盘合并为单一 Agent 工作台，删除重复概况页与拥挤双栏。统一导航、表单
+  和内容表面；滚动条保留槽位、viewport 单向驱动换行和布局，hover 只改颜色。
+- 气泡增加工作区首行；目标和活动摘要保留任务主干与命令/路径等对象，避免
+  完整 JSON 与仅工具名的粗略展示。收敛重复的仪表盘、菜单与摘要测试，保留
+  生命周期、只读归属、布局稳定和资源清理的行为回归。
+
+- Codex state DB rollover、归档/删除 tombstone、metadata-only admission
+  和 orphan active turn 不再把旧会话永久显示；OpenCode inactive rows、
+  DSH 超过发现窗口的 WAITING 日志和 ZCode orphan turn 使用有界 lease。
+- 修正 Electron 托盘隐藏的恢复方式：Codex、DSH、ZCode Desktop 通过已核验的
+  应用单实例启动入口恢复内部内容；任务栏最小化仍使用原生恢复。此前仅显示
+  HWND 会留下停在关闭/最小化按钮的旧画面，延迟前置不能修复。窗口筛选排除
+  helper、IME、tool/owned/child，重复双击合并；启动和有界等待由 worker 处理，
+  Tk 不等待外部进程，Dashboard 保持自身显隐状态。
+- Codex/DSH/Claude/Kimi/pi 的显式 aborted、cancelled、interrupted、failed
+  事件现在进入有界 ERROR 提醒窗口；正常 completed 仍进入 DONE，不再把异常
+  中断静默降级成 IDLE。
+- 绑定会话目录重扫默认从 15 秒降到 5 秒，仍保持每轮 revision 增量读取和
+  有界 I/O。
 
 - 新增 `OpenCode` / `DSH` 两个 Agent 类型，默认开启；旧 `config.json`
   自动补齐 `monitor.agents` 与 `presentation.concurrent.eligible_kinds`
@@ -79,6 +117,76 @@ benchmark）；真实机器上的 OpenCode / DSH 实机验收未执行（NOT_TES
   不落盘，rollout 读者无法判断是否有未决审批。现在 Codex active turn
   显式携带 `approval_visibility="unavailable"`（仅展示，绝不参与状态
   合成），不再给用户一个没有任何说明的 WORKING 空壳。
+
+### 修复（v4.4.2 重复监听与解析正确性）
+
+以下问题经代码取证 + 上游仓库复核（openai/codex main、deepseek-harness
+master，2026-10）定位；**没有放宽任何 fail-closed 语义**，没有新增轮询
+频率或常驻线程。
+
+- **Codex / DSH 已 claim 会话的重复增量解析**：v4.4.1 只阻止了 claim 后
+  **新开** tailer/解码器；claim 建立前已打开的那份仍每轮 `poll_lines` /
+  tail——terminal watcher 与 desktop source 永久双份解析同一会话文件。
+  现在被 claim 覆盖的会话一律冻结增量读（保留读位置与状态，CLI 消失后
+  下一轮恢复/reclaim），Codex 侧 idle lease 仍以 DB `updated_at` 为锚，
+  活跃会话不会被误释放。
+- **Codex 解析健康误判 PARTIAL**：`_EVENT_TYPES` 白名单缺上游 rollout
+  policy.rs 的 durable 事件（`thread_goal_updated` / `thread_rolled_back` /
+  `thread_settings_applied` / `context_compacted` / `entered_review_mode` /
+  `exited_review_mode` / `patch_apply_end` / `image_generation_end` /
+  `sub_agent_activity`；serde snake_case 命名已对照 main 的
+  `protocol.rs` 复核）。含这些记录的 rollout 不再被计入 unknown 类型。
+- **DSH 单轮事件预算超限静默丢事件**：超 `MAX_EVENTS_PER_POLL` 的行此前
+  被直接丢弃（注释却承诺留在缓冲）。上游一个 zstd 帧=一个追加批次、
+  单帧可含数百事件，丢 `turn/end` 漏 DONE、丢 `approval/decided` 幻影
+  WAITING。现在预算耗尽时未消化数据全部留缓冲（明文残行 / zstd 整帧 /
+  帧内剩余解码文本），下一轮继续；持续超速使缓冲超上限才整体拒绝
+  （fail closed）。帧扫描上限改用独立的 `MAX_FRAMES_PER_POLL`。
+- **DSH 子会话审批污染 root tracker**：`_merged_tracker` 浅拷贝在 root
+  审批为空时与 root 共享同一 dict，子会话审批经 `setdefault` 永久写入
+  root——decided 只到达子会话，root 幻影 WAITING 要等 600s 回放预算
+  剪除。现在无条件复制 dict，折叠视图立即跟随子会话配对解除。
+- **DSH CLI 误绑子会话日志**：同 cwd 下繁忙 subagent 的日志 mtime 更新，
+  会按"最新候选"抢占本应属于 root 会话的终端绑定（错误归属 + 与桌面
+  source 重复显示）。现在 CLI 候选用有界 header 探测排除
+  origin=subagent / parentSession 的子会话（探测不可读时保持包含，
+  不引入新的猜测）。
+- **DSH terminal claim 缺 session_id 时漏发**：header 尚未解析的绑定现在
+  退回 canonical 路径 claim（对齐 Codex watcher 的 file_id 回退），缩短
+  claim 建立前 desktop 侧的重复解码窗口。
+- **WSL `/.dsh/` 子串误报**：任何参数里含 `/.dsh/` 数据路径的进程
+  （如 `tail -f ~/.dsh/sessions/...`）都被判成 DSH agent。现在收紧为
+  规范安装路径 `/.dsh/bin/dsh`（上游 `apps/desktop/cli/dsh`），argv0
+  正则与 `dsh ` 前缀不变。
+- **DSH 事件词表落后上游**：上游 master `known-event-types.ts` 新增
+  `job/registered` / `job/settled`；缺词表时含这些事件的整个会话按
+  fail-closed 契约被判 UNKNOWN（harness 升级后"全部无法解析"）。词表
+  已同步；对更新的未知必需事件仍拒绝重构。
+- **DSH 标准 npm/pnpm 安装漏报**：当前 `@deepseek-ai/dsh` 的 bin 指向
+  `lib/bin.js`，WSL/Windows 进程表常见形态是 `node .../@deepseek-ai/dsh/`
+  或 `.bin/dsh`，不含裸 argv0 `dsh`。现在按官方入口精确匹配，并保留
+  数据路径误报防护；同时不再用 project 目录 mtime 截断老项目中的新会话。
+- **Codex 压缩 rollout 与新字段**：支持上游 `.jsonl.zst` 压缩归档的只读
+  解码、plain/zst 表示切换和有界输出；补齐当前 `EventMsg`/`TurnItem`/
+  `ResponseItem` 字段解析，消息、工具、计划、reasoning 与 goal 字段在
+  paginated rollout 中不再丢失。
+- **Codex Desktop 状态库兼容与重复会话收敛**：兼容仅提供
+  `updated_at_ms` 的新 `threads` schema，并优先读取 `CODEX_SQLITE_HOME`；
+  同一 rollout 的 DB 别名、`.jsonl`/`.jsonl.zst` 表示切换和 CLI claim
+  现在共享 canonical 身份，不再生成重复 target 或重复增量 reader。Desktop
+  的 `preview`/`first_user_message` 也可作为空标题回退。
+- **Dashboard 布局稳定性**：导航栏固定宽度并增加在线摘要，Agents 页在常见
+  窗口宽度下保持列表与详情并列；刷新只更新变化文本，减少侧栏闪烁并明确
+  标示 Codex Desktop / WSL 来源。
+- **GLM/ZCode 与旧 schema**：兼容最新 GLM bundle 的 `zcode-agent.mjs`
+  入口；ZCode `model_usage`/`tool_usage` 缺少可选列时生成 `NULL`，不再
+  因旧 schema 的 `no such column` 让整个 Desktop source 失效。
+
+本次验证使用 Linux Python 3.14：监听核心定向回归 183 项、OpenCode/Kimi/
+路径补充回归 66 项通过；全量收集到
+669 项时，剩余 65 项均因环境缺少 `tkinter`、Windows `ctypes.windll` 或
+`LocalAppData` 而无法导入，未发现监听核心断言失败。Windows Python 3.12
+全量 UI/编译验收仍需在目标环境执行。
 
 ### 边界
 

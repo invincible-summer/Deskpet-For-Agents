@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -24,12 +25,12 @@ from pet.labels import environment_label
 
 
 def _ctx(*, distro="Ubuntu", uid=1000, user="dev", home="/home/dev",
-         generation=1, pid=220):
+         generation=1, pid=220, token="runtime-1", role="agent"):
     return RemoteRuntimeContext(
         kind=AgentKind.ZCODE, transport="wsl-exec",
         source=f"wsl:{distro}", distro=distro, pid=pid, uid=uid,
-        user=user, home=home, runtime_role="agent",
-        observed_at=time.time(), generation=generation)
+        user=user, home=home, runtime_role=role,
+        observed_at=time.time(), generation=generation, process_token=token)
 
 
 def _host(pid=900, token="host-token"):
@@ -75,8 +76,14 @@ class DiscoveryTests(unittest.TestCase):
             "node", "/home/u/.zcode/server/agents/glm/zcode.cjs"), "agent")
         self.assertEqual(p._match_zcode_remote_runtime(
             "zcode-agent", "/home/u/.zcode/server/agents/glm/zcode-agent"), "agent")
-        self.assertIsNone(p._match_zcode_remote_runtime(
-            "node", "/tmp/zcode.cjs"))
+        self.assertEqual(p._match_zcode_remote_runtime(
+            "node", "/home/u/.zcode/server/agents/glm/zcode-agent.mjs"), "agent")
+        for comm, args in (("node", "/tmp/zcode.cjs"),
+                           ("cat", "cat /home/u/.zcode/server/agents/glm/zcode.cjs"),
+                           ("node", "node -e '/home/u/.zcode/server/zcode-server.cjs'"),
+                           ("node", "node /home/u/.zcode/server/zcode-server.cjs.bak")):
+            with self.subTest(args=args):
+                self.assertIsNone(p._match_zcode_remote_runtime(comm, args))
         self.assertIsNone(p._match_agent(
             "node", "/home/u/.zcode/server/agents/glm/zcode.cjs"))
 
@@ -107,6 +114,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(snap.remote_runtimes), 1)
         self.assertEqual(snap.remote_runtimes[0].pid, 101)
         self.assertEqual(snap.remote_runtimes[0].runtime_role, "agent")
+        self.assertEqual(snap.remote_runtimes[0].process_token, "11")
 
     def test_non_authoritative_scan_retains_runtime_cache_and_stop_clears(self):
         p = WslProcessProbe()
@@ -189,17 +197,35 @@ class RemoteReaderTests(unittest.TestCase):
             return SimpleNamespace(returncode=0,
                                    stdout=json.dumps(good.pop(0)).encode(), stderr=b"")
         reader = ZCodeRemoteReader(runner=runner)
-        self.assertTrue(reader.read(_ctx()).authoritative)
+        first = reader.read(_ctx())
+        self.assertTrue(first.authoritative)
         mode["timeout"] = True
         stale = reader.read(_ctx())
         self.assertFalse(stale.authoritative)
         self.assertIsNotNone(stale.facts)
+        self.assertEqual(stale.observed_at, first.observed_at)
+        self.assertEqual(reader.stale(first, "offline").observed_at,
+                         first.observed_at)
         self.assertEqual(reader.timeout_count, 1)
         mode["timeout"] = False
         mode["bad"] = True
         bad = reader.read(_ctx())
         self.assertFalse(bad.authoritative)
         self.assertTrue(any("JSON" in d for d in bad.diagnostics))
+        # A new incarnation under the same distro/UID cannot inherit old facts.
+        changed = reader.read(_ctx(token="runtime-2"))
+        self.assertFalse(changed.authoritative)
+        self.assertIsNone(changed.facts)
+        self.assertEqual(changed.observed_at, 0.0)
+
+    def test_missing_or_stale_runtime_identity_never_executes(self):
+        runner = mock.Mock()
+        reader = ZCodeRemoteReader(runner=runner)
+        for ctx in (_ctx(token=""), replace(_ctx(), observed_at=time.time() - 60),
+                    replace(_ctx(), source="wsl:another")):
+            with self.subTest(context=ctx):
+                self.assertFalse(reader.read(ctx).authoritative)
+        runner.assert_not_called()
 
 
 class DesktopProjectionTests(unittest.TestCase):
@@ -228,7 +254,24 @@ class DesktopProjectionTests(unittest.TestCase):
         self.assertEqual(environment_label(inst), "ZCode · Desktop · WSL Ubuntu")
         source.close()
 
-    def test_remote_waiting_is_exactly_session_scoped(self):
+    def test_healthy_plane_publishes_exact_keys_despite_another_plane_failure(self):
+        ctx = _ctx()
+        failed = _ctx(distro="Debian")
+        state = {
+            ctx.plane_key: ZCodeRemoteFactsSnapshot(
+                ctx, True, _facts("working"), (), self.now),
+            failed.plane_key: ZCodeRemoteFactsSnapshot(failed, False),
+        }
+        source = ZCodeDesktopSource(zcode_db=self.missing,
+                                    remote_provider=lambda: state)
+        out = source.poll((self.host,), frozenset(), self.now)
+        self.assertFalse(out.authoritative)
+        self.assertEqual(len(out.instances), 1)
+        self.assertEqual(out.authoritative_keys,
+                         frozenset({out.instances[0].key}))
+        source.close()
+
+    def test_cached_remote_waiting_does_not_renew_activity_lease(self):
         ctx = _ctx()
         snap = ZCodeRemoteFactsSnapshot(ctx, True, _facts("approve", status="waiting"),
                                         (), self.now)
@@ -237,6 +280,15 @@ class DesktopProjectionTests(unittest.TestCase):
         out = source.poll((self.host,), frozenset(), self.now)
         self.assertEqual(out.observations[out.instances[0].key].status,
                          Status.WAITING)
+        plane = source._remote_planes[ctx.plane_key]
+        self.assertEqual(plane.sessions["approve"].last_activity_ts, self.now)
+        source.poll((self.host,), frozenset(), self.now + 10)
+        self.assertEqual(plane.sessions["approve"].last_activity_ts, self.now)
+        snap = replace(snap, authoritative=False)
+        stale = source.poll((self.host,), frozenset(), self.now + 200)
+        self.assertFalse(stale.authoritative)
+        self.assertEqual(stale.observations, {})
+        self.assertEqual(plane.sessions["approve"].last_activity_ts, self.now)
         source.close()
 
     def test_plane_disappearance_removes_remote_sessions(self):
@@ -245,16 +297,37 @@ class DesktopProjectionTests(unittest.TestCase):
             ctx, True, _facts("r1"), (), self.now)}
         source = ZCodeDesktopSource(zcode_db=self.missing,
                                     remote_provider=lambda: dict(state))
-        self.assertEqual(len(source.poll((self.host,), frozenset(), self.now).instances), 1)
+        first = source.poll((self.host,), frozenset(), self.now)
+        self.assertEqual(len(first.instances), 1)
+        # An unrelated failed plane cannot block this exact runtime's exit.
         state.clear()
+        other = _ctx(distro="Debian")
+        state[other.plane_key] = ZCodeRemoteFactsSnapshot(other, False)
         out = source.poll((self.host,), frozenset(), self.now + 1)
+        self.assertFalse(out.authoritative)
         self.assertEqual(out.instances, ())
-        self.assertEqual(source.stats()["zcode_desktop_remote_planes"], 0)
+        self.assertEqual(out.retired_keys, frozenset({first.instances[0].key}))
+        source.close()
+
+    def test_surviving_remote_server_does_not_keep_stopped_agent(self):
+        ctx = _ctx()
+        state = {ctx.plane_key: ZCodeRemoteFactsSnapshot(
+            ctx, True, _facts("r1"), (), self.now)}
+        source = ZCodeDesktopSource(zcode_db=self.missing,
+                                    remote_provider=lambda: dict(state))
+        first = source.poll((self.host,), frozenset(), self.now)
+        server = _ctx(pid=221, token="server-token", role="server")
+        state[ctx.plane_key] = ZCodeRemoteFactsSnapshot(
+            server, True, _facts("r1"), (), self.now + 1)
+        stopped = source.poll((self.host,), frozenset(), self.now + 1)
+        self.assertTrue(stopped.authoritative)
+        self.assertEqual(stopped.instances, ())
+        self.assertEqual(stopped.retired_keys, frozenset({first.instances[0].key}))
         source.close()
 
     def test_global_eight_session_cap_across_two_remote_planes(self):
         c1 = _ctx(distro="Ubuntu", uid=1000, user="a", home="/home/a")
-        c2 = _ctx(distro="Debian", uid=1001, user="b", home="/home/b")
+        c2 = _ctx(distro="Ubuntu", uid=1001, user="b", home="/home/b")
         def many(prefix, count):
             now_ms = int(self.now * 1000)
             facts = {"catalog": [], "models": [], "tools": [], "turns": []}
@@ -267,7 +340,7 @@ class DesktopProjectionTests(unittest.TestCase):
             return facts
         remote = {
             c1.plane_key: ZCodeRemoteFactsSnapshot(c1, True, many("a", 5), (), self.now),
-            c2.plane_key: ZCodeRemoteFactsSnapshot(c2, True, many("b", 5), (), self.now),
+            c2.plane_key: ZCodeRemoteFactsSnapshot(c2, True, many("a", 5), (), self.now),
         }
         source = ZCodeDesktopSource(zcode_db=self.missing,
                                     remote_provider=lambda: remote)

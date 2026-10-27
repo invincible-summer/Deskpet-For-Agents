@@ -8,6 +8,9 @@ import subprocess
 import time
 import unittest
 import unittest.mock
+import os
+import tempfile
+from pathlib import Path
 
 from agents import paths
 from agents import discovery as discovery_mod
@@ -62,8 +65,24 @@ class MetadataScriptTests(unittest.TestCase):
         self.assertNotIn("cat /proc/$p/environ", script.replace("tr '\\0' '\\n' < /proc/$p/environ", ""))
 
 
+class CodexStatePathTests(unittest.TestCase):
+    def test_sqlite_home_override_is_considered_before_codex_home(self):
+        with tempfile.TemporaryDirectory() as temp:
+            override = Path(temp) / "sqlite-home"
+            fallback = Path(temp) / "codex-home"
+            override.mkdir()
+            fallback.mkdir()
+            (override / "state_5.sqlite").touch()
+            (fallback / "state_6.sqlite").touch()
+            with unittest.mock.patch.dict(
+                    os.environ, {"CODEX_SQLITE_HOME": str(override)},
+                    clear=False), unittest.mock.patch.object(
+                        paths, "codex_home_root", return_value=str(fallback)):
+                found = paths.codex_state_db_candidates()
+            self.assertEqual(found[0], str(override / "state_5.sqlite"))
+            self.assertEqual(found[1], str(fallback / "state_6.sqlite"))
 class EnvironmentPrivacyTests(unittest.TestCase):
-    """plan.md §58：模拟含密钥的 environ，最终 Python 对象只能包含 allowlist。"""
+    """模拟含密钥的 environ：最终 Python 对象只能包含 allowlist。"""
 
     def test_secret_env_never_reaches_python_objects(self):
         secret_text = (
@@ -136,6 +155,23 @@ class PsParsingTests(unittest.TestCase):
             "grep", "grep dsh log"))
         self.assertIsNone(WslProcessProbe._match_agent(
             "sh", "sh -c ./deploy-opencode.sh"))
+        # .dsh 数据路径不是 agent（v4.4.2：/.dsh/ 子串收紧为 /.dsh/bin/dsh）
+        self.assertIsNone(WslProcessProbe._match_agent(
+            "tail",
+            "tail -f /home/u/.dsh/sessions/--repo--/s/session.v4.jsonl.zstd"))
+        self.assertIsNone(WslProcessProbe._match_agent(
+            "cat", "cat ~/.dsh/config.yaml"))
+        # 规范安装路径的 wrapper 形态仍识别（上游 apps/desktop/cli/dsh）
+        self.assertEqual(WslProcessProbe._match_agent(
+            "node", "node /home/u/.dsh/bin/dsh serve"), AgentKind.DSH)
+        # 当前 @deepseek-ai/dsh npm/pnpm 包的真实 node 入口；旧匹配只看
+        # argv0=dsh，导致标准安装完全漏报。
+        self.assertEqual(WslProcessProbe._match_agent(
+            "node", "node /home/u/node_modules/@deepseek-ai/dsh/lib/bin.js web"),
+            AgentKind.DSH)
+        self.assertEqual(WslProcessProbe._match_agent(
+            "node", "/home/u/node_modules/.bin/dsh --profile web"),
+            AgentKind.DSH)
 
 
 class InstanceIdentityTests(unittest.TestCase):
@@ -169,7 +205,7 @@ class InstanceIdentityTests(unittest.TestCase):
 
 
 class WslUncTests(unittest.TestCase):
-    def test_basic_conversion(self):
+    def test_conversion_normalization_rejection_and_roundtrip(self):
         self.assertEqual(paths.wsl_unc("Ubuntu", "/home/foo/.codex"),
                          "\\\\wsl.localhost\\Ubuntu\\home\\foo\\.codex")
         self.assertEqual(paths.wsl_unc("Ubuntu", "/root"),
@@ -177,18 +213,10 @@ class WslUncTests(unittest.TestCase):
         # 规范化多余斜杠
         self.assertEqual(paths.wsl_unc("Ubuntu", "//home//x//"),
                          "\\\\wsl.localhost\\Ubuntu\\home\\x")
-
-    def test_rejects_bad_paths(self):
-        with self.assertRaises(ValueError):
-            paths.wsl_unc("Ubuntu", "")
-        with self.assertRaises(ValueError):
-            paths.wsl_unc("Ubuntu", "relative/path")
-        with self.assertRaises(ValueError):
-            paths.wsl_unc("Ubuntu", "/home/../etc/shadow")
-        with self.assertRaises(ValueError):
-            paths.wsl_unc("", "/home")
-
-    def test_unc_to_linux_roundtrip(self):
+        for distro, linux in (("Ubuntu", ""), ("Ubuntu", "relative/path"),
+                              ("Ubuntu", "/home/../etc/shadow"), ("", "/home")):
+            with self.assertRaises(ValueError):
+                paths.wsl_unc(distro, linux)
         unc = paths.wsl_unc("Ubuntu", "/home/foo/.codex/sessions")
         self.assertEqual(paths.unc_to_linux(unc), "/home/foo/.codex/sessions")
 
@@ -288,19 +316,15 @@ class CanonicalizationTests(unittest.TestCase):
 
 
 class DistroListParsingTests(unittest.TestCase):
-    def test_running_quiet_parsing(self):
-        text = "Ubuntu\r\nDebian\r\n"
-        self.assertEqual(parse_running_quiet(text), ["Ubuntu", "Debian"])
-
-    def test_running_quiet_skips_header(self):
-        text = "\ufeffNAME\nUbuntu\n"
-        self.assertEqual(parse_running_quiet(text), ["Ubuntu"])
-
-    def test_list_verbose_parsing(self):
-        text = ("  NAME            STATE           VERSION\n"
-                "* Ubuntu          Running         2\n"
-                "  Debian          Stopped         2\n")
-        self.assertEqual(parse_list_verbose(text), ["Ubuntu"])
+    def test_running_and_verbose_list_parsing(self):
+        self.assertEqual(parse_running_quiet("Ubuntu\r\nDebian\r\n"),
+                         ["Ubuntu", "Debian"])
+        self.assertEqual(parse_running_quiet("\ufeffNAME\nUbuntu\n"),
+                         ["Ubuntu"])
+        verbose = ("  NAME            STATE           VERSION\n"
+                   "* Ubuntu          Running         2\n"
+                   "  Debian          Stopped         2\n")
+        self.assertEqual(parse_list_verbose(verbose), ["Ubuntu"])
 
     def test_decode_utf16_and_utf8(self):
         utf16 = "Ubuntu\nDebian\n".encode("utf-16-le") + b"\x00"
@@ -325,41 +349,30 @@ def _make_ps_output(rows):
 
 
 class FallbackTokenTests(unittest.TestCase):
-    def test_ticks_present_uses_proc(self):
+    def test_token_source_priority_and_stability(self):
         probe = WslProcessProbe()
         token, source = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX,
                                              "36791842", 60)
         self.assertEqual(token, "36791842")
         self.assertEqual(source, "proc")
-
-    def test_fallback_token_stable_across_scans(self):
-        probe = WslProcessProbe()
         t1, s1 = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX, "", 60)
         t2, s2 = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX, "", 63)
         self.assertEqual(t1, t2)
         self.assertEqual(s1, "fallback")
         self.assertEqual(s2, "fallback")
         self.assertTrue(t1.startswith("fb"))
+        token, _ = probe._resolve_token("Ubuntu", 9, AgentKind.KIMI, "", 1)
+        self.assertTrue(token)
 
-    def test_pid_reuse_rotates_generation(self):
+    def test_generation_rotates_on_pid_reuse_or_kind_change(self):
         probe = WslProcessProbe()
         t1, _ = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX, "", 300)
         # etimes 明显回退 → 同 PID 已被复用
         t2, _ = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX, "", 5)
         self.assertNotEqual(t1, t2)
-
-    def test_kind_change_rotates_generation(self):
-        probe = WslProcessProbe()
-        t1, _ = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX, "", 60)
-        t2, _ = probe._resolve_token("Ubuntu", 5, AgentKind.CLAUDE, "", 62)
-        self.assertNotEqual(t1, t2)
-
-    def test_fallback_token_never_empty(self):
-        probe = WslProcessProbe()
-        token, _ = probe._resolve_token("Ubuntu", 9, AgentKind.KIMI, "", 1)
-        self.assertTrue(token)
-
-
+        t3, _ = probe._resolve_token("Ubuntu", 5, AgentKind.CODEX, "", 60)
+        t4, _ = probe._resolve_token("Ubuntu", 5, AgentKind.CLAUDE, "", 62)
+        self.assertNotEqual(t3, t4)
 class RootFallbackTests(unittest.TestCase):
     """root metadata 重试默认关闭；显式开启才允许一次 -u root 调用。"""
 
@@ -774,7 +787,8 @@ class KimiIndexTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp) / ".kimi-code"
+            root.mkdir()
             session_dir = root / "sessions" / "k1" / "s1" / "agents" / "main"
             session_dir.mkdir(parents=True)
             wire = session_dir / "wire.jsonl"
@@ -785,10 +799,40 @@ class KimiIndexTests(unittest.TestCase):
                                      "workDir": "/proj"}) + "\n")
             inst = AgentInstance(kind=AgentKind.KIMI, pid=1, source="windows",
                                  process_token="1", cwd="/proj")
-            with unittest.mock.patch.object(paths, "_user_home", return_value=str(root)):
+            with unittest.mock.patch.object(paths, "_user_home", return_value=temp):
                 candidates = paths.kimi_wire_candidates(inst)
             # windows 侧 root 为 ~/.kimi-code；索引在同 root 下才能解析
             self.assertTrue(all(p.endswith("wire.jsonl") for _m, p in candidates))
+
+    def test_wire_candidates_fall_back_to_session_state_when_index_omits_row(self):
+        """Kimi Code owns cwd/session facts in state.json; a stale index must
+        not hide a resumed session, while a different cwd remains excluded."""
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / ".kimi-code"
+            root.mkdir()
+            good = root / "sessions" / "key1" / "good" / "agents" / "main"
+            bad = root / "sessions" / "key2" / "bad" / "agents" / "main"
+            good.mkdir(parents=True)
+            bad.mkdir(parents=True)
+            (good.parent.parent / "state.json").write_text(
+                _json.dumps({"cwd": "/proj"}), encoding="utf-8")
+            (bad.parent.parent / "state.json").write_text(
+                _json.dumps({"cwd": "/other"}), encoding="utf-8")
+            (good / "wire.jsonl").write_text(
+                '{"type":"session","id":"good"}\n', encoding="utf-8")
+            (bad / "wire.jsonl").write_text(
+                '{"type":"session","id":"bad"}\n', encoding="utf-8")
+            inst = AgentInstance(kind=AgentKind.KIMI, pid=1,
+                                 source="windows", process_token="1",
+                                 cwd="/proj")
+            with unittest.mock.patch.object(paths, "_user_home",
+                                            return_value=temp):
+                candidates = paths.kimi_wire_candidates(inst)
+            self.assertEqual([p for _m, p in candidates],
+                             [str(good / "wire.jsonl")])
 
 
 # ==================================================== v4.4 Windows inventory
@@ -1129,14 +1173,7 @@ class OpenCodeDshInventoryTests(unittest.TestCase):
 
 
 class DaemonFormAgentTests(unittest.TestCase):
-    """v4.4.1：官方 daemon/app-server 常驻形态必须仍是可观察 Agent。
-
-    实机取证（2026-10）：WSL 中 `codex app-server --remote-control
-    --listen unix://…` 与 `codex app-server daemon pid-update-loop`
-    的 tty=? / tpgid=-1，被 classify_ps_terminal_attachment() 判为
-    DETACHED，整组从 authoritative snapshot 过滤 → Agent 彻底消失。
-    脱离 TTY 是这类常驻 runtime 的设计意图，不是孤儿证据。
-    """
+    """Observe a live app-server once; never turn daemon housekeeping into pets."""
 
     def _row(self, pid, ppid, tty, tpgid, comm, args):
         # _ps_scan 行布局：pid,ppid,sid,pgid,tpgid,tty,uid,etimes,stat,comm,args
@@ -1166,15 +1203,25 @@ class DaemonFormAgentTests(unittest.TestCase):
         state = discovery_mod.canonical_terminal_attachment(11, (), rows)
         self.assertIs(state, TerminalAttachment.DETACHED)
 
-    def test_daemon_sibling_makes_whole_group_unknown(self):
-        # launcher 也是 daemon：整组提升，canonical 不再被过滤
-        rows = {
-            20: self._row(20, 1, "?", -1, "codex", "/bin/codex"),
-            21: self._row(21, 20, "?", -1, "codex",
-                          "/bin/codex app-server daemon pid-update-loop"),
-        }
-        state = discovery_mod.canonical_terminal_attachment(21, (20,), rows)
-        self.assertIs(state, TerminalAttachment.UNKNOWN)
+    def test_daemon_maintenance_is_not_a_separate_agent(self):
+        from agents.discovery import scan_windows_inventory, WslProcessProbe
+        helper = ["codex.exe", "app-server", "daemon", "pid-update-loop"]
+        for with_runtime in (True, False):
+            with self.subTest(with_runtime=with_runtime):
+                rows = [(21, 20, "codex.exe", helper, 21.0, "C:/bin/codex.exe")]
+                if with_runtime:
+                    rows.append((20, _EXPLORER, "codex.exe",
+                                 ["codex.exe", "app-server", "--remote-control"],
+                                 20.0, "C:/bin/codex.exe"))
+                with unittest.mock.patch("psutil.process_iter",
+                                         return_value=_proc_rows(rows)):
+                    inv = scan_windows_inventory()
+                self.assertEqual([i.pid for i in inv.terminal_instances],
+                                 [20] if with_runtime else [])
+        self.assertIsNone(WslProcessProbe._match_agent(
+            "codex", "/bin/codex app-server daemon pid-update-loop"))
+        self.assertEqual(WslProcessProbe._match_agent(
+            "codex", "/bin/codex app-server --remote-control"), AgentKind.CODEX)
 
     def test_attached_still_wins_over_daemon_evidence(self):
         rows = {

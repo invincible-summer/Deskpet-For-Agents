@@ -38,6 +38,38 @@ def _make_gif(path: Path, frames: int = 8, size: int = 96) -> None:
          "delay_ms": 83, "loop": True}), encoding="utf-8")
 
 
+class AnimationTimingTests(unittest.TestCase):
+    def test_frame_period_and_speed_use_seconds(self):
+        from types import SimpleNamespace
+        meta = SimpleNamespace(path="unused", base_delay=83, n=8,
+                               width=10, height=10, loop=True)
+        for speed in (0.5, 1.0, 2.0):
+            with self.subTest(speed=speed):
+                cursor = AnimationCursor("view")
+                cursor.play("pet", "walk", meta)
+                cursor.speed = speed
+                self.assertEqual(cursor.frame_index, 0)
+                self.assertAlmostEqual(cursor.frame_delay(), 0.083 / speed)
+                self.assertTrue(cursor.advance(100.0))
+                self.assertAlmostEqual(cursor.next_due, 100.0 + 0.083 / speed)
+                cursor.play("pet", "sleep", meta, force=True)
+                self.assertEqual(cursor.frame_index, 0)
+
+    def test_scheduler_arms_in_milliseconds(self):
+        from types import SimpleNamespace
+        delays = []
+        root = SimpleNamespace(after=lambda ms, cb: delays.append(ms) or "timer",
+                               after_cancel=lambda token: None)
+        scheduler = AnimationScheduler(root, SharedAnimationCache())
+        cursor = AnimationCursor("view")
+        cursor.play("pet", "walk", SimpleNamespace(path="unused", base_delay=83,
+                    n=8, width=10, height=10, loop=True))
+        scheduler.register(cursor, lambda view: None)
+        self.assertGreaterEqual(delays[-1], 5)
+        self.assertLessEqual(delays[-1], 500)
+        scheduler.stop()
+
+
 class FrameLruTests(unittest.TestCase):
     def setUp(self):
         import tkinter as tk

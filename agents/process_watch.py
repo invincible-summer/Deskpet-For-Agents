@@ -156,10 +156,10 @@ class WindowsExitWatcher:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(0.0, timeout))
             exited = not thread.is_alive()
-        self._thread = None
         if not exited:
             self.started = False
             return False
+        self._thread = None
         # watcher 线程已退出：关闭残留 pending handle 是安全的
         with self._lock:
             leftovers = list(self._pending_add.values())
@@ -199,6 +199,16 @@ class WindowsExitWatcher:
         if not key or pid <= 0:
             return False
         with self._lock:
+            if self._stop.is_set():
+                return False
+            if any(event.key == key for event in self._events):
+                # An exit is already queued for this incarnation. Opening
+                # its signalled handle again only duplicates the same event.
+                return True
+            if key in self._pending_remove:
+                # Wait for the owning thread to retire the old handle before
+                # publishing a replacement under the same dictionary key.
+                return False
             if key in self._logical_keys:
                 return True   # 幂等
             if len(self._logical_keys) >= self.max_watched:
@@ -212,7 +222,7 @@ class WindowsExitWatcher:
                 self._logical_keys.discard(key)
             return False
         with self._lock:
-            if self._stop.is_set():
+            if self._stop.is_set() or key not in self._logical_keys:
                 # stop 已发生且 watcher 可能已退出：handle 尚未发布，
                 # 调用线程仍拥有它，可安全关闭。
                 self._logical_keys.discard(key)

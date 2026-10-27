@@ -27,14 +27,14 @@ class ReleaseLayoutTests(unittest.TestCase):
         # AC-REL-01：仓库不再含个人开发机路径（本测试文件自身除外——
         # 它需要字面量定义被禁 token）。
         # v4.3.1 §20.5：目标扩大到 pet/agents/actions/tools 全部 py、
-        # tests 全部 py（不只 test_*.py）、README/SourceLink 与双 launcher。
+        # tests 全部 py（不只 test_*.py）、README 与双 launcher。
         banned = (_PERSONAL_MINICONDA, _PERSONAL_MINICONDA_ALT, "启动桌宠.bat")
         targets = (list((ROOT / "pet").glob("*.py"))
                    + list((ROOT / "agents").glob("*.py"))
                    + list((ROOT / "actions").glob("*.py"))
                    + list((ROOT / "tools").glob("*.py"))
                    + list((ROOT / "tests").glob("*.py"))
-                   + [ROOT / "README.md", ROOT / "SourceLink.md",
+                   + [ROOT / "README.md", ROOT / "AGENTS.md",
                       ROOT / "main.py", ROOT / "Start-Desktop.bat",
                       ROOT / "Setup-Desktop.bat"])
         targets = [p for p in targets if p != Path(__file__).resolve()]
@@ -85,8 +85,7 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertIn("rename or delete", reusing)
 
     def test_docs_match_v44_runtime_policy(self):
-        # v4.5.0：README 与 runtime policy 一致；SourceLink 为 4.5.0
-        # 调研快照（官方合同/上游实现/issue 实证/第三方逆向四类标注）
+        # README 与 runtime policy 一致；plan.md / SourceLink.md 不再维护
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertNotIn("并发呈现（手动开启）", readme)
         self.assertIn("并行监听默认开启", readme)
@@ -96,12 +95,12 @@ class ReleaseLayoutTests(unittest.TestCase):
         app_src = (ROOT / "pet" / "app.py").read_text(encoding="utf-8")
         self.assertNotIn("并发需手动开启", app_src)
         self.assertIn("启动默认并行监听 + 单宠聚合", app_src)
-        sourcelink = (ROOT / "SourceLink.md").read_text(encoding="utf-8")
-        self.assertNotIn("v4.2.3 — SourceLink", sourcelink)
-        # v4.5.0 四类信任标注齐备（plan2 §20.12）
-        for marker in ("Official contract", "Upstream implementation",
-                       "Empirical issue", "Third-party reverse evidence"):
-            self.assertIn(marker, sourcelink)
+        self.assertFalse((ROOT / "plan.md").exists())
+        self.assertFalse((ROOT / "SourceLink.md").exists())
+        agents_md = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        # Agent 上游对齐版本表存在且指向 AGENTS.md 统一维护
+        self.assertIn("Agent upstream alignment", agents_md)
+        self.assertNotIn("SourceLink", agents_md)
 
     def test_portable_release_files_present(self):
         self.assertTrue((ROOT / "pet" / "runtime_paths.py").is_file())
@@ -124,8 +123,8 @@ class ReleaseLayoutTests(unittest.TestCase):
     def test_version_module_is_single_source(self):
         from pet.version import APP_LABEL, APP_NAME, APP_VERSION
         self.assertEqual(APP_NAME, "DeskPet")
-        self.assertEqual(APP_VERSION, "4.1.0")
-        self.assertEqual(APP_LABEL, "DeskPet V4.1.0")
+        self.assertEqual(APP_VERSION, "4.2.0")
+        self.assertEqual(APP_LABEL, "DeskPet V4.2.0")
         import pet.dashboard as dashboard
         self.assertEqual(dashboard.APP_VERSION, APP_LABEL)
 

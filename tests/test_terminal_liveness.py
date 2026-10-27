@@ -469,6 +469,9 @@ class NoKillInvariantTests(unittest.TestCase):
         # ffmpeg 子进程树（Windows Job Object + cancel），否则退出时
         # 遗留孤儿转换进程。该例外只限 ConverterJob 类内部——只管理
         # 自有子进程，绝不触碰用户 Agent 进程。
+        # DesktopReopen 同样只持有用户激活时自己 Popen 的临时启动器；
+        # 单实例失败/原宿主退出时必须有界回收，不能留下另一个 Agent。
+        # 例外只覆盖该 handle 类，进程发现、身份检查与全部 agents 仍禁用。
         import pathlib
         root = pathlib.Path(__file__).resolve().parent.parent
         banned = ("TerminateProcess", "terminate(", ".kill(", "os.kill",
@@ -482,6 +485,15 @@ class NoKillInvariantTests(unittest.TestCase):
                     _block, sep2, rest = tail.partition("\ndef build_skin")
                     self.assertTrue(sep2, "ConverterJob 后应有 build_skin")
                     text = _head + rest   # 检查 ConverterJob 之外的全部源码
+                elif module == "actions" and path.name == "desktop_launch.py":
+                    head, sep, tail = text.partition("class DesktopReopen:")
+                    self.assertTrue(sep, "owned launcher handle required")
+                    block, sep, rest = tail.partition("\ndef _canonical_path")
+                    self.assertTrue(sep, "owned handle boundary required")
+                    # No observed process/PID lookup is allowed in the handle.
+                    for lookup in ("psutil.", "host_pid", "OpenProcess", "os.kill"):
+                        self.assertNotIn(lookup, block)
+                    text = head + rest
                 for token in banned:
                     self.assertNotIn(
                         token, text,

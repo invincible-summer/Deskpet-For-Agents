@@ -7,28 +7,91 @@ SettingCard 已删除）—— 不引入 Qt/CustomTkinter/ttkbootstrap。
 from __future__ import annotations
 
 import tkinter as tk
+import tkinter.font as tkfont
 import tkinter.ttk as ttk
 
 from .theme import LIGHT, pick_font
+
+
+class BoundedLabel(tk.Label):
+    """Text with an explicit line budget and pixel-based final ellipsis.
+
+    The parent allocates width. A one-character width request prevents the
+    unabridged text from participating in geometry negotiation; only a changed
+    allocation or changed source text recomputes the displayed lines.
+    """
+
+    def __init__(self, master, text="", *, max_lines=1, **options):
+        self._source_text = str(text or "")
+        self._max_lines = max(1, int(max_lines))
+        self._allocated_width = None
+        options.update(width=1, height=self._max_lines, wraplength=0)
+        super().__init__(master, text="", **options)
+        selected_font = options.get("font")
+        self._text_font = (selected_font if isinstance(selected_font, tkfont.Font)
+                           else tkfont.Font(root=self, font=self.cget("font")))
+        self.bind("<Configure>", self._on_width, add="+")
+
+    def configure(self, cnf=None, **options):
+        if cnf is not None and not isinstance(cnf, dict):
+            return super().configure(cnf, **options)
+        if cnf:
+            options = {**cnf, **options}
+        if not options:
+            return super().configure()
+        changed = False
+        if "text" in options:
+            source = str(options.pop("text") or "")
+            changed = source != self._source_text
+            self._source_text = source
+        result = super().configure(**options) if options else None
+        if "font" in options:
+            selected_font = options["font"]
+            self._text_font = (selected_font if isinstance(selected_font, tkfont.Font)
+                               else tkfont.Font(root=self, font=self.cget("font")))
+            changed = True
+        if changed:
+            self._render_text()
+        return result
+
+    config = configure
+
+    def _on_width(self, event):
+        width = max(1, int(event.width) - 2 * (
+            int(self.cget("padx")) + int(self.cget("borderwidth"))
+            + int(self.cget("highlightthickness"))))
+        if width != self._allocated_width:
+            self._allocated_width = width
+            self._render_text()
+
+    def _render_text(self):
+        if self._allocated_width is None:
+            return
+        from .bubble import wrap_text
+        text = "\n".join(wrap_text(self._source_text,
+                                   self._allocated_width,
+                                   self._text_font.measure,
+                                   self._max_lines)).rstrip("\n")
+        if self.cget("text") != text:
+            super().configure(text=text)
 
 
 class NavButton(tk.Frame):
     """左侧导航按钮（高亮态用背景色 + 前景色表达，不只靠颜色）。"""
 
     def __init__(self, master, text: str, command, indent: int = 0):
-        super().__init__(master, bg=LIGHT.page, cursor="hand2")
+        super().__init__(master, bg=LIGHT.nav, cursor="hand2")
         self._text = text
         self._command = command
         self._active = False
         self._font = pick_font(master, 10)
-        self._bold_font = pick_font(master, 10, True)
-        self._marker = tk.Frame(self, width=3, bg=LIGHT.page)
-        self._marker.pack(side="left", fill="y", pady=6)
+        self._marker = tk.Frame(self, width=3, bg=LIGHT.nav)
+        self._marker.pack(side="left", fill="y", pady=5)
         self._label = tk.Label(self, text=("  " * (indent // 8)) + text,
-                               font=self._font, bg=LIGHT.page,
-                               fg=LIGHT.text_secondary, anchor="w",
-                               padx=8 + indent, pady=7)
-        self._label.pack(fill="x", expand=True)
+                               font=self._font, bg=LIGHT.nav,
+                               fg=LIGHT.nav_text, anchor="w",
+                               padx=12 + indent, pady=7)
+        self._label.pack(fill="both", expand=True)
         self._label.configure(takefocus=True)
         self._label.bind("<Return>", lambda _e: self._command())
         self._label.bind("<space>", lambda _e: self._command())
@@ -42,18 +105,17 @@ class NavButton(tk.Frame):
         if active == self._active:
             return
         self._active = active
-        bg = LIGHT.nav_active_bg if active else LIGHT.page
-        fg = LIGHT.nav_active_fg if active else LIGHT.text_secondary
+        bg = LIGHT.nav_selected_bg if active else LIGHT.nav
+        fg = LIGHT.nav_active_fg if active else LIGHT.nav_text
         self.configure(bg=bg)
         self._label.configure(bg=bg,
-                              fg=LIGHT.text if active else fg,
-                              font=self._bold_font if active else self._font)
+                              fg=LIGHT.nav_selected_fg if active else fg)
         self._marker.configure(bg=LIGHT.accent if active else bg)
 
     def _hover(self, entered):
         if self._active:
             return
-        bg = LIGHT.surface_subtle if entered else LIGHT.page
+        bg = LIGHT.nav_hover_bg if entered else LIGHT.nav
         if self.cget("bg") != bg:
             self.configure(bg=bg)
             self._label.configure(bg=bg)
@@ -64,16 +126,41 @@ class StatusChip(tk.Label):
     """状态徽标：颜色 + 文字同时表达（v4plan §13.1 可访问性）。"""
 
     def __init__(self, master, text: str = "", color: str = ""):
+        from .labels import STATUS_LABELS
         self._color = color or LIGHT.unknown
-        super().__init__(master, text=text, font=pick_font(master, 9, True),
-                         bg=LIGHT.surface_subtle, fg=self._color,
-                         padx=8, pady=2)
+        font = pick_font(master, 9, True)
+        character = max(1, font.measure("0"))
+        widest = max(font.measure(value) for value in STATUS_LABELS.values())
+        width = max(8, (widest + character - 1) // character + 1)
+        super().__init__(master, text=text, font=font,
+                         bg=_status_surface(self._color), fg=self._color,
+                         width=width, anchor="center", padx=6, pady=3)
 
     def set(self, text: str, color: str = ""):
         target_color = color or self._color
-        if self["text"] == text and self["fg"] == target_color:
+        target_bg = _status_surface(target_color)
+        if (self["text"] == text and self["fg"] == target_color
+                and self["bg"] == target_bg):
             return
-        self.configure(text=text, fg=target_color)
+        self._color = target_color
+        self.configure(text=text, fg=target_color, bg=target_bg)
+
+
+def _status_surface(color: str) -> str:
+    """Return a stable, low-contrast fill for a status chip.
+
+    The chip keeps a fixed width, so changing status never changes the row's
+    requested width.  The background is deliberately keyed by the semantic
+    color rather than generated at runtime; this keeps rendering cheap and
+    avoids palette-dependent geometry changes on Windows themes.
+    """
+    return {
+        LIGHT.working: "#E1F0E8",
+        LIGHT.done: "#E3F2ED",
+        LIGHT.waiting: "#FFF0DC",
+        LIGHT.error: "#FBE7E7",
+        LIGHT.unknown: "#EDF1EF",
+    }.get(color, LIGHT.surface_subtle)
 
 
 class SegmentedControl(tk.Frame):
@@ -86,11 +173,14 @@ class SegmentedControl(tk.Frame):
         self._selected = -1
         self._initialized = False
         for i, text in enumerate(options):
-            label = tk.Label(self, text=text, padx=12, pady=4,
+            label = tk.Label(self, text=text, padx=12, pady=7,
                              cursor="hand2",
-                             font=pick_font(master, 10, bold=False))
+                             font=pick_font(master, 9, bold=True),
+                             takefocus=True)
             label.pack(side="left")
             label.bind("<Button-1>", lambda _e, idx=i: self.select(idx))
+            label.bind("<Return>", lambda _e, idx=i: self.select(idx))
+            label.bind("<space>", lambda _e, idx=i: self.select(idx))
             self._buttons.append(label)
         self._render(0)
         self._initialized = True
@@ -108,8 +198,7 @@ class SegmentedControl(tk.Frame):
             active = i == index
             label.configure(
                 bg=LIGHT.surface if active else LIGHT.surface_subtle,
-                fg=LIGHT.text if active else LIGHT.text_secondary,
-                font=pick_font(self, 10, bold=active))
+                fg=LIGHT.accent if active else LIGHT.text_secondary)
 
     def selected(self) -> int:
         return self._selected
@@ -123,12 +212,11 @@ class Expander(tk.Frame):
         self._open = False
         self._heading = title
         self._title = tk.Label(
-            self, text="▸  " + title, bg=LIGHT.surface_subtle,
+            self, text="＋  " + title, bg=LIGHT.surface_subtle,
             fg=LIGHT.text, cursor="hand2", anchor="w", justify="left",
-            padx=12, pady=10, takefocus=True,
+            padx=12, pady=9, height=1, takefocus=True,
             font=pick_font(master, 10, True))
         self._title.pack(fill="x")
-        bind_wraplength(self._title, pad=28)
         for sequence in ("<Button-1>", "<Return>", "<space>"):
             self._title.bind(sequence, lambda _e: self.toggle())
         self._title.bind("<Enter>", lambda _e: self._title.configure(bg=LIGHT.nav_active_bg))
@@ -139,9 +227,9 @@ class Expander(tk.Frame):
 
     def toggle(self):
         self._open = not self._open
-        self._title.configure(text=("▾  " if self._open else "▸  ") + self._heading)
+        self._title.configure(text=("−  " if self._open else "＋  ") + self._heading)
         if self._open:
-            self.body.pack(fill="x", pady=(12, 4))
+            self.body.pack(fill="x", pady=(10, 4))
         else:
             self.body.pack_forget()
         return "break"
@@ -165,9 +253,11 @@ class ScrollableFrame(tk.Frame):
         self._window = self._canvas.create_window(
             (0, 0), window=self.inner, anchor="nw")
         self._canvas.configure(yscrollcommand=self._yview_changed)
-        # Reserve a slim gutter so scrollbar visibility never changes text width.
+        # Reserve a fixed gutter so scrollbar visibility never changes text
+        # width.  A fixed value is more stable than querying the native bar
+        # before it has been mapped (Windows themes can report 1px there).
         self._gutter = tk.Frame(self, bg=LIGHT.page,
-                                width=self._bar.winfo_reqwidth())
+                                width=16)
         self._gutter.pack(side="right", fill="y")
         self._gutter.pack_propagate(False)
         self._canvas.configure(yscrollincrement=24)
@@ -252,7 +342,13 @@ class ScrollableFrame(tk.Frame):
                 pass
 
     def _sync_bar(self, region=None):
-        """按需显示滚动条，保留窄槽避免显隐引发换行振荡。"""
+        """按需显示滚动条，并在临界值附近保持当前决定。
+
+        内容高度会因为一次状态文字变化而上下波动几像素。没有滞后时，
+        滚动条会在“刚好能放下”和“刚好超出”之间反复 pack/forget，进而
+        触发一串 Configure 事件。固定 gutter + 12px hysteresis 让几何在
+        临界值附近保持不变，只有真正跨过边界才切换。
+        """
         try:
             if region is None:
                 region = self._canvas.bbox("all")
@@ -260,7 +356,12 @@ class ScrollableFrame(tk.Frame):
         except tk.TclError:
             return
         content_h = region[3] - region[1] if region else 0
-        needed = content_h > canvas_h + 4 and canvas_h > 1
+        if canvas_h <= 1:
+            return
+        margin = 12
+        needed = (content_h > canvas_h + margin
+                  if not self._bar_visible
+                  else content_h > max(1, canvas_h - margin))
         if needed and not self._bar_visible:
             self._bar.pack(in_=self._gutter, fill="y", expand=True)
             self._bar_visible = True
@@ -270,7 +371,6 @@ class ScrollableFrame(tk.Frame):
 
     def _yview_changed(self, first, last):
         self._bar.set(first, last)
-        self._schedule_layout()
 
 
 def bind_wraplength(widget, min_width: int = 160, pad: int = 8):
@@ -282,6 +382,10 @@ def bind_wraplength(widget, min_width: int = 160, pad: int = 8):
     if getattr(widget, "_wrap_bound", False):
         return
     widget._wrap_bound = True
+    # The allocated width belongs to the parent, not to this label's text.
+    # A fixed minimal request breaks text -> request -> parent -> wrap feedback
+    # while fill/sticky still lets the label use the full available width.
+    widget.configure(width=1)
 
     def _on_configure(event):
         try:
@@ -320,19 +424,25 @@ class DashboardMetrics:
 
 
 class SurfacePanel(tk.Frame):
-    """轻量卡片（plan2 §11.1）：1px 边框 frame + body（padding 16）。
+    """轻量卡片（plan2 §11.1）：1px 边框 frame + body（padding 14）。
 
     不用 Canvas/圆角——设置行数量多时 Canvas+window item 的布局回调
     成本不可接受。
     """
 
-    def __init__(self, master, padding: int = 16,
-                 body_bg: str | None = None):
+    def __init__(self, master, padding: int = 14,
+                 body_bg: str | None = None, accent: str | None = None):
         super().__init__(master, bg=body_bg or LIGHT.surface, bd=0,
-                         highlightbackground=LIGHT.border, highlightthickness=1)
+                         highlightbackground=LIGHT.border,
+                         highlightcolor=LIGHT.border,
+                         highlightthickness=1)
+        if accent:
+            # A 3px semantic rail gives important cards a visual anchor
+            # without introducing another nested card or changing their flow.
+            tk.Frame(self, bg=accent, width=3).pack(side="left", fill="y")
         self.body = tk.Frame(self, bg=body_bg or LIGHT.surface)
         self.body.pack(fill="both", expand=True,
-                       padx=padding - 1, pady=padding - 1)
+                       padx=max(0, padding - 1), pady=max(0, padding - 1))
 
 
 class TooltipController:
@@ -616,18 +726,23 @@ class DiscreteSlider(tk.Frame):
 class SettingRow(tk.Frame):
     """四列设置行（plan2 §11.3）。
 
-    wide：| label+info 220 | control flex(min 300) | value 72 | side 96 |
+    wide：| label+info 184 | control flex(min 184) | value 78 | side 104 |
     compact（<720）：label+info 一行；control 满宽；value/side 随行。
     reflow 只 re-grid，不 destroy/recreate。
     """
 
-    LABEL_W = 170
-    CONTROL_MIN_W = 240
-    VALUE_W = 72
-    SIDE_W = 96
-    COL_GAP = 12
-    MIN_H = 48
+    LABEL_W = 184
+    CONTROL_MIN_W = 184
+    VALUE_W = 78
+    SIDE_W = 104
+    COL_GAP = 14
+    MIN_H = 52
+    # The public breakpoint remains 720 for compatibility with callers.  The
+    # two internal thresholds prevent a scrollbar or a single wrapped label
+    # from repeatedly flipping a row between modes.
     COMPACT_BREAK = 720
+    COMPACT_ENTER = 680
+    COMPACT_EXIT = 760
 
     def __init__(self, master, label: str, info: str = "",
                  tooltip: TooltipController | None = None):
@@ -645,8 +760,22 @@ class SettingRow(tk.Frame):
         self._control_cell = tk.Frame(self, bg=LIGHT.surface)
         self._value_cell = tk.Frame(self, bg=LIGHT.surface)
         self._side_cell = tk.Frame(self, bg=LIGHT.surface)
-        self.bind("<Configure>", lambda e: self.reflow(
-            "wide" if e.width >= self.COMPACT_BREAK else "compact"), add="+")
+        self.bind("<Configure>", self._on_configure, add="+")
+
+    @classmethod
+    def mode_for_width(cls, width: int, previous: str | None = None) -> str:
+        """Choose a layout mode with hysteresis around the compact boundary."""
+        width = int(width or 0)
+        if previous == "wide":
+            return "compact" if width < cls.COMPACT_ENTER else "wide"
+        if previous == "compact":
+            return "wide" if width >= cls.COMPACT_EXIT else "compact"
+        return "wide" if width >= cls.COMPACT_BREAK else "compact"
+
+    def _on_configure(self, event):
+        mode = self.mode_for_width(event.width, self._mode)
+        if mode != self._mode:
+            self.reflow(mode)
 
     def set_control(self, widget):
         widget.pack(fill="x", expand=True, in_=self._control_cell)
@@ -669,21 +798,24 @@ class SettingRow(tk.Frame):
             self.grid_columnconfigure(column, minsize=0, weight=0)
         if mode == "wide":
             self.label_cell.grid(row=0, column=0, sticky="ew",
-                                 padx=(0, self.COL_GAP), pady=6)
+                                 padx=(0, self.COL_GAP), pady=7)
             self._control_cell.grid(row=0, column=1, sticky="ew",
-                                    padx=(0, self.COL_GAP), pady=6)
-            self._value_cell.grid(row=0, column=2, sticky="e", pady=6)
+                                    padx=(0, self.COL_GAP), pady=7)
+            self._value_cell.grid(row=0, column=2, sticky="e", pady=7)
             self._side_cell.grid(row=0, column=3, sticky="e",
-                                 padx=(self.COL_GAP, 0), pady=6)
+                                 padx=(self.COL_GAP, 0), pady=7)
             self.grid_columnconfigure(0, minsize=self.LABEL_W, weight=0)
             self.grid_columnconfigure(1, weight=1,
                                       minsize=self.CONTROL_MIN_W)
             self.grid_columnconfigure(2, minsize=self.VALUE_W, weight=0)
             self.grid_columnconfigure(3, minsize=self.SIDE_W, weight=0)
         else:
-            self.label_cell.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(10, 2))
-            self._control_cell.grid(row=1, column=0, columnspan=4, sticky="ew", pady=4)
+            self.label_cell.grid(row=0, column=0, columnspan=4,
+                                 sticky="ew", pady=(9, 2))
+            self._control_cell.grid(row=1, column=0, columnspan=4,
+                                    sticky="ew", pady=4)
             self._value_cell.grid(row=2, column=0, sticky="w", pady=4)
-            self._side_cell.grid(row=2, column=1, sticky="e", pady=(0, 6))
+            self._side_cell.grid(row=2, column=1, columnspan=3,
+                                 sticky="e", pady=(0, 7))
             self.grid_columnconfigure(0, weight=1)
             self.grid_columnconfigure(1, weight=0)

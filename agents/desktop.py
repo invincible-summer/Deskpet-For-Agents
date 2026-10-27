@@ -10,6 +10,8 @@ Codex/ZCode 具体实现在各自模块（codex_desktop.py / zcode_desktop.py）
 本模块绝不出现 schema SQL 或对宿主进程的任何控制。
 """
 import os
+import ntpath
+import re
 from dataclasses import dataclass, field
 
 from .models import AgentInstance, AgentKind, AgentSurface, DesktopHost, Observation
@@ -36,8 +38,20 @@ def canonical_session_path(path: str) -> str:
     canonical 化供 claim 匹配，任何"打开"动作由各 source 的 containment
     校验负责（plan2 §7.2）。
     """
+    text = str(path)
+    # Codex may atomically materialize the same rollout as ``.jsonl`` and
+    # ``.jsonl.zst``.  Treat the compressed suffix as a representation detail
+    # so a terminal claim made just before compression still covers the
+    # desktop source row after the swap.
+    if text.casefold().endswith(".jsonl.zst"):
+        text = text[:-4]
+    # Tests and WSL/Windows adapters may compare Windows paths while running
+    # under a POSIX host.  Do not feed ``C:\\...`` to POSIX realpath (it would
+    # turn the same file into a different relative string).
+    if re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith("\\\\"):
+        return ntpath.normcase(ntpath.normpath(text))
     try:
-        return os.path.normcase(os.path.realpath(str(path)))
+        return os.path.normcase(os.path.realpath(text))
     except Exception:
         return os.path.normcase(str(path))
 
@@ -57,11 +71,13 @@ class SessionClaimKey:
 
 
 def claims_cover(claims: frozenset, kind: str, session_id: str = "",
-                 canonical_path: str = "") -> bool:
+                 canonical_path: str = "", canonical_data_root: str = "") -> bool:
     """terminal claim 集是否已覆盖该逻辑会话（plan2 §3.4 优先级）。
 
     匹配只用 exact 身份证据：session_id 相等或 canonical 会话路径相等
     （路径比较前双方都做 normcase，文件系统大小写不致造成漏配）。
+    指定 data root 时，session id 必须在同一数据面；未限定的旧 claim
+    不能按同名 id 抑制另一个 WSL 用户，exact 文件路径仍可匹配。
     两者都缺失时不匹配（宁可重复显示也不能错杀 terminal target）。
     """
     if not claims:
@@ -73,7 +89,9 @@ def claims_cover(claims: frozenset, kind: str, session_id: str = "",
     for claim in claims:
         if claim.kind != kind:
             continue
-        if want_sid and claim.session_id and claim.session_id == want_sid:
+        if (want_sid and claim.session_id and claim.session_id == want_sid
+                and (not canonical_data_root
+                     or claim.canonical_data_root == canonical_data_root)):
             return True
         have_path = canonical_session_path(claim.canonical_session_path) \
             if claim.canonical_session_path else ""
@@ -102,7 +120,7 @@ def build_terminal_claims(watchers: dict,
         bound = getattr(watcher, "_instance_files", None) or {}
         for key, path in bound.items():
             inst = instances.get(key)
-            if inst is not None and getattr(
+            if inst is None or getattr(
                     inst, "surface", AgentSurface.TERMINAL) is not AgentSurface.TERMINAL:
                 continue
             files = getattr(watcher, "files", None) or {}
@@ -130,7 +148,8 @@ class DesktopSourceSnapshot:
                              Monitor 据此合并并判定"source 内部退场"；
       authoritative=False —— source 暂时不可读（DB locked/corrupt 等）：
                              Monitor 保留 last good targets 并标记 stale，
-                             绝不用本轮结果判死任何会话（plan2 §9/§13）。
+                             只有 retired_keys 的独立权威退出证据可清退；
+                             authoritative_keys 允许健康数据面继续更新。
     """
     instances: tuple[AgentInstance, ...] = ()
     observations: dict[str, Observation] = field(default_factory=dict)
@@ -138,6 +157,12 @@ class DesktopSourceSnapshot:
     host_keys: frozenset = frozenset()
     authoritative: bool = False
     diagnostics: tuple[str, ...] = ()
+    # Exact sessions whose authoritative data plane has retired, even when a
+    # different plane of this source is temporarily unreadable.
+    retired_keys: frozenset[str] = frozenset()
+    # Positive facts read from healthy planes of a partially degraded source.
+    # These keys can be merged without interpreting another plane's absence.
+    authoritative_keys: frozenset[str] = frozenset()
 
 
 class DesktopSessionSource:

@@ -1,6 +1,6 @@
 """V3 被动观察层的数据模型。
 
-V3 的核心原则（plan.md §4/§5/§70）：
+V3 的核心原则：
   * Status / Phase / Mode 三者彻底分离：Plan 是 Mode 不是状态。
   * 每个状态都必须能回答"我是根据什么认为它处于这个状态"——
     Observation 携带证据来源、置信度与过期时间。
@@ -78,6 +78,7 @@ class Phase(str, Enum):
     NONE = ""
     THINKING = "thinking"
     PLANNING = "planning"
+    SEARCHING = "searching"
     READING = "reading"
     CODING = "coding"
     EXECUTING = "executing"
@@ -172,7 +173,7 @@ class Confidence(str, Enum):
 
 @dataclass
 class Observation:
-    """一条带证据语义的状态观察（plan.md §5）。
+    """一条带证据语义的状态观察。
 
     expires_at == 0 表示该证据不过期（如 wire 中未解除的 ApprovalRequest、
     已知 active turn 的 WORKING）；> 0 表示过期后不再支撑其 status
@@ -258,7 +259,7 @@ class DesktopHost:
 
 @dataclass
 class AgentInstance:
-    """Agent 进程身份（plan.md §3.1）。
+    """Agent 进程身份。
 
     key 包含稳定进程 incarnation（process_token），PID 被系统复用后
     不会继承上一个 Agent 的 session/terminal 绑定。
@@ -404,6 +405,7 @@ class RemoteRuntimeContext:
     runtime_role: str
     observed_at: float
     generation: int
+    process_token: str = ""
 
     @property
     def plane_key(self) -> str:
@@ -579,7 +581,7 @@ class Snapshot:
 
 @dataclass
 class AgentTarget:
-    """UI 唯一操作对象（plan.md §29）：实例 + 快照 + 终端窗口绑定。
+    """UI 唯一操作对象：实例 + 快照 + 终端窗口绑定。
 
     terminal_window 只承载 window 级诊断（能否唤起该 Agent 所在的
     Windows Terminal 顶层窗口）；terminal text attribution 由
@@ -601,6 +603,7 @@ class ActivationCode(str, Enum):
     AGENT_GONE = "agent_gone"       # Agent 进程已退出（exact key 不再 live）
     NO_BINDING = "no_binding"       # 没有可安全唤起的终端窗口绑定
     STALE_WINDOW = "stale_window"   # WindowIdentity 校验失败（HWND/PID 复用等）
+    RESTORE_PENDING = "restore_pending"  # worker 正在有界恢复；UI 只等待结果
     FOREGROUND_DENIED = "foreground_denied"  # OS 拒绝抢前台（已 Flash 提醒）
 
 

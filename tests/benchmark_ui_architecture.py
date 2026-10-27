@@ -355,7 +355,7 @@ def check_button_latency_and_configure_convergence(checks):
     """断言（v4.3.1 稳定性 §4）：按钮回调耗时有界（重扫描 O(1)）；
     Configure 风暴合并为一个 idle 并有限收敛，不残留 callback。"""
     from pet.app import PetApp
-    from pet.dashboard import PAGE_AGENTS, PAGE_OVERVIEW, SCALE_STEPS
+    from pet.dashboard import PAGE_AGENTS, PAGE_PETS, SCALE_STEPS
     from pet.petview import PetView
     from tests.test_ui import MemoryConfig
     with\
@@ -390,7 +390,7 @@ def check_button_latency_and_configure_convergence(checks):
         timed("切页提交",
               lambda: dash._show_page(
                   PAGE_AGENTS if dash._page != PAGE_AGENTS
-                  else PAGE_OVERVIEW))
+                  else PAGE_PETS))
         timed("重新扫描提交（O(1) Event）", dash.request_rescan)
         steps = SCALE_STEPS
         counter = {"i": 0}

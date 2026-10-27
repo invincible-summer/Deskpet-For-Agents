@@ -268,6 +268,25 @@ class SessionClaimTests(unittest.TestCase):
         self.assertFalse(claims_cover(claims, "codex"))
         self.assertFalse(claims_cover(claims, "codex", session_id="",
                                       canonical_path=""))
+        scoped = frozenset({SessionClaimKey(
+            kind="zcode", session_id="shared", canonical_data_root="wsl:Ubuntu|uid:1")})
+        for plane, expected in (("wsl:Ubuntu|uid:1", True),
+                                ("wsl:Ubuntu|uid:2", False), ("windows", False)):
+            with self.subTest(plane=plane):
+                self.assertEqual(claims_cover(
+                    scoped, "zcode", session_id="shared", canonical_data_root=plane),
+                    expected)
+
+    def test_compressed_rollout_claim_matches_plain_representation(self):
+        claims = frozenset({SessionClaimKey(
+            kind="codex",
+            canonical_session_path=(
+                "C:\\Users\\u\\.codex\\sessions\\rollout-a.jsonl"),
+        )})
+        self.assertTrue(claims_cover(
+            claims, "codex",
+            canonical_path=(
+                "C:\\Users\\u\\.codex\\sessions\\rollout-a.jsonl.zst")))
 
     def test_build_terminal_claims_from_watcher(self):
         from agents.codex import CodexWatcher
@@ -290,6 +309,9 @@ class SessionClaimTests(unittest.TestCase):
             self.assertEqual(claim.kind, "codex")
             self.assertEqual(claim.session_id, "s1")
             self.assertTrue(claims_cover(claims, "codex", session_id="s1"))
+            # A dropped process cannot keep a stale claim suppressing desktop.
+            self.assertEqual(build_terminal_claims(
+                {AgentKind.CODEX: watcher}, {}), frozenset())
 
     def test_bounded_diagnostics(self):
         items = [f"diag-{i}" for i in range(20)]
@@ -364,6 +386,14 @@ class MonitorDesktopLifecycleTests(unittest.TestCase):
         self.assertEqual(desktop, [])
         self.assertEqual(source.dropped_hosts, [host.host_key])
         self.assertNotIn(host.host_key, monitor._desktop_hosts)
+        # The worker may retain this census for several ticks. Even a source
+        # returning cached rows must not recreate sessions under the dead host.
+        for _ in range(3):
+            source.push(_desktop_snap(source, host, ["t1", "t2", "t3"]))
+            monitor._tick()
+            self.assertEqual(monitor.get_targets(), {})
+            self.assertEqual(monitor._desktop_hosts, {})
+        self.assertIn(host.host_key, monitor._exit_watcher.unregistered)
 
     def test_host_census_absence_drops_sessions(self):
         host = self._host()
@@ -382,6 +412,30 @@ class MonitorDesktopLifecycleTests(unittest.TestCase):
         monitor._tick()
         self.assertEqual(monitor.get_targets(), {})
         self.assertEqual(source.dropped_hosts, [host.host_key])
+        self.assertIn(host.host_key, monitor._exit_watcher.unregistered)
+
+    def test_partial_plane_retirement_does_not_keep_a_ghost(self):
+        host = self._host(kind=AgentKind.ZCODE)
+        source = FakeDesktopSource(AgentKind.ZCODE)
+        first = _desktop_snap(source, host, ["live", "failed", "retired"])
+        source.push(first)
+        monitor = self._monitor(source, [host])
+        monitor._tick()
+        retired = next(inst.key for inst in first.instances
+                       if inst.logical_session_id == "retired")
+        healthy = _desktop_snap(source, host, ["live", "new"])
+        source.push(DesktopSourceSnapshot(
+            authoritative=False, retired_keys=frozenset({retired}),
+            instances=healthy.instances, observations=healthy.observations,
+            authoritative_keys=frozenset(i.key for i in healthy.instances),
+            diagnostics=("OTHER_PLANE_UNREADABLE",)))
+        monitor._tick()
+        self.assertNotIn(retired, monitor.get_targets())
+        targets = monitor.get_targets()
+        self.assertEqual(len(targets), 3)
+        for target in targets.values():
+            self.assertEqual(target.snapshot.stale,
+                             target.instance.logical_session_id == "failed")
 
     def test_desktop_source_error_retains_last_good_and_marks_stale(self):
         host = self._host()

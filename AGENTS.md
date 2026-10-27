@@ -20,13 +20,37 @@ boundary or test seam. Preserve implementations that already satisfy their contr
 
 ## Plans and implementation
 
-Before substantial work, re-read the current repository and the active plan. Treat the
-plan's semantics, interfaces and acceptance criteria as implementation requirements,
-not suggestions. If repository reality conflicts with a plan, update the plan explicitly
-before changing architecture.
+Before substantial work, re-read the current repository and existing docs. Treat
+documented semantics, interfaces and acceptance criteria as implementation
+requirements, not suggestions.
 
-During implementation, continuously compare the code against the plan and avoid scope
-creep. Necessary decisions must be documented with the chosen option and rationale.
+During implementation, continuously compare the code against the documented
+contract and avoid scope creep. Necessary decisions must be documented with the
+chosen option and rationale.
+
+## Agent upstream alignment
+
+Monitoring code must track each Agent's latest upstream design. When updating an
+Agent integration, research the current upstream repository/docs, align the
+reader to it, and refresh the version table below in the same change. Version
+annotations live only in this file, not in source headers.
+
+| Agent | Aligned upstream | Evidence date |
+| --- | --- | --- |
+| ZCode | 0.17.0 (live `db.sqlite` `session.version`; migrations through 0005 / 0.7.0 schema era) | 2026-10-27 |
+| Codex | 0.164.0-alpha.11.1 (live `state_5.sqlite` `cli_version`; rollout JSONL event schema) | 2026-10-27 |
+| OpenCode | anomalyco/opencode dev @ 86976449c40d (`session_v2` / `session_message` / `session_inbox`; `store.ts` `time_suspended` execution claim) | 2026-10-27 |
+| DSH | deepseek-ai/deepseek-harness master @ 22ddee379240 (session.vN.jsonl[.zstd] event stream) | 2026-10-23 |
+| pi | badlogic/pi-mono main @ 177e2ad7e41e (session JSONL event stream) | 2026-10-27 |
+| Kimi Code | live `wire.jsonl` verified on a real CLI install | 2026-09 |
+| Claude Code | code.claude.com docs (transcript/projects layout, permissionMode) | 2026-09 |
+
+All sources share one stable status contract: an open turn is durable evidence
+and holds WORKING through quiet gaps (bounded by an explicit crash-orphan TTL);
+terminal facts (turn end, cancel, `time_idle`, latest terminal turn) close it.
+Usage/stats tables that upstream writes only after a turn must never be the sole
+liveness signal — pair them with the streaming fact the agent writes live
+(ZCode `part.time_updated`, OpenCode `session_message` / execution claim).
 
 ## Safety and privacy
 
@@ -66,5 +90,5 @@ source tests, blocking benchmarks and compiled-artifact acceptance pass.
 
 README describes current user behavior and maintained architecture; `CHANGELOG.md`
 records release history; `VERSIONING.md` defines release/version policy; release notes
-carry version-specific user changes; SourceLink records external research evidence.
-Keep commands, paths, versions and file names synchronized with the actual repository.
+carry version-specific user changes. Keep commands, paths, versions and file names
+synchronized with the actual repository.

@@ -16,21 +16,42 @@ from dataclasses import dataclass, replace
 from .models import AgentKind, RemoteRuntimeContext
 from .paths import zcode_wsl_db_path, zcode_wsl_server_node
 from .sqlite_ro import SchemaCapabilities
-from .zcode_desktop import ZCodeSchemaAdapter
+from .zcode_desktop import ZCodeSchemaAdapter, _LIVE_PART_FRESH_SEC
 
-_BUSY_TIMEOUT_MS = 40
 _TIMEOUT_SEC = 1.5
 _MAX_STDOUT = 64 * 1024
 _MAX_DIAGNOSTICS = 6
-_TABLES = ("session", "model_usage", "tool_usage", "turn_usage")
+_TABLES = ("session", "model_usage", "tool_usage", "turn_usage", "part")
+_RUNTIME_FRESH_SEC = 15.0
+
+_IDENTITY_SCRIPT = r"""
+const fs = require('node:fs');
+const os = require('node:os');
+const identity = JSON.parse(process.argv[process.argv.length - 1]);
+if (process.getuid() !== identity.uid || os.homedir() !== identity.home)
+  throw new Error('REMOTE_USER_CHANGED');
+const stat = fs.readFileSync(`/proc/${identity.pid}/stat`, 'utf8');
+const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+const status = fs.readFileSync(`/proc/${identity.pid}/status`, 'utf8');
+const uid = /^Uid:\s+(\d+)/m.exec(status);
+if (fields[19] !== identity.token || !uid || Number(uid[1]) !== identity.uid)
+  throw new Error('REMOTE_RUNTIME_CHANGED');
+const dbPath = process.argv[1];
+const containedPath = fs.realpathSync(identity.home) + '/.zcode/cli/db/db.sqlite';
+if (fs.realpathSync(dbPath) !== containedPath)
+  throw new Error('REMOTE_DB_PATH_REJECTED');
+if (fs.existsSync(dbPath + '-wal') && !fs.existsSync(dbPath + '-shm'))
+  throw new Error('REMOTE_WAL_SIDECAR_UNAVAILABLE');
+""".strip()
 
 _SCHEMA_SCRIPT = r"""
 const { DatabaseSync } = require('node:sqlite');
 const path = process.argv[1];
-const wanted = ['session', 'model_usage', 'tool_usage', 'turn_usage'];
+const wanted = ['session', 'model_usage', 'tool_usage', 'turn_usage', 'part'];
 let db;
 try {
   db = new DatabaseSync(path, {readOnly: true, timeout: 40, allowExtension: false});
+  db.exec('PRAGMA query_only=ON');
   const names = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => String(r.name)));
   const columns = {};
   for (const table of wanted) {
@@ -51,6 +72,7 @@ const plan = JSON.parse(process.argv[2]);
 let db;
 try {
   db = new DatabaseSync(path, {readOnly: true, timeout: 40, allowExtension: false});
+  db.exec('PRAGMA query_only=ON');
   const out = {};
   for (const q of plan) out[q.key] = db.prepare(q.sql).all(...q.params);
   process.stdout.write(JSON.stringify(out));
@@ -81,6 +103,8 @@ class ZCodeRemoteReader:
         self.timeout_sec = min(2.0, max(0.2, float(timeout_sec)))
         self._adapters: dict[str, ZCodeSchemaAdapter] = {}
         self._last_good: dict[str, dict] = {}
+        self._last_good_at: dict[str, float] = {}
+        self._identities: dict[str, tuple] = {}
         self.spawn_count = 0
         self.timeout_count = 0
         self.error_count = 0
@@ -88,27 +112,42 @@ class ZCodeRemoteReader:
         self.facts_query_count = 0
 
     def drop_except(self, active: set[str]) -> None:
-        for key in list(self._adapters):
+        for key in list(self._identities):
             if key not in active:
                 self._adapters.pop(key, None)
                 self._last_good.pop(key, None)
+                self._last_good_at.pop(key, None)
+                self._identities.pop(key, None)
 
     def close(self) -> None:
         self._adapters.clear()
         self._last_good.clear()
+        self._last_good_at.clear()
+        self._identities.clear()
 
     def stale(self, snap: ZCodeRemoteFactsSnapshot, reason: str,
               now: float | None = None) -> ZCodeRemoteFactsSnapshot:
         diag = tuple((list(snap.diagnostics) + [reason])[-_MAX_DIAGNOSTICS:])
-        return replace(snap, authoritative=False, diagnostics=diag,
-                       observed_at=time.time() if now is None else now)
+        return replace(snap, authoritative=False, diagnostics=diag)
 
     def read(self, ctx: RemoteRuntimeContext) -> ZCodeRemoteFactsSnapshot:
         now = time.time()
         key = ctx.plane_key
         if (ctx.kind is not AgentKind.ZCODE or ctx.transport != "wsl-exec"
-                or not ctx.distro or not ctx.user or not ctx.home):
+                or not ctx.distro or ctx.source != f"wsl:{ctx.distro}"
+                or not ctx.user or not ctx.home or ctx.pid <= 0 or ctx.uid < 0
+                or not ctx.process_token
+                or ctx.runtime_role not in {"agent", "server"}):
             return self._failure(ctx, "REMOTE_RUNTIME_IDENTITY_INCOMPLETE", now)
+        if not 0 <= now - ctx.observed_at <= _RUNTIME_FRESH_SEC:
+            return self._failure(ctx, "REMOTE_RUNTIME_STALE", now)
+        identity = (ctx.uid, ctx.user, ctx.home, ctx.pid, ctx.process_token,
+                    ctx.runtime_role)
+        if self._identities.get(key) != identity:
+            self._adapters.pop(key, None)
+            self._last_good.pop(key, None)
+            self._last_good_at.pop(key, None)
+            self._identities[key] = identity
         try:
             db_path = zcode_wsl_db_path(ctx.home)
             node_path = zcode_wsl_server_node(ctx.home)
@@ -142,7 +181,9 @@ class ZCodeRemoteReader:
             facts = self._normalize_facts(payload)
         except (TypeError, ValueError, KeyError) as exc:
             return self._failure(ctx, f"REMOTE_PAYLOAD_INVALID:{exc}", now)
+        now = time.time()
         self._last_good[key] = facts
+        self._last_good_at[key] = now
         return ZCodeRemoteFactsSnapshot(
             context=ctx, authoritative=True, facts=facts,
             diagnostics=(), observed_at=now)
@@ -150,17 +191,26 @@ class ZCodeRemoteReader:
     def _failure(self, ctx: RemoteRuntimeContext, reason: str,
                  now: float) -> ZCodeRemoteFactsSnapshot:
         self.error_count += 1
+        identity = (ctx.uid, ctx.user, ctx.home, ctx.pid, ctx.process_token,
+                    ctx.runtime_role)
+        same_runtime = self._identities.get(ctx.plane_key) == identity
         return ZCodeRemoteFactsSnapshot(
             context=ctx, authoritative=False,
-            facts=self._last_good.get(ctx.plane_key),
-            diagnostics=(str(reason)[:200],), observed_at=now)
+            facts=self._last_good.get(ctx.plane_key) if same_runtime else None,
+            diagnostics=(str(reason)[:200],),
+            observed_at=self._last_good_at.get(ctx.plane_key, 0.0)
+            if same_runtime else 0.0)
 
     def _exec_json(self, ctx: RemoteRuntimeContext, node_path: str,
                    script: str, args: list[str]) -> tuple[dict | None, str]:
         # Direct argv only. No shell/sh -c, so distro/user/path values cannot become
         # commands even if upstream metadata is malformed.
+        identity = json.dumps({"pid": ctx.pid, "uid": ctx.uid,
+                               "home": ctx.home, "token": ctx.process_token},
+                              ensure_ascii=True, separators=(",", ":"))
         argv = ["wsl.exe", "-d", ctx.distro, "-u", ctx.user,
-                "--exec", node_path, "-e", script, *args]
+                "--exec", node_path, "-e", _IDENTITY_SCRIPT + "\n" + script,
+                *args, identity]
         self.spawn_count += 1
         try:
             r = self._runner(
@@ -175,7 +225,13 @@ class ZCodeRemoteReader:
         stderr = bytes(getattr(r, "stderr", b"") or b"")[:4096].decode(
             "utf-8", "replace")
         if rc != 0:
-            return None, ("REMOTE_EXEC_RC_%d:%s" % (rc, stderr))[:200]
+            for code in ("REMOTE_USER_CHANGED", "REMOTE_RUNTIME_CHANGED",
+                         "REMOTE_DB_PATH_REJECTED", "REMOTE_WAL_SIDECAR_UNAVAILABLE"):
+                if code in stderr:
+                    return None, code
+            if "no such table" in stderr or "no such column" in stderr:
+                return None, "REMOTE_SCHEMA_CHANGED"
+            return None, f"REMOTE_EXEC_RC_{rc}"
         raw = bytes(getattr(r, "stdout", b"") or b"")
         if len(raw) > _MAX_STDOUT:
             return None, "REMOTE_OUTPUT_TOO_LARGE"
@@ -207,12 +263,13 @@ class ZCodeRemoteReader:
 
     @staticmethod
     def _query_plan(adapter: ZCodeSchemaAdapter, now_ms: int) -> list[dict]:
-        lookback = now_ms - 600_000
+        fresh_ms = now_ms - int(_LIVE_PART_FRESH_SEC * 1000)
         candidates = (
             ("catalog", adapter.catalog_sql(), []),
             ("models", adapter.running_models_sql(), []),
             ("tools", adapter.running_tools_sql(), []),
-            ("turns", adapter.recent_turns_sql(lookback), [lookback]),
+            ("turns", adapter.latest_turns_sql(), []),
+            ("parts", adapter.live_parts_sql(), [fresh_ms]),
         )
         plan = []
         for key, sql, params in candidates:
@@ -244,6 +301,11 @@ class ZCodeRemoteReader:
             for r in rows("tools")]
         turns = [
             (r.get("session_id"), r.get("status"), r.get("started_at"),
-             r.get("completed_at")) for r in rows("turns")]
+             r.get("completed_at"), r.get("turn_id"),
+             r.get("cancelled_by_user")) for r in rows("turns")]
+        parts = [
+            (r.get("session_id"), r.get("parent_id"), r.get("time_updated"),
+             r.get("part_type"), r.get("tool_name"), r.get("tool_status"),
+             r.get("text")) for r in rows("parts")]
         return {"catalog": catalog, "models": models,
-                "tools": tools, "turns": turns}
+                "tools": tools, "turns": turns, "parts": parts}

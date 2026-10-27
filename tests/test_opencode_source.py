@@ -18,6 +18,7 @@ from agents.models import (
     AgentInstance,
     AgentKind,
     AgentSurface,
+    Confidence,
     DesktopHost,
     Status,
 )
@@ -260,6 +261,79 @@ class WatcherTests(unittest.TestCase):
         watcher = opencode.OpenCodeWatcher({}, runtime)
         out = watcher.poll([_inst(101, "C:\\work\\proj")])
         self.assertIs(next(iter(out.values())).status, Status.UNKNOWN)
+
+    def test_trusted_active_endpoint_marks_session_working(self):
+        snap = opencode.OpenCodeHttpSnapshot(
+            available=True, authoritative=True, active=frozenset({"ses_a"}),
+            server_pid=5, url="http://127.0.0.1:49374",
+            observed_at=time.time())
+        runtime = self._runtime(http=lambda: snap)
+        watcher = opencode.OpenCodeWatcher({}, runtime)
+        out = watcher.poll([_inst(101, "C:\\work\\proj")])
+        self.assertIs(next(iter(out.values())).status, Status.WORKING)
+
+    def test_execution_claim_holds_working_without_http(self):
+        # store.ts：time_suspended 是 turn 执行 claim；无 HTTP 证据时
+        # turn 内静默保持 WORKING（有界孤儿 TTL），不再抖回 UNKNOWN。
+        runtime = self._runtime()
+        claimed = ("ses_c", "C:/work/proj", "Claim", "", _NOW_MS,
+                   0, 0, "", _NOW_MS - 30000)
+        obs = runtime.observation_for_session(claimed, _NOW)
+        self.assertIs(obs.status, Status.WORKING)
+        self.assertIs(obs.confidence, Confidence.MEDIUM)
+        self.assertTrue(obs.turn_active)
+        orphan = ("ses_c", "C:/work/proj", "Claim", "", _NOW_MS,
+                  0, 0, "",
+                  _NOW_MS - int(opencode._CLAIM_ORPHAN_SEC * 1000) - 5000)
+        self.assertIs(
+            runtime.observation_for_session(orphan, _NOW).status,
+            Status.UNKNOWN)
+
+    def test_fresh_message_streams_working_with_text(self):
+        runtime = self._runtime()
+        row = ("ses_m", "C:/work/proj", "Msg", "", _NOW_MS, 0,
+               0, "", 0)
+        msg = ("ses_m", _NOW_MS - 2000, "assistant", "正在重构气泡格式")
+        obs = runtime.observation_for_session(row, _NOW, message=msg)
+        self.assertIs(obs.status, Status.WORKING)
+        self.assertIs(obs.confidence, Confidence.HIGH)
+        self.assertIn("气泡", obs.summary)
+        stale = ("ses_m", _NOW_MS - int(opencode._LIVE_MESSAGE_FRESH_SEC
+                                        * 1000) - 5000,
+                 "assistant", "旧文本")
+        self.assertIs(
+            runtime.observation_for_session(row, _NOW, message=stale).status,
+            Status.UNKNOWN)
+
+    def test_idle_newer_than_claim_suppresses_activity(self):
+        # time_idle 晚于 claim/最新消息：turn 已结束，残留 claim 与旧消息
+        # 不得复活 WORKING。
+        runtime = self._runtime()
+        row = ("ses_i", "C:/work/proj", "Idle", "", _NOW_MS,
+               _NOW_MS - 1000, _NOW_MS - 500, "completed",
+               _NOW_MS - 1000)
+        msg = ("ses_i", _NOW_MS - 2000, "assistant", "旧文本")
+        obs = runtime.observation_for_session(row, _NOW, message=msg)
+        self.assertIs(obs.status, Status.DONE)
+
+    def test_catalog_lifecycle_outcomes_emit_bounded_reminders(self):
+        runtime = self._runtime()
+        updated = int((_NOW - 1) * 1000)
+        completed = ("ses_done", "C:/work/done", "Done", "", updated,
+                     updated, 0, "completed")
+        failed = ("ses_failed", "C:/work/fail", "Failed", "", updated,
+                  updated, 0, "aborted")
+        self.assertIs(
+            runtime.observation_for_session(completed, _NOW).status,
+            Status.DONE)
+        self.assertIs(
+            runtime.observation_for_session(failed, _NOW).status,
+            Status.ERROR)
+        old = ("ses_old", "C:/work/old", "Old", "", updated - 60000,
+               updated - 60000, 0, "completed")
+        self.assertIs(
+            runtime.observation_for_session(old, _NOW).status,
+            Status.UNKNOWN)
 
     def test_remote_facts_used_for_wsl_instances(self):
         snap = opencode.OpenCodeFactsSnapshot(

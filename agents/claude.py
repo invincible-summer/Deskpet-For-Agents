@@ -28,7 +28,8 @@ from .models import (
     Status,
     parse_mode,
 )
-from .summarize import fmt_command, shorten, question_summary
+from .summarize import (fmt_command, shorten, question_summary,
+                        summarize_text, summarize_tool, tool_detail)
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
@@ -48,7 +49,10 @@ _RECORD_TYPES = frozenset({
     "user", "assistant", "system", "result", "ai-title", "summary",
     "permission-mode", "permissionMode", "permission_mode",
     "input", "input_request", "request_user_input", "user_input_required",
-    "error", "fatal_error", "turn_complete", "turn_finished", "?",
+    "error", "fatal_error", "turn_complete", "turn_finished",
+    "turn_aborted", "turn_cancelled", "turn_interrupted", "task_aborted",
+    "task_cancelled", "task_interrupted", "abort", "cancelled", "canceled",
+    "interrupted", "?",
 })
 
 
@@ -77,13 +81,7 @@ def _first_present(mapping: dict, *keys):
 def _summarize_tool(block) -> tuple[str, str]:
     name = str(block.get("name", "?"))
     inp = block.get("input") or {}
-    detail = ""
-    if isinstance(inp, dict):
-        for key in ("command", "file_path", "path", "pattern", "url", "description", "prompt"):
-            if inp.get(key):
-                detail = str(inp[key])
-                break
-    return name, detail
+    return name, tool_detail(inp, SUMMARY_MAX)
 
 
 class ClaudeFile(FileState):
@@ -161,14 +159,22 @@ class ClaudeFile(FileState):
                     continue
                 btype = block.get("type")
                 if btype == "text" and _text(block.get("text")).strip():
-                    self.last_text = shorten(_text(block.get("text")), SUMMARY_MAX)
+                    self.last_text = summarize_text(_text(block.get("text")), SUMMARY_MAX)
                     self.last_assistant_ts = ts
                     self.last_activity_kind = "assistant"
                     self.phase = Phase.ANSWERING
+                elif btype in {"thinking", "redacted_thinking"}:
+                    self.last_text = summarize_text(block.get("thinking")
+                                                    or block.get("text"), SUMMARY_MAX)
+                    self.last_tool = ""
+                    self.last_assistant_ts = ts
+                    self.last_activity_kind = "reasoning"
+                    self.phase = Phase.THINKING
                 elif btype == "tool_use":
                     name, detail = _summarize_tool(block)
-                    summary = fmt_command(f"{name}: {detail}" if detail else name, SUMMARY_MAX)
+                    summary = summarize_tool(name, detail, SUMMARY_MAX)
                     self.last_tool = summary
+                    self.last_text = ""
                     self.last_tool_ts = ts
                     self.last_activity_kind = "tool"
                     phase = classify_phase(name, detail)
@@ -194,6 +200,10 @@ class ClaudeFile(FileState):
                             self.input_call_id = ""
                             self.phase = Phase.THINKING
                         self.open_tools.pop(str(block.get("tool_use_id") or ""), None)
+                        if not self.open_tools and not self.input_pending:
+                            self.last_text = self.last_tool = ""
+                            self.last_activity_kind = ""
+                            self.phase = Phase.THINKING
                     elif block.get("type") == "text":
                         plain.append(_text(block.get("text")))
                     elif "text" in block and not block.get("type"):
@@ -203,7 +213,7 @@ class ClaudeFile(FileState):
             # 普通用户文本 → Goal（最新一次真实输入；plan §12）。
             # 新 turn 开始时同时失效旧 ERROR 瞬态（plan1 R03）；
             # 纯 tool_result block 不构成"新用户 Goal"，不清瞬态。
-            text = shorten(" ".join(x for x in plain if x.strip()), GOAL_MAX)
+            text = summarize_text(" ".join(x for x in plain if x.strip()), GOAL_MAX)
             if text:
                 self.input_pending = False
                 self.input_call_id = ""
@@ -229,7 +239,8 @@ class ClaudeFile(FileState):
             self._set_input(obj)
         elif t in {"error", "fatal_error"} or (t == "system" and obj.get("subtype") == "error"):
             self._set_error(obj, ts)
-        elif t == "system" and obj.get("subtype") in {"turn_duration", "turn_complete", "turn_finished"}:
+        elif t == "system" and obj.get("subtype") in {
+                "turn_duration", "turn_complete", "turn_finished"}:
             # 使用记录里的时间，历史回放不能伪造“刚完成”。
             self.done_ts = ts
             self.turn_active = False
@@ -237,7 +248,24 @@ class ClaudeFile(FileState):
             self.input_pending = False
             self.open_tools.clear()
             self.phase = Phase.NONE
+        elif ((t == "system" and obj.get("subtype") in {
+                "turn_aborted", "turn_cancelled", "turn_interrupted",
+                "task_aborted", "task_cancelled", "task_interrupted",
+                "aborted", "cancelled", "canceled", "interrupted"})
+              or t in {"turn_aborted", "turn_cancelled", "turn_interrupted",
+                        "task_aborted", "task_cancelled", "task_interrupted",
+                        "abort", "cancelled", "canceled", "interrupted"}):
+            self._set_error({"message": "任务异常中断"}, ts)
         elif t in {"result", "turn_complete", "turn_finished"}:
+            subtype = str(obj.get("subtype") or obj.get("status")
+                          or obj.get("stop_reason") or "").casefold()
+            if (obj.get("is_error") or obj.get("isError")
+                    or subtype in {"error", "failed", "failure", "aborted",
+                                   "cancelled", "canceled", "interrupted"}):
+                self._set_error({
+                    "message": obj.get("error") or obj.get("result")
+                    or obj.get("message") or "任务异常结束"}, ts)
+                return
             self.input_pending = False
             self.input_call_id = ""
             self.open_tools.clear()
@@ -258,13 +286,11 @@ class ClaudeFile(FileState):
             return self.input_summary or "等待输入"
         if status == Status.DONE:
             return self.last_text or "回合完成"
-        if self.last_activity_kind == "assistant" and self.last_text:
+        if self.last_activity_kind in {"assistant", "reasoning"}:
             return self.last_text
-        if self.last_activity_kind == "tool" and self.last_tool:
+        if self.last_activity_kind == "tool":
             return self.last_tool
-        if self.last_assistant_ts >= self.last_tool_ts and self.last_text:
-            return self.last_text
-        return self.last_tool or self.last_text
+        return ""
 
     def observation(self, now: float, cfg: dict) -> Observation | None:
         obs = self.base_observation()

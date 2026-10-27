@@ -18,7 +18,9 @@ from agents.desktop import SessionClaimKey, claims_cover
 from agents.models import (
     AgentInstance,
     AgentKind,
+    Confidence,
     DesktopHost,
+    Phase,
     Status,
 )
 
@@ -176,18 +178,31 @@ class EventTrackerTests(unittest.TestCase):
         self.assertIsNone(t.observation(now + 100))
 
     def test_crash_orphan_turn_never_permanent_working(self):
-        # 打开的 turn 无后续事件超过静默上限 → UNKNOWN（plan §六）
+        # 打开的 turn 是 durable 事实：短静默保持 WORKING（置信降级），
+        # 超过孤儿上限才按 crash orphan 回 UNKNOWN（绝不永久 Working）。
         now = 1700000100.0
         t = self._tracker([("turn/start", {"turn": 7})], now)
-        self.assertIsNone(t.observation(now + dsh.OPEN_TURN_QUIET_SEC + 5))
+        quiet = t.observation(now + dsh.OPEN_TURN_QUIET_SEC + 5)
+        self.assertIs(quiet.status, Status.WORKING)
+        self.assertIs(quiet.confidence, Confidence.MEDIUM)
+        self.assertIs(quiet.phase, Phase.THINKING)
+        self.assertIsNone(t.observation(now + dsh.OPEN_TURN_ORPHAN_SEC + 5))
 
-    def test_interrupted_closer_is_not_working_or_done(self):
+    def test_interrupted_closer_is_error_reminder(self):
         now = 1700000100.0
         t = self._tracker([
             ("turn/start", {"turn": 2}),
             ("turn/end", {"turn": 2, "reason": {"kind": "interrupted"}}),
         ], now)
-        self.assertIsNone(t.observation(now + 1))
+        self.assertIs(t.observation(now + 1).status, Status.ERROR)
+
+    def test_scalar_turn_end_reason_is_not_treated_as_success(self):
+        now = 1700000100.0
+        t = self._tracker([
+            ("turn/start", {"turn": 2}),
+            ("turn/end", {"turn": 2, "reason": "aborted"}),
+        ], now)
+        self.assertIs(t.observation(now + 1).status, Status.ERROR)
 
     def test_approval_pairing_within_replay_budget(self):
         now = 1700000100.0
@@ -477,6 +492,24 @@ class DshDesktopSourceTests(unittest.TestCase):
         obs = snap.observations[inst.key]
         self.assertIs(obs.status, Status.WAITING)
 
+    def test_admitted_waiting_log_survives_discovery_window(self):
+        cwd = "/repo"
+        path = self._write_log(cwd, "ses_old", [
+            _event_line("turn/start", 1, {"turn": 1}),
+            _event_line("approval/asked", 2,
+                        {"id": "old", "toolName": "write"}),
+        ])
+        src = dsh.DshDesktopSource(cfg={}, sessions_root=self.root)
+        first = src.poll((self._host(),), frozenset(), 100.0)
+        self.assertEqual(len(first.instances), 1)
+        # The log stops growing and falls outside the 180s discovery window;
+        # the already-admitted pending session must remain owned and visible.
+        os.utime(path, (0, 0))
+        src._last_scan = 0.0
+        second = src.poll((self._host(),), frozenset(), 400.0)
+        self.assertEqual(len(second.instances), 1)
+        self.assertEqual(second.instances[0].logical_session_id, "ses_old")
+
     def test_claim_covered_session_not_duplicated(self):
         cwd = "/repo"
         self._write_log(cwd, "ses_cl", [
@@ -733,6 +766,235 @@ class ClaimsSkipTailerTests(unittest.TestCase):
         self.assertEqual(len(snap.instances), 1)
         self.assertEqual(snap.instances[0].logical_session_id,
                          "ses_free")
+
+
+class EventBudgetBackpressureTests(unittest.TestCase):
+    """v4.4.2：单轮事件预算耗尽时未消化数据留缓冲，绝不静默丢弃。
+
+    上游一个 zstd 帧=一个追加批次（单帧可含数百事件）；旧实现把超预算
+    的行直接丢掉——丢 turn/end 漏 DONE、丢 approval/decided 幻影 WAITING。
+    """
+
+    BUDGET = dsh.MAX_EVENTS_PER_POLL
+
+    def _filler(self, seq_start, count):
+        out = b""
+        for i in range(seq_start, seq_start + count):
+            out += _event_line("step/start", i, {"turn": 1, "step": i})
+        return out
+
+    def test_plain_over_budget_no_loss(self):
+        c = dsh.DshLogConsumer(compression="none")
+        payload = (_header_line()
+                   + _event_line("turn/start", 1, {"turn": 1})
+                   + _event_line("approval/asked", 2,
+                                 {"id": "apr_1", "toolName": "bash"})
+                   + self._filler(3, self.BUDGET + 8)
+                   + _event_line("approval/decided", 4,
+                                 {"id": "apr_1", "outcome": "allowed-once"})
+                   + _event_line("turn/end", 5,
+                                 {"turn": 1, "reason": {"kind": "completed"}}))
+        c.consume(payload[:len(payload) // 2], 1.0)
+        self.assertGreater(c.tracker.records_seen, 0)
+        # 半行残端 + 预算余量都留在缓冲；补上后半（读端分块送达）
+        c.consume(payload[len(payload) // 2:], 1.1)
+        rounds = 0
+        while c._buffer and rounds < 50:
+            c.consume(b"", 1.0 + rounds)
+            rounds += 1
+        self.assertLess(rounds, 50, "backlog must be drainable")
+        # 全部事件消化完毕：asked 已被 decided 配对解除、turn 已完成
+        self.assertEqual(c.tracker.pending_approvals, {})
+        self.assertEqual(c.tracker.open_turn, 0)
+        self.assertTrue(c.tracker.turn_known_over)
+        self.assertGreater(c.tracker.records_seen, self.BUDGET)
+        self.assertEqual(c.refused, "")
+
+    @unittest.skipUnless(_HAVE_ZSTD, "zstandard unavailable")
+    def test_zstd_over_budget_keeps_whole_frames(self):
+        c = dsh.DshLogConsumer(compression="zstd")
+        frame_a = _compress(_header_line()
+                            + _event_line("turn/start", 1, {"turn": 1})
+                            + self._filler(2, self.BUDGET + 4))
+        frame_b = _compress(_event_line(
+            "turn/end", 9, {"turn": 1, "reason": {"kind": "completed"}}))
+        c.consume(frame_a + frame_b, 1.0)
+        # 帧内剩余解码文本与未解码整帧都留在缓冲，本轮一个不丢
+        self.assertTrue(c._pending_plain)
+        self.assertTrue(c._buffer)
+        rounds = 0
+        while (c._pending_plain or c._buffer) and rounds < 50:
+            c.consume(b"", 1.0 + rounds)
+            rounds += 1
+        self.assertLess(rounds, 50, "backlog must be drainable")
+        self.assertEqual(c.tracker.open_turn, 0)
+        self.assertTrue(c.tracker.turn_known_over)
+        self.assertEqual(c.refused, "")
+
+
+class UpstreamVocabularyTests(unittest.TestCase):
+    """2026-10 上游 master 新增 job/* 词表：不得把含新事件的会话判 UNKNOWN。"""
+
+    def test_job_events_known_and_not_refused(self):
+        self.assertIn("job/registered", dsh.KNOWN_EVENT_TYPES)
+        self.assertIn("job/settled", dsh.KNOWN_EVENT_TYPES)
+        c = dsh.DshLogConsumer(compression="none")
+        c.consume(_header_line()
+                  + _event_line("job/registered", 1, {"id": "j1"})
+                  + _event_line("turn/start", 2, {"turn": 1}), 1.0)
+        self.assertEqual(c.refused, "")
+        self.assertEqual(c.tracker.open_turn, 1)
+
+
+class MergedTrackerIsolationTests(unittest.TestCase):
+    """子会话审批折叠不得污染 root tracker（旧 bug：幻影 WAITING 要等
+    600s 回放预算才被剪除）。"""
+
+    def test_child_approval_merge_does_not_write_into_root(self):
+        root = dsh.DshLogConsumer(compression="none")
+        root.tracker.turn_known_over = True
+        root.tracker.done_ts = 100.0
+        child = dsh.DshLogConsumer(compression="none")
+        child.header = dsh.DshHeaderInfo(
+            version=4, session_id="ses_child", parent_session="ses_root",
+            valid=True)
+        child.tracker.pending_approvals["a_child"] = ("bash", 100.0)
+        sess = dsh._DshDesktopSession(path="/x", session_id="ses_root",
+                                      root_session_id="ses_root")
+        merged = dsh._merged_tracker(root, {"c": child}, sess)
+        self.assertIn("a_child", merged.pending_approvals)    # 折叠可见
+        self.assertEqual(root.tracker.pending_approvals, {})  # root 不被污染
+        # 子会话 decided 后合并视图立即解除（无需等回放预算剪除）
+        child.tracker.pending_approvals.pop("a_child", None)
+        merged2 = dsh._merged_tracker(root, {"c": child}, sess)
+        self.assertEqual(merged2.pending_approvals, {})
+
+
+class ChildSessionExclusionTests(unittest.TestCase):
+    """CLI 候选排除子会话：繁忙 subagent 的日志不得抢占 root 绑定。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self._tmp.name, "sessions")
+        os.makedirs(self.root, exist_ok=True)
+        self._old = paths.dsh_sessions_root
+        paths.dsh_sessions_root = lambda: self.root
+
+    def tearDown(self):
+        paths.dsh_sessions_root = self._old
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _inst(pid, cwd):
+        return AgentInstance(kind=AgentKind.DSH, pid=pid, source="windows",
+                             cwd=cwd, key=f"w|dsh|{pid}|t{pid}")
+
+    def _write_log(self, cwd, session_id, events, parent="", mtime=None):
+        project = dsh.dsh_project_dir(self.root, cwd)
+        sdir = os.path.join(project, dsh.dsh_encode_segment(session_id))
+        os.makedirs(sdir, exist_ok=True)
+        path = os.path.join(sdir, "session.v4.jsonl")
+        extra = ({"parentSession": parent, "origin": "subagent"}
+                 if parent else {})
+        with open(path, "wb") as f:
+            f.write(_header_line(session_id=session_id, cwd=cwd, **extra))
+            for line in events:
+                f.write(line)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def test_busy_child_log_never_steals_binding(self):
+        cwd = "/repo"
+        root = self._write_log(cwd, "ses_root", [
+            _event_line("turn/start", 1, {"turn": 1}),
+        ], mtime=time.time() - 10)
+        child = self._write_log(cwd, "ses_child", [
+            _event_line("turn/start", 1, {"turn": 1}),
+            _event_line("approval/asked", 2,
+                        {"id": "a_c", "toolName": "bash"}),
+        ], parent="ses_root", mtime=time.time())
+        self.assertTrue(dsh.dsh_child_session(child))
+        self.assertFalse(dsh.dsh_child_session(root))
+        watcher = dsh.DshWatcher({})
+        out = watcher.poll([self._inst(301, cwd)])
+        (key, obs), = out.items()
+        self.assertEqual(obs.session_id, "ses_root")
+        self.assertEqual(watcher._instance_files[key], root)
+
+    def test_unreadable_or_invalid_child_header_is_not_admitted_as_root(self):
+        cwd = "/repo3"
+        project = dsh.dsh_project_dir(self.root, cwd)
+        sdir = os.path.join(project, dsh.dsh_encode_segment("unknown"))
+        os.makedirs(sdir, exist_ok=True)
+        path = os.path.join(sdir, "session.v4.jsonl")
+        with open(path, "wb") as f:
+            f.write(b"not a valid DSH header\n")
+        watcher = dsh.DshWatcher({})
+        self.assertIsNone(dsh._dsh_child_session_state(path))
+        out = watcher.poll([self._inst(303, cwd)])
+        self.assertFalse(next(iter(out.values())).session_bound)
+
+    def test_terminal_claims_fall_back_to_path(self):
+        cwd = "/repo2"
+        root = self._write_log(cwd, "ses_p", [
+            _event_line("turn/start", 1, {"turn": 1})])
+        watcher = dsh.DshWatcher({})
+        # session_id 尚未解析（未 poll）的绑定也要能按路径发 claim
+        watcher.files[root] = watcher.make_state(root)
+        key = self._inst(302, cwd).key
+        watcher._instance_files[key] = root
+        claims = watcher.terminal_claims()
+        self.assertTrue(claims_cover(claims, "dsh", canonical_path=root))
+
+
+class ClaimedConsumerFreezeTests(unittest.TestCase):
+    """v4.4.2：claim 建立前已打开的 consumer 冻结增量读，claim 消失恢复。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self._tmp.name, "sessions")
+        os.makedirs(self.root, exist_ok=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _host():
+        return DesktopHost(kind=AgentKind.DSH, source="windows", pid=500,
+                           process_token="1.000", started_at=1.0)
+
+    def test_open_consumer_frozen_while_claimed(self):
+        cwd = "/repo"
+        project = dsh.dsh_project_dir(self.root, cwd)
+        sdir = os.path.join(project, dsh.dsh_encode_segment("ses_fz"))
+        os.makedirs(sdir, exist_ok=True)
+        path = os.path.join(sdir, "session.v4.jsonl")
+        with open(path, "wb") as f:
+            f.write(_header_line(session_id="ses_fz", cwd=cwd))
+            f.write(_event_line("turn/start", 1, {"turn": 1}))
+        src = dsh.DshDesktopSource(cfg={}, sessions_root=self.root)
+        host = self._host()
+        now = time.time()
+        snap = src.poll((host,), frozenset(), now)
+        self.assertEqual(len(snap.instances), 1)    # 先打开 consumer 并 tail
+        consumer = src._logs[path]
+        frozen_pos = consumer.file_pos
+        # 追加完成事件；带 claim 再 poll → 不发 target 也不增量读
+        with open(path, "ab") as f:
+            f.write(_event_line("turn/end", 9,
+                                {"turn": 1, "reason": {"kind": "completed"}}))
+        claims = frozenset({SessionClaimKey(kind="dsh",
+                                            session_id="ses_fz")})
+        snap = src.poll((host,), claims, now + 1)
+        self.assertEqual(snap.instances, ())
+        self.assertEqual(consumer.file_pos, frozen_pos)
+        self.assertEqual(consumer.tracker.open_turn, 1)  # 未读新字节
+        # claim 消失 → 恢复增量读，看到完成事件
+        snap = src.poll((host,), frozenset(), now + 2)
+        self.assertEqual(len(snap.instances), 1)
+        self.assertGreater(consumer.file_pos, frozen_pos)
+        self.assertEqual(consumer.tracker.open_turn, 0)
 
 
 if __name__ == "__main__":

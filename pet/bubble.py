@@ -74,6 +74,21 @@ def fit_text(text, width, measure):
     return text[:lo]+'…' if measure('…')<=width else ''
 
 
+def fit_heading(text, width, measure):
+    """Keep the current state visible while shortening a long workspace."""
+    parts = text.split(' · ')
+    if len(parts) != 3:
+        return fit_text(text, width, measure)
+    name, workspace, state = parts
+    prefix, suffix = name + ' · ', ' · ' + state
+    available = width - measure(prefix + suffix)
+    if available >= measure('…'):
+        return prefix + fit_text(workspace, available, measure) + suffix
+    if measure(suffix) > width:
+        return fit_text(state, width, measure)
+    return fit_text(name, max(0, width - measure(suffix)), measure) + suffix
+
+
 def wrap_text(text, width, measure, count=2):
     text=' '.join(str(text or '')[:512].split())
     lines=[]
@@ -142,11 +157,15 @@ class SingleAgentBubbleRenderer(BubbleRendererBase):
     def layout(self):
         m = self._metrics(); self.w, self.h = m['w'], m['h']
         font = self.font()
+        linespace = max(1, font.metrics('linespace'))
+        self._footer_height = max(m['button'], linespace)
+        # One header, exactly two activity lines, and one goal/footer line.
+        self.h = max(self.h, 2*m['pad'] + self._footer_height
+                     + 3*linespace + 2*m['gap'])
         key = (self.model.text, self._font_key, tuple(m.items()))
         if key != self._layout_key:
-            available = self.h - 2*m['pad'] - m['button'] - font.metrics('linespace') - 2*m['gap']
-            count = max(1, min(2, available // max(1, font.metrics('linespace'))))
-            self.disp_lines = wrap_text(self.model.text, self.w-2*m['pad'], font.measure, count)
+            self.disp_lines = wrap_text(self.model.text, self.w-2*m['pad'],
+                                        font.measure, 2)
             self._layout_key = key
         return self.w, self.h
 
@@ -171,13 +190,15 @@ class SingleAgentBubbleRenderer(BubbleRendererBase):
                                  fill=bg, outline=border))
         add(c.create_polygon(round_rect_points(ox, oy, x1, y1, m['radius']), smooth=True,
                              fill=bg, outline=border, width=1))
-        title = fit_text(self.model.status or 'DeskPet', self.w-2*pad, font.measure)
-        add(c.create_text(ox+pad, oy+pad, text=title, anchor='nw', font=font, fill=self.model.accent))
-        ty = oy+pad+font.metrics('linespace')+m['gap']
+        ty = oy + pad
+        title = fit_heading(self.model.status or 'DeskPet', self.w-2*pad, font.measure)
+        add(c.create_text(ox+pad, ty, text=title, anchor='nw', font=font, fill=self.model.accent))
+        ty += font.metrics('linespace')+m['gap']
         for line in self.disp_lines:
             add(c.create_text(ox+pad, ty, text=line, anchor='nw', font=font, fill=font_color))
             ty += font.metrics('linespace')
-        by = y1-pad-m['button']
+        footer_height = max(m['button'], font.metrics('linespace'))
+        by = y1-pad-footer_height
         # 整个可见气泡矩形都是双击激活区（v4.1.3 §12），携带绘制时
         # 固化的 exact key——visual identity == click identity。
         # 实际 action 只由 PetWindow 的 <Double-Button-1> handler 执行。
@@ -187,7 +208,7 @@ class SingleAgentBubbleRenderer(BubbleRendererBase):
             self._hit_boxes.append((
                 (ox, oy, x1, y1),
                 HitTarget(action="activate_agent", agent_key=key_for_hit)))
-        add(c.create_text(ox+pad, by+m['button']/2, anchor='w', font=font,
+        add(c.create_text(ox+pad, by+footer_height/2, anchor='w', font=font,
                           text=fit_text(self.model.footer, self.w-2*pad, font.measure), fill='#6a7c75'))
 
     def hit_button(self, x, y):

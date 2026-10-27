@@ -31,6 +31,8 @@ if user32:
     user32.IsIconic.restype = wt.BOOL
     user32.ShowWindowAsync.argtypes = [wt.HWND, ctypes.c_int]
     user32.ShowWindowAsync.restype = wt.BOOL
+    user32.IsWindowEnabled.argtypes = [wt.HWND]
+    user32.IsWindowEnabled.restype = wt.BOOL
     user32.SetForegroundWindow.argtypes = [wt.HWND]
     user32.SetForegroundWindow.restype = wt.BOOL
     user32.GetForegroundWindow.restype = wt.HWND
@@ -46,6 +48,8 @@ if user32:
     user32.GetWindowLongW.restype = ctypes.c_long
     user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
     user32.GetWindow.restype = wt.HWND
+    user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+    user32.GetWindowRect.restype = wt.BOOL
 
 
 def enum_windows(*, include_hidden=False):
@@ -64,7 +68,11 @@ def enum_windows(*, include_hidden=False):
             cls = ctypes.create_unicode_buffer(128)
             user32.GetWindowTextW(hwnd, title, n + 1)
             user32.GetClassNameW(hwnd, cls, 128)
-            if title.value:
+            # Tray-hidden Electron windows commonly have no caption.  Visible
+            # enumeration keeps the historical title filter (it avoids
+            # transient unnamed top-level windows); the hidden pass must retain
+            # titleless windows so the real BrowserWindow can be restored.
+            if title.value or include_hidden:
                 out.append((int(hwnd), pid.value, title.value, cls.value))
         return True
 
@@ -74,12 +82,45 @@ def enum_windows(*, include_hidden=False):
 
 def is_app_window(hwnd: int) -> bool:
     """Exclude owned/tool/child windows, including hidden Electron helpers."""
-    if not user32 or not user32.IsWindow(hwnd):
+    if (not user32 or not user32.IsWindow(hwnd)
+            or not user32.IsWindowEnabled(hwnd)):
         return False
     style = user32.GetWindowLongW(hwnd, -16)
     exstyle = user32.GetWindowLongW(hwnd, -20)
     return not (style & 0x40000000 or exstyle & 0x80
                 or user32.GetWindow(hwnd, 4))  # WS_CHILD / TOOLWINDOW / OWNER
+
+
+def window_ready(hwnd: int) -> bool:
+    """Native visibility only; this does not prove Electron content is shown.
+
+    A tray-hidden BrowserWindow must first be shown by the application itself.
+    External ShowWindow cannot restore its hidden Aura content tree.
+    """
+    # Non-Windows unit tests replace restore/foreground primitives with mocks;
+    # readiness cannot be observed there, so preserve the mocked transaction.
+    if not user32:
+        return True
+    if not user32.IsWindow(int(hwnd)):
+        return False
+    return bool(user32.IsWindowVisible(int(hwnd))
+                and not user32.IsIconic(int(hwnd)))
+
+
+def window_visible(hwnd: int) -> bool:
+    return bool(user32 and user32.IsWindow(int(hwnd))
+                and user32.IsWindowVisible(int(hwnd)))
+
+
+def window_area(hwnd: int) -> int:
+    """Bounded top-level area used to reject tiny helper windows."""
+    if not user32 or not user32.IsWindow(int(hwnd)):
+        return 0
+    rect = wt.RECT()
+    if not user32.GetWindowRect(int(hwnd), ctypes.byref(rect)):
+        return 0
+    return max(0, int(rect.right - rect.left)) * max(
+        0, int(rect.bottom - rect.top))
 
 
 def _ancestor_pids(pid, depth=12):
@@ -165,14 +206,16 @@ def validate_window(identity: WindowIdentity) -> bool:
     return True
 
 
-def restore_window(hwnd: int) -> bool:
+def restore_window(hwnd: int, *, allow_hidden: bool = True) -> bool:
     """异步恢复最小化窗口，避免失去响应的终端堵塞 Tk 主线程。"""
     if not user32 or not user32.IsWindow(int(hwnd)):
+        return False
+    if not allow_hidden and not user32.IsWindowVisible(int(hwnd)):
         return False
     if user32.IsIconic(int(hwnd)):
         return bool(user32.ShowWindowAsync(int(hwnd), 9))   # SW_RESTORE
     if not user32.IsWindowVisible(int(hwnd)):
-        return bool(user32.ShowWindowAsync(int(hwnd), 5))   # SW_SHOW (tray hidden)
+        return bool(user32.ShowWindowAsync(int(hwnd), 4))   # SW_SHOWNOACTIVATE
     return True
 
 
@@ -184,8 +227,9 @@ def try_set_foreground(hwnd: int) -> bool:
     """
     if not user32 or not user32.IsWindow(int(hwnd)):
         return False
-    user32.SetForegroundWindow(int(hwnd))
-    return int(user32.GetForegroundWindow()) == int(hwnd)
+    hwnd = int(hwnd)
+    user32.SetForegroundWindow(hwnd)
+    return int(user32.GetForegroundWindow()) == hwnd
 
 
 class FLASHWINFO(ctypes.Structure):

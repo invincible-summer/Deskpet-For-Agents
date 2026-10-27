@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import time
@@ -23,7 +24,8 @@ from agents.models import (
 )
 from agents.monitor import Monitor
 from agents.terminal_service import WindowsTerminalService
-from agents.zcode_desktop import ZCodeDesktopSource
+from agents.zcode_desktop import ZCodeDesktopSource, ZCodeSchemaAdapter
+from agents.sqlite_ro import SchemaCapabilities
 
 
 def _host(pid=950, token="222.000") -> DesktopHost:
@@ -53,6 +55,9 @@ class ZcodeDbFixture:
         con.execute("""CREATE TABLE turn_usage (
             session_id TEXT, turn_id TEXT, status TEXT, started_at INTEGER,
             completed_at INTEGER)""")
+        con.execute("""CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+            time_created INTEGER, time_updated INTEGER, data TEXT)""")
         con.commit()
         con.close()
 
@@ -90,6 +95,24 @@ class ZcodeDbFixture:
             "VALUES (?,?,?,?,?,?,?,?,?)",
             (f"t-{sid}-{now_ms}-{tool}", sid, "turn-1", "call-1", tool,
              status, approval, now_ms, None))
+        con.commit()
+        con.close()
+
+    def add_part(self, sid: str, ptype="reasoning", text="", tool="",
+                 updated_ms=None):
+        con = sqlite3.connect(self.db_path)
+        now_ms = updated_ms if updated_ms is not None else int(
+            time.time() * 1000)
+        data = {"type": ptype}
+        if text:
+            data["text"] = text
+        if tool:
+            data["tool"] = tool
+        con.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, "
+            "time_updated, data) VALUES (?,?,?,?,?,?)",
+            (f"p-{sid}-{now_ms}", f"msg-{sid}", sid, now_ms - 1000,
+             now_ms, json.dumps(data, ensure_ascii=True)))
         con.commit()
         con.close()
 
@@ -133,6 +156,58 @@ class ZCodeDesktopSourceTests(unittest.TestCase):
     def _poll(self, source, hosts=(None,), claims=frozenset()):
         hosts = tuple(_host() if h is None else h for h in hosts)
         return source.poll(hosts, frozenset(claims), time.time())
+
+    def test_optional_usage_columns_are_capability_safe(self):
+        caps = SchemaCapabilities(
+            user_version=1,
+            tables=frozenset({"session", "model_usage", "tool_usage"}),
+            columns={
+                "session": ("id", "time_created", "time_updated"),
+                "model_usage": ("session_id", "status", "started_at"),
+                "tool_usage": ("session_id", "status", "started_at",
+                                "approval_status"),
+            })
+        adapter = ZCodeSchemaAdapter(caps)
+        models = adapter.running_models_sql()
+        tools = adapter.running_tools_sql()
+        self.assertIn("NULL", models)
+        self.assertIn("NULL", tools)
+        # 固定行形态：缺列用 NULL 占位，绝不引用真实列名
+        self.assertIn("NULL AS parent_id", models)
+        self.assertIn("NULL AS turn_id", models)
+        self.assertNotIn("m.parent_id", models)
+        self.assertNotIn("s.parent_id", models)
+        self.assertIn("NULL AS tool_name", tools)
+        self.assertNotIn("t.tool_name", tools)
+
+    # ---- 稳定监听：幻影 running 压制 + 流式活跃证据（实机取证 2026-10-27） ----
+
+    def test_leftover_running_tool_suppressed_by_later_terminal_turn(self):
+        # html-to-video 实机案例：工具行 turn 无终止记录（turn_usage 缺行），
+        # 同会话更晚的终止 turn 是决定性证据 → 不产生 WORKING，不 admit。
+        now_ms = int(time.time() * 1000)
+        self.fx.add_session("s-phantom", title="移除声明",
+                            updated_ms=now_ms - 3600_000)
+        self.fx.add_tool("s-phantom", tool="Edit",
+                         started_ms=now_ms - 3700_000)
+        self.fx.add_turn("s-phantom", status="completed",
+                         started_ms=now_ms - 1800_000,
+                         completed_ms=now_ms - 1700_000)
+        snap = self._poll(self._source())
+        self.assertEqual(snap.instances, ())
+
+    def test_live_part_holds_working_between_usage_rows(self):
+        # 实机取证：turn/model usage 是回合后统计表；流式期间只有
+        # part.time_updated 实时前进 → WORKING/THINKING + 思考正文。
+        now_ms = int(time.time() * 1000)
+        self.fx.add_session("s-live", updated_ms=now_ms)
+        self.fx.add_part("s-live", "reasoning", "正在统一气泡格式",
+                         updated_ms=now_ms - 2000)
+        snap = self._poll(self._source())
+        obs = snap.observations[snap.instances[0].key]
+        self.assertIs(obs.status, Status.WORKING)
+        self.assertIs(obs.phase, Phase.THINKING)
+        self.assertIn("气泡", obs.summary or "")
 
     # ---- 基础：3 root tasks → 3 独立 target（AC-ZCODE-01 合成对照） ----
 
@@ -256,12 +331,16 @@ class ZCodeDesktopSourceTests(unittest.TestCase):
         self.assertEqual(
             snap.observations[snap.instances[0].key].status, Status.ERROR)
 
-    def test_cancelled_turn_is_not_done(self):
+    def test_cancelled_turn_is_error_reminder_not_done(self):
         self.fx.add_session("s-x", title="X")
+        # Stopping a turn may leave old running rows behind after interruption.
+        self.fx.add_model("s-x", started_ms=int(time.time() * 1000) - 6000)
+        self.fx.add_tool("s-x", approval="requested",
+                         started_ms=int(time.time() * 1000) - 6000)
         self.fx.add_turn("s-x", status="cancelled")
         snap = self._poll(self._source())
         obs = snap.observations[snap.instances[0].key]
-        self.assertEqual(obs.status, Status.IDLE)   # 不伪造成功庆祝
+        self.assertEqual(obs.status, Status.ERROR)  # 明确异常中断提醒
 
     # ---- admission ----
 
@@ -286,7 +365,8 @@ class ZCodeDesktopSourceTests(unittest.TestCase):
         self.fx.add_session("s-claim", title="已被 claim")
         self.fx.add_model("s-claim", status="running")
         source = self._source()
-        claim = {SessionClaimKey(kind="zcode", session_id="s-claim")}
+        claim = {SessionClaimKey(kind="zcode", session_id="s-claim",
+                                 canonical_data_root="windows")}
         snap = self._poll(source, claims=claim)
         self.assertEqual(snap.instances, ())
         snap = self._poll(source)
@@ -309,10 +389,14 @@ class ZCodeDesktopSourceTests(unittest.TestCase):
             snap = source.poll((_host(),), frozenset(),
                                time.time() + 8.0)
             self.assertFalse(snap.authoritative)
+            attempts = source.db_busy_count
+            stale = source.poll((_host(),), frozenset(), time.time() + 8.2)
+            self.assertFalse(stale.authoritative)
+            self.assertEqual(source.db_busy_count, attempts)
         finally:
             holder.rollback()
             holder.close()
-        snap = self._poll(source)
+        snap = source.poll((_host(),), frozenset(), time.time() + 9.0)
         self.assertTrue(snap.authoritative)
         self.assertEqual(len(snap.instances), 1)
 
@@ -357,6 +441,28 @@ class ZCodeDesktopSourceTests(unittest.TestCase):
         self.assertEqual(source.stats()["zcode_desktop_sessions"], 0)
         snap = self._poll(source, hosts=())
         self.assertEqual(snap.instances, ())
+
+    def test_deleted_or_archived_sessions_retire_their_exact_targets(self):
+        from unittest.mock import patch
+        for operation in ("DELETE FROM session WHERE id = 's-stop'",
+                          "UPDATE session SET time_archived = 1 WHERE id = 's-stop'"):
+            with self.subTest(operation=operation):
+                self.fx.add_session("s-stop")
+                self.fx.add_model("s-stop")
+                source = self._source()
+                first = self._poll(source)
+                self.fx.exec(operation)
+                with patch.object(source, "_remote_provider", return_value={
+                        "failed": type("Stale", (), {
+                            "context": type("C", (), {"source": "wsl:Ubuntu"})(),
+                            "authoritative": False, "facts": None})()}):
+                    stopped = self._poll(source)
+                self.assertFalse(stopped.authoritative)
+                self.assertEqual(stopped.instances, ())
+                self.assertEqual(stopped.retired_keys,
+                                 frozenset({first.instances[0].key}))
+                self.fx.exec("DELETE FROM model_usage")
+                self.fx.exec("DELETE FROM session")
 
     def test_fingerprint_gating(self):
         self.fx.add_session("s-f")

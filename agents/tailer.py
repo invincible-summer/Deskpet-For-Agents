@@ -1,6 +1,6 @@
 """增量 JSONL tailer：只读追加，轮询 stat，读增量，容忍最后一行残缺。
 
-V3 优化（plan.md §33）：metadata（size/mtime_ns）没有变化时直接返回，
+V3 优化：metadata（size/mtime_ns）没有变化时直接返回，
 只在变化或每 5 秒 safety verification 时读取文件 prefix 检测替换，
 降低 \\\\wsl.localhost 上的额外 I/O。
 """
@@ -41,7 +41,7 @@ class FileTailer:
         self._last_sig = sig
         identity = (getattr(st, "st_dev", 0), getattr(st, "st_ino", 0))
         replaced = self._identity is not None and identity != self._identity
-        # plan.md §33：metadata 有变化或每 5 秒 safety verification 时才读
+        # metadata 有变化或每 5 秒 safety verification 时才读
         # prefix 检测替换；metadata 未变的常规 poll 直接跳过这次额外 I/O。
         if self._identity is not None and not replaced and check_prefix:
             try:

@@ -14,7 +14,6 @@ import time
 
 from actions import winkeys
 from agents.models import Status
-from agents.summarize import shorten
 
 from . import skins
 from .animator import AnimationCursor, SharedAnimationCache, AnimationScheduler
@@ -461,29 +460,14 @@ class PetView:
         m.visible = True
         snap = target.snapshot
         head = snap.kind.label
-        from .labels import mode_text, phase_text
-        if snap.status == Status.WORKING:
-            label = " · ".join(x for x in (head, mode_text(snap),
-                                           phase_text(snap) or "处理中") if x)
-        else:
-            label = " · ".join(x for x in (head, status_text(snap)) if x)
-        m.status = label
-        if snap.status in (Status.WAITING, Status.INPUT):
-            m.text = snap.waiting_detail or snap.summary or "等待处理"
-            m.footer = "请在终端处理"
-            m.accent = "#a06b38"
-        else:
-            m.text = shorten(snap.summary or "等待新的任务", 160)
-            if snap.goal:
-                m.footer = "目标 · " + shorten(snap.goal, 60)
-            else:
-                inst = target.instance
-                if inst.distro:
-                    m.footer = f"DeskPet · WSL {inst.distro}"
-                else:
-                    m.footer = "Windows"
-            m.accent = "#487f73" if snap.status == Status.DONE else (
-                "#a06060" if snap.status == Status.ERROR else "#487f73")
+        from .labels import phase_text, workspace_name
+        from agents.summarize import summarize_text
+        state = (phase_text(snap) or "处理中"
+                 if snap.status is Status.WORKING else status_text(snap))
+        m.status = f"{head} · {workspace_name(target)} · {state}"
+        m.footer = "目标 · " + (summarize_text(snap.goal, 100) or "暂无明确任务")
+        m.accent = ("#a06b38" if snap.status in (Status.WAITING, Status.INPUT)
+                    else "#a06060" if snap.status is Status.ERROR else "#487f73")
         from .labels import activity_text
         m.text = activity_text(snap, bool(self.view_config.get("bubble.show_details", True)))
         if snap.stale:

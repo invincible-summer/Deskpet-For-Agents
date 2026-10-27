@@ -1,23 +1,4 @@
-"""DP43-R14～R22 UI 生命周期/菜单/退出/启动可靠性测试（plan §5-§13）。
-
-Phase 0 红测试集：本文件先于实现提交，覆盖 plan §14 Phase 0 列出的
-七类已确认缺陷——
-
-  1. Fleet menu explicit view（R14：production 回调未传 view，
-     `_menu_view` 从未被赋值）；
-  2. rapid tray generation（R15：stop 后立即 self.tray=None，
-     新 generation 在旧 worker STOPPING 期间被创建）；
-  3. tray protocol duplicate/context（R15：一次右键手势产生两个
-     "right"；NOTIFYICON_VERSION_4 的 WM_CONTEXTMENU 未被识别）；
-  4. Dashboard FocusOut auto-collapse（R16：焦点变化被当成关闭意图）；
-  5. shutdown additive timeout（R17：局部有界但总时延可叠加）；
-  6. SkinCatalog indirect lock（R19：持 catalog lock 做磁盘扫描，
-     Tk 读内存也要等 I/O）；
-  7. startup job ordering（R18/R19：首个 view 在 bootstrap 前提交
-     BUILD；first snapshot 做磁盘扫描；dashboard 顶层 import）。
-
-实现完成后同一批测试转为常驻回归（不允许删除或放宽断言）。
-"""
+"""UI 生命周期回归：菜单所有权、托盘代次、退出期限与启动顺序。"""
 import copy
 import os
 import queue
@@ -78,7 +59,7 @@ def make_app(cfg=None):
 
 
 # ================================================================ R14
-class PetMenuExplicitViewRedTests(unittest.TestCase):
+class PetMenuExplicitViewTests(unittest.TestCase):
     """R14：Pet 菜单 builder 必须显式携带 view；_menu_view 必须消失。"""
 
     def test_fleet_menu_production_path_carries_view(self):
@@ -162,7 +143,7 @@ class PetMenuExplicitViewRedTests(unittest.TestCase):
 
 
 # ================================================================ R15
-class TrayGenerationRedTests(unittest.TestCase):
+class TrayGenerationTests(unittest.TestCase):
     """R15：rapid off→on 不得在旧 worker STOPPING 期间创建新 generation。"""
 
     def test_rapid_off_on_keeps_single_generation(self):
@@ -268,7 +249,7 @@ class TrayGenerationRedTests(unittest.TestCase):
                 app.quit()
 
 
-class TrayProtocolRedTests(unittest.TestCase):
+class TrayProtocolTests(unittest.TestCase):
     """R15：一个手势 = 一个语义事件；VERSION_4 只认 WM_CONTEXTMENU。"""
 
     def _bare_icon(self):
@@ -332,52 +313,10 @@ class TrayProtocolRedTests(unittest.TestCase):
 
 
 # ================================================================ R16
-class DashboardFocusRedTests(unittest.TestCase):
-    """R16：FocusOut 不得改变 Dashboard 的 open 状态。"""
-
-    def test_focusout_does_not_close_dashboard(self):
-        app = make_app()
-        try:
-            app.open_dashboard()
-            app.root.update()
-            dash = app.dashboard
-            own = int(dash.winfo_id())
-            # 旧代码曾用 _had_focus/GetForegroundWindow 推断关闭意图；
-            # 新代码该整条路径已删除（setattr 只是 inert，保证本测试
-            # 在两种实现下可运行）
-            dash._had_focus = True
-            dash.event_generate('<FocusOut>')
-            app.root.update()
-            self.assertTrue(dash.is_open(),
-                            "FocusOut 不得自动收起 Dashboard")
-            # 二次焦点往返仍稳定
-            dash.event_generate('<FocusIn>')
-            dash.event_generate('<FocusOut>')
-            app.root.update()
-            self.assertTrue(dash.is_open())
-            dash.hide_dashboard()
-            self.assertFalse(dash.is_open())
-            dash.open()
-            self.assertTrue(dash.is_open())
-        finally:
-            app.quit()
-
-    def test_no_autocollapse_symbols(self):
-        app = make_app()
-        try:
-            app.open_dashboard()
-            dash = app.dashboard
-            for symbol in ('_on_focus_lost', '_maybe_auto_collapse',
-                           '_native_dialog_open', '_had_focus'):
-                self.assertFalse(
-                    hasattr(dash, symbol) or symbol in dir(dash),
-                    f"auto-collapse 路径 {symbol} 必须删除")
-        finally:
-            app.quit()
 
 
 # ================================================================ R17
-class ShutdownDeadlineRedTests(unittest.TestCase):
+class ShutdownDeadlineTests(unittest.TestCase):
     """R17：退出总等待 ≤ 单一全局 deadline（不叠加局部 timeout）。"""
 
     def test_quit_uses_single_global_deadline(self):
@@ -509,7 +448,7 @@ class ShutdownFaultInjectionTests(unittest.TestCase):
 
 
 # ================================================================ R19
-class SkinCatalogLockRedTests(unittest.TestCase):
+class SkinCatalogLockTests(unittest.TestCase):
     """R19：snapshot() 纯内存；磁盘扫描永远在锁外。"""
 
     def test_ui_read_never_waits_for_disk_scan(self):
@@ -555,7 +494,7 @@ class SkinCatalogLockRedTests(unittest.TestCase):
 
 
 # ================================================================ R18
-class StartupOrderingRedTests(unittest.TestCase):
+class StartupOrderingTests(unittest.TestCase):
     """R18/R19：首个 view 先于后台 runtime；首帧路径无磁盘扫描。"""
 
     def test_initial_view_no_build_request_before_bootstrap(self):

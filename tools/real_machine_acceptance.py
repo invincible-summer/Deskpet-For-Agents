@@ -1170,7 +1170,7 @@ def suite_dashboard_visual():
     print("  real_rendering=true, data_source=synthetic_fixture")
     from pet.config import Config
     from pet.dashboard import (PAGE_AGENTS, PAGE_DIAG, PAGE_LOOK,
-                               PAGE_MONITOR, PAGE_OVERVIEW, PAGE_PETS,
+                               PAGE_MONITOR, PAGE_PETS,
                                PAGE_SETTINGS)
     saved, cfg_mod, tmp = temp_config_copy()
     try:
@@ -1192,19 +1192,18 @@ def suite_dashboard_visual():
         # 给一个 fixture Agent 挂 AMBIGUOUS binding 展示"未定位"终端行
         key = sorted(instances)[0]
         build_fixture_binding(app, key)
-        # ---- §26.7 特殊状态：0 Agent Overview
+        # ---- §26.7 特殊状态：0 Agent workspace
         app.monitor.instances = {}
         app.monitor.snapshots = {}
         app._aggregate()
         _set_logical_size(app, 1120, 720)
-        _visual_page_capture(app, PAGE_OVERVIEW,
-                             "overview-empty-wide.png",
-                             "0-Agent Overview（特殊状态）")
-        # ---- 恢复 fixture：多 Agent Overview + wide 七页
+        _visual_page_capture(app, PAGE_AGENTS,
+                             "workspace-empty-wide.png",
+                             "Empty Agent workspace（特殊状态）")
+        # ---- 恢复 fixture：Agent workspace + wide pages
         install_display_fixture(app, instances, snapshots)
         build_fixture_binding(app, key)
         _set_logical_size(app, 1120, 720)
-        _visual_page_capture(app, PAGE_OVERVIEW, "overview-wide.png", "Overview wide（多 Agent fixture）", fixture=fixture)
         _visual_page_capture(app, PAGE_AGENTS, "agents-wide.png", "Agents wide", fixture=fixture)
         _visual_page_capture(app, PAGE_PETS, "pets-wide.png", "Pets wide", fixture=fixture)
         _visual_page_capture(app, PAGE_LOOK, "appearance-wide.png", "Appearance wide", fixture=fixture)
@@ -1310,18 +1309,18 @@ def suite_dashboard_visual():
         app.monitor.instances = dict(instances)
         app.monitor.snapshots = dict(snapshots)
         app._aggregate()
-        dash._show_page(PAGE_OVERVIEW)
+        dash._show_page(PAGE_AGENTS)
         dash.refresh_current_page()
         app.root.update()
         canvas = dash.content._canvas
         canvas.yview_moveto(1.0)
         app.root.update()
-        path = ARTIFACTS.screenshot("dashboard/overview-scroll-bottom.png")
+        path = ARTIFACTS.screenshot("dashboard/workspace-scroll-bottom.png")
         capture_window_png(int(dash.winfo_id()), path)
-        record_visual_metric("Overview scroll near bottom（特殊状态）",
-                             path, PAGE_OVERVIEW, app)
+        record_visual_metric("Workspace scroll near bottom（特殊状态）",
+                             path, PAGE_AGENTS, app)
         png_machine_sanity(path)
-        step("dashboard-visual", "Overview scroll near bottom：截图", True,
+        step("dashboard-visual", "Workspace scroll near bottom：截图", True,
              evidence=EVIDENCE_REAL_RENDER, artifacts=[str(path)])
         # hide/reopen 后当前页
         current = dash._page
@@ -1872,12 +1871,12 @@ def suite_dashboard_interactive():
                         "detail": f"rescan×{len(rescan_calls)}"}
             return None
         ok_rescan = interactive_step(
-            "dashboard-interactive", "overview-rescan",
-            "切到「概览」页（点左侧导航），真实点击右上「重新扫描」按钮",
+            "dashboard-interactive", "workspace-rescan",
+            "切到「Agent 工作台」页，真实点击右上「重新扫描」按钮",
             observe_rescan, timeout=30, evidence=EVIDENCE_REAL_MOUSE,
             on_tick=pump_app)
         app.monitor.rescan = orig_rescan
-        step("dashboard-interactive", "Overview 重新扫描按钮真实触发",
+        step("dashboard-interactive", "工作台重新扫描按钮真实触发",
              bool(ok_rescan) and len(rescan_calls) == 1,
              f"calls={len(rescan_calls)}", EVIDENCE_REAL_MOUSE)
         app.request_quit()

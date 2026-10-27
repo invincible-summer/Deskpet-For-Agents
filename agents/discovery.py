@@ -1,4 +1,4 @@
-"""V3 进程发现层：Windows 原生（psutil）+ WSL ProcessProbe（plan.md §7-§9）。
+"""V3 进程发现层：Windows 原生（psutil）+ WSL ProcessProbe。
 
 只读、无 hooks、无注入。WSL 探测分三层：
   1. wsl.exe --list --running --quiet → Running 发行版（每轮全新查询，
@@ -21,6 +21,7 @@ V3.1 加固：
 """
 import os
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -109,6 +110,22 @@ def is_daemon_form(args) -> bool:
     return any(mark in low for mark in _DAEMON_FORM_MARKS)
 
 
+def is_codex_maintenance(args) -> bool:
+    """The daemon PID publisher is housekeeping, never a user Agent session."""
+    try:
+        argv = shlex.split(args) if isinstance(args, str) else list(args or ())
+    except ValueError:
+        return False
+    commands = [str(arg).casefold() for arg in argv]
+    if commands[1:4] == ["app-server", "daemon", "pid-update-loop"]:
+        return True
+    return (bool(commands)
+            and commands[0].replace("\\", "/").rsplit("/", 1)[-1]
+            in {"node", "node.exe"}
+            and len(commands) > 1 and "codex" in commands[1]
+            and commands[2:5] == ["app-server", "daemon", "pid-update-loop"])
+
+
 def canonical_terminal_attachment(
         canonical_pid: int,
         launcher_pids: tuple[int, ...],
@@ -195,6 +212,27 @@ def _norm_cmdline(proc) -> str:
         return ""
 
 
+def _is_dsh_cli_cmd(cmd: str) -> bool:
+    """识别 DSH 官方 CLI 的真实启动入口（大小写/路径分隔符不敏感）。
+
+    ``@deepseek-ai/dsh`` 当前把 ``dsh`` 指向 ``lib/bin.js``；npm/pnpm
+    会把它包装成 node 命令，进程表里不会出现裸 ``dsh``。只匹配官方
+    package/bin 入口、``.bin`` shim、桌面共享 CLI 和 Python module 入口，
+    避免把 prompt 或 ``~/.dsh`` 数据路径里的关键字误判为 agent。
+    """
+    low = str(cmd or "").lower().replace("\\", "/")
+    if re.search(r"(?:^|/)\.bin/dsh(?:\.cmd|\.exe)?(?:\s|$)", low):
+        return True
+    if re.search(
+            r"(?:^|/)node_modules/@deepseek-ai/dsh/(?:lib/)?bin\.js(?:\s|$)",
+            low):
+        return True
+    if re.search(r"(?:^|/)\.dsh/bin/dsh(?:\.js)?(?:\s|$)", low):
+        return True
+    return bool(re.search(
+        r"(?:^|\s)-m\s+(?:deepseek[_-])?dsh(?:\s|$)", low))
+
+
 def _match_kind(name: str, cmd: str) -> AgentKind | None:
     base = name.lower()
     if base == "claude.exe":
@@ -215,6 +253,8 @@ def _match_kind(name: str, cmd: str) -> AgentKind | None:
     if _OPENCODE_PKG_MARK in cmd:
         # npm 全局 shim（node.exe ...node_modules\opencode-ai\...）
         return AgentKind.OPENCODE
+    if _is_dsh_cli_cmd(cmd):
+        return AgentKind.DSH
     if base == "node.exe" or base == "python.exe" or base == "pythonw.exe":
         # node/python 的判定依赖命令行，已在上面处理
         return None
@@ -435,7 +475,7 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
         if pid in codex_host_roots:
             continue
         args = _args_of(info(pid))
-        if _is_electron_helper(args):
+        if _is_electron_helper(args) or _is_codex_helper_cmd(args):
             continue
         if any(basename(a) == "codex.exe"
                for a in _ancestor_chain(pid, parent_by_pid)):
@@ -523,6 +563,9 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
         base = _basename_of(inf)
         args = _args_of(inf)
         if base.startswith("codex") and base.endswith(".exe"):
+            if is_codex_maintenance(args):
+                roles[pid] = ROLE_OTHER
+                continue
             # CLI 判定严格于 4.3.1 的宽 name 匹配：必须终端 ancestry 或
             # 控制台宿主证据；explorer/未知 ancestry 的 codex.exe 不再
             # 冒充 CLI（避免桌面宿主 runtime 误报）。
@@ -1066,11 +1109,36 @@ class WslProcessProbe:
         processes are evidence that a Desktop data plane is live; they must never be
         emitted as AgentSurface.TERMINAL targets.
         """
-        low = str(args or "").lower().replace("\\", "/")
-        if ("/.zcode/server/agents/glm/zcode.cjs" in low
-                or "/.zcode/server/agents/glm/zcode-agent" in low):
+        try:
+            argv = shlex.split(str(args or ""))
+        except ValueError:
+            return None
+        if not argv:
+            return None
+        executable = argv[0].rsplit("/", 1)[-1].casefold()
+        if executable in {"node", "nodejs"}:
+            entry = ""
+            for arg in argv[1:]:
+                if arg in {"-e", "--eval", "-p", "--print", "-r", "--require",
+                           "--loader", "--import"}:
+                    return None
+                if arg.startswith("-"):
+                    continue
+                entry = arg
+                break
+        else:
+            entry = argv[0]
+        low = entry.casefold()
+        # 3.x/3.16 bundles keep the GLM runtime below this containment root,
+        # while the entry filename changed between cjs and the SEA fallback.
+        # Match only known entry names; arbitrary files under ``.zcode`` are
+        # not evidence of a live Agent.
+        if re.search(
+                r"/\.zcode/server/agents/glm/"
+                r"(?:zcode\.cjs|zcode-agent(?:\.(?:cjs|js|mjs))?)"
+                r"$", low):
             return "agent"
-        if "/.zcode/server/zcode-server.cjs" in low:
+        if low.endswith("/.zcode/server/zcode-server.cjs"):
             return "server"
         return None
 
@@ -1080,6 +1148,8 @@ class WslProcessProbe:
         if re.search(r"(^|/)claude( |$|\.)", low) or "claude-code" in low or "@anthropic-ai/claude-code" in low:
             return AgentKind.CLAUDE
         if re.search(r"(^|/)codex( |$|\.)", low) or low.startswith("codex ") or "codex-x86_64" in low or "codex-aarch64" in low:
+            if is_codex_maintenance(args):
+                return None
             return AgentKind.CODEX
         if "kimi" in low and ("kimi-cli" in low or "/kimi" in low or low.startswith("kimi") or " kimi " in low):
             return AgentKind.KIMI
@@ -1092,7 +1162,11 @@ class WslProcessProbe:
                 or "/.opencode/bin/opencode" in low):
             return AgentKind.OPENCODE
         if (re.search(r"(^|/)dsh( |$|\.)", low) or low.startswith("dsh ")
-                or "/.dsh/" in low):
+                or "/.dsh/bin/dsh" in low
+                or _is_dsh_cli_cmd(low)):
+            # 标准 npm/pnpm 安装的 node .../@deepseek-ai/dsh/lib/bin.js
+            # 也属于官方 CLI；宽泛的 `/.dsh/` 子串仍不能使用，否则
+            # cat/tail ~/.dsh/sessions/... 会被误判成 agent。
             return AgentKind.DSH
         return None
 
@@ -1299,6 +1373,8 @@ class WslProcessProbe:
             remote_runtimes: list[RemoteRuntimeContext] = []
             for uid, (row, role) in sorted(remote_by_uid.items()):
                 info = meta.get(row[0], {})
+                if str(info.get("uid") or "") != str(uid):
+                    continue
                 remote_runtimes.append(RemoteRuntimeContext(
                     kind=AgentKind.ZCODE,
                     transport="wsl-exec",
@@ -1311,6 +1387,7 @@ class WslProcessProbe:
                     runtime_role=role,
                     observed_at=now,
                     generation=gen,
+                    process_token=str(info.get("ticks") or ""),
                 ))
             instances = []
             for (pid, ppid, sid, pgid, tpgid, tty, uid, etimes,

@@ -1,4 +1,4 @@
-"""V3 纯监听测试：无 Tk 窗口、无子进程、无真实 Agent（plan.md §56-§61）。"""
+"""V3 纯监听测试：无 Tk 窗口、无子进程、无真实 Agent。"""
 from __future__ import annotations
 
 import json
@@ -18,6 +18,7 @@ from agents.kimi import KimiFile, KimiWatcher
 from agents.models import (
     AgentInstance,
     AgentKind,
+    DesktopHost,
     Confidence,
     EvidenceSource,
     Mode,
@@ -382,7 +383,7 @@ class CodexWatcherTests(unittest.TestCase):
         self.assertEqual(state.observation(base + 3, {}).status, Status.WORKING)
         state.feed(json.dumps({"type": "event_msg", "timestamp": base + 4, "payload": {
             "type": "turn_aborted", "reason": "interrupted"}}))
-        self.assertEqual(state.observation(base + 5, {}).status, Status.IDLE)
+        self.assertEqual(state.observation(base + 5, {}).status, Status.ERROR)
 
     def test_silence_never_creates_a_guessed_approval(self):
         state = CodexFile("codex.jsonl")
@@ -496,13 +497,15 @@ class ClaudeWatcherTests(unittest.TestCase):
 
     # -------------------------------------------- plan1 跨 turn 瞬态失效矩阵
 
-    def test_new_user_text_invalidates_stale_error(self):
-        # AC-CLAUDE-01：error 后新普通 user text → 立即 WORKING
+    def test_stale_error_invalidation_rules(self):
+        # AC-CLAUDE-01/02：error 后新普通 user text / 更新的 assistant
+        # 活动立即回到 WORKING；纯 tool_result user record 不清旧 ERROR。
         state = ClaudeFile("claude.jsonl")
         base = time.time()
         state.feed(json.dumps({"type": "error", "timestamp": base,
                                "message": "boom"}))
-        self.assertEqual(state.observation(base + 1, {}).status, Status.ERROR)
+        self.assertEqual(state.observation(base + 1, {}).status,
+                         Status.ERROR)
         state.feed(json.dumps({
             "type": "user", "timestamp": base + 5,
             "message": {"content": [{"type": "text", "text": "继续修复"}]},
@@ -511,35 +514,28 @@ class ClaudeWatcherTests(unittest.TestCase):
         self.assertEqual(obs.status, Status.WORKING)
         self.assertFalse(state.error_ts)
 
-    def test_new_assistant_activity_invalidates_stale_error(self):
-        # AC-CLAUDE-02：更新的 assistant 活动不被旧 ERROR TTL 压住
-        state = ClaudeFile("claude.jsonl")
-        base = time.time()
-        state.feed(json.dumps({"type": "error", "timestamp": base,
-                               "message": "boom"}))
-        self.assertEqual(state.observation(base + 1, {}).status, Status.ERROR)
-        state.feed(json.dumps({
+        state2 = ClaudeFile("claude.jsonl")
+        state2.feed(json.dumps({"type": "error", "timestamp": base,
+                                "message": "boom"}))
+        state2.feed(json.dumps({
             "type": "assistant", "timestamp": base + 5,
             "message": {"content": [{"type": "text", "text": "已恢复"}]},
         }))
-        obs = state.observation(base + 5.5, {})
-        self.assertEqual(obs.status, Status.WORKING)
+        self.assertEqual(state2.observation(base + 5.5, {}).status,
+                         Status.WORKING)
 
-    def test_tool_result_only_user_record_keeps_stale_error(self):
-        # plan1 §5（AC-CLAUDE-02 附带）：纯 tool_result user record 不是
-        # 新用户 Goal/新 turn，不清旧 ERROR 瞬态
-        state = ClaudeFile("claude.jsonl")
-        base = time.time()
-        state.feed(json.dumps({"type": "error", "timestamp": base,
-                               "message": "boom"}))
-        state.feed(json.dumps({
+        state3 = ClaudeFile("claude.jsonl")
+        state3.feed(json.dumps({"type": "error", "timestamp": base,
+                                "message": "boom"}))
+        state3.feed(json.dumps({
             "type": "user", "timestamp": base + 2,
-            "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+            "message": {"content": [{"type": "tool_result",
+                                     "tool_use_id": "t1",
                                      "content": "noise"}]},
         }))
-        obs = state.observation(base + 3, {})
+        obs = state3.observation(base + 3, {})
         self.assertEqual(obs.status, Status.ERROR)
-        self.assertEqual(state.goal, "")
+        self.assertEqual(state3.goal, "")
 
 
 class PiSessionV3Tests(unittest.TestCase):
@@ -613,7 +609,7 @@ class PiSessionV3Tests(unittest.TestCase):
             "stopReason": "aborted"}}))
         obs = state.observation(base + 0.2, {})
         self.assertNotEqual(obs.status, Status.DONE)
-        self.assertEqual(obs.status, Status.IDLE)
+        self.assertEqual(obs.status, Status.ERROR)
 
     def test_length_stopreason_marks_limit_not_error(self):
         state = self._state()
@@ -667,8 +663,9 @@ class PiSessionV3Tests(unittest.TestCase):
         obs = state.observation(base + 120, {})
         self.assertIsNot(obs.status, Status.WORKING)
 
-    def test_new_user_turn_invalidates_stale_error(self):
-        # AC-PI-02：ERROR TTL 内新 user turn → 立即 WORKING/THINKING，Goal=B
+    def test_new_user_turn_invalidates_stale_error_and_done(self):
+        # AC-PI-02/03：ERROR TTL / DONE 8s 窗口内新 user turn 都立即
+        # 回到 WORKING/THINKING，Goal 更新为新任务。
         state = self._state()
         base = time.time()
         state.feed(json.dumps({"type": "message", "timestamp": base,
@@ -688,25 +685,23 @@ class PiSessionV3Tests(unittest.TestCase):
         self.assertEqual(obs.goal, "任务 B")
         self.assertFalse(state.error_ts)
 
-    def test_new_user_turn_invalidates_stale_done(self):
-        # AC-PI-03：DONE 8s 窗口内新 user turn → 立即 WORKING，不显示旧 DONE
-        state = self._state()
-        base = time.time()
-        state.feed(json.dumps({"type": "message", "timestamp": base,
-                               "message": {"role": "user",
-                                           "content": "任务 A"}}))
-        state.feed(json.dumps({"type": "message", "timestamp": base + 1,
-                               "message": {"role": "assistant",
-                                           "content": [{"type": "text",
-                                                        "text": "完成"}],
-                                           "stopReason": "stop"}}))
-        self.assertEqual(state.observation(base + 1.5, {}).status, Status.DONE)
-        state.feed(json.dumps({"type": "message", "timestamp": base + 3,
-                               "message": {"role": "user",
-                                           "content": "任务 B"}}))
-        obs = state.observation(base + 3.5, {})
-        self.assertEqual(obs.status, Status.WORKING)
-        self.assertEqual(obs.phase, Phase.THINKING)
+        state2 = self._state()
+        state2.feed(json.dumps({"type": "message", "timestamp": base,
+                                "message": {"role": "user",
+                                            "content": "任务 A"}}))
+        state2.feed(json.dumps({"type": "message", "timestamp": base + 1,
+                                "message": {"role": "assistant",
+                                            "content": [{"type": "text",
+                                                         "text": "完成"}],
+                                            "stopReason": "stop"}}))
+        self.assertEqual(state2.observation(base + 1.5, {}).status,
+                         Status.DONE)
+        state2.feed(json.dumps({"type": "message", "timestamp": base + 3,
+                                "message": {"role": "user",
+                                            "content": "任务 B"}}))
+        obs2 = state2.observation(base + 3.5, {})
+        self.assertEqual(obs2.status, Status.WORKING)
+        self.assertEqual(obs2.phase, Phase.THINKING)
 
     def test_image_only_user_message_starts_turn(self):
         # AC-PI-04：无文本/仅图片 user message 也建立 turn，不伪造 Goal
@@ -1003,9 +998,10 @@ class KimiWatcherTests(unittest.TestCase):
 
     # -------------------------------------------- plan1 跨 turn 瞬态失效矩阵
 
-    def test_prompt_accepted_invalidates_stale_error(self):
-        # AC-KIMI-01：真实 wire 序列无 turn.begin 时，prompt.accepted
-        # 即用户输入证据，旧 ERROR 失效并进入 WORKING
+    def test_prompt_or_step_activity_invalidates_stale_error(self):
+        # AC-KIMI-01/02：真实 wire 序列无 turn.begin 时，prompt.accepted
+        # 与 context.append_loop_event -> step.begin 都是新活动证据，
+        # 不被旧 ERROR TTL 压住。
         state = KimiFile("wire.jsonl")
         base = time.time()
         state.feed(json.dumps({"type": "prompt.accepted",
@@ -1022,23 +1018,18 @@ class KimiWatcherTests(unittest.TestCase):
         self.assertEqual(obs.goal, "重试")
         self.assertFalse(state.error_ts)
 
-    def test_step_begin_invalidates_stale_error(self):
-        # AC-KIMI-02：context.append_loop_event -> step.begin 的真实路径
-        # 不被旧 ERROR TTL 压住
-        state = KimiFile("wire.jsonl")
-        base = time.time()
-        state.feed(json.dumps({"type": "prompt.accepted",
-                               "time": int(base * 1000),
-                               "content": [{"type": "text", "text": "任务 A"}]}))
-        state.feed(json.dumps({"type": "error", "time": int((base + 1) * 1000),
-                               "message": "boom"}))
-        self.assertEqual(state.observation(base + 1.5, {}).status, Status.ERROR)
-        state.feed(json.dumps({"type": "context.append_loop_event",
-                               "event": {"type": "step.begin", "step": 1},
-                               "time": int((base + 5) * 1000)}))
-        obs = state.observation(base + 5.5, {})
-        self.assertEqual(obs.status, Status.WORKING)
-        self.assertFalse(state.error_ts)
+        state2 = KimiFile("wire.jsonl")
+        state2.feed(json.dumps({"type": "prompt.accepted",
+                                "time": int(base * 1000),
+                                "content": [{"type": "text", "text": "任务 A"}]}))
+        state2.feed(json.dumps({"type": "error", "time": int((base + 1) * 1000),
+                                "message": "boom"}))
+        state2.feed(json.dumps({"type": "context.append_loop_event",
+                                "event": {"type": "step.begin", "step": 1},
+                                "time": int((base + 5) * 1000)}))
+        obs2 = state2.observation(base + 5.5, {})
+        self.assertEqual(obs2.status, Status.WORKING)
+        self.assertFalse(state2.error_ts)
 
     def test_unresolved_approval_survives_ordinary_activity(self):
         # AC-KIMI-03：未 resolve 的显式 approval 不因普通活动被清掉
@@ -1131,6 +1122,7 @@ class BindingTests(unittest.TestCase):
 class MonitorPassiveTests(unittest.TestCase):
     def test_monitor_fuses_session_and_terminal_observation(self):
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         monitor._terminal_service = WindowsTerminalService(None)   # 无 UIA 环境
         inst = AgentInstance(AgentKind.CODEX, 101, "wsl:Ubuntu", cwd="/w",
@@ -1138,7 +1130,7 @@ class MonitorPassiveTests(unittest.TestCase):
         watcher = monitor._watchers[AgentKind.CODEX]
         with patch.object(watcher, "poll") as wpoll, \
              patch.object(monitor._probe, "snapshot",
-                          return_value=probe({"windows": (True, [inst])})):
+                          return_value=probe({"wsl:Ubuntu": (True, [inst])})):
             def fake_poll(instances):
                 obs = Observation(
                     source=EvidenceSource.SESSION, timestamp=time.time(),
@@ -1154,6 +1146,18 @@ class MonitorPassiveTests(unittest.TestCase):
         self.assertEqual(target.snapshot.status, Status.WORKING)
         self.assertEqual(target.snapshot.phase, Phase.CODING)
         self.assertEqual(target.snapshot.mode, Mode.PLAN)
+        # Snapshot metadata alone changes visible workspace/title; timestamps
+        # alone do not cause another UI refresh.
+        for field, value in (("cwd", "/different/workspace"),
+                             ("title", "Rename workspace task")):
+            revision = monitor._ui_revision
+            setattr(monitor.snapshots[inst.key], field, value)
+            monitor._refresh_ui_revision()
+            current, changed = monitor.get_targets_if_changed(revision)
+            self.assertGreater(current, revision)
+            self.assertEqual(getattr(changed[inst.key].snapshot, field), value)
+            monitor._refresh_ui_revision()
+            self.assertEqual(monitor.get_targets_if_changed(current), (current, None))
 
     def test_terminal_waiting_preempts_session_working(self):
         """终端可见审批（HIGH observation binding）覆盖会话 WORKING（plan §26）。"""
@@ -1164,6 +1168,7 @@ class MonitorPassiveTests(unittest.TestCase):
             TerminalWindowBinding, WindowBindingConfidence, WindowIdentity,
         )
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         observer = TerminalObserver(TerminalBackend(), cfg={})
         observer._started = True
@@ -1190,7 +1195,7 @@ class MonitorPassiveTests(unittest.TestCase):
              patch.object(monitor._terminal_service, "resolve",
                           return_value=(fake_window, fake_obs)), \
              patch.object(monitor._probe, "snapshot",
-                          return_value=probe({"windows": (True, [inst])})):
+                          return_value=probe({"wsl:Ubuntu": (True, [inst])})):
             wpoll.return_value = {inst.key: Observation(
                 source=EvidenceSource.SESSION, timestamp=time.time(),
                 status=Status.WORKING, phase=Phase.CODING,
@@ -1207,6 +1212,7 @@ class MonitorPassiveTests(unittest.TestCase):
                                          TerminalObserver, TerminalBackend)
         from agents.models import TerminalWindowBinding, WindowBindingConfidence
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         observer = TerminalObserver(TerminalBackend(), cfg={})
         observer._started = True
@@ -1229,7 +1235,7 @@ class MonitorPassiveTests(unittest.TestCase):
              patch.object(monitor._terminal_service, "resolve",
                           return_value=(fake_window, {})), \
              patch.object(monitor._probe, "snapshot",
-                          return_value=probe({"windows": (True, [inst])})):
+                          return_value=probe({"wsl:Ubuntu": (True, [inst])})):
             wpoll.return_value = {inst.key: Observation(
                 source=EvidenceSource.SESSION, timestamp=time.time(),
                 status=Status.WORKING, turn_active=True,
@@ -1248,6 +1254,7 @@ class MonitorPassiveTests(unittest.TestCase):
             TerminalWindowBinding, WindowBindingConfidence, WindowIdentity,
         )
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         observer = TerminalObserver(TerminalBackend(), cfg={})
         observer._started = True
@@ -1293,6 +1300,7 @@ class MonitorPassiveTests(unittest.TestCase):
             TerminalWindowBinding, WindowBindingConfidence, WindowIdentity,
         )
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         observer = TerminalObserver(TerminalBackend(), cfg={})
         observer._started = True
@@ -1327,6 +1335,7 @@ class MonitorPassiveTests(unittest.TestCase):
     def test_source_health_isolation_for_stale_flag(self):
         """Ubuntu 扫描失败只影响 Ubuntu 实例的 stale 标记。"""
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         monitor._terminal_service = WindowsTerminalService(None)
         ubuntu = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
@@ -1345,6 +1354,7 @@ class MonitorPassiveTests(unittest.TestCase):
     def test_authoritative_absence_commits_exit_immediately(self):
         """权威空 source：exact key 本轮即退出（v4plan §4.2，无 grace）。"""
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         monitor._terminal_service = WindowsTerminalService(None)
         debian = AgentInstance(AgentKind.CODEX, 1, "wsl:Debian",
@@ -1361,6 +1371,7 @@ class MonitorPassiveTests(unittest.TestCase):
     def test_windows_global_scan_failure_is_not_authoritative_empty(self):
         """Windows 全局枚举失败：authoritative=False，旧实例保留（v4plan §4.1）。"""
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         monitor._terminal_service = WindowsTerminalService(None)
         win = AgentInstance(AgentKind.CODEX, 5, "windows", process_token="5")
@@ -1386,6 +1397,7 @@ class MonitorPassiveTests(unittest.TestCase):
 
     def test_one_distro_stopped_does_not_affect_other(self):
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         monitor._terminal_service = WindowsTerminalService(None)
         ubuntu = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
@@ -1402,6 +1414,7 @@ class MonitorPassiveTests(unittest.TestCase):
 
     def test_one_distro_failed_does_not_affect_other(self):
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         monitor._terminal_service = WindowsTerminalService(None)
         ubuntu = AgentInstance(AgentKind.CODEX, 1, "wsl:Ubuntu",
@@ -1421,6 +1434,7 @@ class MonitorPassiveTests(unittest.TestCase):
         """exit 事件晚到且 key 已被新 incarnation 替换：不删新实例。"""
         from agents.process_watch import ProcessExitEvent
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         monitor._terminal_service = WindowsTerminalService(None)
         new = AgentInstance(AgentKind.CODEX, 7, "windows",
@@ -1436,6 +1450,7 @@ class MonitorPassiveTests(unittest.TestCase):
     def test_exit_event_commits_exit_for_exact_incarnation(self):
         from agents.process_watch import ProcessExitEvent
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         monitor._terminal_service = WindowsTerminalService(None)
         inst = AgentInstance(AgentKind.CODEX, 7, "windows",
@@ -1455,6 +1470,7 @@ class MonitorPassiveTests(unittest.TestCase):
         from agents.terminal_uia import (ObservedTerminalControl,
                                          TerminalObserver, TerminalBackend)
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         observer = TerminalObserver(TerminalBackend(), cfg={})
         observer._started = True
@@ -1484,6 +1500,7 @@ class MonitorPassiveTests(unittest.TestCase):
     def test_last_instance_exit_triggers_zero_kind_poll_cleanup(self):
         """最后一个某 kind Agent 退出后 poll([]) 仍被调用（v4plan §4.6）。"""
         config = MemoryConfig()
+        config.set("monitor.wsl_enabled", True)
         monitor = Monitor(config)
         monitor._terminal_service = WindowsTerminalService(None)
         inst = AgentInstance(AgentKind.CODEX, 1, "windows", process_token="1")
@@ -1544,11 +1561,41 @@ class SourceToggleTests(unittest.TestCase):
             worker._tick()
         self.assertEqual(scan.call_count, 1)   # 下一 probe 周期立即恢复
 
+    def test_disabled_source_rejects_cached_instances(self):
+        for source, option in (("windows", "windows_enabled"),
+                               ("wsl:Ubuntu", "wsl_enabled")):
+            with self.subTest(source=source):
+                cfg = MemoryConfig()
+                cfg.set(f"monitor.{option}", False)
+                monitor = Monitor(cfg)
+                inst = AgentInstance(AgentKind.CODEX, 70, source,
+                                     process_token="old")
+                monitor.instances[inst.key] = inst
+                with patch.object(monitor._probe, "snapshot", return_value=probe(
+                        {source: (False, [inst])})):
+                    monitor._merge_instances(1000.0)
+                    monitor._merge_instances(1001.0)
+                self.assertEqual(monitor.instances, {})
+
+    def test_failed_scan_invalidates_desktop_inventory_authority(self):
+        worker = self._worker()
+        host = DesktopHost(AgentKind.CODEX, pid=900, process_token="9")
+        inventory = discovery_mod.WindowsRuntimeInventory(desktop_hosts=(host,))
+        with patch("agents.monitor.scan_windows_inventory", return_value=inventory):
+            worker._tick()
+        self.assertTrue(worker.inventory_authoritative())
+        worker._last_windows = 0.0
+        with patch("agents.monitor.scan_windows_inventory",
+                   side_effect=discovery_mod.ProbeUnavailable("census failed")):
+            worker._tick()
+        self.assertFalse(worker.inventory_authoritative())
+        self.assertEqual(worker.desktop_hosts(), (host,))
+
 
 class MonitorTickOrderTests(unittest.TestCase):
     """v4.1.1 §10.3：exit 事件后同 tick 不再处理 stale instance。"""
 
-    def test_exit_event_same_tick_skips_stale_instance(self):
+    def test_exit_event_outranks_repeated_cached_census_and_allows_new_incarnation(self):
         from agents.process_watch import ProcessExitEvent
         from agents.models import ObservationBindingConfidence, \
             TerminalObservationBinding
@@ -1573,12 +1620,21 @@ class MonitorTickOrderTests(unittest.TestCase):
             return ({}, obs)
 
         with patch.object(monitor._probe, "snapshot",
-                          return_value=probe({"windows": (True, [])})), \
+                          return_value=probe({"windows": (True, [gone])})) as census, \
              patch.object(monitor._terminal_service, "resolve",
                           side_effect=fake_resolve), \
              patch.object(monitor._watchers[AgentKind.CODEX], "poll",
                           return_value={}):
+            for _ in range(3):
+                monitor._tick()
+                self.assertNotIn(gone.key, monitor.get_targets())
+            # Reusing the numeric PID with a new create-time is a new agent.
+            replacement = AgentInstance(AgentKind.CODEX, gone.pid, "windows",
+                                        process_token="replacement")
+            census.return_value = probe({"windows": (True, [replacement])}, gen=2)
             monitor._tick()
+            self.assertIn(replacement.key, monitor.get_targets())
+            self.assertEqual(monitor._retired_processes, {})
         # exit 事件 drain 之后重新 snapshot：resolve 不再见到已退出 key
         resolved_keys = [k for call in resolve_calls for k in call]
         self.assertNotIn(gone.key, resolved_keys)
@@ -1620,6 +1676,15 @@ class NewKindMonitorWiringTests(unittest.TestCase):
         self.assertIsInstance(monitor._watchers[AgentKind.DSH],
                               __import__("agents.dsh",
                                          fromlist=["DshWatcher"]).DshWatcher)
+        # Initially disabled kinds can be enabled later without a second
+        # registration path or duplicate source objects.
+        monitor._register_desktop_sources()
+        monitor._register_desktop_sources()
+        kinds = [source.kind for source in monitor._desktop_sources]
+        self.assertEqual(len(kinds), len(set(kinds)))
+        self.assertIn(AgentKind.CODEX, kinds)
+        self.assertIn(AgentKind.ZCODE, kinds)
+        monitor.stop()
 
     def test_kind_disabled_clears_desktop_sessions_only_for_that_kind(self):
         # plan §三陷阱：_poll_desktop_sources 按 kind 清理；关闭 opencode
@@ -1672,6 +1737,12 @@ class NewKindMonitorWiringTests(unittest.TestCase):
         self.assertEqual(oc.polled, 0)      # 关闭的 kind 不再 poll
         self.assertGreaterEqual(dsh_src.polled, 1)
         self.assertIn(dsh_inst.key, monitor.instances)   # dsh 不被误删
+        polled = dsh_src.polled
+        cfg["monitor"]["windows_enabled"] = False
+        monitor._tick()
+        self.assertEqual(monitor.get_targets(), {})
+        self.assertEqual(monitor._desktop_hosts, {})
+        self.assertEqual(dsh_src.polled, polled)
 
     def test_opencode_worker_refresh_respects_kind_toggle(self):
         from agents.monitor import ProcessProbeWorker
@@ -1911,6 +1982,29 @@ class ApprovalVisibilityTests(unittest.TestCase):
         snap = reduce_state(inst, session, None, None, now)
         self.assertIs(snap.status, Status.WORKING)
         self.assertEqual(snap.approval_visibility, "unavailable")
+
+
+class CodexDurableEventWhitelistTests(unittest.TestCase):
+    """上游 rollout policy.rs 的 durable 事件全部在白名单内。
+
+    缺词表类型会让含该记录的 rollout 解析健康误判 PARTIAL（2026-10
+    对照 openai/codex main protocol.rs serde snake_case 命名复核）。
+    """
+
+    DURABLE_TYPES = (
+        "thread_goal_updated", "thread_rolled_back", "thread_settings_applied",
+        "context_compacted", "entered_review_mode", "exited_review_mode",
+        "patch_apply_end", "image_generation_end", "sub_agent_activity",
+    )
+
+    def test_durable_event_types_all_recognized(self):
+        state = CodexFile("rollout-x.jsonl")
+        for etype in self.DURABLE_TYPES:
+            state._count_record({"type": "event_msg",
+                                 "payload": {"type": etype}})
+        self.assertEqual(state.unknown_types, {})
+        self.assertEqual(state.records_seen, len(self.DURABLE_TYPES))
+        self.assertEqual(state.recognized_records, len(self.DURABLE_TYPES))
 
 
 if __name__ == "__main__":

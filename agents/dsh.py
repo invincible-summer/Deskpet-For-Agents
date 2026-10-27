@@ -1,6 +1,6 @@
 """DSH（DeepSeek Harness）无插件只读监听 adapter（无插件监听 plan §三/P3）。
 
-上游事实（SourceLink 2026-10-11 §3，DSH master d743267）：
+上游事实（DSH master 22ddee379240）：
   * 数据根：``$DSH_HOME``（默认 ``~/.dsh``）下的 ``sessions/``；绝不读
     ``$DSH_HOME/.credentials.yaml``、launch token 或 Host 私有 IPC。
   * 物理布局：``sessions/--<projectKey(cwd)>--/<encodeSegment(id)>/
@@ -19,7 +19,8 @@
   * 只读已知单文件尾部；不写 cursor 到 Agent 目录；不解码半帧；
   * WAITING 仅来自完整可归属的 asked→（尚未）decided，且回放预算内的
     事件才算数——很久以前未配对的 asked 不得伪装仍在等待；
-  * 打开的 turn 静默超过上限 → UNKNOWN（crash orphan 不是 Working）；
+  * 打开的 turn 是 durable 事实：短静默只是事件稀疏，保持 WORKING；
+    超过 ``OPEN_TURN_ORPHAN_SEC`` 仍无事件才按 crash orphan 回 UNKNOWN；
   * 未来格式版本 / 双编码并存 / 未知必需事件 → 该 session 降级 UNKNOWN；
   * ``zstandard`` 解码库只在真正需要解码 zstd 帧时才 import。
 """
@@ -63,20 +64,30 @@ MAX_TAIL_CHUNK = 4 * 1024 * 1024        # 单轮最多读 4MB 增量
 MAX_FRAME_DECOMPRESSED = 8 * 1024 * 1024  # 单帧解压输出上限
 MAX_PENDING_FRAME_BYTES = 8 * 1024 * 1024  # 半帧缓冲上限（超限视为损坏）
 MAX_EVENT_LINE = 1024 * 1024            # 单行 JSON 上限
-# v4.4.1：单轮事件消化上限。512 在实机上让 853 帧的会话只前进到 2438 秒
-# 前的事件（其余留在 _buffer 等下一轮），turn 状态因此滞后数轮；提高到
-# 2048 仍是有界上限（防单轮解压/解析预算失控），剩余帧照旧留在缓冲。
+# 单轮事件消化上限（v4.4.1 由 512 提高），防单轮解压/解析预算失控的有界
+# 上限。v4.4.2 起预算耗尽时未消化的数据**全部留在缓冲**（明文残行 /
+# zstd 整帧 / 帧内剩余解码文本 _pending_plain），下一轮继续消化——绝不
+# 静默丢弃事件（丢 turn/end 漏 DONE、丢 approval/decided 幻影 WAITING）。
+# 写入端持续超速使缓冲超过 MAX_PENDING_FRAME_BYTES 时才整体拒绝
+# （fail closed）。
 MAX_EVENTS_PER_POLL = 2048              # 单轮最多消化事件数
+# 单轮最多扫描的完整帧数。帧数≠事件数：上游每个追加批次一个帧，单帧可含
+# 数百事件，真正的消化上限由 MAX_EVENTS_PER_POLL 执行。
+MAX_FRAMES_PER_POLL = 2048              # 单轮最多扫描的完整帧数
 # v4.4.1：近端起步参数与 agents/base.py 对齐。
 MAX_NEAR_END_TAIL = 256 * 1024          # 近端起步的回读窗口
 MAX_NEAR_END_SCAN = 256 * 1024          # 向前找帧边界的最大扫描量
 _ZSTD_MAGIC_BYTES = (0xFD2FB528).to_bytes(4, "little")
 MAX_HEADER_READ_BYTES = 4 * 1024        # header 引导读取上限（有界）
 MAX_TRACKED_DSH_FILES = 8               # CLI watcher 同时跟踪的日志上限
-MAX_SESSION_DIRS = 16                   # 每个 project 目录最多考察的 session 目录
+MAX_SESSION_DIRS = 64                   # 每个 project 目录最多考察的 session 目录
 MAX_PROJECT_DIRS = 32                   # desktop source 最多考察的 project 目录
 APPROVAL_REPLAY_SEC = 600.0             # asked 事件回放预算
 OPEN_TURN_QUIET_SEC = 120.0             # 打开的 turn 无新事件的降级时限
+# turn 打开但没有新事件的持久锁存上限：长时间运行的工具/慢速流式不因
+# 短静默降级 UNKNOWN（与 Codex durable turn 对齐）；超时仍按 crash orphan
+# 处理，绝不永久 WORKING。
+OPEN_TURN_ORPHAN_SEC = 600.0
 DONE_WINDOW_SEC = 8.0
 ERROR_WINDOW_SEC = 30.0
 IDLE_LEASE_SEC = 600.0
@@ -308,6 +319,9 @@ KNOWN_EVENT_TYPES = frozenset({
     "turn/end", "turn/start", "user/message",
     "web/deepseek-search-llm-request", "working-directory/change",
     "workspace/changes",
+    # 2026-10 上游 master 新增（known-event-types.ts）；缺词表会把含这些
+    # 事件的整个会话判 UNKNOWN（对更新的未知必需事件 fail-closed 仍生效）。
+    "job/registered", "job/settled",
 })
 
 _HEADER_REQUIRED_KEYS = ("type", "version", "id", "createdAt", "isSeeded",
@@ -442,6 +456,7 @@ class DshEventTracker:
     last_assistant_ts: float = 0.0
     done_ts: float = 0.0
     error_ts: float = 0.0
+    error_text: str = ""
     last_event_ts: float = 0.0
     last_event_wall: float = 0.0      # 读取到达时间（事件 time 缺失时兜底）
     goal: str = ""
@@ -485,14 +500,45 @@ class DshEventTracker:
             if not self.open_turn or ended == self.open_turn:
                 self.open_turn = 0
             reason = data.get("reason")
-            kind = str(reason.get("kind") or "") if isinstance(reason, dict) else ""
+            if isinstance(reason, dict):
+                kind = str(reason.get("kind") or reason.get("status")
+                           or reason.get("outcome") or "").casefold()
+            else:
+                # Older v3 writers used a scalar reason/status.  It is still
+                # an explicit lifecycle fact, so normalize it instead of
+                # silently treating an interrupted turn as completed.
+                kind = str(reason or data.get("status")
+                           or data.get("outcome") or "").casefold()
             self.turn_known_over = True
-            if kind == "completed":
+            if kind in {"completed", "complete", "success", "succeeded",
+                        "done"}:
                 self.done_ts = max(self.done_ts, ts)
             elif kind == "error":
                 self.error_ts = max(self.error_ts, ts)
-            # aborted/blocked/max-tokens/interrupted/forked：中性——
-            # interrupted 是 crash 追补的 closer，绝不能算 Working/Done
+                self.error_text = str(data.get("message") or
+                                      data.get("error") or
+                                      (reason.get("error") if isinstance(reason, dict)
+                                       else "") or "任务失败")[:SUMMARY_MAX]
+            elif kind in _TURN_END_NEUTRAL:
+                # Aborted/interrupted/forked/blocked/max-tokens are explicit
+                # abnormal outcomes.  Keep an ERROR reminder window instead
+                # of silently dropping to UNKNOWN/IDLE.
+                self.error_ts = max(self.error_ts, ts)
+                labels = {"aborted": "任务已中断", "interrupted": "任务被中断",
+                          "blocked": "任务被阻塞", "max-tokens": "任务达到长度限制",
+                          "forked": "任务已分叉"}
+                self.error_text = labels.get(kind, "任务异常结束")
+        elif etype == "session/end-seed":
+            self.open_turn = 0
+            self.turn_known_over = True
+            raw_reason = data.get("reason") or data.get("outcome") or ""
+            reason = (str(raw_reason.get("kind") or raw_reason.get("status")
+                         or raw_reason.get("outcome") or "")
+                      if isinstance(raw_reason, dict)
+                      else str(raw_reason)).casefold()
+            if reason and reason not in {"completed", "normal", "done"}:
+                self.error_ts = max(self.error_ts, ts)
+                self.error_text = f"任务{reason}"[:SUMMARY_MAX]
         elif etype == "step/start":
             self.last_step_ts = max(self.last_step_ts, ts)
             if self.open_turn:
@@ -555,6 +601,7 @@ class DshEventTracker:
         if self.error_ts and 0 <= now - self.error_ts < ERROR_WINDOW_SEC:
             obs.status = Status.ERROR
             obs.confidence = Confidence.EXACT
+            obs.summary = self.error_text or "任务异常"
             return obs
         if self.open_turn:
             quiet = now - self.open_turn_last_ts
@@ -567,6 +614,15 @@ class DshEventTracker:
                     obs.summary = self.last_tool_name
                 elif self.last_assistant_ts:
                     obs.phase = Phase.THINKING
+                return obs
+            if 0 <= quiet <= OPEN_TURN_ORPHAN_SEC:
+                # 显式 turn/start 仍打开：静默只是事件稀疏（长命令、慢流式），
+                # 不是 turn 结束证据。保持 WORKING，置信降级；超过孤儿上限
+                # 仍按 crash orphan 回到 UNKNOWN。
+                obs.status = Status.WORKING
+                obs.confidence = Confidence.MEDIUM
+                obs.turn_active = True
+                obs.phase = Phase.THINKING
                 return obs
             # 打开的 turn 长时间无事件：crash orphan，绝不能永久 Working
             return None
@@ -620,56 +676,75 @@ class DshLogConsumer:
     # 为 True 时主流首行不是 header 不再判 HEADER_INVALID。
     _header_bootstrapped: bool = False
     # file_pos 只由读取方（DshFile._tail_pos / DshDesktopSource）推进；
-    # _buffer 是尚未解码成事件的原始字节（zstd 半帧 / 明文残行）。
+    # _buffer 是尚未解码成事件的原始字节（zstd 半帧/整帧 / 明文残行），
+    # _pending_plain 是已解码但本轮预算耗尽未消化的事件文本（仅 zstd）。
     file_pos: int = 0
     _buffer: bytes = b""
+    _pending_plain: bytes = b""
     _events_this_poll: int = 0
 
     def consume(self, chunk: bytes, wall_ts: float) -> None:
         if self.refused:
             return
         self._events_this_poll = 0
+        if self._pending_plain:
+            # 先消化上一轮预算耗尽留下的解码文本（顺序先于新帧）。
+            pending, self._pending_plain = self._pending_plain, b""
+            self._pending_plain = self._drain_lines(pending, wall_ts)
         self._buffer += chunk
         if self.compression == "zstd":
             self._consume_zstd(wall_ts)
         else:
-            self._consume_plain(wall_ts)
-        if len(self._buffer) > MAX_PENDING_FRAME_BYTES:
-            # 缓冲无界增长只可能是写入端异常：拒绝该日志（fail closed）
+            self._buffer = self._drain_lines(self._buffer, wall_ts)
+        if len(self._buffer) + len(self._pending_plain) > MAX_PENDING_FRAME_BYTES:
+            # 缓冲无界增长只可能是写入端异常或持续超速：拒绝该日志
+            # （fail closed），绝不静默丢弃事件。
             self.refused = "PENDING_BUFFER_OVERFLOW"
             self._buffer = b""
+            self._pending_plain = b""
 
     def _consume_zstd(self, wall_ts: float) -> None:
         try:
             frames, _torn = scan_zstd_frames(
-                self._buffer, max_frames=MAX_EVENTS_PER_POLL)
+                self._buffer, max_frames=MAX_FRAMES_PER_POLL)
         except ValueError as exc:
             self.refused = f"CORRUPT:{exc}"
             self._buffer = b""
+            self._pending_plain = b""
             return
         consumed = 0
         for start, end in frames:
+            if self._events_this_poll >= MAX_EVENTS_PER_POLL:
+                # 预算尽：整帧留在 _buffer，下一轮重新解码。
+                break
             frame = self._buffer[start:end]
             try:
                 plaintext = decode_zstd_frame(frame)
             except ValueError as exc:
                 self.refused = f"DECODE:{exc}"
                 self._buffer = b""
+                self._pending_plain = b""
                 return
-            self._feed_plain(plaintext, wall_ts)
+            # 帧内剩余未消化文本留 _pending_plain（单帧可含数百事件）。
+            self._pending_plain += plaintext
+            self._pending_plain = self._drain_lines(
+                self._pending_plain, wall_ts)
             consumed = end
         if consumed:
             self._buffer = self._buffer[consumed:]
 
-    def _consume_plain(self, wall_ts: float) -> None:
-        lines = self._buffer.split(b"\n")
-        self._buffer = lines.pop()
-        for raw in lines:
-            self._feed_line(raw, wall_ts)
-
-    def _feed_plain(self, plaintext: bytes, wall_ts: float) -> None:
-        for raw in plaintext.split(b"\n"):
-            self._feed_line(raw, wall_ts)
+    def _drain_lines(self, data: bytes, wall_ts: float) -> bytes:
+        """按行喂事件直到本轮预算耗尽；返回未消化剩余（含残行）。"""
+        pos = 0
+        while pos < len(data):
+            if self._events_this_poll >= MAX_EVENTS_PER_POLL:
+                break
+            idx = data.find(b"\n", pos)
+            if idx < 0:
+                break            # 残行留在缓冲，等写完整
+            self._feed_line(data[pos:idx], wall_ts)
+            pos = idx + 1
+        return data[pos:]
 
     def _feed_line(self, raw: bytes, wall_ts: float) -> None:
         if len(raw) > MAX_EVENT_LINE:
@@ -701,13 +776,45 @@ class DshLogConsumer:
                 self.refused = f"FORMAT_VERSION_{info.version}"
                 return
             return
-        if self._events_this_poll >= MAX_EVENTS_PER_POLL:
-            return
         self._events_this_poll += 1
         self.tracker.feed_event(obj, wall_ts)
 
 
 # ---------------------------------------------------------- 文件发现
+
+def _dsh_child_session_state(path: str) -> bool | None:
+    """该日志是否为子会话（origin=subagent / parentSession）。
+
+    有界读取文件首部 header 判定（header 恒为第一行/第一帧，远小于
+    MAX_HEADER_READ_BYTES）。读取/解析失败返回 None；调用方必须
+    fail-closed，不能把未知子会话当 root。
+    """
+    try:
+        with open(path, "rb") as f:
+            # A zstd frame may contain the header plus the first event batch;
+            # 4 KiB is enough for the header itself but not necessarily for a
+            # complete frame, so use the existing bounded frame cap here.
+            head = f.read(MAX_PENDING_FRAME_BYTES)
+    except OSError:
+        return None
+    parsed = parse_generation_filename(os.path.basename(path))
+    if parsed is None:
+        return None
+    probe = DshLogConsumer(compression=parsed[1])
+    try:
+        probe.consume(head, time.time())
+    except Exception:
+        return None
+    if not probe.header_seen or not probe.header.valid:
+        return None
+    return bool(probe.header.parent_session
+                or probe.header.origin == "subagent")
+
+
+def dsh_child_session(path: str) -> bool:
+    """Compatibility wrapper: only a verified child returns True."""
+    return _dsh_child_session_state(path) is True
+
 
 def dsh_session_candidates(root: str, cwd: str,
                            window_sec: float = 180.0) -> list[tuple[float, str]]:
@@ -732,19 +839,19 @@ def dsh_project_candidates(project_dir: str,
     dirs = []
     for e in entries:
         try:
-            if e.is_dir(follow_symlinks=False):
-                dirs.append((e.stat(follow_symlinks=False).st_mtime, e.path))
-        except OSError:
-            continue
-    dirs.sort(reverse=True)
-    for _m, dir_path in dirs[:MAX_SESSION_DIRS]:
-        log = _select_generation(dir_path)
-        if log is None:
-            continue
-        try:
+            if not e.is_dir(follow_symlinks=False):
+                continue
+            log = _select_generation(e.path)
+            if log is None:
+                continue
             mtime = os.stat(log).st_mtime
+            dirs.append((mtime, e.path, log))
         except OSError:
             continue
+    # 排序依据是 canonical log 的 mtime，而不是 session 目录名/目录 mtime；
+    # 老项目目录中的新 turn 仍能进入有界候选预算。
+    dirs.sort(key=lambda item: (item[0], item[1].casefold()), reverse=True)
+    for mtime, _dir_path, log in dirs[:MAX_SESSION_DIRS]:
         if now - mtime <= window_sec:
             found.append((mtime, log))
     found.sort(reverse=True)
@@ -897,13 +1004,30 @@ class DshFile(FileState):
 
 
 class DshWatcher(BaseWatcher):
-    """DSH CLI 终端实例 watcher：cwd → project 目录 → 最新 session 日志。
+    """DSH CLI 终端实例 watcher：cwd → project 目录 → 最新 root session 日志。
 
     归属规则（plan §二.1）：同 cwd 只有一个 live DSH 进程时才把最新活跃
-    日志绑给它；同 cwd 多实例无法从外部区分 session → 全部不绑
-    （fail closed，绝不合并/猜测）。
+    root 日志绑给它；同 cwd 多实例无法从外部区分 session → 全部不绑
+    （fail closed，绝不合并/猜测）。子会话（origin=subagent /
+    parentSession）是 root 会话内部委派的产物，绝不作为终端候选——繁忙
+    subagent 的日志 mtime 更新，会按"最新"抢占本应属于 root 的绑定。
     """
     kind = AgentKind.DSH
+
+    def __init__(self, monitor_cfg: dict):
+        super().__init__(monitor_cfg)
+        # normcase 路径 → 是否子会话（有界缓存，防扫描型内存增长）。
+        self._child_cache: dict[str, bool | None] = {}
+
+    def _is_child(self, path: str) -> bool | None:
+        key = os.path.normcase(path)
+        cached = self._child_cache.get(key)
+        if cached is None:
+            cached = _dsh_child_session_state(path)
+            if len(self._child_cache) >= 64:
+                self._child_cache.clear()
+            self._child_cache[key] = cached
+        return cached
 
     def _roots_for_source(self, source: str, instances: list) -> list[str]:
         if source == "windows":
@@ -948,9 +1072,11 @@ class DshWatcher(BaseWatcher):
                 try:
                     for mtime, path in dsh_session_candidates(
                             root, cwd, float(window)):
-                        if path.lower() not in seen:
-                            seen.add(path.lower())
-                            out.append((mtime, path))
+                        child_state = self._is_child(path)
+                        if path.lower() in seen or child_state is not False:
+                            continue
+                        seen.add(path.lower())
+                        out.append((mtime, path))
                 except Exception:
                     continue
         return out
@@ -967,12 +1093,18 @@ class DshWatcher(BaseWatcher):
         return DshFile(path)
 
     def terminal_claims(self) -> frozenset:
-        """已绑定 CLI 实例的会话 claim（desktop source 去重用）。"""
+        """已绑定 CLI 实例的会话 claim（desktop source 去重用）。
+
+        session_id 尚未解析（header 引导失败/首轮未读）时退回 canonical
+        路径 claim——同 cwd 单实例语义下的绑定是 exact 文件身份，路径仍可
+        精确匹配 desktop 侧同一日志（对齐 codex watcher 的 file_id 回退），
+        缩短 claim 建立前的重复解码窗口。
+        """
         claims = set()
         for key, path in self._instance_files.items():
             st = self.files.get(path)
             sid = str(getattr(st, "session_id", "") or "") if st else ""
-            if sid:
+            if sid or path:
                 claims.add(SessionClaimKey(kind="dsh", session_id=sid,
                                            canonical_session_path=path))
         return frozenset(claims)
@@ -1109,6 +1241,9 @@ class _DshDesktopSession:
     last_activity_ts: float = 0.0
 
 
+_DESKTOP_IDLE_LEASE_SEC = 600.0
+
+
 class DshDesktopSource(DesktopSessionSource):
     """DSH 官方 Desktop 宿主的被动 source（共享 $DSH_HOME/sessions）。
 
@@ -1163,21 +1298,34 @@ class DshDesktopSource(DesktopSessionSource):
             consumer = self._logs.get(sess.path)
             if consumer is None:
                 continue
+            if claims_cover(claimed_sessions, "dsh",
+                            session_id=sess.session_id,
+                            canonical_path=sess.path):
+                # terminal exact binding 优先：不发 target，也不增量解码
+                # ——CLI watcher 是该日志的权威读者，desktop 侧继续 tail
+                # 只会让同一份日志被两份解码器重复解压。consumer 状态
+                # 保留，CLI 消失后下一轮恢复增量读取（reclaim）。
+                continue
             self._tail_consumer(consumer, now)
             tracker = _merged_tracker(consumer, self._child_consumers, sess)
+            if (sess.admitted and not tracker.pending_approvals
+                    and not (tracker.open_turn and
+                             now - tracker.open_turn_last_ts
+                             <= OPEN_TURN_ORPHAN_SEC)
+                    and sess.last_activity_ts
+                    and now - sess.last_activity_ts > _DESKTOP_IDLE_LEASE_SEC):
+                self._sessions.pop(key, None)
+                self._logs.pop(sess.path, None)
+                continue
             if not sess.admitted:
                 if not (tracker.pending_approvals
                         or (tracker.open_turn and now - tracker.open_turn_last_ts
-                            <= OPEN_TURN_QUIET_SEC)
+                            <= OPEN_TURN_ORPHAN_SEC)
                         or (tracker.last_event_ts
                             and now - tracker.last_event_ts <= window)):
                     continue
                 sess.admitted = True
                 sess.bound_host_key = host.host_key
-            if claims_cover(claimed_sessions, "dsh",
-                            session_id=sess.session_id,
-                            canonical_path=sess.path):
-                continue
             inst = AgentInstance(
                 kind=AgentKind.DSH, pid=0, source="windows",
                 surface=AgentSurface.DESKTOP,
@@ -1224,30 +1372,48 @@ class DshDesktopSource(DesktopSessionSource):
             try:
                 if not entry.is_dir(follow_symlinks=False):
                     continue
-                pst = entry.stat(follow_symlinks=False)
-                if now - pst.st_mtime > max(window * 2, IDLE_LEASE_SEC):
-                    continue
             except OSError:
                 continue
             for mtime, log in dsh_project_candidates(entry.path, window):
                 cands.append((mtime, log))
         cands.sort(reverse=True)
-        live_paths = {os.path.normcase(log)
-                      for _m, log in cands[:24]}
-        for _m, log in cands[:24]:
+        # Keep every already-admitted/active path in the scan set even when
+        # its mtime is older than the discovery window.  A pending approval
+        # commonly stops appending while the user is deciding; dropping it
+        # after 180s used to delete a live target and its reader.
+        retained = {sess.path for sess in self._sessions.values()}
+        retained.update(self._child_consumers)
+        selected: list[tuple[float, str]] = list(cands[:24])
+        selected_paths = {os.path.normcase(log) for _m, log in selected}
+        for path in sorted(retained):
+            if os.path.normcase(path) in selected_paths:
+                continue
+            try:
+                mtime = os.stat(path).st_mtime
+            except OSError:
+                continue
+            selected.append((mtime, path))
+            selected_paths.add(os.path.normcase(path))
+        live_paths = set(selected_paths)
+        for _m, log in selected:
             consumer = self._logs.get(log)
+            claimed = claims_cover(claimed_sessions, "dsh",
+                                   canonical_path=log)
             if consumer is None:
                 # v4.4.1：被 terminal claim 覆盖的会话不再创建 consumer——
                 # 否则同一份 zstd 日志会被 CLI watcher 与 desktop source
                 # 两份解码器重复解压（重复监听的 CPU/IO 来源）。
-                if claims_cover(claimed_sessions, "dsh",
-                                canonical_path=log):
+                if claimed:
                     continue
                 consumer = DshLogConsumer(
                     path=log,
                     compression=parse_generation_filename(
                         os.path.basename(log))[1])
                 self._logs[log] = consumer
+            if claimed:
+                # v4.4.2：claim 建立前已打开的 consumer 同样冻结增量读
+                # （只挡新建挡不住早开的那份）。
+                continue
             self._tail_consumer(consumer, now)
             header = consumer.header
             if not consumer.header_seen or not header.session_id:
@@ -1318,8 +1484,10 @@ def _merged_tracker(consumer: DshLogConsumer,
     """
     import copy as _copy
     merged = _copy.copy(consumer.tracker)
-    if merged.pending_approvals:
-        merged.pending_approvals = dict(merged.pending_approvals)
+    # 无条件复制：root 审批为空时浅拷贝会让 merged 与 root tracker 共享
+    # 同一个 dict，子会话审批经 setdefault 永久写入 root（decided 只会到达
+    # 子会话 consumer，root 的幻影 WAITING 要等 600s 回放预算才被剪除）。
+    merged.pending_approvals = dict(merged.pending_approvals)
     for child in children.values():
         if child.header.parent_session != sess.session_id:
             continue

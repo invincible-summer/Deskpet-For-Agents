@@ -8,10 +8,11 @@
   * TurnComplete 序列化为 "task_complete"。
   * error / exec_command_begin / *_approval_request / request_user_input 等
     都是 transient：不写入 rollout。因此 rollout 静默绝不推断 WAITING
-    （plan.md §6/§11）；审批只能来自 Terminal UIA 观察。
+    审批只能来自 Terminal UIA 观察。
   * user_message 的文本字段是 message；agent_message 也是 message。
 """
 import json
+import os
 import time
 
 from .base import BaseWatcher, FileState, classify_phase, parse_ts
@@ -25,10 +26,14 @@ from .models import (
     Status,
     parse_mode,
 )
-from .summarize import CODEX_MODE, CODEX_SANDBOX, fmt_command, shorten, question_summary, wrapped_command
+from .summarize import (CODEX_MODE, CODEX_SANDBOX, fmt_command, shorten,
+                        question_summary, wrapped_command, summarize_text,
+                        summarize_tool, tool_detail)
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
+_CODEX_ZSTD_MAX_COMPRESSED = 32 * 1024 * 1024
+_CODEX_ZSTD_MAX_DECOMPRESSED = 128 * 1024 * 1024
 
 # rollout 顶层记录类型（2026-09 查证）
 _TOP_RECORD_TYPES = frozenset({
@@ -45,6 +50,37 @@ _EVENT_TYPES = frozenset({
     "task_cancelled", "user_message", "agent_message", "agent_reasoning",
     "agent_reasoning_raw_content", "mcp_tool_call_end", "web_search_end",
     "item_completed", "input_received", "user_input", "token_count",
+    # 上游 rollout policy.rs 的 durable 事件（protocol.rs serde snake_case
+    # 命名，2026-10 对照 main 复核）：缺任何一个都会让含该记录的 rollout
+    # 解析健康误判 PARTIAL。
+    "thread_goal_updated", "thread_rolled_back", "thread_settings_applied",
+    "context_compacted", "entered_review_mode", "exited_review_mode",
+    "patch_apply_end", "image_generation_end", "sub_agent_activity",
+    # Current protocol.rs EventMsg names. Most are transient, but retaining
+    # them avoids labelling a healthy rollout PARTIAL when a newer client
+    # persists a lifecycle marker.
+    "warning", "auth_recovery_started", "auth_recovery_completed",
+    "guardian_warning", "realtime_conversation_started",
+    "realtime_conversation_realtime", "realtime_conversation_closed",
+    "realtime_conversation_sdp", "model_reroute", "model_verification",
+    "turn_moderation_metadata", "safety_buffering", "thread_queue_changed",
+    "session_configured", "environment_connected", "environment_disconnected",
+    "mcp_startup_update", "mcp_startup_complete", "mcp_tool_call_begin",
+    "web_search_begin", "image_generation_begin", "exec_command_begin",
+    "exec_command_output_delta", "terminal_interaction", "exec_command_end",
+    "exec_approval_request", "request_permissions", "request_user_input",
+    "dynamic_tool_call_request", "dynamic_tool_call_response",
+    "elicitation_request", "elicitation_abandoned",
+    "apply_patch_approval_request", "guardian_assessment", "deprecation_notice",
+    "patch_apply_begin", "patch_apply_updated", "turn_diff", "plan_update",
+    "shutdown_complete", "raw_response_item", "raw_response_completed",
+    "item_started", "hook_started", "hook_completed",
+    "agent_message_content_delta", "plan_delta", "reasoning_content_delta",
+    "reasoning_raw_content_delta", "agent_reasoning_section_break",
+    "collab_agent_spawn_begin", "collab_agent_spawn_end",
+    "collab_agent_interaction_begin", "collab_agent_interaction_end",
+    "collab_waiting_begin", "collab_waiting_end", "collab_close_begin",
+    "collab_close_end", "collab_resume_begin", "collab_resume_end",
 })
 # response_item 的 payload.type
 _ITEM_TYPES = frozenset({
@@ -52,6 +88,13 @@ _ITEM_TYPES = frozenset({
     "custom_tool_call", "input", "request_user_input", "error",
     "reasoning",
     "function_call_output", "custom_tool_call_output", "tool_result",
+    "agent_message", "user_message", "command_execution", "plan",
+    "dynamic_tool_call", "collab_agent_tool_call", "sub_agent_activity",
+    "web_search", "image_view", "extension", "image_generation",
+    "entered_review_mode", "exited_review_mode", "file_change",
+    "mcp_tool_call", "context_compaction", "tool_search_call",
+    "tool_search_output", "web_search_call", "image_generation_call",
+    "configuration_update", "compaction", "compaction_trigger",
 })
 
 
@@ -68,8 +111,37 @@ def _text_content(value) -> str:
     if isinstance(value, list):
         return " ".join(_text_content(item) for item in value)
     if isinstance(value, dict):
-        return str(value.get("text") or value.get("value") or "")
+        nested = (value.get("text") or value.get("value")
+                  or value.get("content") or value.get("message"))
+        if nested is not None and nested is not value:
+            return _text_content(nested)
+        summary = value.get("summary_text")
+        if isinstance(summary, list):
+            return " ".join(_text_content(x) for x in summary)
+        return ""
     return ""
+
+
+def _lifecycle_reason(payload: dict) -> tuple[str, str]:
+    """Normalize current and older Codex completion payloads.
+
+    The Rust enum normally serializes a scalar event tag, but bridge/client
+    adapters have emitted ``reason``/``outcome`` objects as well.  Returning
+    both a normalized kind and a short message keeps abnormal endings from
+    being mistaken for successful ``task_complete`` events.
+    """
+    raw = (payload.get("reason") or payload.get("status")
+           or payload.get("outcome") or payload.get("subtype") or "")
+    detail = ""
+    if isinstance(raw, dict):
+        detail = str(raw.get("message") or raw.get("error")
+                     or raw.get("detail") or "")
+        raw = (raw.get("kind") or raw.get("status")
+               or raw.get("outcome") or raw.get("type") or "")
+    kind = str(raw or "").casefold().replace("_", "-")
+    if payload.get("is_error") or payload.get("isError"):
+        kind = kind or "error"
+    return kind, detail
 
 
 class CodexFile(FileState):
@@ -88,6 +160,12 @@ class CodexFile(FileState):
 
     def __init__(self, path: str):
         super().__init__(path)
+        self._init_codex_state()
+        self._compressed = str(path).lower().endswith(".jsonl.zst")
+        self._compressed_sig = None
+        self._compressed_error = ""
+
+    def _init_codex_state(self):
         self.title = ""
         self.goal = ""
         self.last_text = ""
@@ -106,6 +184,108 @@ class CodexFile(FileState):
         self.last_assistant_ts = 0.0
         self.last_tool_ts = 0.0
         self.last_activity_kind = ""
+        # Monotonic runtime fact used by desktop admission. Metadata/header
+        # records may refresh a file without representing a user/assistant/
+        # tool turn; those records must not create a target by themselves.
+        self.meaningful_revision = 0
+        self.last_meaningful_ts = 0.0
+        self._feed_ts = 0.0
+
+    def _reset_for_replacement(self):
+        """Reset parser state when a rollout representation is atomically replaced."""
+        source = self.source
+        FileState.__init__(self, self.path)
+        self.source = source
+        self._init_codex_state()
+
+    @staticmethod
+    def _decode_zstd_lines(path: str):
+        """Yield decoded JSONL lines from one immutable Codex ``.jsonl.zst``.
+
+        Codex compresses archived rollouts as one zstd stream (``.zst``), while
+        DSH uses concatenated ``.zstd`` frames.  Keep this reader separate so a
+        Codex archive is never mistaken for a DSH frame stream.  The output and
+        input caps keep a corrupt archive from consuming unbounded memory.
+        """
+        try:
+            import zstandard  # type: ignore
+        except ImportError as exc:
+            raise ValueError("zstandard library unavailable") from exc
+        size = os.path.getsize(path)
+        if size > _CODEX_ZSTD_MAX_COMPRESSED:
+            raise ValueError("compressed rollout exceeds input cap")
+        pending = b""
+        produced = 0
+        with open(path, "rb") as raw:
+            with zstandard.ZstdDecompressor().stream_reader(raw) as reader:
+                while True:
+                    chunk = reader.read(65536)
+                    if not chunk:
+                        break
+                    produced += len(chunk)
+                    if produced > _CODEX_ZSTD_MAX_DECOMPRESSED:
+                        raise ValueError("decompressed rollout exceeds output cap")
+                    pending += chunk
+                    while True:
+                        idx = pending.find(b"\n")
+                        if idx < 0:
+                            break
+                        yield pending[:idx]
+                        pending = pending[idx + 1:]
+        # A torn final JSONL record is intentionally ignored, matching the
+        # plain FileTailer contract; complete records have a trailing newline.
+
+    def _consume_decoded_line(self, raw: bytes, arrival: float):
+        if len(raw) > self.tailer.MAX_LINE:
+            self.parse_errors += 1
+            return
+        line = raw.decode("utf-8", errors="replace").strip("\r")
+        if not line:
+            return
+        try:
+            obj = json.loads(line)
+        except (TypeError, ValueError):
+            obj = None
+        if isinstance(obj, dict):
+            self._count_record(obj)
+        self._observe(obj, arrival)
+        try:
+            self.feed(line)
+        except Exception:
+            self.parse_errors += 1
+        self.last_event_ts = max(self.last_event_ts, self._observed_ts or arrival)
+
+    def _poll_compressed_lines(self):
+        arrival = time.time()
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return
+        sig = (st.st_size, getattr(st, "st_mtime_ns", 0),
+               getattr(st, "st_dev", 0), getattr(st, "st_ino", 0))
+        if sig == self._compressed_sig:
+            return
+        if self._compressed_sig is not None:
+            self._reset_for_replacement()
+        self._compressed_sig = sig
+        before = self.last_event_ts
+        try:
+            for raw in self._decode_zstd_lines(self.path):
+                self._consume_decoded_line(raw, arrival)
+        except Exception as exc:
+            self._compressed_error = str(exc)[:200]
+            self.parse_errors += 1
+            self.last_parse_error = self._compressed_error
+            return
+        self._compressed_error = ""
+        self.last_arrival_ts = arrival
+        self.last_event_ts = max(self.last_event_ts, before)
+
+    def poll_lines(self):
+        if self._compressed:
+            self._poll_compressed_lines()
+            return
+        super().poll_lines()
 
     # ------------------------------------------------------------- helpers
     def _touch(self, obj: dict, payload: dict) -> float:
@@ -127,13 +307,18 @@ class CodexFile(FileState):
 
     def _set_goal(self, value) -> bool:
         """Goal 第一来源：当前 turn 最新普通 user message（plan §11）。"""
-        text = shorten(str(value or ""), GOAL_MAX)
+        text = summarize_text(value, GOAL_MAX)
         if text:
             self.goal = text
             return True
         return False
 
+    def _mark_meaningful(self) -> None:
+        self.meaningful_revision += 1
+        self.last_meaningful_ts = max(self.last_meaningful_ts, self._feed_ts)
+
     def _set_error(self, payload: dict, ts: float):
+        self._mark_meaningful()
         value = (payload.get("message") or payload.get("error") or
                  payload.get("reason") or payload.get("detail") or "Codex 报告错误")
         self.error_text = shorten(str(value), SUMMARY_MAX)
@@ -151,6 +336,7 @@ class CodexFile(FileState):
         self.phase = Phase.USER_INPUT
 
     def _begin_turn(self):
+        self._mark_meaningful()
         self.task_active = self.turn_active = True
         self.turn_known_over = False
         self.done_ts = self.error_ts = 0.0
@@ -162,25 +348,37 @@ class CodexFile(FileState):
         self.phase = Phase.THINKING
 
     def _set_assistant(self, text: str, ts: float):
-        text = shorten(text, SUMMARY_MAX)
+        text = summarize_text(text, SUMMARY_MAX)
         if text:
+            self._mark_meaningful()
             self.last_text = text
             self.last_assistant_ts = ts
             self.last_activity_kind = "assistant"
             self.phase = Phase.ANSWERING
 
     def _set_tool(self, name: str, detail, ts: float):
+        self._mark_meaningful()
         self.turn_active = True
         self.turn_known_over = False
         self.done_ts = 0.0
         self.error_ts = 0.0
-        detail_s = fmt_command(detail, 100) if detail else ""
-        self.last_cmd = detail_s or self.last_cmd
-        self.last_tool = fmt_command(f"{name}: {detail_s}" if detail_s else str(name), SUMMARY_MAX)
+        detail_s = tool_detail(detail, SUMMARY_MAX)
+        self.last_cmd = detail_s
+        self.last_text = ""
+        self.last_tool = summarize_tool(name, detail_s, SUMMARY_MAX)
         self.last_tool_ts = ts
         self.last_activity_kind = "tool"
         phase = classify_phase(name, detail_s)
         self.phase = phase if phase is not Phase.NONE else Phase.EXECUTING
+
+    def _set_reasoning(self, value, ts: float):
+        """Project only reasoning text actually present in the session log."""
+        self._mark_meaningful()
+        self.last_text = summarize_text(value, SUMMARY_MAX)
+        self.last_tool = self.last_cmd = ""
+        self.last_assistant_ts = ts
+        self.last_activity_kind = "reasoning"
+        self.phase = Phase.THINKING
 
     # ------------------------------------------------------------- feed
     def feed(self, line: str):
@@ -193,6 +391,7 @@ class CodexFile(FileState):
         if not isinstance(payload, dict):
             payload = {}
         ts = self._touch(obj, payload)
+        self._feed_ts = parse_ts(obj.get("timestamp")) or parse_ts(payload.get("timestamp"))
 
         if rtype == "session_meta":
             self.cwd = str(payload.get("cwd") or self.cwd)
@@ -259,7 +458,20 @@ class CodexFile(FileState):
                 self.mode = mode
                 self.mode_raw = mode_raw
             self.phase = Phase.THINKING
-        elif ptype in {"task_complete", "turn_complete", "turn_finished"}:
+        elif ptype in {"task_complete", "turn_complete", "turn_finished",
+                       "turn_ended", "task_ended", "turn_failed",
+                       "task_failed"}:
+            reason, nested_detail = _lifecycle_reason(payload)
+            if (ptype in {"turn_failed", "task_failed"}
+                    or reason in {"error", "failed", "failure", "aborted",
+                                   "cancelled", "canceled", "interrupted",
+                                   "blocked"}):
+                self._set_error({
+                    "message": payload.get("message")
+                    or payload.get("error") or nested_detail
+                    or payload.get("reason")
+                    or "任务异常中断"}, ts)
+                return
             self.task_active = False
             self.turn_active = False
             self.turn_known_over = True
@@ -269,13 +481,12 @@ class CodexFile(FileState):
             if msg:
                 self._set_assistant(_text_content(msg), ts)
             self.phase = Phase.NONE
-        elif ptype in {"turn_aborted", "task_aborted", "turn_cancelled", "task_cancelled"}:
-            self.task_active = False
-            self.turn_active = False
-            self.turn_known_over = True
-            self.input_pending = False
-            self.done_ts = 0.0
-            self.phase = Phase.NONE
+        elif ptype in {"turn_aborted", "task_aborted", "turn_cancelled",
+                       "task_cancelled", "turn_interrupted",
+                       "task_interrupted"}:
+            self._set_error({
+                "message": payload.get("message") or payload.get("reason")
+                or "任务异常中断"}, ts)
         elif ptype == "user_message":
             # 普通用户输入 → Goal 第一来源；用户提交即开始新 turn。
             self._begin_turn()
@@ -287,21 +498,51 @@ class CodexFile(FileState):
             self.input_pending = False
             self.phase = Phase.THINKING
         elif ptype in {"agent_message"}:
+            self._mark_meaningful()
             self._set_assistant(_text_content(payload.get("message")), ts)
         elif ptype in {"agent_reasoning", "agent_reasoning_raw_content"}:
-            text = _text_content(payload.get("text"))
-            if text:
-                self.phase = Phase.THINKING
-        elif ptype in {"mcp_tool_call_end", "web_search_end"}:
+            self._set_reasoning(payload.get("text") or payload.get("summary")
+                                or payload.get("summary_text"), ts)
+        elif ptype in {"reasoning_content_delta", "reasoning_raw_content_delta"}:
+            self._set_reasoning(payload.get("delta") or payload.get("text"), ts)
+        elif ptype == "agent_message_content_delta":
+            self._set_assistant(_text_content(payload.get("delta")
+                                              or payload.get("text")), ts)
+        elif ptype in {"mcp_tool_call_begin", "mcp_tool_call_end",
+                       "web_search_begin", "web_search_end",
+                       "image_generation_begin", "image_generation_end",
+                       "exec_command_begin", "exec_command_output_delta",
+                       "patch_apply_begin", "patch_apply_updated",
+                       "sub_agent_activity",
+                       "collab_agent_spawn_begin", "collab_agent_interaction_begin"}:
             invocation = payload.get("invocation") or {}
-            name = (invocation.get("tool") if isinstance(invocation, dict) else "") or ptype
-            self._set_tool(str(name), invocation if isinstance(invocation, dict) else "", ts)
+            detail = (payload.get("command") or payload.get("cmd")
+                      or payload.get("arguments") or invocation)
+            name = (invocation.get("tool") if isinstance(invocation, dict) else "") or \
+                payload.get("tool") or payload.get("name") or ptype
+            self._set_tool(str(name), detail, ts)
         elif ptype == "item_completed":
             item = payload.get("item") or {}
             if isinstance(item, dict):
                 self._feed_turn_item(item, ts)
         elif ptype in {"input_received", "user_input"}:
             self.input_pending = False
+        elif ptype in {"thread_goal_updated", "plan_update", "plan_delta"}:
+            value = (payload.get("goal") or payload.get("text")
+                     or payload.get("title") or payload.get("plan"))
+            if isinstance(value, dict):
+                value = value.get("text") or value.get("goal") or value.get("title")
+            if value:
+                self._set_goal(value)
+                if ptype != "thread_goal_updated":
+                    self.phase = Phase.PLANNING
+        elif ptype == "shutdown_complete":
+            self.task_active = False
+            self.turn_active = False
+            self.turn_known_over = True
+            self.input_pending = False
+            self.done_ts = 0.0
+            self.phase = Phase.NONE
         elif ptype == "token_count":
             pass   # 活动证据已由 last_event_ts 记录
         else:
@@ -313,39 +554,43 @@ class CodexFile(FileState):
         """paginated history 的 item_completed TurnItem（command_execution 等）。"""
         itype = str(item.get("type") or "").lower()
         item_ts = parse_ts(item.get("timestamp")) or ts
-        if itype in {"agentmessage", "assistantmessage", "message"}:
+        if itype in {"agentmessage", "agent_message", "assistantmessage",
+                     "assistant_message", "usermessage", "user_message", "message"}:
+            self._mark_meaningful()
             role = str(item.get("role") or "")
-            if role == "user":
+            if role == "user" or itype in {"usermessage", "user_message"}:
                 self._begin_turn()
-                self._set_goal(item.get("text") or item.get("content"))
+                self._set_goal(item.get("text") or item.get("content")
+                               or item.get("message"))
                 self.turn_active = True
                 self.turn_known_over = False
             else:
-                self._set_assistant(_text_content(item.get("text") or item.get("content")), item_ts)
+                self._set_assistant(
+                    _text_content(item.get("text") or item.get("content")
+                                  or item.get("message")), item_ts)
         elif itype in {"commandexecution", "command_execution", "functioncall",
                        "function_call", "localshellcall", "customtoolcall"}:
             command = item.get("command") or item.get("cmd") or item.get("arguments")
             if isinstance(command, dict):
                 command = command.get("command") or command.get("cmd") or str(command)
             self._set_tool(itype, command, item_ts)
-        elif itype in {"reasoning", "agentreasoning"}:
-            self.phase = Phase.THINKING
+        elif itype in {"reasoning", "agentreasoning", "agent_reasoning"}:
+            self._set_reasoning(item.get("summary") or item.get("summary_text")
+                                or item.get("text") or item.get("content"), item_ts)
         elif itype == "plan":
             self.phase = Phase.PLANNING
-        elif itype in {"mcp tool call", "mcptoolcall"}:
+        elif itype in {"mcp tool call", "mcptoolcall", "mcp_tool_call",
+                       "dynamic_tool_call", "web_search", "image_generation",
+                       "collab_agent_tool_call", "sub_agent_activity"}:
             self._set_tool(str(item.get("tool") or "mcp"), item.get("arguments"), item_ts)
 
     def _feed_response_item(self, payload: dict, ts: float):
         ptype = str(payload.get("type") or "")
         if ptype == "message":
             role = str(payload.get("role") or "")
-            texts = []
-            for content in payload.get("content") or []:
-                if isinstance(content, dict):
-                    texts.append(_text_content(content.get("text") or content.get("content")))
-                else:
-                    texts.append(_text_content(content))
-            text = " ".join(x for x in texts if x)
+            if role in {"user", "assistant"}:
+                self._mark_meaningful()
+            text = _text_content(payload.get("content"))
             if role == "user":
                 self._begin_turn()
                 if self._set_goal(text):
@@ -354,40 +599,66 @@ class CodexFile(FileState):
                     self.done_ts = 0.0
             elif role == "assistant" and text:
                 self._set_assistant(text, ts)
-        elif ptype in {"function_call", "tool_call", "local_shell_call", "custom_tool_call"}:
-            args = payload.get("arguments") or payload.get("input") or payload.get("action") or ""
+        elif ptype in {"function_call", "tool_call", "local_shell_call",
+                       "custom_tool_call", "tool_search_call", "web_search_call",
+                       "image_generation_call", "dynamic_tool_call",
+                       "collab_agent_tool_call"}:
+            args = (payload.get("arguments") or payload.get("input")
+                    or payload.get("action") or payload.get("query") or "")
             parsed = args if isinstance(args, dict) else {}
             command = args
-            name = payload.get("name") or ptype
+            name = payload.get("name") or payload.get("tool") or ptype
             if isinstance(args, str):
                 try:
                     parsed = json.loads(args)
                 except (TypeError, ValueError):
                     parsed = None
                 if isinstance(parsed, dict):
-                    command = parsed.get("cmd") or parsed.get("command") or parsed.get("path") or args
+                    command = (parsed.get("cmd") or parsed.get("command")
+                               or parsed.get("path") or parsed.get("tool") or args)
             elif isinstance(args, dict):
-                command = args.get("cmd") or args.get("command") or args.get("path") or str(args)
+                command = (args.get("cmd") or args.get("command")
+                           or args.get("path") or args.get("tool") or str(args))
             if str(name).split(".")[-1] == "exec":
                 command = wrapped_command(command)
-            self._set_tool(str(name), command, ts)
+            self._set_tool(str(name), parsed if isinstance(parsed, dict) else command, ts)
             tool = str(name).split(".")[-1]
             if tool in {"request_user_input", "request_user_input_async", "AskUserQuestion"}:
                 self._set_input(parsed if isinstance(parsed, dict) else {})
-                self.input_call_id = str(payload.get("call_id") or "") if tool != "request_user_input_async" else ""
+                self.input_call_id = str(
+                    payload.get("call_id") or payload.get("callId") or "") \
+                    if tool != "request_user_input_async" else ""
             elif tool == "create_goal":
                 self.goal_mode = True
+                if isinstance(parsed, dict):
+                    self._set_goal(parsed.get("objective"))
             elif tool == "update_goal" and isinstance(parsed, dict) and parsed.get("status") in {"complete", "blocked"}:
                 self.goal_mode = False
-        elif ptype in {"function_call_output", "custom_tool_call_output", "tool_result"}:
-            if self.input_call_id and payload.get("call_id") == self.input_call_id:
+        elif ptype in {"function_call_output", "custom_tool_call_output",
+                       "tool_result", "tool_search_output"}:
+            call_id = payload.get("call_id") or payload.get("callId")
+            if self.input_call_id and call_id == self.input_call_id:
                 self.input_pending = False
                 self.input_call_id = ""
+                self.phase = Phase.THINKING
+            elif not self.input_pending:
+                # A result does not mean that the previous assistant answer
+                # or tool command is the current activity.
+                self.last_text = self.last_tool = self.last_cmd = ""
+                self.last_activity_kind = ""
                 self.phase = Phase.THINKING
         elif ptype in {"input", "request_user_input"}:
             self._set_input(payload)
         elif ptype == "error":
             self._set_error(payload, ts)
+        elif ptype == "reasoning":
+            self._set_reasoning(payload.get("summary") or payload.get("summary_text")
+                                or payload.get("content") or payload.get("text"), ts)
+        elif ptype in {"context_compaction", "compaction",
+                       "configuration_update"}:
+            self.last_text = self.last_tool = self.last_cmd = ""
+            self.last_activity_kind = ""
+            self.phase = Phase.THINKING
 
     # ------------------------------------------------------------- status
     def _summary_text(self, status: Status) -> str:
@@ -397,15 +668,15 @@ class CodexFile(FileState):
             return self.input_summary or "等待输入"
         if status == Status.DONE:
             return self.last_text or "任务完成"
-        if self.last_activity_kind == "assistant" and self.last_text:
+        if self.last_activity_kind in {"assistant", "reasoning"}:
             return self.last_text
-        if self.last_activity_kind == "tool" and self.last_tool:
+        if self.last_activity_kind == "tool":
             return self.last_tool
-        if self.last_assistant_ts >= self.last_tool_ts and self.last_text:
-            return self.last_text
-        return self.last_tool or self.last_text
+        return ""
 
     def observation(self, now: float, cfg: dict) -> Observation | None:
+        if self._compressed_error:
+            return None
         obs = self.base_observation()
         obs.mode = Mode.GOAL if self.goal_mode else self.mode
         obs.mode_raw = self.mode_raw

@@ -17,8 +17,8 @@ admission / lease（plan2 §7.4）：
   * admit 条件（任一）：rollout 当前 active turn；DeskPet 启动后出现
     新增长；cold start 时 DB updated_at 在 active_file_window_sec 内且
     解析显示进行中；
-  * idle lease 10 分钟（内部常量，非 config）；有 WORKING/WAITING/INPUT
-    观察时绝不因 TTL 移除；
+  * idle lease 10 分钟（内部常量，非 config）；未闭合 active turn 另有
+    有界孤儿租约，旧 task_started 不能永久维持目标；
   * archived=0；thread_source 排除 generated（subagent/guardian/…）；
     originator 列存在时只接受已知 desktop 族，未知值进有界诊断；
   * catalog LIMIT 32；最多同时 track 8 个 session（与 Presentation
@@ -65,22 +65,40 @@ _DESKTOP_ORIGINATORS = frozenset({
     "codex_atlas",
     "codex desktop",  # Windows Desktop state_5.sqlite 实机来源名称
 })
-# thread_source（上游 migration 0030 / protocol thread_data.rs）中明确
-# 非 root/user 的 generated 值：绝不形成用户 pet。
-_GENERATED_THREAD_SOURCES = frozenset({
-    "subagent", "guardian", "guardian_review", "memory_consolidation",
+
+
+def _is_desktop_originator(value: str) -> bool:
+    """Return whether a DB originator is an explicit Codex desktop family."""
+    originator = str(value or "").strip().casefold()
+    # Upstream allows free-form desktop labels beginning with ``Codex ``.
+    # Keep CLI values such as codex_cli_rs excluded: the space is intentional.
+    return bool(originator and (
+        originator in _DESKTOP_ORIGINATORS or originator.startswith("codex ")))
+
+
+_DESKTOP_SOURCES = frozenset({
+    "desktop", "appserver", "app_server", "chatgpt_desktop",
 })
+
+
+def _is_desktop_source(value: str) -> bool:
+    source = str(value or "").strip().casefold().replace("-", "_")
+    return source in _DESKTOP_SOURCES
+
 
 _MAX_SESSIONS = 8            # 与 Presentation 1..8 上限对应（plan2 §6.2）
 _CATALOG_LIMIT = 32          # plan2 §6.2：catalog LIMIT <= 32
 _IDLE_LEASE_SEC = 600.0      # plan2 §7.4：默认 idle lease 10 分钟
+_ORPHAN_ACTIVE_TTL_SEC = 180.0  # 未收到 durable event 的 orphan turn 上限
 _SAFETY_REFRESH_SEC = 7.5    # plan2 §6.2：空闲 safety refresh 5~10s
 _FAILURE_RETRY_SEC = 1.0     # 失败后的最短重试间隔（防 busy SQL storm）
 _DIAG_MAX = 8
 
-_REQUIRED_THREAD_COLUMNS = ("id", "rollout_path", "updated_at", "archived")
-_PREFERRED_COLUMNS = ("title", "cwd", "has_user_event", "thread_source",
-                      "originator", "source", "updated_at_ms")
+_REQUIRED_THREAD_COLUMNS = ("id", "rollout_path", "archived")
+_TIME_COLUMNS = ("updated_at", "updated_at_ms", "recency_at_ms")
+_PREFERRED_COLUMNS = ("title", "preview", "first_user_message", "name",
+                      "cwd", "has_user_event", "thread_source", "originator",
+                      "source", "updated_at_ms")
 
 
 @dataclass
@@ -99,6 +117,9 @@ class _DesktopSession:
     file: CodexFile | None = None
     last_status: Status | None = None
     last_activity_ts: float = 0.0
+    last_active_ts: float = 0.0  # semantic activity only, never catalog/token telemetry
+    last_event_ts: float = 0.0
+    meaningful_growth: bool = False
 
 
 class CodexDesktopSource(DesktopSessionSource):
@@ -115,6 +136,7 @@ class CodexDesktopSource(DesktopSessionSource):
         self._cfg = dict(cfg or {})
         self._codex_home = codex_home or paths.codex_home_root()
         self._db_path = db_path or ""
+        self._explicit_db_path = bool(db_path)
         self._ro: ReadOnlySqlite | None = None
         self._caps: SchemaCapabilities | None = None
         self._fingerprint = DbFingerprint(exists=False)
@@ -132,6 +154,9 @@ class CodexDesktopSource(DesktopSessionSource):
         """释放 DB 连接与全部 session 文件句柄（shutdown/测试用）。"""
         self._release_all()
         self._close_db()
+        self._fingerprint = DbFingerprint(exists=False)
+        self._last_sql = 0.0
+        self._retry_at = 0.0
 
     def drop_host(self, host_key: str) -> None:
         """host 退出：释放绑定该 host 的全部 session 状态（plan2 §9）。"""
@@ -139,6 +164,8 @@ class CodexDesktopSource(DesktopSessionSource):
             sess = self._sessions[thread_id]
             if not host_key or sess.bound_host_key == host_key:
                 self._release(thread_id)
+        if not self._sessions:
+            self.close()
 
     def stats(self) -> dict:
         return {
@@ -150,10 +177,17 @@ class CodexDesktopSource(DesktopSessionSource):
 
     # ------------------------------------------------------------ 主路径
     def poll(self, hosts, claimed_sessions, now) -> DesktopSourceSnapshot:
-        codex_hosts = [h for h in hosts if h.kind is AgentKind.CODEX]
+        codex_hosts = list({h.host_key: h for h in hosts
+                            if h.kind is AgentKind.CODEX}.values())
         diag: list[str] = []
         if not codex_hosts:
-            self._release_all()
+            self.close()
+            return self._finish((), {}, codex_hosts, diag, now)
+        if len(codex_hosts) != 1:
+            # A global catalog has no per-host ownership evidence. Choosing
+            # the first PID can attribute one host's task to another process.
+            self.close()
+            diag.append("AMBIGUOUS_DESKTOP_HOSTS")
             return self._finish((), {}, codex_hosts, diag, now)
         # host 找到、DB 找不到：不把 host 冒充 agent（plan2 §13）
         db = self._resolve_db(diag)
@@ -190,15 +224,18 @@ class CodexDesktopSource(DesktopSessionSource):
 
     # ------------------------------------------------------------ DB
     def _resolve_db(self, diag: list[str]) -> str:
-        if self._db_path and os.path.isfile(self._db_path):
-            return self._db_path
-        self._close_db()
-        for cand in paths.codex_state_db_candidates(self._codex_home):
-            self._db_path = cand
-            if os.path.isfile(cand):
-                return cand
-        self._db_path = ""
-        return ""
+        # Explicit test/profile overrides remain authoritative.  Otherwise
+        # re-evaluate the candidate list so a Codex upgrade from state_N to
+        # state_(N+1) cannot leave the reader pinned to the old catalog.
+        candidates = ([self._db_path] if self._explicit_db_path
+                      else paths.codex_state_db_candidates(self._codex_home))
+        chosen = next((p for p in candidates if p and os.path.isfile(p)), "")
+        if chosen != self._db_path:
+            self._close_db()
+            self._fingerprint = DbFingerprint(exists=False)
+            self._release_all()
+            self._db_path = chosen
+        return chosen
 
     def _close_db(self):
         if self._ro is not None:
@@ -236,8 +273,13 @@ class CodexDesktopSource(DesktopSessionSource):
             diag.append("INCOMPATIBLE_SCHEMA")
             return None
         cols = set(caps.columns_of("threads"))
-        select = list(_REQUIRED_THREAD_COLUMNS)
-        select += [c for c in _PREFERRED_COLUMNS if c in cols]
+        time_col = next((name for name in _TIME_COLUMNS if name in cols), "")
+        if not time_col:
+            diag.append("INCOMPATIBLE_SCHEMA")
+            return None
+        select = list(_REQUIRED_THREAD_COLUMNS) + [time_col]
+        select += [c for c in _PREFERRED_COLUMNS
+                   if c in cols and c not in select]
         where = ["archived = 0"]
         if "has_user_event" in cols:
             # Desktop 用户任务可保持 has_user_event=0；明确 user 来源
@@ -245,13 +287,15 @@ class CodexDesktopSource(DesktopSessionSource):
             where.append("(has_user_event = 1 OR thread_source = 'user')"
                          if "thread_source" in cols else "has_user_event = 1")
         if "thread_source" in cols:
-            quoted = ",".join(
-                "'" + v + "'" for v in sorted(_GENERATED_THREAD_SOURCES))
+            # Upstream's enum also has free-form Feature(String) and nested
+            # sub-agent variants.  An allow-list of known generated labels
+            # would let a new feature create another visible card, so only an
+            # explicit user thread (or legacy NULL) is admitted.
             where.append(
-                f"(thread_source IS NULL OR thread_source NOT IN ({quoted}))")
+                "(thread_source IS NULL OR thread_source = 'user')")
         sql = (f"SELECT {', '.join(select)} FROM threads "
                f"WHERE {' AND '.join(where)} "
-               f"ORDER BY updated_at DESC LIMIT {_CATALOG_LIMIT}")
+               f"ORDER BY {time_col} DESC LIMIT {_CATALOG_LIMIT}")
         rows = self._ro.query(sql, max_rows=_CATALOG_LIMIT)
         self.db_query_count = self._ro.query_count
         self.db_busy_count = self._ro.busy_count
@@ -274,6 +318,16 @@ class CodexDesktopSource(DesktopSessionSource):
                     return ms / 1000.0
             except (TypeError, ValueError):
                 pass
+        if value <= 0:
+            for name in ("updated_at_ms", "recency_at_ms"):
+                if name not in row.keys():
+                    continue
+                try:
+                    ms = float(row[name] or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ms > 1e12:
+                    return ms / 1000.0
         if value > 1e12:      # 毫秒 epoch
             return value / 1000.0
         return value
@@ -281,7 +335,11 @@ class CodexDesktopSource(DesktopSessionSource):
     def _apply_catalog(self, rows, codex_hosts):
         """行 → 内部 session 候选；不触碰 rollout 文件（poll 统一读）。"""
         host_key = codex_hosts[0].host_key
-        seen = set()
+        # A DB migration/recovery can briefly expose two rows for one rollout
+        # (for example while a reverted thread is being materialized).  The
+        # rollout path is the exact durable identity; retaining both rows
+        # creates duplicate desktop cards and two readers for one file.
+        candidates: list[tuple[float, str, object, str]] = []
         for row in rows:
             try:
                 thread_id = str(row["id"] or "")
@@ -289,17 +347,31 @@ class CodexDesktopSource(DesktopSessionSource):
                 continue
             if not thread_id:
                 continue
-            # originator 列存在时要求 desktop 族（plan2 §7.1）；未知新值
-            # 只写诊断，不自动当 Desktop
             keys = row.keys()
             if "originator" in keys:
-                originator = str(row["originator"] or "").strip().casefold()
-                if originator and originator not in _DESKTOP_ORIGINATORS:
+                if row["originator"]:
+                    if not _is_desktop_originator(row["originator"]):
+                        continue
+                elif "source" in keys and not _is_desktop_source(row["source"]):
+                    # NULL originator is unknown, not evidence that a CLI
+                    # thread belongs to this Desktop host.
                     continue
             rollout = self._validate_rollout_path(row["rollout_path"])
             if rollout is None:
-                continue   # 越界/无法解析：拒绝该 row（plan2 §7.2）
+                continue
             updated_at = self._row_updated_at(row)
+            candidates.append((updated_at, thread_id, row,
+                               canonical_session_path(rollout)))
+        candidates.sort(key=lambda item: (-item[0], item[1], item[3]))
+        by_path: dict[str, tuple[float, str, object, str]] = {}
+        for item in candidates:
+            by_path.setdefault(item[3], item)
+        seen = set()
+        selected_paths = set(by_path)
+        for updated_at, thread_id, row, _canonical in by_path.values():
+            rollout = self._validate_rollout_path(row["rollout_path"])
+            if rollout is None:  # file may have been replaced between queries
+                continue
             seen.add(thread_id)
             sess = self._sessions.get(thread_id)
             if sess is None:
@@ -319,15 +391,27 @@ class CodexDesktopSource(DesktopSessionSource):
                     sess.first_seen_size = self._safe_size(rollout)
             sess.bound_host_key = host_key
             sess.db_updated_at = max(sess.db_updated_at, updated_at)
-            if "title" in row.keys():
-                sess.db_title = str(row["title"] or "")[:120]
+            if any(name in row.keys() for name in
+                   ("title", "preview", "first_user_message", "name")):
+                for name in ("title", "preview", "first_user_message", "name"):
+                    value = str(row[name] or "") if name in row.keys() else ""
+                    if value.strip():
+                        sess.db_title = value[:120]
+                        break
             if "cwd" in row.keys():
                 sess.db_cwd = str(row["cwd"] or "")
-        # catalog 缺席（archived=1 / DELETE / 滚出 LIMIT 32）→ 标记；
-        # 真正退场走 idle lease（active 观察优先，plan2 §7.4）
-        for thread_id, sess in self._sessions.items():
+        # catalog 缺席是本轮权威事实：archived、DELETE、滚出当前索引或
+        # state DB rollover 都必须立即 tombstone，不能让旧 WORKING lease
+        # 把已关闭会话保留十分钟甚至永久。
+        for thread_id, sess in list(self._sessions.items()):
             if thread_id not in seen:
-                sess.archived_seen = True
+                if canonical_session_path(sess.rollout_path) in selected_paths:
+                    # This is a duplicate alias of a row selected above,
+                    # rather than a temporarily missing catalog entry. Drop
+                    # it now so an active duplicate cannot survive its lease.
+                    self._release(thread_id)
+                    continue
+                self._release(thread_id)
 
     def _validate_rollout_path(self, raw) -> str | None:
         """DB rollout_path 是 untrusted local metadata（plan2 §7.2）。"""
@@ -340,6 +424,18 @@ class CodexDesktopSource(DesktopSessionSource):
             real = os.path.realpath(text)
         except Exception:
             return None
+        # Codex's compression worker can replace an archived ``.jsonl`` with
+        # ``.jsonl.zst`` while the state row still carries the logical plain
+        # path during the transition. Resolve the sibling only inside the
+        # already validated rollout root; prefer plain when both exist.
+        if not os.path.isfile(real) and real.lower().endswith(".jsonl"):
+            compressed = real + ".zst"
+            if os.path.isfile(compressed):
+                real = os.path.realpath(compressed)
+        elif real.lower().endswith(".jsonl.zst"):
+            plain = real[:-4]
+            if os.path.isfile(plain):
+                real = os.path.realpath(plain)
         norm = os.path.normcase(real)
         for root in paths.codex_rollout_roots(self._codex_home):
             try:
@@ -366,6 +462,7 @@ class CodexDesktopSource(DesktopSessionSource):
         host_by_key = {h.host_key: h for h in codex_hosts}
         for thread_id in list(self._sessions):
             sess = self._sessions[thread_id]
+            sess.meaningful_growth = False
             host = host_by_key.get(sess.bound_host_key)
             if host is None:
                 # host 已不在本轮 inventory：等 Monitor 的 census/exit
@@ -374,29 +471,62 @@ class CodexDesktopSource(DesktopSessionSource):
             claimed = claims_cover(
                 claimed_sessions, "codex", session_id=thread_id,
                 canonical_path=sess.rollout_path)
-            if claimed and sess.file is None:
-                # v4.4.1：terminal 已精确绑定同一会话时，desktop source
-                # **完全不打开** rollout tailer——否则同一文件会被两份
-                # parser 重复增量读取与重复身份解析（重复监听的 CPU/IO
-                # 来源）。已打开过的保留状态供 reclaim，不再增量读。
+            if claimed:
+                # The live terminal watcher owns this exact session. Release
+                # the desktop reader too, so there is only one open parser.
+                # If the claim disappears, reopen and replay the bounded tail.
+                self._release_file(sess)
+                if self._lease_expired(sess, now):
+                    self._release(thread_id)
                 continue
+            # Keep the lease anchored to the monitor clock when the rollout
+            # actually grew during this poll.  The durable event timestamp is
+            # an upstream clock and may lag (or, in benchmarks, be far behind
+            # the simulated monitor clock); a newly observed record is still
+            # authoritative evidence that this target is alive now.
+            before_size = self._safe_size(sess.rollout_path)
+            before_pos = (getattr(sess.file.tailer, "pos", -1)
+                          if sess.file is not None else -1)
+            before_arrival = (getattr(sess.file, "last_arrival_ts", 0.0)
+                              if sess.file is not None else 0.0)
+            before_meaningful = (getattr(sess.file, "meaningful_revision", 0)
+                                 if sess.file is not None else 0)
             obs = self._read_rollout(sess, now)
+            after_size = self._safe_size(sess.rollout_path)
+            after_pos = (getattr(sess.file.tailer, "pos", -1)
+                         if sess.file is not None else -1)
+            after_arrival = (getattr(sess.file, "last_arrival_ts", 0.0)
+                             if sess.file is not None else 0.0)
+            after_meaningful = (getattr(sess.file, "meaningful_revision", 0)
+                                if sess.file is not None else 0)
+            grew = ((before_pos >= 0 and after_pos > before_pos)
+                    or (before_arrival > 0 and after_arrival > before_arrival)
+                    or (before_size >= 0 and after_size > before_size)
+                    or (sess.first_seen_size >= 0
+                        and after_size > sess.first_seen_size))
+            sess.meaningful_growth = bool(
+                grew and after_meaningful > before_meaningful)
             if obs is not None:
                 sess.last_status = obs.status
-                anchor = max(sess.file.last_event_ts if sess.file else 0.0,
+                meaningful_ts = (getattr(sess.file, "last_meaningful_ts", 0.0)
+                                 if sess.file is not None else 0.0)
+                sess.last_event_ts = max(
+                    sess.last_event_ts, meaningful_ts)
+                sess.last_active_ts = max(sess.last_active_ts, meaningful_ts)
+                anchor = max(meaningful_ts,
                              sess.last_activity_ts, sess.db_updated_at)
                 if anchor:
                     sess.last_activity_ts = max(sess.last_activity_ts, anchor)
-            # idle lease（plan2 §7.4）：active/WAITING/INPUT 绝不因 TTL
-            # 移除；其余超时释放（admitted 与候选一致处理）
+            if sess.meaningful_growth and obs is not None and obs.status in (
+                    Status.WORKING, Status.WAITING, Status.INPUT):
+                sess.last_activity_ts = max(sess.last_activity_ts, now)
+                sess.last_active_ts = max(sess.last_active_ts, now)
+            # A durable start without further events has a bounded orphan
+            # lease; completed sessions use the ordinary idle lease.
             if self._lease_expired(sess, now):
                 self._release(thread_id)
                 continue
             if not sess.admitted and not self._admit(sess, now):
-                continue
-            if claimed:
-                # terminal exact binding 优先（plan2 §3.4）：不发 target；
-                # 保留状态，CLI 消失后下一轮 reclaim
                 continue
             inst = AgentInstance(
                 kind=AgentKind.CODEX, pid=0, source="windows",
@@ -460,20 +590,26 @@ class CodexDesktopSource(DesktopSessionSource):
             return False
         reason = ""
         obs_status = sess.last_status
-        if obs_status in (Status.WORKING, Status.WAITING, Status.INPUT):
+        active_fact = bool(
+            sess.file is not None
+            and (getattr(sess.file, "turn_active", False)
+                 or getattr(sess.file, "input_pending", False)))
+        if active_fact and sess.file is not None:
+            meaningful_ts = getattr(sess.file, "last_meaningful_ts", 0.0)
+            active_fact = (bool(meaningful_ts) and 0 <= now - meaningful_ts
+                           <= _ORPHAN_ACTIVE_TTL_SEC)
+        if active_fact or obs_status in (Status.WAITING, Status.INPUT):
             reason = "active-turn"          # rollout 当前解析为 active turn
         elif (sess.file is not None and sess.first_seen_size >= 0
-                and self._safe_size(sess.rollout_path) > sess.first_seen_size):
+                and self._safe_size(sess.rollout_path) > sess.first_seen_size
+                and sess.meaningful_growth):
             reason = "growth"               # DeskPet 启动后出现新增长
         if not reason and sess.db_updated_at:
-            # cold start：DB updated_at 在窗口内且解析显示正在进行；
-            # 刚进入 DONE/ERROR 展示窗口的会话同样 admit（否则用户
-            # 看不到"刚完成"的桌面线程；老 DONE 仍被窗口拒绝）
+            # cold start 只接受明确仍在进行的 turn；仅靠近期 DB metadata
+            # 或刚完成的历史行不能创建“未使用会话”目标。
             if 0 <= now - sess.db_updated_at <= self.active_window_sec:
                 if obs_status is Status.WORKING:
                     reason = "cold-start-active"
-                elif obs_status in (Status.DONE, Status.ERROR):
-                    reason = "cold-start-recent-terminal"
         if not reason:
             return False
         sess.admitted = True
@@ -485,7 +621,10 @@ class CodexDesktopSource(DesktopSessionSource):
         10 分钟无活动/无 DB 更新 → 释放。TTL 只决定 target 是否继续
         显示，绝不把状态改成 WAITING/DONE。"""
         if sess.last_status in (Status.WORKING, Status.WAITING, Status.INPUT):
-            return False
+            # Rollout 中的 task_started 没有 runtime close 语义；超过有界
+            # durable-event 静默窗口后按 orphan 处理，避免永远 WORKING。
+            anchor = sess.last_active_ts
+            return not anchor or now - anchor > _ORPHAN_ACTIVE_TTL_SEC
         anchor = max(sess.last_activity_ts, sess.db_updated_at)
         return bool(anchor) and now - anchor > _IDLE_LEASE_SEC
 

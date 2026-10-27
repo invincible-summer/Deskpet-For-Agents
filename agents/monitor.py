@@ -89,14 +89,14 @@ class NativeTerminalLease:
 
 @dataclass(frozen=True)
 class ActivationRepairRequest:
-    """一次 stale-binding 修复请求（v4.3.1 DP43-R08 §16.5）。
+    """Runtime-only terminal repair or desktop activation; at most 16 jobs.
 
-    UI 在 activate_cached 得到 STALE_WINDOW 后提交；同 agent 天然
-    coalesce（dict 键控），pending 上限 = Agent 上限。
+    Desktop requests coalesce by host incarnation, terminal requests by agent.
     """
     request_id: int
     agent_key: str
     expires_at: float
+    desktop_instance: AgentInstance | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +104,7 @@ class ActivationRepairResult:
     request_id: int
     agent_key: str
     repaired: bool
+    activation_result: ActivationResult | None = None
 
 
 def _num(value, default=0.0) -> float:
@@ -190,7 +191,9 @@ class ProcessProbeWorker:
     def inventory_authoritative(self) -> bool:
         with self._lock:
             inv = self._inventory
-        return bool(inv is not None and inv.authoritative)
+            snap = self._snapshot.get("windows")
+        return bool(inv is not None and inv.authoritative
+                    and snap is not None and snap.authoritative)
 
     def zcode_remote_snapshots(self) -> dict[str, object]:
         """Latest bounded remote ZCode facts, produced only by this worker."""
@@ -515,11 +518,9 @@ class Monitor:
         # v4.3 §4.2 UI 语义 revision：signature 不含只影响新鲜度的时间戳
         self._ui_revision = 0
         self._ui_signature: tuple = ()
-        # v4.3.1 DP43-R08 §16.5：stale binding 的异步 repair 队列。
-        # _repair_requests 按 agent_key 键控（同 agent coalesce）；
-        # _repair_results bounded（16），bridge 每 tick 有界收割。
+        # Shared bounded worker queue for terminal repairs and app activation.
         self._repair_lock = threading.Lock()
-        self._repair_requests: dict[str, ActivationRepairRequest] = {}
+        self._repair_requests: dict[object, ActivationRepairRequest] = {}
         self._repair_next_id = 1
         self._repair_results: "queue.Queue[ActivationRepairResult]" = (
             queue.Queue(maxsize=16))
@@ -532,6 +533,12 @@ class Monitor:
         # 本轮 non-authoritative desktop source 的 session keys（stale 标记）
         self._desktop_stale_keys: set[str] = set()
         self._desktop_poll_count = 0
+        # A process exit outranks the worker's cached census. Keep only exact
+        # incarnations still present in that cache; the next authoritative
+        # absence prunes these runtime-only tombstones.
+        self._retired_processes: dict[str, str] = {}
+        self._retired_hosts: set[str] = set()
+        self._disabled_desktop_sources: set[AgentKind] = set()
 
     # ------------------------------------------------------------ 生命周期
     def start(self):
@@ -559,7 +566,7 @@ class Monitor:
         self._thread.start()
 
     def _register_desktop_sources(self):
-        """按启用 kind 注册生产 Desktop sources（plan2 §5/§11）。
+        """单次构造生产 Desktop sources，运行时按 kind/source 开关读取。
 
         每个 Kind 只注册一个权威 source（无插件监听 plan §三：
         Monitor._poll_desktop_sources 按 kind 清理，多条同 kind source
@@ -571,25 +578,19 @@ class Monitor:
         """
         if self._desktop_sources:
             return
-        cfg_m = dict(self.config.get("monitor") or {})
-        enabled = self._enabled_kinds(cfg_m)
-        if AgentKind.CODEX in enabled:
-            self._desktop_sources.append(
-                CodexDesktopSource(cfg=dict(self._source_cfg)))
-        if AgentKind.ZCODE in enabled:
-            from .zcode_desktop import ZCodeDesktopSource
-            self._desktop_sources.append(ZCodeDesktopSource(
-                cfg=dict(self._source_cfg),
-                remote_provider=self._probe.zcode_remote_snapshots))
-        if AgentKind.OPENCODE in enabled:
-            from .opencode import OpenCodeDesktopSource
-            self._desktop_sources.append(OpenCodeDesktopSource(
-                cfg=dict(self._source_cfg),
-                runtime=self._opencode_runtime))
-        if AgentKind.DSH in enabled:
-            from .dsh import DshDesktopSource
-            self._desktop_sources.append(DshDesktopSource(
-                cfg=dict(self._source_cfg)))
+        # Construction performs no reads. Register every supported kind once
+        # so enabling a kind later does not require restarting DeskPet.
+        from .zcode_desktop import ZCodeDesktopSource
+        from .opencode import OpenCodeDesktopSource
+        from .dsh import DshDesktopSource
+        self._desktop_sources.extend((
+            CodexDesktopSource(cfg=dict(self._source_cfg)),
+            ZCodeDesktopSource(cfg=dict(self._source_cfg),
+                               remote_provider=self._probe.zcode_remote_snapshots),
+            OpenCodeDesktopSource(cfg=dict(self._source_cfg),
+                                  runtime=self._opencode_runtime),
+            DshDesktopSource(cfg=dict(self._source_cfg)),
+        ))
 
     def _start_terminal(self):
         # 启动失败不锁存：backend.available() 是唯一可用性事实来源
@@ -716,7 +717,7 @@ class Monitor:
         return (
             snap.key,
             snap.kind.value, snap.source,
-            inst.project, inst.cwd,
+            inst.project, inst.cwd, snap.cwd, snap.title,
             snap.status.value, snap.phase.value,
             snap.mode.value, snap.mode_raw,
             snap.policy,
@@ -818,25 +819,36 @@ class Monitor:
         with self.lock:
             inst = self.instances.get(key)
         if inst is not None and is_desktop_instance(inst):
-            return self._desktop_window_service.activate_host(inst)
+            rid = self.request_activation_repair(key, desktop_instance=inst)
+            return ActivationResult(ActivationCode.RESTORE_PENDING if rid
+                                    else ActivationCode.NO_BINDING)
         return self._terminal_service.activate_cached(
             key, is_agent_live=self.is_live_key)
 
     # ------------------------------------------------------------ 异步 repair（DP43-R08 §16.5）
-    def request_activation_repair(self, agent_key: str) -> int:
+    def request_activation_repair(self, agent_key: str, *,
+                                  desktop_instance=None) -> int:
         """O(1)、线程安全、同 agent coalesce：UI 在 STALE_WINDOW 后调用。"""
         key = str(agent_key or "")
         if not key:
             return 0
+        queue_key = key
+        if desktop_instance is not None:
+            queue_key = ("desktop", desktop_instance.kind,
+                         desktop_instance.host_pid,
+                         desktop_instance.host_process_token)
         with self._repair_lock:
-            existing = self._repair_requests.get(key)
+            existing = self._repair_requests.get(queue_key)
             if existing is not None:
                 return existing.request_id
+            if len(self._repair_requests) >= 16:
+                return 0
             rid = self._repair_next_id
             self._repair_next_id += 1
-            self._repair_requests[key] = ActivationRepairRequest(
-                rid, key, time.time() + 10.0)
-            return rid
+            self._repair_requests[queue_key] = ActivationRepairRequest(
+                rid, key, time.time() + 10.0, desktop_instance)
+        self._wake.set()
+        return rid
 
     def drain_activation_repairs(self, max_items: int = 4):
         """UI bridge 每 tick 有界收割（<=4）repair 结果。"""
@@ -849,17 +861,42 @@ class Monitor:
         return out
 
     def _process_repair_requests(self, now: float) -> None:
-        """Monitor _tick 专属（§16.5）：drain bounded repair 请求 →
-        repair binding → publish bounded result。不新增线程。"""
+        """Worker only: advance bounded jobs without waiting on subprocesses."""
         with self._repair_lock:
-            pending = list(self._repair_requests.values())
-            self._repair_requests.clear()
-        for req in pending:
+            pending = list(self._repair_requests.items())
+        for queue_key, req in pending:
             if req.expires_at <= now:
-                continue   # 过期：不执行也不发布（用户早已离开该动作）
+                with self._repair_lock:
+                    self._repair_requests.pop(queue_key, None)
+                if req.desktop_instance is not None:
+                    self._desktop_window_service.cancel(req.desktop_instance)
+                    self._publish_repair_result(req, False, ActivationResult(
+                        ActivationCode.NO_BINDING, detail="activation expired"))
+                continue
             with self.lock:
                 instances = list(self.instances.values())
-                live = req.agent_key in self.instances
+                inst = self.instances.get(req.agent_key)
+                live = inst is not None
+            if req.desktop_instance is not None:
+                if live:
+                    try:
+                        result = self._desktop_window_service.activate_host(inst)
+                    except Exception:
+                        self._desktop_window_service.cancel(req.desktop_instance)
+                        result = ActivationResult(ActivationCode.NO_BINDING,
+                                                  detail="app activation failed")
+                else:
+                    self._desktop_window_service.cancel(req.desktop_instance)
+                    result = ActivationResult(ActivationCode.AGENT_GONE)
+                if result.code is ActivationCode.RESTORE_PENDING:
+                    continue
+                with self._repair_lock:
+                    self._repair_requests.pop(queue_key, None)
+                self._publish_repair_result(
+                    req, result.code is ActivationCode.OK, result)
+                continue
+            with self._repair_lock:
+                self._repair_requests.pop(queue_key, None)
             if not live:
                 self._publish_repair_result(req, False)
                 continue
@@ -870,11 +907,12 @@ class Monitor:
             self._publish_repair_result(req, repaired)
 
     def _publish_repair_result(self, req: ActivationRepairRequest,
-                               repaired: bool) -> None:
+                               repaired: bool,
+                               activation_result=None) -> None:
         try:
             self._repair_results.put_nowait(
                 ActivationRepairResult(req.request_id, req.agent_key,
-                                       repaired))
+                                       repaired, activation_result))
         except queue.Full:
             try:
                 self._repair_results.get_nowait()
@@ -883,7 +921,7 @@ class Monitor:
             try:
                 self._repair_results.put_nowait(
                     ActivationRepairResult(req.request_id, req.agent_key,
-                                           repaired))
+                                           repaired, activation_result))
             except queue.Full:
                 pass
 
@@ -959,15 +997,29 @@ class Monitor:
         return max(0.2, min(5.0, value))
 
     def _loop(self):
-        while not self._stop.is_set():
-            self._wake.clear()
-            t0 = time.time()
-            try:
-                self._tick()
-            except Exception as exc:
-                self._log(f"监控异常: {exc!r}")
-            elapsed = time.time() - t0
-            self._wake.wait(max(0.15, self._poll_sec() - elapsed))
+        next_tick = 0.0
+        try:
+            while not self._stop.is_set():
+                self._wake.clear()
+                try:
+                    self._process_repair_requests(time.time())
+                    if time.monotonic() >= next_tick:
+                        started = time.monotonic()
+                        self._tick()
+                        next_tick = max(started + self._poll_sec(),
+                                        time.monotonic() + 0.15)
+                except Exception as exc:
+                    self._log(f"监控异常: {exc!r}")
+                    next_tick = time.monotonic() + self._poll_sec()
+                delay = max(0.02, next_tick - time.monotonic())
+                with self._repair_lock:
+                    active = bool(self._repair_requests)
+                # Only an explicit, bounded activation transaction needs this
+                # deadline. Session readers retain their normal poll cadence.
+                if self._wake.wait(min(delay, 0.05) if active else delay):
+                    next_tick = 0.0  # rescan/process-exit wake remains immediate
+        finally:
+            self._desktop_window_service.close()
 
     def _enabled_kinds(self, cfg_m: dict) -> set:
         out = set()
@@ -993,10 +1045,17 @@ class Monitor:
         found: dict[str, AgentInstance] = {}
         authoritative: set[str] = set()
         for source, sp in probe_snap.items():
-            if source == "windows" and not windows_enabled:
+            cached_keys = {inst.key for inst in sp.instances}
+            if sp.authoritative:
+                for key, retired_source in list(self._retired_processes.items()):
+                    if retired_source == source and key not in cached_keys:
+                        self._retired_processes.pop(key, None)
+            if ((source == "windows" and not windows_enabled)
+                    or (source.startswith("wsl:") and not wsl_enabled)):
                 continue
             for inst in sp.instances:
-                if inst.kind in enabled:
+                if (inst.source == source and inst.kind in enabled
+                        and inst.key not in self._retired_processes):
                     found[inst.key] = inst
             if sp.authoritative:
                 authoritative.add(source)
@@ -1006,13 +1065,6 @@ class Monitor:
             exits: list[tuple[str, str]] = []
             for key, inst in old.items():
                 if key in found:
-                    continue
-                if getattr(inst, "surface", AgentSurface.TERMINAL) is AgentSurface.DESKTOP:
-                    # Desktop 逻辑会话的生死由 desktop source 的
-                    # authoritative snapshot 与 host lease 管理（plan2 §5/§9），
-                    # 绝不按 process census absence 判死；本轮保留，
-                    # 退场判定在 _poll_desktop_sources。
-                    merged[key] = inst
                     continue
                 source_disabled = (
                     (inst.source == "windows" and not windows_enabled)
@@ -1026,6 +1078,10 @@ class Monitor:
                     # 用户配置意图高于 probe health，即使该 source 本轮
                     # authoritative=False 也必须退出。
                     exits.append((key, "kind-disabled"))
+                elif getattr(inst, "surface", AgentSurface.TERMINAL) is AgentSurface.DESKTOP:
+                    # Logical sessions are owned by their desktop source,
+                    # after explicit source/kind configuration has been applied.
+                    merged[key] = inst
                 elif inst.source in authoritative:
                     exits.append((key, "authoritative-absence"))
                 else:
@@ -1047,6 +1103,8 @@ class Monitor:
         self.snapshots.pop(key, None)
         self.window_bindings.pop(key, None)
         self.terminal_observation_bindings.pop(key, None)
+        self._native_terminal_leases.pop(key, None)
+        self._desktop_stale_keys.discard(key)
         # 运行期 terminal runtime binding 级联失效（不再有 manual path）
         self._terminal_service.drop_instance(key)
         for watcher in self._watchers.values():
@@ -1080,6 +1138,7 @@ class Monitor:
                     if (inst.pid != ev.pid
                             or str(inst.process_token) != ev.process_token):
                         continue
+                    self._retired_processes[ev.key] = inst.source
                     self._commit_exit(ev.key, "process-exit-event", now)
                     continue
                 host = self._desktop_hosts.get(ev.key)
@@ -1087,6 +1146,7 @@ class Monitor:
                     if (host.pid != ev.pid
                             or str(host.process_token) != ev.process_token):
                         continue
+                    self._retired_hosts.add(ev.key)
                     self._drop_desktop_host_locked(
                         ev.key, "desktop-host-exit-event", now)
                     dropped_hosts.append(ev.key)
@@ -1096,25 +1156,36 @@ class Monitor:
     # ------------------------------------------------------------ desktop lifecycle
     def _sync_desktop_hosts(self, now: float):
         """从最新 inventory 同步 host 表；census 权威缺席即 drop（plan2 §9）。"""
-        hosts = self._probe.desktop_hosts()
-        if self._probe.inventory_authoritative():
-            live_keys = {h.host_key for h in hosts}
-            dropped: list[str] = []
-            with self.lock:
-                for host_key in list(self._desktop_hosts):
-                    if host_key not in live_keys:
-                        self._drop_desktop_host_locked(
-                            host_key, "desktop-host-census-absence", now)
-                        dropped.append(host_key)
-            for host_key in dropped:
-                self._notify_sources_host_dropped(host_key)
-        for host in hosts:
-            self._desktop_hosts[host.host_key] = host
+        cached_hosts = self._probe.desktop_hosts()
+        authoritative = self._probe.inventory_authoritative()
+        cfg_m = self.config.get("monitor") or {}
+        enabled = self._enabled_kinds(cfg_m)
+        windows_enabled = bool(cfg_m.get("windows_enabled", True))
+        if authoritative:
+            self._retired_hosts.intersection_update(
+                host.host_key for host in cached_hosts)
+        hosts = {host.host_key: host for host in cached_hosts
+                 if windows_enabled and host.kind in enabled
+                 and host.host_key not in self._retired_hosts}
+        dropped: list[str] = []
+        with self.lock:
+            for host_key, host in list(self._desktop_hosts.items()):
+                disabled = not windows_enabled or host.kind not in enabled
+                if disabled or (authoritative and host_key not in hosts):
+                    self._drop_desktop_host_locked(
+                        host_key, "desktop-host-disabled" if disabled
+                        else "desktop-host-census-absence", now)
+                    dropped.append(host_key)
+            self._desktop_hosts.update(hosts)
+        for host_key in dropped:
+            self._notify_sources_host_dropped(host_key)
 
     def _drop_desktop_host_locked(self, host_key: str, reason: str,
                                   now: float) -> None:
         """删除一个 host 的全部逻辑会话（调用方必须已持有 self.lock）。"""
         self._desktop_hosts.pop(host_key, None)
+        if self._exit_watcher is not None:
+            self._exit_watcher.unregister(host_key)
         for key, inst in list(self.instances.items()):
             if (getattr(inst, "surface", AgentSurface.TERMINAL)
                     is AgentSurface.DESKTOP and inst.host_key == host_key):
@@ -1145,10 +1216,12 @@ class Monitor:
             return
         claims = build_terminal_claims(self._watchers, instances)
         hosts = tuple(self._desktop_hosts.values())
-        enabled = self._enabled_kinds(
-            self.config.get("monitor") or {})
+        cfg_m = self.config.get("monitor") or {}
+        enabled = self._enabled_kinds(cfg_m)
+        windows_enabled = bool(cfg_m.get("windows_enabled", True))
+        wsl_enabled = bool(cfg_m.get("wsl_enabled", True))
         for source in self._desktop_sources:
-            if source.kind not in enabled:
+            if source.kind not in enabled or not windows_enabled:
                 # kind toggle 关闭：立即清除该 source 的全部会话
                 with self.lock:
                     for key, inst in list(self.instances.items()):
@@ -1156,17 +1229,38 @@ class Monitor:
                                 is AgentSurface.DESKTOP
                                 and inst.kind == source.kind):
                             self._commit_exit(key, "kind-disabled", now)
+                if source.kind not in self._disabled_desktop_sources:
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
+                    self._disabled_desktop_sources.add(source.kind)
                 continue
+            self._disabled_desktop_sources.discard(source.kind)
             try:
                 snap = source.poll(hosts, claims, now)
             except Exception as exc:
                 self._log(f"{getattr(source, 'kind', '?')} desktop source 异常: {exc!r}")
                 snap = DesktopSourceSnapshot(
                     authoritative=False, diagnostics=(repr(exc),))
-            found: dict[str, AgentInstance] = {
-                inst.key: inst for inst in snap.instances}
+            found: dict[str, AgentInstance] = {}
+            for inst in snap.instances:
+                host = self._desktop_hosts.get(inst.host_key)
+                if (inst.kind is source.kind
+                        and inst.surface is AgentSurface.DESKTOP
+                        and host is not None and host.kind is source.kind
+                        and inst.host_pid == host.pid
+                        and inst.host_process_token == host.process_token
+                        and (wsl_enabled or not inst.source.startswith("wsl:"))):
+                    found[inst.key] = inst
             with self.lock:
                 self._desktop_poll_count += 1
+                for key in snap.retired_keys:
+                    found.pop(key, None)
+                    inst = self.instances.get(key)
+                    if (inst is not None and inst.kind is source.kind
+                            and inst.surface is AgentSurface.DESKTOP):
+                        self._commit_exit(key, "desktop-plane-absence", now)
                 if snap.authoritative:
                     for key, inst in list(self.instances.items()):
                         if (getattr(inst, "surface", AgentSurface.TERMINAL)
@@ -1175,22 +1269,26 @@ class Monitor:
                                 and key not in found):
                             self._commit_exit(
                                 key, "desktop-source-absence", now)
-                    for key, inst in found.items():
-                        if key not in self.instances:
-                            self._log(f"发现桌面会话 "
-                                      f"{inst.kind.label} (host pid={inst.host_pid})")
-                        self.instances[key] = inst
-                        self._desktop_stale_keys.discard(key)
-                    # 只合并权威观察；缺失的 key 由 reduce 保守降级
-                    for key, obs in snap.observations.items():
-                        if key in found:
-                            session_obs[key] = obs
                 else:
                     for key, inst in list(self.instances.items()):
                         if (getattr(inst, "surface", AgentSurface.TERMINAL)
                                 is AgentSurface.DESKTOP
                                 and inst.kind == source.kind):
                             self._desktop_stale_keys.add(key)
+                # One failing plane cannot block positive facts from a healthy
+                # plane. Unmarked cached rows remain non-authoritative.
+                accepted = (found if snap.authoritative else {
+                    key: inst for key, inst in found.items()
+                    if key in snap.authoritative_keys})
+                for key, inst in accepted.items():
+                    if key not in self.instances:
+                        self._log(f"发现桌面会话 "
+                                  f"{inst.kind.label} (host pid={inst.host_pid})")
+                    self.instances[key] = inst
+                    self._desktop_stale_keys.discard(key)
+                for key, obs in snap.observations.items():
+                    if key in accepted:
+                        session_obs[key] = obs
 
     def _prune_detached_native(self, instances: dict[str, AgentInstance],
                                probe_snap: dict[str, SourceProbeSnapshot],
@@ -1246,6 +1344,7 @@ class Monitor:
                         commit_keys.append(key)
                 # external_parent_alive 为 None/True：不递增，不判死
             for key in commit_keys:
+                self._retired_processes[key] = instances[key].source
                 self._native_terminal_leases.pop(key, None)
                 self._commit_exit(key, "terminal-detached-native", now)
             # 租约生命周期与实例一致：实例已消失（其他 exit 路径）即清理
@@ -1328,11 +1427,6 @@ class Monitor:
         for key in self._prune_detached_native(instances, probe_snap, now):
             instances.pop(key, None)
             session_obs.pop(key, None)
-
-        # 3.6) stale binding 异步 repair（v4.3.1 DP43-R08 §16.5）：
-        # UI 提交的 repair 请求在本线程执行 UIA refresh + re-resolve
-        # （Tk 绝不同步等待），结果发布到 bounded 队列由 bridge 收割。
-        self._process_repair_requests(now)
 
         # 3.7) Desktop sources（plan2 §5 顺序 3–5）：terminal claims →
         # poll → 合并逻辑会话/观察。之后重新拷贝 instances 供融合使用。

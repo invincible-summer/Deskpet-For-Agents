@@ -182,6 +182,18 @@ class ForegroundTests(unittest.TestCase):
             self.assertTrue(winkeys.restore_window(11))
         self.assertIn("restore", user.calls)
 
+    def test_desktop_restore_does_not_reveal_hidden_electron_hwnd(self):
+        from unittest.mock import MagicMock
+        user = MagicMock()
+        user.IsWindow.return_value = True
+        user.IsIconic.return_value = False
+        user.IsWindowVisible.return_value = False
+        user.ShowWindowAsync.return_value = True
+        with patch.object(winkeys, "user32", user):
+            self.assertFalse(winkeys.restore_window(11, allow_hidden=False))
+        user.ShowWindow.assert_not_called()
+        user.ShowWindowAsync.assert_not_called()
+
     def test_no_key_injection_surface(self):
         """V3/V4.1 不变量：winkeys 不提供任何键盘注入入口。"""
         for banned in ('send_key', 'send_input', 'keybd_event', 'SendInput',

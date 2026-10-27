@@ -3,8 +3,9 @@ import tkinter as tk
 import unittest
 from unittest.mock import patch
 
-from pet.widgets import (DiscreteSlider, Expander, ScrollableFrame,
-                         SettingRow, TooltipController)
+from pet.widgets import (BoundedLabel, DiscreteSlider, Expander, ScrollableFrame,
+                         SegmentedControl, SettingRow, StatusChip,
+                         TooltipController, bind_wraplength)
 
 
 class DashboardPolishTests(unittest.TestCase):
@@ -40,6 +41,11 @@ class DashboardPolishTests(unittest.TestCase):
                 self.assertEqual(row._mode, "compact")
                 for column in range(4):
                     self.assertEqual(row.grid_columnconfigure(column)["minsize"], 0)
+        for width, previous, expected in ((700, "wide", "wide"),
+                                           (679, "wide", "compact"),
+                                           (700, "compact", "compact"),
+                                           (760, "compact", "wide")):
+            self.assertEqual(SettingRow.mode_for_width(width, previous), expected)
 
     def test_scrollbar_toggle_preserves_viewport_width(self):
         frame = ScrollableFrame(self.root)
@@ -53,6 +59,17 @@ class DashboardPolishTests(unittest.TestCase):
             self.root.update()
             self.assertEqual(frame._bar_visible, height > 600)
             self.assertEqual(frame._canvas.winfo_width(), width)
+            self.assertIsNone(frame._layout_after)
+        content.destroy()
+        label = tk.Label(frame.inner, text="很长的设置说明 " * 80,
+                         anchor="w", justify="left")
+        label.pack(fill="x")
+        bind_wraplength(label)
+        for width in (320, 96, 320):
+            self.root.geometry(f"{width}x600")
+            self.root.update()
+            self.assertLessEqual(int(label["wraplength"]), label.winfo_width())
+            self.assertLessEqual(label.winfo_width(), frame._canvas.winfo_width())
             self.assertIsNone(frame._layout_after)
 
     def test_expander_retains_body_and_grows_for_wrapped_text(self):
@@ -89,6 +106,43 @@ class DashboardPolishTests(unittest.TestCase):
             self.assertIsNone(tooltip._win)
         finally:
             tooltip.hide()
+
+    def test_status_and_segment_selection_keep_geometry(self):
+        from pet.labels import STATUS_LABELS
+        from pet.theme import pick_font
+        chip = StatusChip(self.root, "工作中")
+        chip.pack()
+        self.root.update()
+        width = chip.winfo_width()
+        for text in STATUS_LABELS.values():
+            chip.set(text)
+            self.root.update_idletasks()
+            self.assertEqual(chip.winfo_width(), width)
+            self.assertLessEqual(pick_font(self.root, 9, True).measure(text),
+                                 width - 2 * int(chip["padx"]))
+        segment = SegmentedControl(self.root, ["全部", "需要关注", "工作中"])
+        segment.pack()
+        self.root.update_idletasks()
+        width = segment.winfo_width()
+        for index in (1, 2, 0):
+            segment.select(index)
+            self.root.update_idletasks()
+            self.assertEqual(segment.winfo_width(), width)
+        text = "修复 Agent 监听，保留自然语言意图与对象。" * 60
+        label = BoundedLabel(self.root, text=text, max_lines=2,
+                             font=("Microsoft YaHei UI", 10), anchor="nw")
+        label.pack(fill="x")
+        for width in (480, 160, 480):
+            self.root.geometry(f"{width}x600")
+            self.root.update()
+            self.assertTrue(label["text"].endswith("…"))
+            self.assertLessEqual(len(label["text"].splitlines()), 2)
+            self.assertTrue(all(label._text_font.measure(line)
+                                <= label._allocated_width
+                                for line in label["text"].splitlines()))
+            with patch.object(tk.Label, "configure") as configure:
+                label.configure(text=text)
+                configure.assert_not_called()
 
 
 if __name__ == "__main__":

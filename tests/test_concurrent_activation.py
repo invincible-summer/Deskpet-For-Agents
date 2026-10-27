@@ -14,7 +14,8 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -23,6 +24,7 @@ from agents.models import (
     ActivationResult,
     AgentInstance,
     AgentKind,
+    AgentSurface,
     Snapshot,
     Status,
     TerminalWindowBinding,
@@ -31,6 +33,7 @@ from agents.models import (
 )
 from agents.terminal_service import WindowsTerminalService
 from agents.terminal_uia import WT_WINDOW_CLASS
+from agents.monitor import ActivationRepairResult
 
 NOW = 1_000_000.0
 
@@ -89,6 +92,22 @@ def snap(i, status=Status.WORKING):
     return Snapshot(i.key, i.kind, i.source, i.pid, status=status, ts=NOW)
 
 
+def activation_app(instance):
+    """Only the UI activation boundary; no Tk windows or monitor workers."""
+    from pet.app import PetApp
+    app = PetApp.__new__(PetApp)
+    app._closing = False
+    app.root = Mock()
+    app.dashboard = None
+    app._menu_controller = Mock()
+    app.ui = Mock()
+    app.monitor = Mock()
+    app.monitor.get_target.return_value = SimpleNamespace(instance=instance)
+    app.agent_toast = Mock()
+    app.toast = Mock()
+    return app
+
+
 def make_app(slots):
     from pet.app import PetApp
     from pet.petview import PetView
@@ -136,6 +155,84 @@ class ForegroundRecorder:
     def _foreground(self, hwnd):
         self.foreground.append(hwnd)
         return True
+
+
+class DesktopActivationQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.desktop = AgentInstance(
+            kind=AgentKind.CODEX, pid=0, source="windows",
+            surface=AgentSurface.DESKTOP, host_pid=901,
+            host_process_token="1.000", host_key="host-1",
+            logical_session_id="session-1")
+
+    def test_desktop_clicks_delegate_to_worker_queue_without_tk_retries(self):
+        app = activation_app(self.desktop)
+        app.monitor.activate_target.return_value = ActivationResult(
+            ActivationCode.RESTORE_PENDING)
+        app.activate_agent(self.desktop.key)
+        app.activate_agent(self.desktop.key)
+        # Monitor owns coalescing; Tk only enqueues each explicit request.
+        self.assertEqual(app.monitor.activate_target.call_count, 2)
+        app.monitor.activate_target.assert_called_with(self.desktop.key)
+        app.root.after.assert_not_called()
+        app.monitor.request_activation_repair.assert_not_called()
+        self.assertEqual(app.ui.kick.call_count, 2)
+
+    def test_final_desktop_results_only_present_feedback(self):
+        for code in (ActivationCode.OK, ActivationCode.FOREGROUND_DENIED,
+                     ActivationCode.AGENT_GONE, ActivationCode.NO_BINDING,
+                     ActivationCode.STALE_WINDOW):
+            with self.subTest(code=code):
+                app = activation_app(self.desktop)
+                app.monitor.drain_activation_repairs.return_value = [
+                    ActivationRepairResult(
+                        request_id=1, agent_key=self.desktop.key,
+                        repaired=False,
+                        activation_result=ActivationResult(code))]
+                app._drain_activation_repairs()
+                app.monitor.activate_target.assert_not_called()
+                app.monitor.request_activation_repair.assert_not_called()
+                app.root.after.assert_not_called()
+                app.ui.kick.assert_not_called()
+                if code is ActivationCode.AGENT_GONE:
+                    app.toast.assert_called_once_with("该 Agent 已退出", 4)
+                else:
+                    app.agent_toast.assert_called_once()
+                    self.assertEqual(app.agent_toast.call_args.args[0],
+                                     self.desktop.key)
+
+    def test_activation_preserves_dashboard_and_unrelated_modal_grab(self):
+        for state in ("iconic", "withdrawn"):
+            with self.subTest(state=state):
+                app = activation_app(self.desktop)
+                app.dashboard = Mock()
+                app.dashboard.state.return_value = state
+                modal = Mock()
+                app.root.grab_current.return_value = modal
+                app.monitor.activate_target.return_value = ActivationResult(
+                    ActivationCode.RESTORE_PENDING)
+                app.activate_agent(self.desktop.key)
+                app._menu_controller.dismiss.assert_called_once()
+                app.dashboard.tooltip.hide.assert_called_once()
+                for method in ("state", "deiconify", "withdraw", "iconify",
+                               "lift", "focus_force", "focus_set"):
+                    getattr(app.dashboard, method).assert_not_called()
+                app.root.grab_current.assert_not_called()
+                modal.grab_release.assert_not_called()
+
+    def test_terminal_repair_keeps_one_final_cached_activation(self):
+        agent = inst(AgentKind.CODEX, 1)
+        for code in (ActivationCode.OK, ActivationCode.STALE_WINDOW):
+            with self.subTest(code=code):
+                app = activation_app(agent)
+                app.monitor.drain_activation_repairs.return_value = [
+                    ActivationRepairResult(1, agent.key, True)]
+                app.monitor.is_live_key.return_value = True
+                app.monitor.activate_target.return_value = ActivationResult(code)
+                app._drain_activation_repairs()
+                app.monitor.activate_target.assert_called_once_with(agent.key)
+                app.monitor.request_activation_repair.assert_not_called()
+                app.root.after.assert_not_called()
 
 
 class FleetBodyActivationTests(unittest.TestCase):

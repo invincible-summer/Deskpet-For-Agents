@@ -1,11 +1,10 @@
-# DeskPet V4.1.0
+# DeskPet V4.2.0
 
 DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的 AI 编码 Agent，并把当前任务、模式和工作状态显示成桌宠动画与气泡。
 
 支持 Windows / WSL 终端中的 Codex CLI、Claude Code、Kimi CLI、pi、OpenCode CLI 与 DSH（DeepSeek Harness）CLI，以及 Codex Desktop / ChatGPT Desktop Codex 模式、ZCode Desktop、OpenCode Desktop 和 DeepSeek Harness Desktop；ZCode Desktop 通过 Remote Development 连接到 WSL 时，也会从对应 WSL 用户环境读取会话状态。DeskPet 不接管 Agent，不要求 Hook、插件或 MCP，也不会自动审批。
 
-当前源码版本是 **4.1.0**。`v4.1.0` 是源码里程碑的标准 annotated Git tag，但本版本**不创建 GitHub Release，也不生成新的 Portable/EXE 发布文件**；仓库的 latest Portable 仍然是已经发布的 **v4.0.0**。
-
+当前源码版本是 **4.2.0**。`v4.2.0` 是本轮监听与桌面唤起可靠性升级的源码版本；本版本**不创建 GitHub Release，也不生成新的 Portable/EXE 发布文件**，除非另行发布验收通过的二进制资产。
 版本 tag 与二进制 Release 分开推进：tag 用于固定已经验收的源码里程碑，GitHub Release 只在确实值得重新分发 Portable 的版本上显式发布，不会再由 tag push 自动触发。历史 `v1.0.0`、`v2.0.0`、`v3.0.0` Release 用于按开发顺序补齐源码版本历史，不反向制造当时并不存在的 Portable 二进制。详细规则见 [VERSIONING.md](VERSIONING.md)。
 
 ## 下载与启动
@@ -70,6 +69,15 @@ DeskPet 自动发现并显示状态
 
 DeskPet 会根据可用证据显示 Thinking、Reading、Coding、Testing、Waiting Approval、Done、Idle 等状态；Mode（例如 Plan）会独立显示。
 
+气泡首行显示当前工作区名称（来自会话的工作目录），下面依次显示 Agent/状态、
+当前动作和任务目标。活动摘要保留命令、文件路径或搜索词等必要对象；结构化输入
+只提取任务主干，不直接展示 JSON 字段。读取不到动作细节时沿用明确状态和任务
+上下文，不猜测 Agent 正在执行的内容；气泡不显示思考强度。
+
+Dashboard 默认打开 **Agent 工作台**，在一个页面查看状态统计、筛选会话并展开
+所选会话详情；桌宠、外观、监听与隐私、诊断、设置分别管理各自功能。
+监听开关关闭或进程确认退出后，旧发现缓存不会重新生成同一进程的桌宠。
+
 ## 三种显示模式
 
 - **单 Agent / SINGLE**：一只桌宠对应当前 Agent。
@@ -77,6 +85,8 @@ DeskPet 会根据可用证据显示 Thinking、Reading、Coding、Testing、Wait
 - **多宠分离 / FLEET**：每个 Agent 使用独立桌宠；每只桌宠可以选择不同皮肤，同一套皮肤也可以重复使用。
 
 双击对应 Agent 的气泡或桌宠可以请求唤起它所在的终端或桌面应用。桌面端目前只承诺恢复并前置宿主应用，不猜测或调用私有会话跳转接口。
+
+Codex、DSH、ZCode 最小化到托盘时，DeskPet 使用已核验的应用单实例启动入口，请应用自身恢复窗口内容；任务栏最小化使用 Windows 恢复。重复唤起请求会合并，Dashboard 保持当前显隐状态。无法核验宿主或启动方式时显示失败，不猜测启动另一个实例。真实托盘交互验收进度见 [验收记录](tests/ACCEPTANCE-desktop-activation.md)。
 
 ## 自定义皮肤
 
@@ -131,7 +141,9 @@ Dashboard 的设置页可以直接查看并打开这个目录。
 OpenCode 与 DSH（DeepSeek Harness）同样以无插件、只读方式接入：
 
 - **OpenCode** 读取本机（或对应 WSL 用户）`~/.local/share/opencode` 下的
-  `opencode.db` 会话索引，只提供标题、工作目录等元数据。OpenCode 的未决
+  `opencode.db` 会话索引，并在能力探测通过时读取只读的 active/execution
+  facts；只提供标题、工作目录等有界元数据。归档、删除和长期无活动的
+  会话不会持续展示。OpenCode 的未决
   审批保存在其运行进程内存中；只有当本机 OpenCode 托管服务的注册文件
   （`~/.local/state/opencode/service.json`）指向的端口与一个存活的
   OpenCode 进程吻合、且该服务的只读 `GET /api/permission/request` 可匿名
@@ -140,7 +152,8 @@ OpenCode 与 DSH（DeepSeek Harness）同样以无插件、只读方式接入：
   显示为"状态暂不可读"（DEGRADED），绝不伪造。
 - **DSH** 直接读取 `$DSH_HOME/sessions`（默认 `~/.dsh/sessions`）下的
   会话日志：明文 `session[.vN].jsonl` 直接解析；默认压缩格式
-  `session.vN.jsonl.zstd` 按上游逐帧追加的结构解码（只消费完整帧，
+  `session.vN.jsonl.zstd` 按上游逐帧追加的结构解码（支持当前 generation，
+  只消费完整帧，
   半帧等待写完整；每帧校验 checksum 并限制解压大小）。大日志从帧边界
   起步，header 由有界引导读取恢复。`turn/start`、
   `turn/end`、`step/*`、`tool/*` 事件给出 Working/Done/Error 状态，
@@ -190,8 +203,7 @@ SHA256SUMS.txt                     ZIP 的 SHA-256 校验值
 
 - [VERSIONING.md](VERSIONING.md)：Semantic Versioning、源码 tag 与正式 Release 规则。
 - [CHANGELOG.md](CHANGELOG.md)：各版本新增功能、修复内容及历史版本映射。
-- [SourceLink.md](SourceLink.md)：Agent 监听、Windows/WSL、桌面端数据源等调研与依据。
-- [AGENTS.md](AGENTS.md)：仓库开发和验收约定。
+- [AGENTS.md](AGENTS.md)：仓库开发和验收约定（含各 Agent 上游对齐版本表）。
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)：Portable 包中第三方组件说明。
 
 源码测试与发布构建面向维护者，不影响普通用户通过 Portable ZIP 解压即用。

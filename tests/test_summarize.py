@@ -1,60 +1,62 @@
-"""summarize 单元测试（v4.3.1 §20.4 正规化 unittest）。
-
-覆盖 markdown 清理、首行提取、空输入、截断、fmt_command；末尾附
-轻量 import smoke（真实模块导入，无 module-level print/assert）。
-"""
-from pathlib import Path
+"""Display contracts: readable task intent, actionable tools and bounded text."""
+import json
 import unittest
 
-ROOT = Path(__file__).resolve().parents[1]
-
-import sys
-sys.path.insert(0, str(ROOT))
-
-from agents.summarize import fmt_command, shorten
+from agents.summarize import fmt_command, shorten, summarize_text, summarize_tool
 
 
-class ShortenTests(unittest.TestCase):
-    def test_markdown_markers_removed(self):
-        self.assertEqual(shorten("# 标题**加粗**", 50), "标题加粗")
+class SummaryTests(unittest.TestCase):
+    def test_task_main_clause_and_structured_envelopes(self):
+        examples = (
+            ("# 标题**加粗**", "标题加粗"),
+            ("第一行\n第二行", "第一行"),
+            ("## 目标\n修复 WSL 连接\n实现细节", "修复 WSL 连接"),
+            ({"objective": "修复 WSL 连接", "reasoning_effort": "high",
+              "metadata": {"id": "hidden"}}, "修复 WSL 连接"),
+            ('{"goal":{"text":"修复 WSL 连接"},"id":"hidden"}', "修复 WSL 连接"),
+            ([{"type": "text", "text": "修复监听"}], "修复监听"),
+            ({"transport": {"id": "hidden"}}, ""),
+            ('{"objective":', ""),
+            ("", ""),
+        )
+        for value, expected in examples:
+            with self.subTest(value=value):
+                self.assertEqual(summarize_text(value), expected)
+        self.assertEqual(shorten("rg foo_bar /tmp/my_path"), "rg foo_bar /tmp/my_path")
 
-    def test_first_line_only(self):
-        self.assertEqual(shorten("第一行\n第二行", 50), "第一行")
+    def test_tool_keeps_intent_and_object_without_json_fields(self):
+        for name, detail, expected in (
+            ("Bash", {"description": "验证监听修复", "command": "python -m unittest",
+                      "timeout_ms": 30000}, ("测试", "验证监听修复", "python -m unittest")),
+            ("Read", {"file_path": "agents/monitor.py", "offset": 100}, ("读取", "agents/monitor.py")),
+            ("Grep", {"pattern": "host_key", "path": "agents/"}, ("搜索", "host_key", "agents/")),
+            ("exec_command", json.dumps({"cmd": "rg foo_bar /tmp/my_path",
+                                          "max_output_tokens": 1000}), ("rg foo_bar /tmp/my_path",)),
+            ("functions.exec", "text(await tools.exec_command({workdir: '/work', cmd: 'rg foo_bar /tmp/my_path', max_output_tokens: 1000}));",
+             ("rg foo_bar /tmp/my_path",)),
+            ("Read", [{"file_path": "agents/monitor.py", "transport": "hidden"},
+                       {"token": "private"}], ("读取", "agents/monitor.py")),
+            ("Bash", "rg tools.exec_command agents/", ("rg tools.exec_command agents/",)),
+            ("apply_patch", "*** Begin Patch\n*** Update File: agents/monitor.py\n@@\n-old\n+new\n*** End Patch",
+             ("修改", "agents/monitor.py")),
+        ):
+            with self.subTest(name=name):
+                text = summarize_tool(name, detail, 160)
+                for part in expected:
+                    self.assertIn(part, text)
+                for metadata in ("timeout_ms", "max_output_tokens", '\"cmd\"', '\"file_path\"', "*** Begin Patch"):
+                    self.assertNotIn(metadata, text)
 
-    def test_empty_input(self):
-        self.assertEqual(shorten("", 50), "")
-
-    def test_long_text_truncated_with_ellipsis(self):
-        long_text = "这是一条很长的输出" * 20
-        s = shorten(long_text, 40)
-        self.assertLessEqual(len(s), 41)
-        self.assertTrue(s.endswith("…"), s)
-
-    def test_short_text_untouched(self):
-        self.assertEqual(shorten("短文本", 40), "短文本")
-
-
-class FmtCommandTests(unittest.TestCase):
-    def test_joined_with_spaces(self):
-        self.assertEqual(fmt_command(["bash", "-lc", "npm test"]),
-                         "bash -lc npm test")
-
-    def test_truncated_to_limit(self):
-        cmd = fmt_command(["bash", "-lc", "x" * 200], 30)
-        self.assertLessEqual(len(cmd), 30)
-        self.assertIn("…", cmd)
-
-
-class ImportSmokeTests(unittest.TestCase):
-    def test_core_modules_import(self):
-        import agents.claude  # noqa: F401
-        import agents.codex  # noqa: F401
-        import agents.kimi  # noqa: F401
-        import agents.pi  # noqa: F401
-        import agents.summarize  # noqa: F401
-        import pet.app  # noqa: F401
-        import pet.autostart  # noqa: F401
-        import pet.tray  # noqa: F401
+    def test_display_limits_preserve_commands_and_never_dump_unknown_objects(self):
+        for limit in (1, 2, 20, 40, 120):
+            with self.subTest(limit=limit):
+                self.assertLessEqual(len(shorten("这是一条很长的输出" * 30, limit)), limit)
+                self.assertLessEqual(len(summarize_text({"goal": "x" * 200}, limit)), limit)
+                self.assertLessEqual(len(fmt_command(["bash", "-lc", "x" * 200], limit)), limit)
+        self.assertEqual(fmt_command(["bash", "-lc", "npm test"]), "bash -lc npm test")
+        self.assertEqual(summarize_tool("Bash", {"transport": {"id": "private"}}), "执行")
+        self.assertEqual(summarize_tool("functions.exec",
+                         "text(await tools.exec_command({cmd: dynamicCommand, token: 'private'}));"), "执行")
 
 
 if __name__ == "__main__":

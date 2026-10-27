@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 from agents.codex_desktop import CodexDesktopSource
+from agents.codex import CodexFile
 from agents.desktop import SessionClaimKey
 from agents.models import (
     AgentKind,
@@ -25,6 +26,12 @@ from agents.models import (
 
 _CFG = {"activity_grace_sec": 10, "active_file_window_sec": 180,
         "goal_max_chars": 120, "summary_max_chars": 160}
+
+try:
+    import zstandard  # type: ignore
+    _HAVE_ZSTD = True
+except ImportError:
+    _HAVE_ZSTD = False
 
 
 def _thread_row(thread_id: str, rollout_path: str, **extra):
@@ -153,6 +160,20 @@ class CodexDesktopSourceTests(unittest.TestCase):
         for obs in snap.observations.values():
             self.assertEqual(obs.status, Status.WORKING)
 
+    def test_duplicate_catalog_rows_for_one_rollout_produce_one_target(self):
+        path = self.fx.write_rollout("rollout-alias.jsonl",
+                                     active_rollout("thread-new"))
+        self.fx.add_thread(_thread_row("thread-old", path,
+                                       updated_at=int(time.time()) - 5,
+                                       title="old"))
+        self.fx.add_thread(_thread_row("thread-new", path,
+                                       updated_at=int(time.time()),
+                                       title="new"))
+        snap = self._poll(self._source())
+        self.assertEqual(len(snap.instances), 1)
+        self.assertEqual(snap.instances[0].logical_session_id, "thread-new")
+        self.assertEqual(snap.observations[snap.instances[0].key].goal, "new")
+
     def test_active_done_plan_independent_observations(self):
         pa = self.fx.write_rollout("a.jsonl", active_rollout("t-a"))
         pb = self.fx.write_rollout("b.jsonl", done_rollout("t-b"))
@@ -163,7 +184,9 @@ class CodexDesktopSourceTests(unittest.TestCase):
         status = {inst.logical_session_id: snap.observations[inst.key].status
                   for inst in snap.instances}
         self.assertEqual(status["t-a"], Status.WORKING)
-        self.assertEqual(status["t-b"], Status.DONE)
+        # A historical terminal rollout is not admitted from metadata alone;
+        # only the currently active and newly changed sessions become targets.
+        self.assertNotIn("t-b", status)
         self.assertEqual(status["t-c"], Status.WORKING)
         mode_c = snap.observations[
             next(i.key for i in snap.instances
@@ -177,6 +200,29 @@ class CodexDesktopSourceTests(unittest.TestCase):
         self.fx.add_thread(_thread_row('desktop', path,
                                       originator='Codex Desktop', source='vscode',
                                       has_user_event=0, thread_source='user'))
+        snap = self._poll(self._source())
+        self.assertEqual(len(snap.instances), 1)
+        self.assertEqual(snap.observations[snap.instances[0].key].status,
+                         Status.WORKING)
+
+    def test_current_ms_only_threads_schema_is_readable(self):
+        # Current Codex state migrations expose updated_at_ms while older
+        # readers may not have the legacy seconds column.
+        con = sqlite3.connect(self.fx.db_path)
+        con.execute("DROP TABLE threads")
+        con.execute("""CREATE TABLE threads (
+            id TEXT, rollout_path TEXT, updated_at_ms INTEGER, archived INTEGER,
+            title TEXT, cwd TEXT, has_user_event INTEGER,
+            thread_source TEXT, originator TEXT)""")
+        con.commit()
+        con.close()
+        path = self.fx.write_rollout("ms-only.jsonl", active_rollout("ms-only"))
+        self.fx.add_thread({
+            "id": "ms-only", "rollout_path": path,
+            "updated_at_ms": int(time.time() * 1000), "archived": 0,
+            "title": "ms title", "cwd": "/w", "has_user_event": 1,
+            "thread_source": "user", "originator": "codex desktop",
+        })
         snap = self._poll(self._source())
         self.assertEqual(len(snap.instances), 1)
         self.assertEqual(snap.observations[snap.instances[0].key].status,
@@ -201,12 +247,52 @@ class CodexDesktopSourceTests(unittest.TestCase):
         snap = self._poll(self._source())
         self.assertEqual(snap.instances, ())
 
+    def test_authoritative_archive_tombstones_admitted_rollout(self):
+        path = self.fx.write_rollout("archive.jsonl", active_rollout("t-archive"))
+        self.fx.add_thread(_thread_row("t-archive", path))
+        source = self._source()
+        self.assertEqual(len(self._poll(source).instances), 1)
+        self.fx.update_rows("UPDATE threads SET archived = 1 WHERE id = ?",
+                            ("t-archive",))
+        snap = self._poll(source)
+        self.assertEqual(snap.instances, ())
+        self.assertEqual(source.stats()["codex_desktop_sessions"], 0)
+
+    def test_state_db_rollover_drops_old_catalog(self):
+        path = self.fx.write_rollout("old.jsonl", active_rollout("t-old"))
+        self.fx.add_thread(_thread_row("t-old", path))
+        source = self._source()
+        self.assertEqual(len(self._poll(source).instances), 1)
+        import shutil
+        new_db = self.fx.root / "state_6.sqlite"
+        shutil.copy2(self.fx.db_path, new_db)
+        con = sqlite3.connect(new_db)
+        con.execute("DELETE FROM threads")
+        con.commit()
+        con.close()
+        snap = self._poll(source)
+        self.assertEqual(snap.instances, ())
+        self.assertEqual(source._db_path, str(new_db))
+
+    def test_unknown_feature_thread_source_is_excluded(self):
+        path = self.fx.write_rollout("feature.jsonl", active_rollout("t-feature"))
+        self.fx.add_thread(_thread_row("t-feature", path,
+                                       thread_source="feature_new_rollout"))
+        self.assertEqual(self._poll(self._source()).instances, ())
+
     def test_unknown_originator_not_treated_as_desktop(self):
         p = self.fx.write_rollout("x.jsonl", active_rollout("t-x"))
         self.fx.add_thread(_thread_row("t-x", p, originator="codex_cli_rs"))
         source = self._source()
         snap = self._poll(source)
         self.assertEqual(snap.instances, ())
+
+    def test_null_originator_cli_row_is_not_treated_as_desktop(self):
+        path = self.fx.write_rollout("null-originator.jsonl",
+                                     active_rollout("t-null-originator"))
+        self.fx.add_thread(_thread_row("t-null-originator", path,
+                                       originator=None, source="cli"))
+        self.assertEqual(self._poll(self._source()).instances, ())
 
     def test_originator_column_absent_accepts_user_threads(self):
         # capability：本机上游可能没有 originator 列（migration < 0053）。
@@ -255,6 +341,19 @@ class CodexDesktopSourceTests(unittest.TestCase):
         self.assertEqual(snap.observations[
             snap.instances[0].key].status, Status.WORKING)
 
+    def test_metadata_only_growth_does_not_admit(self):
+        p = self.fx.write_rollout("metadata.jsonl", [
+            {"type": "session_meta", "payload": {
+                "session_id": "t-meta", "cwd": "/w"}},
+        ])
+        self.fx.add_thread(_thread_row("t-meta", p, updated_at=0))
+        source = self._source()
+        self.assertEqual(self._poll(source).instances, ())
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "turn_context",
+                                "payload": {"cwd": "/w"}}) + "\n")
+        self.assertEqual(self._poll(source).instances, ())
+
     def test_max_eight_sessions_tracked(self):
         for i in range(10):
             p = self.fx.write_rollout(f"m{i}.jsonl", active_rollout(f"t-m{i}"))
@@ -275,17 +374,35 @@ class CodexDesktopSourceTests(unittest.TestCase):
 
     # ---- claim 去重（plan2 §3.4） ----
 
-    def test_cli_claimed_thread_not_emitted_then_reclaimed(self):
-        p = self.fx.write_rollout("cl.jsonl", active_rollout("t-cl"))
-        self.fx.add_thread(_thread_row("t-cl", p))
+    def test_cli_claim_owns_one_reader_then_desktop_reclaims(self):
+        # Cover both a claim present at admission and one arriving after the
+        # desktop reader opened. Neither path keeps a second file reader.
+        p = self.fx.write_rollout("fz.jsonl", active_rollout("t-fz"))
+        self.fx.add_thread(_thread_row("t-fz", p))
         source = self._source()
-        claim = {SessionClaimKey(kind="codex", session_id="t-cl")}
+        claim = {SessionClaimKey(kind="codex", session_id="t-fz")}
+        self.assertEqual(self._poll(source, claims=claim).instances, ())
+        self.assertIsNone(source._sessions["t-fz"].file)
+        snap = self._poll(source)
+        self.assertEqual(len(snap.instances), 1)      # tailer 已打开
+        sess = source._sessions["t-fz"]
+        self.assertIsNotNone(sess.file)
+        frozen_pos = sess.file.tailer.pos
+        # A claim arriving after admission releases the open desktop reader.
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "event_msg", "timestamp": time.time(),
+                "payload": {"type": "task_complete",
+                            "last_agent_message": "ok"}}) + "\n")
         snap = self._poll(source, claims=claim)
         self.assertEqual(snap.instances, ())
-        # CLI 消失 → 下一轮 reclaim 同一逻辑 thread
+        self.assertIsNone(sess.file)
+        # CLI 消失 → 恢复增量读，reclaim 后看到完成事件
         snap = self._poll(source)
         self.assertEqual(len(snap.instances), 1)
-        self.assertEqual(snap.instances[0].logical_session_id, "t-cl")
+        self.assertGreater(sess.file.tailer.pos, frozen_pos)
+        self.assertEqual(snap.observations[snap.instances[0].key].status,
+                         Status.DONE)
 
     # ---- path 安全（plan2 §7.2） ----
 
@@ -410,6 +527,15 @@ class CodexDesktopSourceTests(unittest.TestCase):
         self.assertEqual(source.stats()["codex_desktop_sessions"], 1)
         source.drop_host(self.host.host_key)
         self.assertEqual(source.stats()["codex_desktop_sessions"], 0)
+        self.assertIsNone(source._ro)
+        # The same unchanged DB must be queried immediately after a reopen.
+        snap = self._poll(source)
+        self.assertEqual(len(snap.instances), 1)
+        # Multiple independent hosts cannot claim one unscoped global DB.
+        ambiguous = self._poll(source, hosts=(self.host, _host(901, "222")))
+        self.assertEqual(ambiguous.instances, ())
+        self.assertIn("AMBIGUOUS_DESKTOP_HOSTS", ambiguous.diagnostics)
+        self.assertEqual(len(self._poll(source).instances), 1)
         # host 消失后的 poll 不发 target
         snap = self._poll(source, hosts=())
         self.assertEqual(snap.instances, ())
@@ -433,6 +559,24 @@ class CodexDesktopSourceTests(unittest.TestCase):
         self.assertEqual(len(snap.instances), 1)
         # WORKING 状态受保护：即使 last_activity 停留也不释放
         self.assertTrue(snap.observations[snap.instances[0].key].turn_active)
+
+    @unittest.skipUnless(_HAVE_ZSTD, "zstandard unavailable")
+    def test_compressed_rollout_is_decoded_once(self):
+        path = self.fx.rollout_dir() / "rollout-compressed.jsonl.zst"
+        raw = b"".join(json.dumps(item).encode() + b"\n"
+                       for item in active_rollout("compressed"))
+        path.write_bytes(zstandard.ZstdCompressor().compress(raw))
+        state = CodexFile(str(path))
+        state.poll_lines()
+        obs = state.observation(time.time(), _CFG)
+        self.assertEqual(state.session_id, "compressed")
+        self.assertIsNotNone(obs)
+        self.assertIs(obs.status, Status.WORKING)
+        # A stable compressed archive is immutable; a second poll must not
+        # replay records or duplicate parser counters.
+        seen = state.records_seen
+        state.poll_lines()
+        self.assertEqual(state.records_seen, seen)
 
 
 if __name__ == "__main__":

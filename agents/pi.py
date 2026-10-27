@@ -14,7 +14,7 @@ from .models import (
     Phase,
     Status,
 )
-from .summarize import fmt_command, shorten
+from .summarize import fmt_command, shorten, summarize_text, summarize_tool, tool_detail
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
@@ -65,7 +65,7 @@ class PiFile(FileState):
             self.cwd = str(cwd)
         goal = obj.get("goal") or obj.get("task")
         if goal and not self.goal:
-            self.goal = shorten(str(goal), GOAL_MAX)
+            self.goal = summarize_text(goal, GOAL_MAX)
         return ts
 
     def _begin_turn(self):
@@ -115,7 +115,7 @@ class PiFile(FileState):
                 self.session_id = str(sid)
             title = obj.get("title") or obj.get("name") or obj.get("goal")
             if title:
-                self.goal = shorten(str(title), GOAL_MAX)
+                self.goal = summarize_text(title, GOAL_MAX)
                 self.title = self.goal
             return
 
@@ -148,7 +148,7 @@ class PiFile(FileState):
             if role == "assistant" and btype in {"text", "output_text"}:
                 value = _text(block.get("text") or block.get("content"))
                 if value.strip():
-                    self.last_text = shorten(value, SUMMARY_MAX)
+                    self.last_text = summarize_text(value, SUMMARY_MAX)
                     self.last_assistant_ts = ts
                     self.last_activity_kind = "assistant"
                     self.phase = Phase.ANSWERING
@@ -158,19 +158,15 @@ class PiFile(FileState):
             elif role == "user" and btype in {"text", "input_text"}:
                 value = _text(block.get("text") or block.get("content"))
                 if value.strip():
-                    self.goal = shorten(value, GOAL_MAX)
+                    self.goal = summarize_text(value, GOAL_MAX)
             elif btype in {"thinking", "ThinkingContent", "thinking_content"}:
                 self.phase = Phase.THINKING
             elif btype in {"toolCall", "tool_call"}:
                 name = block.get("name") or "?"
                 args = block.get("arguments")
-                detail = ""
-                if isinstance(args, dict):
-                    detail = str(args.get("command") or args.get("path") or args.get("file_path") or "")
-                elif isinstance(args, str):
-                    detail = args
+                detail = tool_detail(args, SUMMARY_MAX)
                 self.last_cmd = fmt_command(f"{name}: {detail}" if detail else str(name), 100)
-                self.last_tool = fmt_command(f"{name}: {detail}" if detail else str(name), SUMMARY_MAX)
+                self.last_tool = summarize_tool(str(name), detail, SUMMARY_MAX)
                 self.last_tool_ts = ts
                 self.last_activity_kind = "tool"
                 phase = classify_phase(str(name), detail)
@@ -178,7 +174,7 @@ class PiFile(FileState):
             elif btype in {"toolResult", "tool_result"}:
                 value = _text(block.get("content") or block.get("text") or block.get("output"))
                 if value.strip():
-                    self.last_text = shorten(value, SUMMARY_MAX)
+                    self.last_text = summarize_text(value, SUMMARY_MAX)
                     self.last_assistant_ts = ts
                     self.last_activity_kind = "assistant"
 
@@ -221,12 +217,12 @@ class PiFile(FileState):
             self._set_error({"message": msg.get("errorMessage")
                              or msg.get("error") or msg.get("message")}, ts)
             return
-        if reason == "aborted":
-            # 不伪造成功庆祝：无 DONE 窗口，直接回 IDLE
-            self.turn_active = False
-            self.turn_known_over = True
-            self.done_ts = 0.0
-            self.phase = Phase.NONE
+        if reason in {"aborted", "cancelled", "canceled", "interrupted"}:
+            # 明确的 abort 是异常结束，保留 ERROR 提醒窗口；不能静默
+            # 退回 IDLE，否则用户看不到任务被中断。
+            label = "任务已取消" if reason in {"cancelled", "canceled"} \
+                else "任务已中断"
+            self._set_error({"message": label}, ts)
             return
         # unknown/empty：维持 block 处理后的保守状态
 
@@ -246,13 +242,13 @@ class PiFile(FileState):
                 for item in content)
         else:
             value = _text(content)
-        value = value.strip()
-        self.last_tool = shorten(f"{name}: {value}" if value else name,
-                                 SUMMARY_MAX)
+        value = summarize_text(value, SUMMARY_MAX)
+        if value or not self.last_tool:
+            self.last_tool = summarize_tool(name, value, SUMMARY_MAX)
         self.last_tool_ts = ts
         self.last_activity_kind = "tool"
         if value:
-            self.last_text = shorten(value, SUMMARY_MAX)
+            self.last_text = value
         phase = classify_phase(name, value)
         self.phase = phase if phase is not Phase.NONE else Phase.EXECUTING
 

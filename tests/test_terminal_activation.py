@@ -281,6 +281,7 @@ class AsyncRepairQueueTests(unittest.TestCase):
         monitor._repair_requests = {}
         monitor._repair_next_id = 1
         monitor._repair_results = queue_mod.Queue(maxsize=16)
+        monitor._wake = threading_mod.Event()
 
         class _Svc:
             def __init__(self):

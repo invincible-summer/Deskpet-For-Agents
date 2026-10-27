@@ -1,10 +1,8 @@
-"""Dashboard v4.3（plan2 §10-§17）：信息架构完全重做。
+"""Native desktop workspace with retained pages and a single layout owner.
 
-7 页导航：概览 / Agents / 桌宠 / 外观 / 监听与隐私 / 诊断 + 底部设置。
-shell 尺寸按 96-DPI 逻辑像素定义（DashboardMetrics 换算）；页面 lazy
-build + retained rows（状态变化只 configure，不整页重建）；只有当前页
-刷新（refresh_current_page，由 UiCoordinator 驱动）；滚轮只在页面
-canvas 范围内滚动（无 bind_all）。
+The Agent workspace owns session counts, filtering and details. Settings pages
+have separate responsibilities. Viewport width drives page layout; hover and
+runtime updates never renegotiate control metrics or rebuild the current page.
 """
 from __future__ import annotations
 import tkinter as tk
@@ -12,15 +10,18 @@ import threading
 import time
 from tkinter import filedialog, messagebox, ttk
 
-from agents.models import Status, WindowBindingConfidence
+from agents.models import AgentSurface, Status
+from agents.summarize import summarize_text
 
 from . import autostart, skins
-from .labels import mode_text, phase_text, status_text
+from .labels import (activity_text, environment_label, mode_text, phase_text,
+                     status_text, workspace_name)
 from .presentation import PresentationMode
 from .theme import LIGHT, STATUS_COLOR, pick_font, configure_dashboard_styles
 from .ui_coordinator import UiDirty
 from .version import APP_LABEL as APP_VERSION
 from .widgets import (
+    BoundedLabel,
     DashboardMetrics,
     DiscreteSlider,
     Expander,
@@ -34,8 +35,7 @@ from .widgets import (
     bind_wraplength,
 )
 
-PAGE_OVERVIEW = "概览"
-PAGE_AGENTS = "Agents"
+PAGE_AGENTS = "Agent 工作台"
 PAGE_PETS = "桌宠"
 PAGE_LOOK = "外观"
 PAGE_MONITOR = "监听与隐私"
@@ -45,16 +45,25 @@ PAGE_SETTINGS = "设置"
 # §10.2 shell 常量（96-DPI 逻辑像素）
 DEFAULT_WINDOW_W = 1120
 DEFAULT_WINDOW_H = 760
-NAV_WIDTH = 196
+NAV_WIDTH = 184
 BRAND_HEIGHT = 64
 NAV_ITEM_HEIGHT = 40
 PAGE_HEADER_HEIGHT = 64
-PAGE_CONTENT_MAX_WIDTH = 960
+PAGE_CONTENT_MAX_WIDTH = 1040
 PAGE_PAD_X = 24
 PAGE_PAD_Y = 20
 SECTION_GAP = 12
 ROW_GAP = 8
 
+# 视觉层级只在这里定义，页面名称仍然保持原有公开键值。
+PAGE_DESCRIPTIONS = {
+    PAGE_AGENTS: "所有会话，一个工作台。查看状态并回到正在运行的 Agent。",
+    PAGE_PETS: "管理并发桌宠与 Agent 绑定",
+    PAGE_LOOK: "调整桌宠和气泡的显示方式",
+    PAGE_MONITOR: "控制观察来源与隐私边界",
+    PAGE_DIAG: "检查运行健康与性能指标",
+    PAGE_SETTINGS: "启动、窗口与本地配置",
+}
 # §13.2 固定离散值（默认点 1.00）
 SCALE_STEPS = (0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00)
 SPEED_STEPS = (0.50, 0.75, 1.00, 1.25, 1.50, 2.00, 3.00)
@@ -68,10 +77,16 @@ def _binding_conf_value(binding):
     return value.value if hasattr(value, "value") else str(value)
 
 
-def _section_title(parent, text: str):
-    tk.Label(parent, text=text, bg=parent["bg"], fg=LIGHT.text,
+def _section_title(parent, text: str, *, trailing=None):
+    """Render a compact section heading without adding a second card layer."""
+    row = tk.Frame(parent, bg=parent["bg"])
+    row.pack(fill="x", pady=(0, ROW_GAP))
+    tk.Label(row, text=text, bg=parent["bg"], fg=LIGHT.text,
              font=pick_font(parent, 11, True), anchor="w").pack(
-        fill="x", pady=(0, ROW_GAP))
+        side="left")
+    if trailing is not None:
+        trailing.pack(side="right")
+    return row
 
 
 def _pack_once(widget, **options):
@@ -95,6 +110,22 @@ def _configure_changed(widget, **options):
             changed[key] = value
     if changed:
         widget.configure(**changed)
+
+
+def _activation_label(instance) -> str:
+    """Use the action wording that matches the target's runtime surface."""
+    return ("打开应用" if getattr(instance, "surface", None)
+            is AgentSurface.DESKTOP else "打开终端")
+
+
+def _ellipsize(value, limit: int = 64) -> str:
+    """Bound dynamic labels so a new summary never changes card height."""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return "—"
+    if len(text) <= limit:
+        return text
+    return text[:max(1, limit - 1)].rstrip() + "…"
 
 
 class DashboardPage:
@@ -130,387 +161,277 @@ class DashboardPage:
                 if not widget.cget("style"):
                     widget.configure(style="Dashboard.Horizontal.TScale" if kind == "TScale"
                                      else "Dashboard." + kind)
-            if isinstance(widget, tk.Label) and widget.winfo_manager() == "pack":
-                options = widget.pack_info()
-                if options.get("fill") in ("x", "both"):
-                    widget.configure(justify="left")
-                    bind_wraplength(widget, pad=12)
+            # Wrapping is opt-in for descriptive text. Applying a Configure
+            # handler to every packed label makes each status/title a second
+            # layout owner and feeds requested widths back into the Canvas.
             self._polish(widget)
 
 
-class OverviewPage(DashboardPage):
-    """§12.1：SummaryGrid + 需要注意 + 全量 Agent retained rows。"""
-
-    name = PAGE_OVERVIEW
-
-    def build(self, parent):
-        header = self.dash.page_header(parent, PAGE_OVERVIEW)
-        header.add_action("重新扫描", self.dash.request_rescan,
-                          primary=False)
-        body = self.dash.page_body(parent)
-        # SummaryGrid：4 个轻量 metric panel（wide 4 列 / compact 2×2）
-        grid = tk.Frame(body, bg=LIGHT.page)
-        grid.pack(fill="x", pady=(0, SECTION_GAP))
-        self._metric_cells = {}
-        for key, label in (("live", "在线 Agents"), ("working", "正在工作"),
-                           ("waiting", "需要关注"), ("terminal", "可打开终端")):
-            panel = SurfacePanel(grid, padding=12)
-            tk.Label(panel.body, text=label, bg=LIGHT.surface,
-                     fg=LIGHT.text_secondary,
-                     font=pick_font(panel, 9)).pack(anchor="w")
-            value = tk.Label(panel.body, text="0", bg=LIGHT.surface,
-                             fg=LIGHT.text,
-                             font=pick_font(panel, 15, True))
-            value.pack(anchor="w")
-            self._metric_cells[key] = (panel, value)
-        # 需要注意
-        attn = SurfacePanel(body)
-        attn.pack(fill="x", pady=(0, SECTION_GAP))
-        attn_row = tk.Frame(attn.body, bg=LIGHT.surface)
-        attn_row.pack(fill="x")
-        self._attn_label = tk.Label(attn_row, text="当前没有需要处理的请求",
-                                    bg=LIGHT.surface, fg=LIGHT.text,
-                                    font=pick_font(attn, 10), anchor="w")
-        self._attn_label.pack(side="left", fill="x", expand=True)
-        self._attn_btn = ttk.Button(attn_row, text="打开终端", width=12,
-                                    command=self._open_attention)
-        self._attn_btn.pack(side="right")
-        self._attn_key = ""
-        # 当前 Agents（retained keyed rows）
-        self._agents_panel = SurfacePanel(body)
-        self._agents_panel.pack(fill="x")
-        _section_title(self._agents_panel.body, "当前 Agents")
-        self._rows_frame = tk.Frame(self._agents_panel.body, bg=LIGHT.surface)
-        self._rows_frame.pack(fill="x")
-        self._rows: dict[str, dict] = {}
-        self._row_order: list[str] = []
-
-    def _open_attention(self):
-        if self._attn_key:
-            self.dash.app.activate_agent(self._attn_key)
-
-    def refresh(self, reason: UiDirty):
-        targets = self.dash.app.monitor.get_targets()
-        working = sum(1 for t in targets.values()
-                      if t.snapshot.status == Status.WORKING)
-        waiting = sum(1 for t in targets.values()
-                      if t.snapshot.status in (Status.WAITING,
-                                               Status.INPUT))
-        error = sum(1 for t in targets.values()
-                    if t.snapshot.status == Status.ERROR)
-        wakeable = sum(1 for t in targets.values()
-                       if t.terminal_window is not None
-                       and t.terminal_window.wakeable)
-        values = {"live": len(targets), "working": working,
-                  "waiting": waiting + error, "terminal": wakeable}
-        for key, (_panel, label) in self._metric_cells.items():
-            _configure_changed(label, text=str(values[key]))
-        # 需要注意：WAITING/INPUT/ERROR 首要 Agent
-        priority = None
-        for status_order in (Status.WAITING, Status.INPUT, Status.ERROR):
-            for t in targets.values():
-                if t.snapshot.status == status_order:
-                    priority = t
-                    break
-            if priority is not None:
-                break
-        if priority is not None:
-            self._attn_key = priority.key
-            _configure_changed(self._attn_label,
-                text=f"{priority.snapshot.kind.label} · "
-                     f"{priority.instance.project or '?'} · "
-                     f"{status_text(priority.snapshot)}")
-        else:
-            self._attn_key = ""
-            _configure_changed(self._attn_label,
-                               text="当前没有需要处理的请求")
-        self._refresh_rows(targets)
-
-    def _refresh_rows(self, targets):
-        frame = self._rows_frame
-        keys = list(targets)
-        # 删除消失的行
-        for key in list(self._rows):
-            if key not in targets:
-                row = self._rows.pop(key)
-                for widget in row.values():
-                    widget.destroy()
-                self._row_order.remove(key)
-        order_changed = False
-        for key in keys:
-            if key not in self._rows:
-                self._create_row(key, targets[key])
-                order_changed = True
-        if order_changed or self._row_order != keys:
-            self._row_order = list(keys)
-            # 排序变化：re-pack 现有 row（§16.1 不 recreate）
-            for widget in frame.winfo_children():
-                widget.pack_forget()
-            for key in keys:
-                self._rows[key]["frame"].pack(fill="x", pady=2)
-        for key in keys:
-            self._update_row(key, targets[key])
-
-    def _create_row(self, key, target):
-        frame = tk.Frame(self._rows_frame, bg=LIGHT.surface)
-        title = tk.Label(frame, text="", bg=LIGHT.surface, fg=LIGHT.text,
-                         font=pick_font(frame, 10, True), anchor="w")
-        frame.columnconfigure(0, weight=1)
-        title.grid(row=0, column=0, sticky="ew", pady=8)
-        bind_wraplength(title)
-        chip = StatusChip(frame)
-        chip.grid(row=0, column=1, padx=8)
-        open_btn = ttk.Button(frame, text="打开终端", width=10,
-                              command=lambda k=key:
-                              self.dash.app.activate_agent(k))
-        open_btn.configure(style="Dashboard.TButton")
-        open_btn.grid(row=0, column=2, padx=(8, 0))
-        self._rows[key] = {"frame": frame, "title": title, "chip": chip}
-
-    def _update_row(self, key, target):
-        row = self._rows[key]
-        snap = target.snapshot
-        title = (f"{snap.kind.label} · "
-                 f"{target.instance.project or target.instance.source}")
-        if row["title"]["text"] != title:
-            row["title"].configure(text=title)
-        chip_text = status_text(snap)
-        if row["chip"]["text"] != chip_text:
-            row["chip"].set(chip_text,
-                            STATUS_COLOR.get(snap.status.value,
-                                             LIGHT.unknown))
-
-    def reflow(self, width: int):
-        cols = 4 if width >= 720 else 2
-        for i, cell in enumerate(self._metric_cells.values()):
-            cell[0].grid_forget()
-        for i, cell in enumerate(self._metric_cells.values()):
-            cell[0].grid(row=i // cols, column=i % cols, sticky="nsew",
-                         padx=6, pady=6)
-        for col in range(cols):
-            self._metric_cells["live"][0].master.grid_columnconfigure(
-                col, weight=1)
-
-
 class AgentsPage(DashboardPage):
-    """§12.2：list + retained 字段 detail；高级诊断 Expander。"""
+    """One workspace: summary, filtered retained rows, selected-session details."""
 
     name = PAGE_AGENTS
+    FILTERS = ("全部", "需要关注", "工作中", "待命")
 
     def build(self, parent):
         header = self.dash.page_header(parent, PAGE_AGENTS)
         header.add_action("重新扫描", self.dash.request_rescan)
         body = self.dash.page_body(parent)
-        self._split = tk.Frame(body, bg=LIGHT.page)
-        self._split.pack(fill="both", expand=True)
-        # 左列
-        self._list_panel = SurfacePanel(self._split)
-        _section_title(self._list_panel.body, "Agents")
+        summary = SurfacePanel(body, padding=16)
+        summary.pack(fill="x", pady=(0, SECTION_GAP))
+        self._metrics = {}
+        for col, (key, title, color) in enumerate((
+                ("live", "在线会话", LIGHT.text),
+                ("working", "正在工作", LIGHT.working),
+                ("attention", "需要关注", LIGHT.waiting))):
+            summary.body.columnconfigure(col, weight=1, uniform="metric")
+            cell = tk.Frame(summary.body, bg=LIGHT.surface)
+            cell.grid(row=0, column=col, sticky="ew", padx=(0, 12))
+            tk.Label(cell, text=title, bg=LIGHT.surface,
+                     fg=LIGHT.text_secondary, anchor="w",
+                     font=pick_font(cell, 9)).pack(fill="x")
+            value = tk.Label(cell, text="0", width=1, height=1,
+                             bg=LIGHT.surface, fg=color, anchor="w",
+                             font=pick_font(cell, 22, True))
+            value.pack(fill="x", pady=(3, 0))
+            self._metrics[key] = value
+
+        self._list_panel = SurfacePanel(body, padding=16)
+        self._list_panel.pack(fill="x", pady=(0, SECTION_GAP))
+        toolbar = tk.Frame(self._list_panel.body, bg=LIGHT.surface)
+        toolbar.pack(fill="x", pady=(0, 12))
+        from .widgets import SegmentedControl
+        self._filter = 0
+        self._filters = SegmentedControl(
+            toolbar, list(self.FILTERS), command=self._set_filter)
+        self._filters.pack(side="left")
+        self._list_count = tk.Label(toolbar, text="0 个会话", width=18,
+                                    anchor="e", bg=LIGHT.surface,
+                                    fg=LIGHT.text_secondary,
+                                    font=pick_font(toolbar, 9))
+        self._list_count.pack(side="right")
         self._list_frame = tk.Frame(self._list_panel.body, bg=LIGHT.surface)
         self._list_frame.pack(fill="x")
+        self._empty = tk.Frame(self._list_frame, bg=LIGHT.surface, height=108)
+        self._empty.pack_propagate(False)
+        self._empty_title = tk.Label(
+            self._empty, text="暂无在线 Agent", bg=LIGHT.surface,
+            fg=LIGHT.text, font=pick_font(parent, 12, True))
+        self._empty_title.pack(pady=(20, 6))
+        tk.Label(self._empty, text="启动受支持的 Agent 后，会话会自动出现在这里。",
+                 bg=LIGHT.surface, fg=LIGHT.text_secondary,
+                 font=pick_font(parent, 9)).pack()
         self._rows: dict[str, dict] = {}
-        # 右列
-        self._detail_panel = SurfacePanel(self._split)
-        self._detail_head = tk.Frame(self._detail_panel.body,
-                                     bg=LIGHT.surface)
-        self._detail_head.pack(fill="x")
-        self._detail_title = tk.Label(self._detail_head, text="未选择 Agent",
-                                      bg=LIGHT.surface, fg=LIGHT.text,
-                                      font=pick_font(self._detail_head, 11,
-                                                     True), anchor="w")
-        self._detail_title.pack(side="left", fill="x", expand=True)
-        bind_wraplength(self._detail_title)
-        self._detail_chip = StatusChip(self._detail_head)
-        self._detail_chip.pack(side="left", padx=(8, 0))
-        actions = tk.Frame(self._detail_panel.body, bg=LIGHT.surface)
-        actions.pack(fill="x", pady=(8, 0))
-        ttk.Button(actions, text="打开终端", width=14,
-                   command=self._activate_selected).pack(side="left")
-        InfoButton(actions,
-                   "恢复并前置该 Agent 所在的 Windows Terminal 窗口"
-                   "（窗口级语义：两个 Agent 同属一个 Terminal 窗口 → "
-                   "前置同一窗口，不切换标签页、不发送键盘输入）。",
-                   self.dash.tooltip).pack(side="left", padx=(6, 0))
-        self._include_btn = ttk.Button(actions, text="加入并发", width=14,
-                                       command=self._toggle_include)
-        self._include_btn.pack(side="left", padx=8)
-        ttk.Button(actions, text="重新扫描", width=10,
-                   command=self.dash.request_rescan).pack(side="left")
-        self._fields_frame = tk.Frame(self._detail_panel.body,
-                                      bg=LIGHT.surface)
-        self._fields_frame.pack(fill="x", pady=(8, 0))
-        self._fields: dict[str, tk.Label] = {}
-        self._advanced = Expander(self._detail_panel.body, "高级诊断")
-        self._advanced.pack(fill="x", pady=(8, 0))
-        self._advanced_label = tk.Label(
-            self._advanced.body, text="（未选择）", bg=LIGHT.surface,
-            fg=LIGHT.text, font=pick_font(self._advanced, 9, mono=True),
-            justify="left", anchor="nw")
-        self._advanced_label.pack(fill="x")
+        self._row_order: tuple[str, ...] = ()
         self._detail_key = ""
 
-    # ------------------------------------------------------------ actions
+        self._detail_panel = SurfacePanel(body, padding=16)
+        self._detail_panel.pack(fill="x")
+        _section_title(self._detail_panel.body, "会话详情")
+        head = tk.Frame(self._detail_panel.body, bg=LIGHT.surface)
+        head.pack(fill="x")
+        head.columnconfigure(0, weight=1)
+        self._detail_title = BoundedLabel(
+            head, text="选择一个会话查看详情", width=1, height=1,
+            bg=LIGHT.surface, fg=LIGHT.text,
+            font=pick_font(head, 12, True), anchor="w")
+        self._detail_title.grid(row=0, column=0, sticky="ew")
+        self._detail_chip = StatusChip(head, "—")
+        self._detail_chip.grid(row=0, column=1, padx=(12, 0))
+        actions = tk.Frame(self._detail_panel.body, bg=LIGHT.surface)
+        actions.pack(fill="x", pady=(12, 8))
+        self._activate_btn = ttk.Button(
+            actions, text="打开终端", width=12,
+            style="Dashboard.Primary.TButton", state="disabled",
+            command=self._activate_selected)
+        self._activate_btn.pack(side="left")
+        self._include_btn = ttk.Button(
+            actions, text="在桌宠中隐藏", width=16, state="disabled",
+            command=self._toggle_include)
+        self._include_btn.pack(side="left", padx=(8, 0))
+        InfoButton(actions, "打开操作只恢复并前置所属窗口；不会切换终端标签、"
+                   "发送输入或改变桌宠当前关注的 Agent。",
+                   self.dash.tooltip).pack(side="left", padx=(8, 0))
+        self._fields_frame = tk.Frame(self._detail_panel.body,
+                                      bg=LIGHT.surface)
+        self._fields_frame.pack(fill="x")
+        self._fields = {}
+        self._fields_frame.columnconfigure(1, weight=1)
+        for index, text in enumerate(("目标", "当前活动", "等待内容", "模式 / 阶段",
+                                      "环境", "项目路径", "所属窗口")):
+            tk.Label(self._fields_frame, text=text, width=12, anchor="nw",
+                     bg=LIGHT.surface, fg=LIGHT.text_secondary,
+                     font=pick_font(parent, 9)).grid(
+                         row=index, column=0, sticky="nw", pady=5)
+            value = BoundedLabel(self._fields_frame, text="—",
+                             max_lines=2 if index in (0, 1, 2, 5) else 1,
+                             anchor="nw", justify="left", bg=LIGHT.surface,
+                             fg=LIGHT.text, font=pick_font(parent, 10))
+            value.grid(row=index, column=1, sticky="ew", pady=5)
+            self._fields[text] = value
+        self._advanced = Expander(self._detail_panel.body, "连接与解析信息")
+        self._advanced.pack(fill="x", pady=(12, 0))
+        self._advanced_label = tk.Label(
+            self._advanced.body, text="未选择会话", width=1,
+            bg=LIGHT.surface, fg=LIGHT.text_secondary,
+            font=pick_font(parent, 9, mono=True), justify="left", anchor="nw")
+        self._advanced_label.pack(fill="x")
+        bind_wraplength(self._advanced_label)
+
+    def _set_filter(self, index):
+        self._filter = index
+        self.dash.app.ui.request(UiDirty.DASHBOARD)
+
+    def _matches(self, target):
+        status = target.snapshot.status
+        return (self._filter == 0
+                or self._filter == 1 and status in (
+                    Status.WAITING, Status.INPUT, Status.ERROR)
+                or self._filter == 2 and status is Status.WORKING
+                or self._filter == 3 and status in (Status.IDLE, Status.DONE))
+
     def _activate_selected(self):
-        # §11：打开终端只恢复并前置该 Agent 的 Terminal 窗口——不偷偷
-        # 改 presentation 的 focused 状态（与 Fleet/Tray/Overview 同语义）。
-        if self._detail_key:
+        if self._detail_key and self.dash.app.monitor.is_live_key(self._detail_key):
             self.dash.app.activate_agent(self._detail_key)
 
     def _toggle_include(self):
-        app = self.dash.app
         if not self._detail_key:
             return
+        app = self.dash.app
         current = app.presentation.instance_included(self._detail_key)
-        app.presentation.set_instance_included(
-            self._detail_key, current is False)
+        app.presentation.set_instance_included(self._detail_key, current is False)
         app.ui.request(UiDirty.PRESENTATION)
 
-    def select(self, key: str):
-        if key == self._detail_key:
-            return
-        self._detail_key = key
-        self.dash.app.ui.request(UiDirty.DASHBOARD)
+    def select(self, key):
+        if key != self._detail_key:
+            self._detail_key = key
+            self.dash.app.ui.request(UiDirty.DASHBOARD)
+
+    def _create_row(self, key):
+        frame = tk.Frame(self._list_frame, height=self.dash.metrics.px(66),
+                         bg=LIGHT.surface, cursor="hand2",
+                         highlightthickness=1, highlightbackground=LIGHT.border)
+        frame.grid_propagate(False)
+        frame.columnconfigure(0, weight=1)
+        title = BoundedLabel(frame, text="", anchor="w",
+                         bg=LIGHT.surface, fg=LIGHT.text,
+                         font=pick_font(frame, 10, True))
+        title.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 0))
+        meta = BoundedLabel(frame, text="", anchor="w",
+                        bg=LIGHT.surface, fg=LIGHT.text_secondary,
+                        font=pick_font(frame, 9))
+        meta.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 8))
+        chip = StatusChip(frame)
+        chip.grid(row=0, column=1, rowspan=2, padx=10)
+        open_btn = ttk.Button(frame, text="打开终端", width=10,
+                              style="Dashboard.TButton",
+                              command=lambda k=key: self.dash.app.activate_agent(k))
+        open_btn.grid(row=0, column=2, rowspan=2, padx=(0, 12))
+        for widget in (frame, title, meta, chip):
+            widget.bind("<Button-1>", lambda _e, k=key: self.select(k))
+        title.configure(takefocus=True)
+        title.bind("<Return>", lambda _e, k=key: self.select(k))
+        title.bind("<space>", lambda _e, k=key: self.select(k))
+        self._rows[key] = {"frame": frame, "title": title, "meta": meta,
+                           "chip": chip, "open_btn": open_btn}
 
     def refresh(self, reason: UiDirty):
         targets = self.dash.app.monitor.get_targets()
-        # retained list rows
-        for key in list(self._rows):
+        counts = {
+            "live": len(targets),
+            "working": sum(t.snapshot.status is Status.WORKING
+                           for t in targets.values()),
+            "attention": sum(t.snapshot.status in (
+                Status.WAITING, Status.INPUT, Status.ERROR)
+                for t in targets.values()),
+        }
+        for key, value in counts.items():
+            _configure_changed(self._metrics[key], text=str(value))
+        for key in tuple(self._rows):
             if key not in targets:
-                row = self._rows.pop(key)
-                row["frame"].destroy()
-        created = False
-        for key in targets:
+                self._rows.pop(key)["frame"].destroy()
+        for key in sorted(targets):
             if key not in self._rows:
-                frame = tk.Frame(self._list_frame, bg=LIGHT.surface,
-                                 cursor="hand2")
-                title = tk.Label(frame, text="", bg=LIGHT.surface,
-                                 fg=LIGHT.text, anchor="w",
-                                 font=pick_font(frame, 10, True))
-                frame.columnconfigure(0, weight=1)
-                title.grid(row=0, column=0, sticky="ew", pady=8)
-                bind_wraplength(title)
-                chip = StatusChip(frame)
-                chip.grid(row=0, column=1, padx=(8, 0))
-                # §10.1：StatusChip 是独立 child widget——点击 chip 区域
-                # 不会触发 parent frame 的 widget-level binding，必须
-                # 显式绑定同一 select_row，整行才是真实可点击区域。
-                def select_row(_event=None, k=key):
-                    self.select(k)
-                for widget in (frame, title, chip):
-                    widget.bind("<Button-1>", select_row)
-                self._rows[key] = {"frame": frame, "title": title,
-                                   "chip": chip}
-                created = True
-        for key, target in targets.items():
-            row = self._rows[key]
-            snap = target.snapshot
-            text = (f"{snap.kind.label} · "
-                    f"{target.instance.project or target.instance.source}")
-            if row["title"]["text"] != text:
-                row["title"].configure(text=text)
-            chip_text = status_text(snap)
-            if row["chip"]["text"] != chip_text:
-                row["chip"].set(chip_text,
-                                STATUS_COLOR.get(snap.status.value,
-                                                 LIGHT.unknown))
-        ordered = sorted(targets)
-        # 新建的行必须 pack（创建顺序 == sorted 顺序时旧条件永远不触发，
-        # 行不可见也不可点——与 OverviewPage 的 order_changed 同语义）
-        if created or [k for k in self._rows] != ordered:
-            for widget in self._list_frame.winfo_children():
-                widget.pack_forget()
-            for key in ordered:
-                self._rows[key]["frame"].pack(fill="x", pady=2, ipady=4)
-        # detail
-        target = targets.get(self._detail_key)
-        if target is None:
-            if self._rows and self._detail_key == "":
-                self._detail_key = ordered[0]
-                target = targets.get(self._detail_key)
-                if target is None:
-                    return
-            self._detail_title.configure(text="未选择 Agent")
-            self._detail_chip.set("—")
-            return
-        snap = target.snapshot
-        inst = target.instance
-        binding = target.terminal_window
-        title = f"{snap.kind.label} · {inst.project or inst.source}"
-        if self._detail_title["text"] != title:
-            self._detail_title.configure(text=title)
-        chip_text = status_text(snap)
-        if self._detail_chip["text"] != chip_text:
-            self._detail_chip.set(chip_text,
-                                  STATUS_COLOR.get(snap.status.value,
-                                                   LIGHT.unknown))
-        fields = [
-            ("状态", status_text(snap)),
-            ("模式 / 阶段", " / ".join(x for x in (mode_text(snap),
-                                                  phase_text(snap)) if x)
-             or "—"),
-            ("目标", snap.goal or "—"),
-            ("当前活动", snap.summary or "—"),
-            ("等待内容", snap.waiting_detail or "—"),
-            ("环境", f"{'WSL ' + inst.distro if inst.distro else 'Windows'}"
-                     f" · {inst.source}"),
-            ("项目路径", inst.cwd or "—"),
-            ("终端", ("可打开"
-                      if binding is not None and binding.wakeable
-                      else "未定位")),
-        ]
-        for label_text, value_text in fields:
-            label = self._fields.get(label_text)
-            if label is None:
-                rowf = tk.Frame(self._fields_frame, bg=LIGHT.surface)
-                rowf.pack(fill="x", pady=2)
-                tk.Label(rowf, text=label_text, width=10, anchor="nw",
-                         bg=LIGHT.surface, fg=LIGHT.text_secondary,
-                         font=pick_font(rowf, 9)).pack(side="left")
-                label = tk.Label(rowf, text="", anchor="w", justify="left",
-                                 bg=LIGHT.surface, fg=LIGHT.text,
-                                 font=pick_font(rowf, 10), wraplength=420)
-                label.pack(side="left", fill="x", expand=True)
-                bind_wraplength(label, min_width=160)
-                self._fields[label_text] = label
-            if label["text"] != value_text:
-                label.configure(text=value_text)
-        # 高级诊断（PID/HWND 等运行期身份只在收起的 expander 展示）
-        adv = [f"kind={snap.kind.value}", f"source={inst.source}",
-               f"pid={inst.pid}",
-               f"process_token={inst.process_token}",
-               f"started_at={inst.started_at:.0f}"]
-        if binding is not None and binding.window is not None:
-            adv.append(f"hwnd={binding.window.hwnd}")
-            adv.append(f"binding={_binding_conf_value(binding)}")
-            adv.append(f"title={binding.title or ''}")
-        adv.append(f"parser={snap.parser_health or 'UNKNOWN'}"
-                   + (f"（{snap.parser_detail}）" if snap.parser_detail
-                      else ""))
-        _configure_changed(self._advanced_label, text="\n".join(adv))
-        # include 状态 → 按钮文案（None = 未显式设置，按默认参与展示）
-        included = self.dash.app.presentation.instance_included(
-            self._detail_key)
-        _configure_changed(self._include_btn,
-            text="移出并发" if included is not False else "加入并发")
-
-    def reflow(self, width: int):
-        # Stacking preserves readable details and avoids a cramped action row.
-        wide = width >= 1040
-        if wide:
-            self._list_panel.pack_forget()
-            self._detail_panel.pack_forget()
-            self._list_panel.pack(side="left", fill="y",
-                                  padx=(0, SECTION_GAP))
-            self._list_panel.configure(width=304)
-            self._list_panel.pack_propagate(False)
-            self._detail_panel.pack(side="left", fill="both", expand=True)
+                self._create_row(key)
+        visible = tuple(key for key in sorted(targets) if self._matches(targets[key]))
+        _configure_changed(self._list_count,
+                           text=f"显示 {len(visible)} / 在线 {len(targets)}")
+        if visible != self._row_order:
+            for row in self._rows.values():
+                _pack_forget_once(row["frame"])
+            for key in visible:
+                self._rows[key]["frame"].pack(fill="x", pady=(0, 6))
+            self._row_order = visible
+        if visible:
+            _pack_forget_once(self._empty)
         else:
-            self._list_panel.pack_forget()
-            self._detail_panel.pack_forget()
-            self._list_panel.pack(fill="x")
-            self._list_panel.pack_propagate(True)
-            self._detail_panel.pack(fill="both", expand=True, pady=(
-                SECTION_GAP, 0))
+            _configure_changed(self._empty_title,
+                               text="暂无在线 Agent" if not targets
+                               else "没有符合筛选条件的会话")
+            _pack_once(self._empty, fill="x")
+        if self._detail_key not in visible:
+            self._detail_key = visible[0] if visible else ""
+        for key in visible:
+            target = targets[key]
+            row = self._rows[key]
+            _configure_changed(row["title"], text=_ellipsize(
+                f"{target.snapshot.kind.label} · {workspace_name(target)}", 80))
+            _configure_changed(row["meta"], text=_ellipsize(
+                f"{environment_label(target.instance)}  ·  "
+                f"{activity_text(target.snapshot)}", 100))
+            row["chip"].set(status_text(target.snapshot), STATUS_COLOR.get(
+                target.snapshot.status.value, LIGHT.unknown))
+            _configure_changed(row["open_btn"], text=_activation_label(target.instance))
+            selected = key == self._detail_key
+            bg = LIGHT.accent_soft if selected else LIGHT.surface
+            _configure_changed(row["frame"], bg=bg, highlightbackground=(
+                LIGHT.accent if selected else LIGHT.border))
+            for part in ("title", "meta"):
+                _configure_changed(row[part], bg=bg)
+        self._refresh_detail(targets.get(self._detail_key))
+
+    def _refresh_detail(self, target):
+        if target is None:
+            _configure_changed(self._detail_title, text="选择一个会话查看详情")
+            self._detail_chip.set("—", LIGHT.unknown)
+            for label in self._fields.values():
+                _configure_changed(label, text="—")
+            _configure_changed(self._advanced_label, text="未选择会话")
+            self._activate_btn.state(["disabled"])
+            self._include_btn.state(["disabled"])
+            return
+        snap, inst, binding = target.snapshot, target.instance, target.terminal_window
+        _configure_changed(self._detail_title, text=_ellipsize(
+            f"{snap.kind.label} · {workspace_name(target)}", 80))
+        self._detail_chip.set(status_text(snap), STATUS_COLOR.get(
+            snap.status.value, LIGHT.unknown))
+        self._activate_btn.state(["!disabled"])
+        self._include_btn.state(["!disabled"])
+        _configure_changed(self._activate_btn, text=_activation_label(inst))
+        included = self.dash.app.presentation.instance_included(self._detail_key)
+        _configure_changed(self._include_btn,
+                           text="在桌宠中隐藏" if included is not False
+                           else "在桌宠中显示")
+        fields = {
+            "目标": summarize_text(snap.goal or snap.title, 300) or "—",
+            "当前活动": activity_text(snap, limit=300),
+            "等待内容": summarize_text(snap.waiting_detail, 300) or "—",
+            "模式 / 阶段": " / ".join(x for x in (
+                mode_text(snap), phase_text(snap)) if x) or "—",
+            "环境": environment_label(inst), "项目路径": inst.cwd or "—",
+            "所属窗口": "可打开" if binding is not None and binding.wakeable else "未定位",
+        }
+        for key, text in fields.items():
+            _configure_changed(self._fields[key], text=_ellipsize(text, 300))
+        detail = [f"kind={snap.kind.value}", f"source={inst.source}",
+                  f"pid={inst.pid}", f"process_token={inst.process_token}",
+                  f"started_at={inst.started_at:.0f}"]
+        if binding is not None and binding.window is not None:
+            detail.extend((f"hwnd={binding.window.hwnd}",
+                           f"binding={_binding_conf_value(binding)}"))
+        detail.append(f"parser={snap.parser_health or 'UNKNOWN'}"
+                      + (f" ({snap.parser_detail})" if snap.parser_detail else ""))
+        _configure_changed(self._advanced_label, text="\n".join(detail))
 
 
 class PetsPage(DashboardPage):
@@ -602,6 +523,8 @@ class PetsPage(DashboardPage):
         self.cards_frame = tk.Frame(panel_b.body, bg=LIGHT.surface)
         self.cards_frame.pack(fill="x")
         self._slot_cards: dict[str, dict] = {}
+        self._slot_order: tuple[str, ...] = ()
+        self._card_cols = 1
         self._rows: list[SettingRow] = [r1, r2, r3, r4]
 
     # ------------------------------------------------------------ actions
@@ -710,10 +633,12 @@ class PetsPage(DashboardPage):
         for card in self._slot_cards.values():
             card["panel"].destroy()
         self._slot_cards.clear()
+        self._slot_order = ()
 
     def _refresh_slot_cards(self, state, max_targets: int):
         app = self.dash.app
         slot_ids = app.presentation.slot_ids()[:max(max_targets, 1)]
+        layout_changed = tuple(slot_ids) != self._slot_order
         for slot_id in list(self._slot_cards):
             if slot_id not in slot_ids:
                 self._slot_cards.pop(slot_id)["panel"].destroy()
@@ -765,11 +690,13 @@ class PetsPage(DashboardPage):
                        "跟随全局")
             if card["skin_var"].get() != current:
                 card["skin_var"].set(current)
+        self._slot_order = tuple(slot_ids)
+        if layout_changed:
+            self._arrange_slot_cards()
 
     def _create_slot_card(self, slot_id: str, index: int) -> dict:
         app = self.dash.app
         panel = SurfacePanel(self.cards_frame)
-        panel.pack(fill="x", pady=4)
         head = tk.Frame(panel.body, bg=LIGHT.surface)
         head.pack(fill="x")
         tk.Label(head, text=f"桌宠 {index}", bg=LIGHT.surface,
@@ -797,7 +724,7 @@ class PetsPage(DashboardPage):
                    self.dash.tooltip).pack(side="left", padx=(6, 0))
         skin_var = tk.StringVar(value="跟随全局")
         values = ["跟随全局"] + sorted(skins.list_skins())
-        combo = ttk.Combobox(skin_row, textvariable=skin_var, width=28,
+        combo = ttk.Combobox(skin_row, textvariable=skin_var, width=18,
                              values=values, state="readonly")
         combo.pack(side="left", padx=(6, 0))
         skin_state = tk.Label(skin_row, text="—", bg=LIGHT.surface,
@@ -823,10 +750,34 @@ class PetsPage(DashboardPage):
         self._slot_cards[slot_id] = card
         return card
 
+    def _arrange_slot_cards(self):
+        """Arrange retained cards only when the width mode changes."""
+        if not self._slot_cards:
+            return
+        panels = [card["panel"] for card in self._slot_cards.values()]
+        for panel in panels:
+            panel.pack_forget()
+            panel.grid_forget()
+        for column in range(2):
+            self.cards_frame.grid_columnconfigure(
+                column, weight=1 if column < self._card_cols else 0)
+        if self._card_cols == 2:
+            for index, panel in enumerate(panels):
+                panel.grid(row=index // 2, column=index % 2,
+                           sticky="nsew",
+                           padx=(0 if index % 2 == 0 else 6,
+                                 6 if index % 2 == 0 else 0), pady=4)
+        else:
+            for panel in panels:
+                panel.pack(fill="x", pady=4)
+
     def reflow(self, width: int):
-        mode = "wide" if width >= SettingRow.COMPACT_BREAK else "compact"
         for row in getattr(self, "_rows", ()):
-            row.reflow(mode)
+            row.reflow(SettingRow.mode_for_width(width, row._mode))
+        cols = 2 if width >= 820 else 1
+        if cols != self._card_cols:
+            self._card_cols = cols
+            self._arrange_slot_cards()
 
 
 class AppearancePage(DashboardPage):
@@ -1071,9 +1022,8 @@ class AppearancePage(DashboardPage):
             self.skin_var.set(skin)
 
     def reflow(self, width: int):
-        mode = "wide" if width >= SettingRow.COMPACT_BREAK else "compact"
         for r in self._rows:
-            r.reflow(mode)
+            r.reflow(SettingRow.mode_for_width(width, r._mode))
 
 
 class MonitorPage(DashboardPage):
@@ -1423,7 +1373,8 @@ class SettingsPage(DashboardPage):
         self.autostart_state.pack(anchor="w")
         self.autostart_detail = tk.Label(
             auto.body, text="", bg=LIGHT.surface, fg=LIGHT.text_secondary,
-            font=pick_font(auto, 9), wraplength=480, justify="left")
+            font=pick_font(auto, 9), wraplength=480, justify="left",
+            height=2, anchor="nw")
         self.autostart_detail.pack(anchor="w")
         bind_wraplength(self.autostart_detail)
         arow = tk.Frame(auto.body, bg=LIGHT.surface)
@@ -1593,7 +1544,7 @@ class SettingsPage(DashboardPage):
                                fg=LIGHT.waiting)
             _configure_changed(self.autostart_detail,
                 text=f"注册路径与当前 DeskPet 路径不一致：\n"
-                     f"{st.registered_command}")
+                     f"{_ellipsize(st.registered_command, 120)}")
             _pack_once(self.autostart_repair_btn,
                        in_=self._autostart_row, side="left", padx=6)
             _configure_changed(
@@ -1627,30 +1578,39 @@ class SettingsPage(DashboardPage):
 
 
 class _PageHeader:
-    """页面头（§10.2 高 64）：左标题 + 右动作区。"""
+    """Stable page header: title hierarchy on the left, actions on the right."""
 
-    def __init__(self, parent, title: str, metrics: DashboardMetrics):
-        self.frame = tk.Frame(parent, bg=LIGHT.page)
-        self.frame.pack(fill="x", pady=(0, 8))
-        tk.Frame(self.frame, bg=LIGHT.page,
-                 height=metrics.px(PAGE_HEADER_HEIGHT)).pack(
-            side="left", fill="y")
-        self._title = tk.Label(self.frame, text=title, bg=LIGHT.page,
-                               fg=LIGHT.text,
-                               font=pick_font(parent, 15, True))
-        self._title.pack(side="left", padx=(metrics.px(PAGE_PAD_X), 0))
+    def __init__(self, parent, title: str, metrics: DashboardMetrics,
+                 description: str = ""):
+        self.frame = tk.Frame(parent, bg=LIGHT.page,
+                              height=metrics.px(PAGE_HEADER_HEIGHT))
+        self.frame.pack(fill="x", padx=metrics.px(PAGE_PAD_X),
+                        pady=(metrics.px(14), metrics.px(8)))
+        self.frame.pack_propagate(False)
         self._actions = tk.Frame(self.frame, bg=LIGHT.page)
-        self._actions.pack(side="right",
-                           padx=(0, metrics.px(PAGE_PAD_X)))
+        self._actions.pack(side="right", padx=(12, 0))
+        title_group = tk.Frame(self.frame, bg=LIGHT.page)
+        title_group.pack(side="left", fill="both", expand=True)
+        self._title = tk.Label(title_group, text=title, bg=LIGHT.page,
+                               fg=LIGHT.text, anchor="w", width=1,
+                               font=pick_font(parent, 17, True))
+        self._title.pack(fill="x")
+        if description:
+            tk.Label(title_group, text=description, bg=LIGHT.page,
+                     fg=LIGHT.text_secondary, anchor="w", width=1,
+                     font=pick_font(parent, 9)).pack(fill="x", pady=(2, 0))
 
     def add_action(self, text: str, command, primary: bool = False):
-        return ttk.Button(self._actions, text=text, width=14 if primary
-                          else 10, command=command).pack(side="left",
-                                                         padx=4)
+        button = ttk.Button(self._actions, text=text, width=14 if primary
+                            else 10, command=command,
+                            style="Dashboard.Primary.TButton" if primary
+                            else "Dashboard.TButton")
+        button.pack(side="left", padx=4)
+        return button
 
 
 class Dashboard(tk.Toplevel):
-    """v4.3 仪表盘 shell：固定 7 页导航 + lazy/retained 页面。"""
+    """Retained desktop shell with one Agent workspace and focused settings."""
 
     def __init__(self, app):
         self.app = app
@@ -1662,7 +1622,7 @@ class Dashboard(tk.Toplevel):
         self.configure(bg=LIGHT.page)
         self.protocol("WM_DELETE_WINDOW", self.hide_dashboard)
         self.selected_key = ""
-        self._page = PAGE_OVERVIEW
+        self._page = PAGE_AGENTS
         self._closing = False
         self._dialog_active = False
         self._visibility_epoch = 0
@@ -1703,8 +1663,8 @@ class Dashboard(tk.Toplevel):
         # avoids scheduling useless 50ms work on every retained-dashboard open.
         self._last_configure_size = None
         self.bind("<Configure>", self._on_configure)
-        # Overview 立即构建（默认页）
-        self._show_page(PAGE_OVERVIEW)
+        # 工作台立即构建；其余页面首次访问时构建。
+        self._show_page(PAGE_AGENTS)
 
     # ================================================== shell
     def _apply_window_geometry(self):
@@ -1729,20 +1689,56 @@ class Dashboard(tk.Toplevel):
 
     def _build_shell(self):
         m = self.metrics
-        nav = tk.Frame(self, bg=LIGHT.page, width=m.px(NAV_WIDTH))
+        # Keep the rail's physical width stable for the lifetime of the
+        # retained Toplevel.  A fixed rail plus a permanent scrollbar gutter
+        # prevents open/refresh/reflow from moving the content edge and makes
+        # the active marker visually steady.
+        nav = tk.Frame(self, bg=LIGHT.nav, width=m.px(NAV_WIDTH),
+                       highlightthickness=0, bd=0)
         nav.pack(side="left", fill="y")
         nav.pack_propagate(False)
-        brand = tk.Label(nav, text="DeskPet 仪表盘", bg=LIGHT.page,
-                         fg=LIGHT.text, anchor="w", padx=16,
-                         font=pick_font(self, 13, True))
-        brand.pack(fill="x",
-                   ipady=(m.px(BRAND_HEIGHT) - brand.winfo_reqheight()) // 2)
-        tk.Frame(nav, bg=LIGHT.border, height=1).pack(fill="x", padx=16, pady=(0, 12))
+        brand_row = tk.Frame(nav, bg=LIGHT.nav,
+                             height=m.px(BRAND_HEIGHT))
+        brand_row.pack(fill="x")
+        brand_row.pack_propagate(False)
+        mark = tk.Label(brand_row, text="D", bg=LIGHT.accent,
+                        fg="#FFFFFF", width=2, anchor="center",
+                        font=pick_font(self, 14, True))
+        mark.pack(side="left", padx=(16, 9), pady=15)
+        brand_group = tk.Frame(brand_row, bg=LIGHT.nav)
+        brand_group.pack(side="left", fill="both", expand=True, pady=11)
+        tk.Label(brand_group, text="DeskPet", bg=LIGHT.nav,
+                 fg="#F3FBF7", anchor="w",
+                 font=pick_font(self, 13, True)).pack(anchor="w")
+        tk.Label(brand_group, text="Agent workspace", bg=LIGHT.nav,
+                 fg=LIGHT.nav_text, anchor="w",
+                 font=pick_font(self, 8)).pack(anchor="w", pady=(1, 0))
+        tk.Frame(nav, bg=LIGHT.nav_surface, height=1).pack(fill="x", padx=16,
+                                                    pady=(0, 14))
         self._nav_buttons: dict[str, NavButton] = {}
-        for page in (PAGE_OVERVIEW, PAGE_AGENTS, PAGE_PETS, PAGE_LOOK,
+        tk.Label(nav, text="工作区", bg=LIGHT.nav, fg=LIGHT.nav_text,
+                 anchor="w", padx=16,
+                 font=pick_font(self, 8, True)).pack(fill="x", pady=(0, 4))
+        for page in (PAGE_AGENTS, PAGE_PETS, PAGE_LOOK,
                      PAGE_MONITOR, PAGE_DIAG):
             self._add_nav_item(nav, page)
-        tk.Frame(nav, bg=LIGHT.page).pack(fill="both", expand=True)
+        spacer = tk.Frame(nav, bg=LIGHT.nav)
+        spacer.pack(fill="both", expand=True)
+        status_card = tk.Frame(nav, bg=LIGHT.nav_surface, height=m.px(64))
+        status_card.pack(fill="x", padx=10, pady=(0, 10))
+        status_card.pack_propagate(False)
+        tk.Label(status_card, text="实时监控", bg=LIGHT.nav_surface,
+                 fg=LIGHT.nav_text, anchor="w",
+                 font=pick_font(self, 8, True)).pack(fill="x", padx=11,
+                                                     pady=(8, 0))
+        self._nav_status = tk.Label(
+            status_card, text="正在读取 Agent…", bg=LIGHT.nav_surface,
+            fg="#F3FBF7", anchor="w", justify="left", height=2,
+            padx=11, font=pick_font(self, 8))
+        self._nav_status.pack(fill="x", padx=0, pady=(1, 0))
+        tk.Label(nav, text="配置", bg=LIGHT.nav, fg=LIGHT.nav_text,
+                 anchor="w", padx=16,
+                 font=pick_font(self, 8, True)).pack(fill="x", pady=(0, 4))
         self._add_nav_item(nav, PAGE_SETTINGS)   # 固定底部
         # 右内容：页面区（滚动容器）
         self.content = self._make_scroller()
@@ -1795,13 +1791,14 @@ class Dashboard(tk.Toplevel):
     def _add_nav_item(self, nav, page: str):
         btn = NavButton(nav, page, command=lambda p=page: self._show_page(p))
         btn.configure(height=self.metrics.px(NAV_ITEM_HEIGHT))
+        btn.pack_propagate(False)
         btn.pack(fill="x", padx=10, pady=3)
         btn._label.configure(pady=max(2, self.metrics.px(
             NAV_ITEM_HEIGHT - 30) // 2))
         self._nav_buttons[page] = btn
 
     def _register_pages(self):
-        for page_cls in (OverviewPage, AgentsPage, PetsPage,
+        for page_cls in (AgentsPage, PetsPage,
                          AppearancePage, MonitorPage, DiagnosticsPage,
                          SettingsPage):
             page = page_cls(self)
@@ -1809,7 +1806,8 @@ class Dashboard(tk.Toplevel):
 
     # ================================================== 页面生命周期（§15）
     def page_header(self, parent, title: str) -> _PageHeader:
-        return _PageHeader(parent, title, self.metrics)
+        return _PageHeader(parent, title, self.metrics,
+                           PAGE_DESCRIPTIONS.get(title, ""))
 
     def page_body(self, parent) -> tk.Frame:
         body = tk.Frame(parent, bg=LIGHT.page,
@@ -1851,8 +1849,34 @@ class Dashboard(tk.Toplevel):
             return
         if self.state() == "withdrawn":
             return
+        self._refresh_nav_status()
         if self._current is not None:
             self._current.refresh(reason)
+
+    def _refresh_nav_status(self):
+        """Update the rail summary in place; never rebuild navigation widgets."""
+        if not hasattr(self, "_nav_status"):
+            return
+        try:
+            targets = self.app.monitor.get_targets()
+        except Exception:
+            return
+        live = len(targets)
+        working = sum(1 for target in targets.values()
+                      if target.snapshot.status is Status.WORKING)
+        attention = sum(1 for target in targets.values() if target.snapshot.status
+                        in (Status.WAITING, Status.INPUT, Status.ERROR))
+        signature = (live, working, attention)
+        if signature == getattr(self, "_nav_status_signature", None):
+            return
+        self._nav_status_signature = signature
+        if not live:
+            text = "暂无在线 Agent"
+        else:
+            text = f"在线 {live} · 工作中 {working}"
+            if attention:
+                text += f"\n需要关注 {attention}"
+        _configure_changed(self._nav_status, text=text)
 
     def refresh(self):
         self.refresh_current_page(UiDirty.DASHBOARD)
@@ -1981,7 +2005,18 @@ class Dashboard(tk.Toplevel):
         self._reflow_after = self.after(50, self._reflow_debounced)
 
     def _reflow_debounced(self):
+        # The geometry helper is also called directly by deterministic tests
+        # and by a few DPI-change paths.  Cancel the still-pending token first
+        # so a direct call cannot leave a second callback behind; otherwise a
+        # later shutdown would destroy the Toplevel while that Tcl command was
+        # still scheduled.
+        token = self._reflow_after
         self._reflow_after = None
+        if token is not None:
+            try:
+                self.after_cancel(token)
+            except tk.TclError:
+                pass
         if self._closing or not self.winfo_exists():
             return
         new_metrics = DashboardMetrics.for_window(self)
@@ -1996,7 +2031,8 @@ class Dashboard(tk.Toplevel):
                     - 2 * self.metrics.px(PAGE_PAD_X))
         crossed = any((width >= breakpoint) !=
                       (self._last_reflow_width >= breakpoint)
-                      for breakpoint in (SettingRow.COMPACT_BREAK, 1040))
+                      for breakpoint in (SettingRow.COMPACT_ENTER,
+                                        SettingRow.COMPACT_EXIT, 840, 1040))
         # §10.3：只有 DPI 变化或跨 breakpoint 才重排；像素级拖拽零工作
         if dpi_changed or crossed or self._last_reflow_width < 0:
             self._last_reflow_width = width
@@ -2014,7 +2050,7 @@ class Dashboard(tk.Toplevel):
         if not self._dialog_active:
             self.focus_set()
         if self._current is None:
-            self._show_page(PAGE_OVERVIEW)
+            self._show_page(PAGE_AGENTS)
         elif was_hidden:
             self._current.on_show()
 

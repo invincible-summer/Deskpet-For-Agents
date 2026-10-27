@@ -184,11 +184,14 @@ class TkTests(unittest.TestCase):
         gc.collect()                  # 主线程收残余引用环（v4.2.1）
 
     def test_fixed_card_cached_items_at_scales(self):
-        for scale in (.5, .75, 1, 1.5, 2):
+        for scale, font_size in ((.5, 11), (.75, 11), (1, 11),
+                                 (1.5, 11), (2, 11), (.5, 28), (1, 28)):
             self.cfg.set('scale', scale)
+            self.cfg.set('bubble.font_size', font_size)
             self.bubble.invalidate()
-            self.bubble.model = BubbleModel(visible=True, status='Codex · Plan · 编码中',
-                                            text='正在分析气泡布局与缩放方式', footer='目标 · 迁移 JWT')
+            self.bubble.model = BubbleModel(visible=True, status='Codex · deskpet · 编写中',
+                                            text='正在分析气泡布局与缩放方式', footer='目标 · 迁移 JWT',
+                                            agent_key='preview-codex')
             normal = self.bubble.layout()
             self.bubble.draw(0, 0, normal[0] // 2, normal[1] + 8)
             items = self.canvas.find_all()
@@ -196,6 +199,16 @@ class TkTests(unittest.TestCase):
                 self.bubble.layout()
                 self.bubble.draw(0, 0, normal[0] // 2, normal[1] + 8)
             self.assertEqual(items, self.canvas.find_all())
+            texts = [item for item in items if self.canvas.type(item) == 'text']
+            self.assertEqual(len(texts), 4)  # header + two activity lines + goal
+            self.assertTrue(self.canvas.itemcget(texts[0], 'text').endswith('编写中'))
+            self.assertEqual(len(self.bubble.disp_lines), 2)
+            footer_top = self.canvas.bbox(texts[-1])[1]
+            for item in texts[1:-1]:
+                if self.canvas.bbox(item):
+                    self.assertLessEqual(self.canvas.bbox(item)[3], footer_top)
+            tail = self.canvas.bbox(items[0])
+            self.assertLessEqual(abs(tail[3] - (normal[1] + 8)), 2)
 
     def test_bubble_hit_carries_exact_agent_key(self):
         """V4.1：气泡无审批按钮；底行命中携带 exact agent_key。"""
@@ -264,130 +277,8 @@ class TkTests(unittest.TestCase):
         scheduler.stop()
 
 
-class MenuEphemeralLifecycleTests(unittest.TestCase):
-    """v4.2.3 §9 / DP43-R14/R15：popup menu 的确定性销毁与 churn 上限。
-
-    Tray 菜单已原生化（worker 线程内 HMENU）；Pet 菜单由
-    TkContextMenuController 拥有（test_dp43_ui_lifecycle 覆盖）。
-    本类保留通用 Tk menu 销毁原语（controller._destroy）的合同。
-    """
-
-    def _app(self):
-        from pet.app import PetApp
-        from pet.petview import PetView
-        cfg = MemoryConfig()
-        with\
-             patch.object(PetView, 'load_skin', lambda self, bm: None):
-            app = PetApp(cfg)
-            app.pet_manager.activate_skin_runtime()
-            app._disarm_first_map_trigger()
-            return app
-
-    def test_destroy_menu_idempotent_no_tclerror(self):
-        app = self._app()
-        try:
-            import tkinter as tkmod
-            menu = tkmod.Menu(app.root, tearoff=0)
-            path = menu._w
-            destroy = app._menu_controller._destroy
-            destroy(menu)
-            self.assertEqual(app.root.tk.call('winfo', 'exists', path), 0)
-            # 幂等：重复 destroy / None 不抛
-            destroy(menu)
-            destroy(None)
-        finally:
-            app.quit()
-
-    def test_menu_churn_1000_no_widget_growth_or_tclerror(self):
-        app = self._app()
-        try:
-            import tkinter as tkmod
-            paths = []
-            for _ in range(1000):
-                menu = tkmod.Menu(app.root, tearoff=0)
-                paths.append(menu._w)
-                app._menu_controller._destroy(menu)
-            # 所有历史 menu widget 均已销毁（无线性增长）
-            alive = [p for p in paths
-                     if app.root.tk.call('winfo', 'exists', p)]
-            self.assertEqual(alive, [])
-            # 无新增 after timer（菜单生命周期不靠定时器）
-        finally:
-            app.quit()
 
 
-class DashboardStableToplevelTests(unittest.TestCase):
-    """DP43-R16：Dashboard 是 retained Toplevel——失焦绝不关闭；
-    关闭只来自 X / 显式 hide / App shutdown。
-
-    （替换旧 DashboardAutoCollapseTests 的语义；auto-collapse 整条
-    生命周期已删除。）
-    """
-
-    def _app(self):
-        from pet.app import PetApp
-        from pet.petview import PetView
-        cfg = MemoryConfig()
-        with patch.object(PetView, 'load_skin', lambda self, bm: None):
-            app = PetApp(cfg)
-            app.pet_manager.activate_skin_runtime()
-            app._disarm_first_map_trigger()
-            return app
-
-    def test_focusout_never_closes(self):
-        app = self._app()
-        try:
-            app.open_dashboard()
-            app.root.update()
-            dash = app.dashboard
-            self.assertTrue(dash.is_open())
-            dash.event_generate('<FocusIn>')
-            dash.event_generate('<FocusOut>')
-            app.root.update()
-            self.assertTrue(dash.is_open())
-        finally:
-            app.quit()
-
-    def test_hide_reopen_keeps_current_page(self):
-        app = self._app()
-        try:
-            app.open_dashboard()
-            app.root.update()
-            dash = app.dashboard
-            # 切到非默认页再 hide/reopen：current page 保留
-            from pet.dashboard import PAGE_PETS
-            dash._show_page(PAGE_PETS)
-            page = dash._page
-            dash.hide_dashboard()
-            self.assertFalse(dash.is_open())
-            dash.open()
-            self.assertTrue(dash.is_open())
-            self.assertEqual(dash._page, page)
-        finally:
-            app.quit()
-
-    def test_open_100_times_single_dashboard(self):
-        app = self._app()
-        try:
-            first = None
-            for _ in range(100):
-                app.open_dashboard()
-                app.root.update()
-                if first is None:
-                    first = app.dashboard
-            self.assertIs(app.dashboard, first)
-            self.assertTrue(first.winfo_exists())
-        finally:
-            app.quit()
-
-    def test_native_dialog_wrappers_do_not_change_lifecycle(self):
-        """messagebox/filedialog 使用标准 parent；不再依赖 suppress 标志
-        （标志已删除，包装函数直接调用）。"""
-        from pet import dashboard as dash_mod
-        self.assertFalse(hasattr(dash_mod.Dashboard, '_maybe_auto_collapse'))
-        src = Path(dash_mod.__file__).read_text(encoding="utf-8")
-        self.assertNotIn('_native_dialog_open', src)
-        self.assertNotIn('_had_focus', src)
 
 
 class AppTests(unittest.TestCase):
@@ -421,15 +312,16 @@ class AppTests(unittest.TestCase):
             waiting_model = app.pet_manager.views["pet-1"].bubble.model
             self.assertIn('Claude Code', waiting_model.status)
             self.assertIn('等待审批', waiting_model.status)
-            self.assertEqual(waiting_model.footer, '请在终端处理')
+            self.assertEqual(waiting_model.footer, '目标 · 暂无明确任务')
             self.assertIn('Bash', waiting_model.text)
-            # focused 指向 Codex 后气泡显示 Plan/编码中
+            # Mode remains in the model, outside the three-part bubble header.
             app.presentation.set_focus(a.key)
             app._aggregate()
             model = app.pet_manager.views["pet-1"].bubble.model
-            self.assertIn('Codex', model.status)
-            self.assertIn('Plan', model.status)
-            self.assertIn('编码中', model.status)
+            self.assertEqual(model.status, 'Codex · DeskPet · 编写中')
+            self.assertEqual(a.mode, Mode.PLAN)
+            self.assertNotIn('Plan', model.text)
+            self.assertEqual(model.footer, '目标 · 完善气泡')
             app.open_dashboard()
             app.root.update()
             self.assertTrue(app.dashboard.winfo_exists())

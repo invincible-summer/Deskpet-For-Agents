@@ -1,4 +1,4 @@
-"""V3 StateReducer：会话观察 + 终端观察 → 最终 Snapshot（plan.md §26-§28）。
+"""V3 StateReducer：会话观察 + 终端观察 → 最终 Snapshot。
 
 语义级证据的优先级严格为：
     ERROR > WAITING > INPUT > WORKING > DONE > IDLE > UNKNOWN
@@ -30,7 +30,7 @@ from .models import (
     Status,
 )
 
-# plan.md §26 状态优先级（数值越小越优先）
+# 状态优先级（数值越小越优先）
 _STATUS_PRIORITY = {
     Status.ERROR: 0,
     Status.WAITING: 1,
@@ -175,6 +175,7 @@ def reduce_state(instance: AgentInstance,
             and session_live.status == Status.WORKING):
         snap.evidence = EvidenceSource.FUSED
 
-    if snap.status == Status.WORKING and not snap.summary:
-        snap.summary = "终端活动" if winner.source == EvidenceSource.TERMINAL else "处理中"
+    if (snap.status == Status.WORKING and not snap.summary
+            and winner.source == EvidenceSource.TERMINAL):
+        snap.summary = "终端活动"
     return snap

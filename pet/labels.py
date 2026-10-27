@@ -1,4 +1,4 @@
-"""UI 本地化标签：Status / Phase / Mode → 中文显示（plan.md §4：UI 再本地化）。"""
+"""UI 本地化标签：Status / Phase / Mode → 中文显示（UI 再本地化）。"""
 from agents.models import Mode, Phase, Status
 
 STATUS_LABELS = {
@@ -8,7 +8,7 @@ STATUS_LABELS = {
 }
 PHASE_LABELS = {
     Phase.THINKING: "思考中", Phase.PLANNING: "计划中", Phase.READING: "阅读中",
-    Phase.CODING: "编码中", Phase.EXECUTING: "执行中", Phase.TESTING: "测试中",
+    Phase.CODING: "编写中", Phase.EXECUTING: "执行中", Phase.TESTING: "测试中",
     Phase.ANSWERING: "回答中", Phase.APPROVAL: "等待审批",
     Phase.USER_INPUT: "等待输入",
 }
@@ -59,9 +59,17 @@ def mode_text(snap) -> str:
     return str(mode or "")
 
 
-def activity_text(snap, detail=True, limit=120):
-    """Shared bounded bubble content for single and aggregate views."""
+def workspace_name(target) -> str:
+    """Use observed metadata only; Windows and WSL paths need no filesystem I/O."""
     from agents.summarize import fmt_command
+    cwd = target.snapshot.cwd or target.instance.cwd or ""
+    parts = str(cwd).replace("\\", "/").rstrip("/").split("/")
+    return fmt_command(parts[-1], 60) if parts[-1] else "工作区未提供"
+
+
+def activity_text(snap, detail=True, limit=120):
+    """Format the observed action, never substitute the user's task or mode."""
+    from agents.summarize import fmt_command, summarize_text, tool_detail
     label = status_text(snap)
     if snap.status == Status.INPUT and "等待选择回复" in (snap.summary or ""):
         label = "等待选择回复"
@@ -69,17 +77,33 @@ def activity_text(snap, detail=True, limit=120):
         label = "等待新任务"
     elif snap.status == Status.WORKING:
         label = phase_text(snap) or label
-    mode = mode_text(snap)
-    if mode:
-        label = f"{mode} · {label}"
     if not detail:
         return fmt_command(label, limit)
     body = (snap.waiting_detail or snap.summary) if snap.status in (Status.WAITING, Status.INPUT) else snap.summary
+    body = (tool_detail(body, limit) if snap.status is Status.WORKING
+            and snap.phase not in (Phase.THINKING, Phase.PLANNING, Phase.ANSWERING)
+            else summarize_text(body, limit))
+    # Older logs may already carry a presentation category. Strip only a
+    # recognized category prefix, keeping the command/path/thought itself.
+    prefixes = ("执行中", "执行", "测试中", "测试", "搜索中", "搜索",
+                "阅读中", "读取", "编写中", "编码中", "修改", "写入",
+                "查询", "思考中", "计划中", "回答中", "等待审批",
+                "等待你的回复", "等待选择回复", "等待新任务", "工作中", "处理中")
+    for category in prefixes:
+        if body == category:
+            body = ""
+            break
+        if body.startswith((category + "：", category + ":")):
+            body = body[len(category) + 1:].strip()
+            break
+    if body.casefold() in {"bash", "shell", "exec_command", "read", "edit",
+                            "write", "grep", "glob", "task", "run",
+                            "执行", "修改", "读取", "搜索", "处理中"}:
+        body = ""
     if not body:
         return fmt_command(label, limit)
-    # 保留状态和独立模式；命令参数仅在剩余空间内截断。
     prefix = label + "："
-    if body.startswith(label) and not mode:
+    if body.startswith(label):
         return fmt_command(body, limit)
     if len(prefix) >= limit:
         return fmt_command(label, limit)

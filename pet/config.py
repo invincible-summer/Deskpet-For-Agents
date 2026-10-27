@@ -70,6 +70,7 @@ DEFAULTS = {
         "wsl_scan_sec": 3.0,
         "file_poll_sec": 0.5,
         "session_scan_sec": 3.0,
+        "directory_rescan_sec": 5.0,
         "activity_grace_sec": 10.0,   # 活动型 WORKING 证据的宽限（活 Agent）
         "active_file_window_sec": 180,
         "terminal_observer": True,
@@ -258,6 +259,8 @@ def normalize(data: dict) -> dict:
         monitor.get("file_poll_sec", 0.5), 0.2, 5.0)
     monitor["session_scan_sec"] = _clamp(
         monitor.get("session_scan_sec", 3.0), 1.0, 60.0)
+    monitor["directory_rescan_sec"] = _clamp(
+        monitor.get("directory_rescan_sec", 5.0), 1.0, 60.0)
     monitor["activity_grace_sec"] = _clamp(
         monitor.get("activity_grace_sec", 10.0), 1.0, 60.0)
     monitor["active_file_window_sec"] = _clamp(

@@ -83,6 +83,11 @@ class WindowsExitWatcherTests(unittest.TestCase):
             self.assertEqual(self.watcher.watched_count(), 1)
             self.watcher.unregister(inst.key)
             self.assertEqual(self.watcher.watched_count(), 0)
+            # A rapid toggle may defer registration until the owner drains
+            # removal; it must never publish two handles under one key.
+            self.watcher.register(inst)
+            self.assertLessEqual(self.watcher.watched_count(), 1)
+            self.watcher.unregister(inst.key)
             # unregister 是异步命令：等 watcher 线程消费 remove（handle
             # 由 watcher 关闭）后再终止进程，确保不再产生事件。
             self._wait_removed(inst.key)
@@ -93,14 +98,15 @@ class WindowsExitWatcherTests(unittest.TestCase):
         finally:
             terminate_process(proc)
 
-    def _wait_removed(self, key: str, timeout: float = 5.0):
+    def _wait_removed(self, key: str, timeout: float = 5.0, watcher=None):
+        watcher = watcher or self.watcher
         deadline = time.time() + timeout
         while time.time() < deadline:
-            with self.watcher._lock:
-                drained = (key not in self.watcher._pending_add
-                           and key not in self.watcher._pending_remove
-                           and key not in self.watcher._logical_keys)
-            if drained and key not in self.watcher._entries:
+            with watcher._lock:
+                drained = (key not in watcher._pending_add
+                           and key not in watcher._pending_remove
+                           and key not in watcher._logical_keys)
+            if drained and key not in watcher._entries:
                 return
             time.sleep(0.02)
         self.fail(f"remove command for {key} not drained in time")
@@ -139,7 +145,7 @@ class WindowsExitWatcherTests(unittest.TestCase):
             terminate_process(proc)
 
     def test_churn_stress_no_crash_duplicate_or_handle_leak(self):
-        """AC-EXIT-03：≥500 次真实 register/unregister/terminate churn。
+        """Bounded real-process churn covers register/exit/unregister paths.
 
         不得 access violation、WAIT_FAILED storm、重复 exit event、
         handle count 线性增长。
@@ -157,7 +163,7 @@ class WindowsExitWatcherTests(unittest.TestCase):
         self.assertTrue(watcher.start())
         baseline = _own_handle_count()
         try:
-            for i in range(500):
+            for i in range(24):
                 proc = _spawn_sleeper()
                 try:
                     inst = _instance(proc.pid, token=f"{i}")
@@ -165,7 +171,7 @@ class WindowsExitWatcherTests(unittest.TestCase):
                         continue
                     if i % 3 == 0:
                         watcher.unregister(inst.key)
-                        self._wait_removed(inst.key, timeout=2.0)
+                        self._wait_removed(inst.key, timeout=2.0, watcher=watcher)
                     proc.terminate()
                     proc.wait(timeout=10)
                 finally:

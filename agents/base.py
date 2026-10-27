@@ -2,7 +2,7 @@
 
 进程发现和会话文件发现是两条不可靠的只读观察线。绑定只使用来源、
 明确会话 ID、工作目录（V3 起来自 /proc/<pid>/cwd 的真实值）、启动时间
-等证据；证据不足时保留 UNKNOWN，不乱绑（plan.md §10/§34/§35）。
+等证据；证据不足时保留 UNKNOWN，不乱绑。
 
 V3 变化：
   * watcher 产出 Observation（带证据/置信度/TTL），由 StateReducer 融合。
@@ -32,8 +32,8 @@ from .tailer import FileTailer
 
 MAX_TRACKED_FILES = 8
 DEFAULT_SCAN_SEC = 3.0        # 有未绑定实例时的解析周期
-BOUND_RESAN_SEC = 15.0        # 全部绑定后的目录重扫周期
-FALLBACK_RETRY_SEC = 15.0     # late-start fallback 的重试周期
+BOUND_RESAN_SEC = 5.0         # 全部绑定后的目录重扫周期（revision 仍每轮 tail）
+FALLBACK_RETRY_SEC = 5.0      # late-start fallback 的重试周期
 GOAL_MAX = 120
 SUMMARY_MAX = 160
 # v4.4.1：近端起步（≥LARGE_FILE_BYTES 从 size-LARGE_FILE_TAIL 起读）会
@@ -748,23 +748,33 @@ def jdump(obj) -> str:
 import re as _re
 
 _TEST_WORDS = _re.compile(r"\b(tests?|pytest|unittest|vitest|jest)\b")
-_READ_WORDS = _re.compile(r"\b(grep|rg|ripgrep|search|find|glob|query|read|reads|cat|head|tail|list|ls|stat|inspect)\b")
+_SEARCH_WORDS = _re.compile(r"\b(grep|rg|ripgrep|search|find|glob|query|websearch)\b")
+_READ_WORDS = _re.compile(r"\b(read|reads|cat|head|tail|list|ls|stat|inspect|fetch|webfetch)\b")
 _CODE_WORDS = _re.compile(r"\b(edit|edits|patch|replace|apply_?patch|modify|write|writes|create|save|delete)\b")
 _EXEC_WORDS = _re.compile(r"\b(bash|shell|command|commands|exec|execute|run|terminal|make|build|task|agent|delegate|spawn)\b")
 
 
 def classify_phase(name: str, detail: str = "") -> Phase:
-    """工具名/命令 → V3 Phase（plan.md §11；UI 再本地化）。"""
+    """工具名/命令 → V3 Phase（UI 再本地化）。"""
     raw = " ".join(str(name or "").replace("_", " ").replace("-", " ").split()).lower()
     detail_low = " ".join(str(detail or "").split()).lower()
-    joined = f"{raw} {detail_low}"
-    if _TEST_WORDS.search(joined):
-        return Phase.TESTING
-    if _READ_WORDS.search(joined):
-        return Phase.READING
-    if _CODE_WORDS.search(joined):
+    # A filename such as tests/test_monitor.py is an object, not proof that
+    # tests are executing. Named file/search tools take precedence over it.
+    if _CODE_WORDS.search(raw):
         return Phase.CODING
-    if _EXEC_WORDS.search(joined):
+    if _SEARCH_WORDS.search(raw):
+        return Phase.SEARCHING
+    if _READ_WORDS.search(raw):
+        return Phase.READING
+    if _TEST_WORDS.search(raw):
+        return Phase.TESTING
+    if _re.search(r"(?:^|[;&|\s])(?:pytest|unittest|vitest|jest)(?:\s|$)|\b(?:npm|pnpm|yarn|cargo|go|dotnet)\s+test\b|\bpython\S*\s+-m\s+unittest\b", detail_low):
+        return Phase.TESTING
+    if _re.match(r"(?:rg|grep|find|fd)\s", detail_low):
+        return Phase.SEARCHING
+    if _re.match(r"(?:cat|head|tail|ls|stat|type|get-content)\s", detail_low):
+        return Phase.READING
+    if _EXEC_WORDS.search(raw):
         return Phase.EXECUTING
     if raw:
         return Phase.EXECUTING

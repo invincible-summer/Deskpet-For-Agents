@@ -7,7 +7,7 @@ import json
 import re
 
 _MD_NOISE = re.compile(r"^[\s>#*\-`·•]+")
-_MD_INLINE = re.compile(r"[`*_/]+")
+_MD_INLINE = re.compile(r"`+|\*{1,3}")
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _LOG_PREFIX = re.compile(
     r"^(?:\[[^\]]{1,32}\]\s*|(?:trace|debug|info|warn|warning|error)\s*:\s*)",
@@ -61,20 +61,137 @@ def fmt_command(cmd, limit: int = 70) -> str:
     return s
 
 
+_TEXT_KEYS = ("objective", "goal", "task", "summary", "description", "text",
+              "message", "content", "prompt", "title", "value")
+_DETAIL_KEYS = ("cmd", "command", "file_path", "path", "pattern", "query", "q", "url",
+                "filePath", "filepath", "glob", "target_file", "description")
+_DISPLAY_INPUT_LIMIT = 16384
+
+
+def _main_text(value, depth=0) -> str:
+    """Select human text from known envelopes, with a bounded traversal."""
+    if depth > 5:
+        return ""
+    if isinstance(value, str):
+        text = value[:_DISPLAY_INPUT_LIMIT].strip()
+        if text.startswith(("{", "[")):
+            try:
+                return _main_text(json.loads(text), depth + 1)
+            except (ValueError, RecursionError):
+                # An incomplete/unknown envelope is not a useful task title.
+                if text.startswith(("{", '[{', '["')):
+                    return ""
+        return text
+    if isinstance(value, dict):
+        for key in _TEXT_KEYS:
+            text = _main_text(value.get(key), depth + 1)
+            if text:
+                return text
+        return ""
+    if isinstance(value, (list, tuple)):
+        return " · ".join(text for item in value[:4]
+                          if (text := _main_text(item, depth + 1)))
+    return ""
+
+
+def summarize_text(value, limit: int = 120) -> str:
+    """Keep the task/action main clause, without rendering protocol fields."""
+    text = _main_text(value)
+    # A heading such as '目标' carries no useful information without its body.
+    lines = text.splitlines()
+    while len(lines) > 1 and lines[0].strip().lstrip("# ").rstrip(":：") in {
+            "目标", "任务", "说明", "计划", "Goal", "Task", "Summary"}:
+        lines.pop(0)
+    return shorten("\n".join(lines), limit)
+
+
+def tool_detail(value, limit: int = 120, _depth: int = 0) -> str:
+    """Keep a tool's actual command/path/query, never substitute its goal."""
+    if _depth > 5:
+        return ""
+    if isinstance(value, str):
+        text = value[:_DISPLAY_INPUT_LIMIT].strip()
+        if text.startswith(("{", "[")):
+            try:
+                return tool_detail(json.loads(text), limit, _depth + 1)
+            except (ValueError, RecursionError):
+                if text.startswith(("{", '[{', '["')):
+                    return ""
+        text = wrapped_command(text)
+        if text.startswith("*** Begin Patch"):
+            paths = re.findall(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", text, re.M)
+            return fmt_command("、".join(paths[:3]), limit)
+        return fmt_command(text, limit)
+    if isinstance(value, dict):
+        parts = []
+        for key in _DETAIL_KEYS:
+            item = value.get(key)
+            if isinstance(item, (str, list, tuple)) and item:
+                detail = tool_detail(item, limit, _depth + 1)
+                if detail and detail not in parts:
+                    parts.append(detail)
+            if len(parts) >= 2:
+                break
+        body = " · ".join(parts)
+        if body:
+            return fmt_command(body, limit)
+        for key in ("arguments", "args", "action", "input", "patch", "patch_text",
+                    "search_query", "queries"):
+            if key in value:
+                nested = tool_detail(value[key], limit, _depth + 1)
+                if nested:
+                    return nested
+        # Descriptions, objectives, arbitrary output and metadata do not prove
+        # which command or object is currently being operated on.
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts = [tool_detail(item, limit, _depth + 1) for item in value[:8]]
+        return fmt_command(" ".join(part for part in parts if part), limit)
+    return ""
+
+
 def wrapped_command(value):
     """Extract a literal shell command from a Codex JavaScript tool wrapper.
 
     Never execute code or infer lifecycle state from source text. Dynamic
-    expressions stay as bounded source text instead of being guessed.
+    expressions stay unavailable instead of exposing their transport wrapper.
     """
     if not isinstance(value, str):
         return value
-    match = re.search(r'\btools\.exec_command\s*\(\s*\{\s*["\']?cmd["\']?\s*:\s*("(?:\\.|[^"\\])*")\s*[,}]', value)
+    match = re.search(r'\btools\.exec_command\s*\(\s*\{', value)
     if match:
-        try:
-            return json.loads(match.group(1))
-        except ValueError:
-            pass
+        # Tokenize literals atomically so a description mentioning 'cmd' cannot
+        # masquerade as the outer object's command. No code is evaluated.
+        tokens = re.findall(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{}()\[\],:]|[A-Za-z_$][\w$]*|[^\s]''',
+                            value[match.end():_DISPLAY_INPUT_LIMIT])
+        depth = 1
+        property_start = True
+        for index, token in enumerate(tokens):
+            if depth == 1 and property_start and token in {"cmd", '"cmd"', "'cmd'"}:
+                if index + 3 < len(tokens) and tokens[index + 1] == ":":
+                    literal = tokens[index + 2]
+                    if tokens[index + 3] in {",", "}"} and literal[:1] in {'"', "'"}:
+                        try:
+                            if literal.startswith('"'):
+                                return json.loads(literal)
+                            # literal_eval accepts only literal data here, never
+                            # variables/calls. The token is bounded to one string.
+                            from ast import literal_eval
+                            return literal_eval(literal)
+                        except (ValueError, SyntaxError):
+                            pass
+                return ""
+            if token in {"{", "(", "["}:
+                depth += 1
+            elif token in {"}", ")", "]"}:
+                depth -= 1
+                if depth == 0:
+                    break
+            property_start = token == "," and depth == 1
+        return ""
+    if (re.match(r'\s*(?:(?:text|image|audio|notify)\s*\(|(?:const|let|var|await)\s|//\s*@exec:)', value)
+            and re.search(r'\btools\.', value)):
+        return ""
     return value
 
 
@@ -112,15 +229,20 @@ def classify_tool(name: str, detail: str = "", limit: int = 90) -> str:
     只保留类别和有限参数，避免把完整 shell 命令或工具输入搬到界面。
     """
     limit = max(8, int(limit))
-    label = _tool_label(name, detail)
-    detail_s = fmt_command(detail, max(8, limit - len(label) - 2)) if detail else ""
+    detail_s = tool_detail(detail, limit)
+    label = _tool_label(name, detail_s)
+    detail_s = fmt_command(detail_s, max(1, limit - len(label) - 1))
     if detail_s:
-        return shorten(f"{label}：{detail_s}", limit)
+        return f"{label}：{detail_s}"
     return shorten(label, limit)
 
 
 def summarize_tool(name: str, detail: str = "", limit: int = 90) -> str:
-    """兼容旧 watcher 的工具摘要命名。"""
+    """动作类别 + 真实对象（命令/路径/搜索词），不展示结构化字段。
+
+    类别与正文都来自工具事实：命令含 unittest/pytest 等按测试归类；
+    无对象时只显示类别，绝不回退到用户目标。
+    """
     return classify_tool(name, detail, limit)
 
 

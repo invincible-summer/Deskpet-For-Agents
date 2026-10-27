@@ -29,7 +29,8 @@ from .models import (
     Status,
     parse_mode,
 )
-from .summarize import fmt_command, shorten, question_summary
+from .summarize import (fmt_command, shorten, question_summary,
+                        summarize_text, summarize_tool, tool_detail)
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
@@ -40,7 +41,9 @@ _TOP_TYPES = frozenset({
     "metadata", "runtime.set_binding", "profile.bind", "prompt.accepted",
     "plan_mode.enter", "plan_mode.exit", "plan_mode.cancel",
     "permission.set_mode", "turn.begin", "turn.started", "turn.ended",
-    "turn.cancel", "error", "fatal", "approval.request", "approval.response",
+    "turn.complete", "turn.completed", "turn.failed", "turn.aborted",
+    "turn.interrupted", "turn.cancelled", "turn.cancel", "error", "fatal",
+    "approval.request", "approval.response",
     "approval.resolved", "ApprovalRequest", "ApprovalResponse",
     "ApprovalRequestResolved", "context.append_loop_event",
     "interaction.request", "interaction.resolved",
@@ -83,16 +86,23 @@ def _first_present(mapping: dict, *keys):
     return ""
 
 
+def _reason_kind(value) -> str:
+    if isinstance(value, dict):
+        value = (value.get("kind") or value.get("status")
+                 or value.get("outcome") or value.get("type") or "")
+    return str(value or "").casefold().replace("_", "-")
+
+
 def approval_summary(p: dict) -> str:
-    for key in ("title", "command", "summary", "description", "reason"):
+    for key in ("command", "title", "summary", "description", "reason"):
         value = p.get(key)
         if isinstance(value, str) and value.strip():
-            return shorten(value, 100)
+            return summarize_text(value, 100)
     args = p.get("arguments") or p.get("args")
-    if isinstance(args, str) and args.strip():
-        return shorten(args, 100)
-    if isinstance(args, dict):
-        return shorten(str(args.get("command") or args.get("path") or args), 100)
+    if isinstance(args, (str, dict)):
+        detail = tool_detail(args, 100)
+        if detail:
+            return detail
     name = p.get("name") or p.get("tool")
     return shorten(str(name), 100) if name else ""
 
@@ -161,20 +171,10 @@ class KimiFile(FileState):
         self.phase = Phase.USER_INPUT
 
     def _set_tool(self, name, args, ts: float):
-        detail = ""
-        if isinstance(args, str):
-            try:
-                a = json.loads(args)
-            except (TypeError, ValueError):
-                a = None
-            if isinstance(a, dict):
-                detail = str(a.get("command") or a.get("path") or a.get("file_path") or "")
-            else:
-                detail = args
-        elif isinstance(args, dict):
-            detail = str(args.get("command") or args.get("path") or args.get("file_path") or "")
+        detail = tool_detail(args, SUMMARY_MAX)
         self.last_cmd = fmt_command(f"{name}: {detail}" if detail else str(name), 100)
-        self.last_tool = fmt_command(f"{name}: {detail}" if detail else str(name), SUMMARY_MAX)
+        self.last_tool = summarize_tool(str(name), detail, SUMMARY_MAX)
+        self.last_text = ""
         self.last_tool_ts = ts
         self.last_activity_kind = "tool"
         phase = classify_phase(str(name), detail)
@@ -204,7 +204,7 @@ class KimiFile(FileState):
             # 不影响 turn 生命周期，也不保留旧 ERROR/DONE 瞬态
             text = _text(obj.get("content"))
             if text:
-                self.goal = shorten(text, GOAL_MAX)
+                self.goal = summarize_text(text, GOAL_MAX)
             self._mark_turn_active()
             self.done_ts = 0.0
             self.phase = Phase.THINKING
@@ -219,22 +219,28 @@ class KimiFile(FileState):
                 self.permission_mode = mode
         elif t in ("turn.begin", "turn.started"):
             self._turn_begin(ts)
-        elif t == "turn.ended":
+        elif t in {"turn.ended", "turn.complete", "turn.completed",
+                   "turn.failed", "turn.aborted", "turn.interrupted",
+                   "turn.cancelled"}:
+            reason = _reason_kind(obj.get("reason") or obj.get("status")
+                                  or obj.get("outcome"))
+            if (t in {"turn.failed", "turn.aborted", "turn.interrupted",
+                      "turn.cancelled"}
+                    or reason in {"cancelled", "canceled", "aborted",
+                                  "interrupted", "error", "failed", "failure",
+                                  "blocked"}):
+                self._set_error({"message": f"任务{reason or '异常中断'}"}, ts)
+                return
             self.turn_active = False
             self.turn_known_over = True
-            self.done_ts = ts if str(obj.get("reason") or "") != "cancelled" else 0.0
+            self.done_ts = ts
             self.input_pending = False
             self.input_id = ""
             self.pending = None
             self.pending_id = ""
             self.phase = Phase.NONE
         elif t == "turn.cancel":
-            self.turn_active = False
-            self.turn_known_over = True
-            self.input_pending = False
-            self.input_id = ""
-            self.done_ts = 0.0
-            self.phase = Phase.NONE
+            self._set_error({"message": "任务已中断"}, ts)
         elif t == "error" or t == "fatal":
             self._set_error(obj, ts)
         elif t == "interaction.request":
@@ -305,6 +311,8 @@ class KimiFile(FileState):
         self.done_ts = 0.0
         self.error_text = ""
         self.error_ts = 0.0
+        self.last_text = self.last_tool = self.last_cmd = ""
+        self.last_activity_kind = ""
         self.phase = Phase.THINKING
 
     def _mark_turn_active(self):
@@ -325,6 +333,8 @@ class KimiFile(FileState):
             # R04：step.begin 是真实权威 start/activity 证据，
             # 同样失效旧 ERROR 瞬态
             self._mark_turn_active()
+            self.last_text = self.last_tool = self.last_cmd = ""
+            self.last_activity_kind = ""
             self.phase = Phase.THINKING
         elif et == "step.end":
             pass   # 活动证据已记录
@@ -332,17 +342,23 @@ class KimiFile(FileState):
             self._set_tool(event.get("name") or event.get("tool") or "?",
                            event.get("args") or event.get("arguments"), ts)
         elif et == "tool.result":
-            pass
+            self.last_text = self.last_tool = self.last_cmd = ""
+            self.last_activity_kind = ""
+            self.phase = Phase.THINKING
         elif et == "content.part":
             part = event.get("part")
             if isinstance(part, dict):
                 ptype = str(part.get("type") or "")
                 if ptype == "think":
+                    self.last_text = summarize_text(part.get("think") or part.get("text"), SUMMARY_MAX)
+                    self.last_tool = self.last_cmd = ""
+                    self.last_assistant_ts = ts
+                    self.last_activity_kind = "reasoning"
                     self.phase = Phase.THINKING
                 elif ptype == "text":
                     text = _text(part)
                     if text:
-                        self.last_text = shorten(text, SUMMARY_MAX)
+                        self.last_text = summarize_text(text, SUMMARY_MAX)
                         self.last_assistant_ts = ts
                         self.last_activity_kind = "assistant"
                         self.phase = Phase.ANSWERING
@@ -390,7 +406,7 @@ class KimiFile(FileState):
         elif pt == "Notification":
             body = payload.get("body") or payload.get("title") or payload.get("text")
             if body:
-                self.last_text = shorten(_text(body), SUMMARY_MAX)
+                self.last_text = summarize_text(body, SUMMARY_MAX)
                 self.last_assistant_ts = ts
                 self.last_activity_kind = "assistant"
                 self.phase = Phase.ANSWERING
@@ -401,11 +417,11 @@ class KimiFile(FileState):
         elif pt in ("UserPrompt", "UserMessage", "PromptSubmitted"):
             text = payload.get("prompt") or payload.get("message") or payload.get("text")
             if text:
-                self.goal = shorten(_text(text), GOAL_MAX)
+                self.goal = summarize_text(text, GOAL_MAX)
         else:
             text = payload.get("text")
             if isinstance(text, str) and text.strip():
-                self.last_text = shorten(text, SUMMARY_MAX)
+                self.last_text = summarize_text(text, SUMMARY_MAX)
                 self.last_assistant_ts = ts
                 self.last_activity_kind = "assistant"
                 self.phase = Phase.ANSWERING
@@ -420,13 +436,11 @@ class KimiFile(FileState):
             return self.input_summary or "等待输入"
         if status == Status.DONE:
             return self.last_text or "回合完成"
-        if self.last_activity_kind == "assistant" and self.last_text:
+        if self.last_activity_kind in {"assistant", "reasoning"}:
             return self.last_text
-        if self.last_activity_kind == "tool" and self.last_tool:
+        if self.last_activity_kind == "tool":
             return self.last_tool
-        if self.last_assistant_ts >= self.last_tool_ts and self.last_text:
-            return self.last_text
-        return self.last_tool or self.last_text
+        return ""
 
     def observation(self, now: float, cfg: dict) -> Observation | None:
         obs = self.base_observation()

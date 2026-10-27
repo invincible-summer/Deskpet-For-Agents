@@ -8,7 +8,7 @@ V4.1（v4plan §15）：root 是隐藏的 controller Tk root，不是宠物。
   * 一个 SkinBuildManager（同 skin+height+fps 只 build 一次）
   * 一个 Monitor / TerminalService / PresentationController
 
-UI 激活 Terminal 只允许 Monitor.activate_target(exact agent_key)。
+UI 激活只允许 Monitor.activate_target(exact agent_key)。
 Aggregate 模式下桌宠 body 单击/双击只做互动，绝不激活 Terminal。
 """
 import gc
@@ -19,7 +19,7 @@ import random
 import time
 import tkinter as tk
 
-from agents.models import ActivationCode, AgentSurface
+from agents.models import ActivationCode, ActivationResult, AgentSurface
 
 from . import autostart, skins
 from .labels import status_text
@@ -257,9 +257,8 @@ class PetApp:
     def activate_agent(self, key: str):
         """唯一激活入口：UI 只携带 exact agent_key（v4.1.3 §20/§21）。
 
-        只恢复并前置该 Agent 所在的 Windows Terminal 顶层窗口（候选
-        由 v3-compatible resolver 给出，confidence 不拦用户显式唤起）；
-        DeskPet 不切换 Terminal 标签页、不发送键盘输入。
+        Desktop 激活排入 Monitor worker，由 bridge 收割最终结果；
+        Terminal 使用已缓存的顶层窗口绑定，不切换标签页或发送输入。
 
         v4.3.1 DP43-R08：cached activation 遇到 stale binding 立即
         返回（Tk 不做 UIA refresh）；修复经 Monitor 线程一次异步
@@ -268,28 +267,56 @@ class PetApp:
         """
         if self._closing:
             return
+        key = str(key or "")
+        self._prepare_activation_input_state()
+        # Dashboard visibility/state is left untouched so an iconified
+        # Dashboard stays iconified.
         result = self.monitor.activate_target(key)
-        desktop = self._target_is_desktop(key)
+        self._show_activation_result(key, result)
+
+    def _show_activation_result(self, key: str, result: ActivationResult, *,
+                                desktop: bool | None = None,
+                                allow_repair: bool = True) -> None:
+        """Present a result without starting another desktop transaction."""
+        if desktop is None:
+            desktop = self._target_is_desktop(key)
         if result.code == ActivationCode.OK:
             if desktop:
-                # plan2 §10：Desktop 激活 capability = APP_ONLY，文案不
-                # 承诺会话级跳转
                 self.agent_toast(key, "已唤起该 Agent 的应用窗口（桌面会话不支持定位到具体对话）", 3)
             else:
                 self.agent_toast(key, "已打开该 Agent 的终端窗口", 2)
         elif result.code == ActivationCode.FOREGROUND_DENIED:
             self.agent_toast(key, "Windows 未允许将该窗口置于前台，已闪烁任务栏提醒", 4)
         elif result.code == ActivationCode.AGENT_GONE:
-            # 该 Agent 的卡片会随本轮 reconcile 消失，无卡可挂 → 主卡提示
             self.toast("该 Agent 已退出", 4)
         elif result.code == ActivationCode.NO_BINDING:
-            self.agent_toast(key, "未能定位该 Agent 的终端窗口", 4)
+            self.agent_toast(key, "未能定位该 Agent 的应用窗口" if desktop
+                             else "未能定位该 Agent 的终端窗口", 4)
         elif result.code == ActivationCode.STALE_WINDOW:
-            self.monitor.request_activation_repair(key)
-            self.ui.kick()   # 立即进入下一 bridge tick 收割 repair 结果
-            self.agent_toast(key, "原终端窗口已失效，正在重新识别…", 4)
+            if allow_repair and not desktop:
+                self.monitor.request_activation_repair(key)
+                self.ui.kick()
+                self.agent_toast(key, "原终端窗口已失效，正在重新识别…", 4)
+            else:
+                self.agent_toast(key, "无法安全恢复该 Agent 窗口", 4)
+        elif result.code == ActivationCode.RESTORE_PENDING:
+            self.ui.kick()
+            self.agent_toast(key, "正在恢复该 Agent 窗口…", 2)
         else:
-            self.agent_toast(key, "无法打开该 Agent 的终端窗口", 4)
+            self.agent_toast(key, "无法打开该 Agent 的应用窗口" if desktop
+                             else "无法打开该 Agent 的终端窗口", 4)
+
+    def _prepare_activation_input_state(self) -> None:
+        """Dismiss DeskPet's menu and tooltip without changing modal state."""
+        try:
+            self._menu_controller.dismiss()
+        except Exception:
+            pass
+        if self.dashboard is not None:
+            try:
+                self.dashboard.tooltip.hide()
+            except Exception:
+                pass
 
     def _target_is_desktop(self, key: str) -> bool:
         try:
@@ -303,13 +330,19 @@ class PetApp:
     def _drain_activation_repairs(self):
         """bridge 每 tick 调用（bounded，<=4 条；DP43-R08 §16.6）。
 
-        repaired → UI 线程做最后一次 activate_cached（最终动作前
+        Desktop worker 结果只展示反馈；Terminal repaired 结果由 UI
+        线程做最后一次 activate_cached（最终动作前
         仍重新核验 is_agent_live + WindowIdentity，fail-closed）；
         这一次激活不再触发新 repair（一次性语义）。
         """
         for res in self.monitor.drain_activation_repairs():
             if self._closing:
                 break
+            if res.activation_result is not None:
+                self._show_activation_result(
+                    res.agent_key, res.activation_result,
+                    desktop=True, allow_repair=False)
+                continue
             if not res.repaired:
                 self.agent_toast(
                     res.agent_key,
