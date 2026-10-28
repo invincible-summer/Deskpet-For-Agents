@@ -61,10 +61,17 @@ def fmt_command(cmd, limit: int = 70) -> str:
     return s
 
 
+def activity_excerpt(value, limit: int = 160) -> str:
+    """Keep the beginning of an observed action, without altering shell syntax."""
+    limit = max(1, int(limit))
+    text = " ".join(_ANSI.sub("", str(value or "")[:16384]).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 _TEXT_KEYS = ("objective", "goal", "task", "summary", "description", "text",
               "message", "content", "prompt", "title", "value")
-_DETAIL_KEYS = ("cmd", "command", "file_path", "path", "pattern", "query", "q", "url",
-                "filePath", "filepath", "glob", "target_file", "description")
+_DETAIL_KEYS = ("pattern", "query", "q", "glob", "url", "file_path", "path",
+                "filePath", "filepath", "target_file")
 _DISPLAY_INPUT_LIMIT = 16384
 
 
@@ -120,21 +127,34 @@ def tool_detail(value, limit: int = 120, _depth: int = 0) -> str:
         text = wrapped_command(text)
         if text.startswith("*** Begin Patch"):
             paths = re.findall(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", text, re.M)
-            return fmt_command("、".join(paths[:3]), limit)
-        return fmt_command(text, limit)
+            return activity_excerpt("、".join(paths[:3]), limit)
+        return activity_excerpt(text, limit)
     if isinstance(value, dict):
+        for key in ("cmd", "command"):
+            command = value.get(key)
+            if isinstance(command, str) and command:
+                return activity_excerpt(wrapped_command(command), limit)
+            if isinstance(command, (list, tuple)) and command:
+                return activity_excerpt(" ".join(item[:_DISPLAY_INPUT_LIMIT]
+                                        for item in command[:64]
+                                        if isinstance(item, str)), limit)
         parts = []
         for key in _DETAIL_KEYS:
             item = value.get(key)
             if isinstance(item, (str, list, tuple)) and item:
-                detail = tool_detail(item, limit, _depth + 1)
+                # Known inputs can intentionally resemble partial JSON (grep
+                # patterns, for example); do not reinterpret them as envelopes.
+                detail = (activity_excerpt(item, limit) if isinstance(item, str)
+                          else activity_excerpt(" ".join(part[:_DISPLAY_INPUT_LIMIT]
+                                                for part in item[:8]
+                                                if isinstance(part, str)), limit))
                 if detail and detail not in parts:
                     parts.append(detail)
             if len(parts) >= 2:
                 break
         body = " · ".join(parts)
         if body:
-            return fmt_command(body, limit)
+            return activity_excerpt(body, limit)
         for key in ("arguments", "args", "action", "input", "patch", "patch_text",
                     "search_query", "queries"):
             if key in value:
@@ -146,7 +166,7 @@ def tool_detail(value, limit: int = 120, _depth: int = 0) -> str:
         return ""
     if isinstance(value, (list, tuple)):
         parts = [tool_detail(item, limit, _depth + 1) for item in value[:8]]
-        return fmt_command(" ".join(part for part in parts if part), limit)
+        return activity_excerpt(" ".join(part for part in parts if part), limit)
     return ""
 
 
@@ -195,54 +215,13 @@ def wrapped_command(value):
     return value
 
 
-_TOOL_RULES = (
-    ("test", ("test", "pytest", "unittest", "vitest", "jest", "check"), "测试"),
-    ("search", ("grep", "rg", "ripgrep", "search", "find", "glob", "query"), "搜索"),
-    ("read", ("read", "cat", "head", "tail", "list", "ls", "stat", "inspect"), "读取"),
-    ("write", ("write", "create", "save", "mkdir", "touch"), "写入"),
-    ("edit", ("edit", "patch", "replace", "apply_patch", "modify", "delete"), "修改"),
-    ("web", ("web", "browser", "fetch", "http", "url", "browse"), "查询"),
-    ("execute", ("bash", "shell", "command", "exec", "run", "terminal"), "执行"),
-    ("delegate", ("task", "agent", "delegate", "spawn"), "委派"),
-)
-
-
-def _tool_label(name: str, detail: str = "") -> str:
-    """返回工具调用的稳定中文类别；未知工具只显示短名称。"""
-    raw = " ".join(str(name or "").replace("_", " ").replace("-", " ").split())
-    low = raw.lower()
-    detail_low = str(detail or "").lower()
-    # 低成本识别常见命令行工具，即使事件只给了命令正文。
-    if any(word in detail_low for word in ("pytest", "npm test", "cargo test", "go test", "unittest", "vitest", "jest")):
-        return "测试"
-    for _kind, words, label in _TOOL_RULES:
-        if any(word in low for word in words):
-            return label
-    if raw:
-        return raw[:24]
-    return "处理中"
-
-
 def classify_tool(name: str, detail: str = "", limit: int = 90) -> str:
-    """工具名/参数 → 适合气泡的一行本地活动摘要。
-
-    只保留类别和有限参数，避免把完整 shell 命令或工具输入搬到界面。
-    """
-    limit = max(8, int(limit))
-    detail_s = tool_detail(detail, limit)
-    label = _tool_label(name, detail_s)
-    detail_s = fmt_command(detail_s, max(1, limit - len(label) - 1))
-    if detail_s:
-        return f"{label}：{detail_s}"
-    return shorten(label, limit)
+    """Compatibility entry point; Phase owns the category, summary the object."""
+    return tool_detail(detail, limit)
 
 
 def summarize_tool(name: str, detail: str = "", limit: int = 90) -> str:
-    """动作类别 + 真实对象（命令/路径/搜索词），不展示结构化字段。
-
-    类别与正文都来自工具事实：命令含 unittest/pytest 等按测试归类；
-    无对象时只显示类别，绝不回退到用户目标。
-    """
+    """Actual command/path/query only; missing input stays empty."""
     return classify_tool(name, detail, limit)
 
 

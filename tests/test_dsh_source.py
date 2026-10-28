@@ -188,6 +188,40 @@ class EventTrackerTests(unittest.TestCase):
         self.assertIs(quiet.phase, Phase.THINKING)
         self.assertIsNone(t.observation(now + dsh.OPEN_TURN_ORPHAN_SEC + 5))
 
+    def test_activity_keeps_actual_command_search_and_reasoning_prefix(self):
+        now = 1700000100.0
+        for name, arguments, phase, expected in (
+            ("bash", {"command": "git diff -- agents/", "description": "不要替代指令"},
+             Phase.EXECUTING, "git diff -- agents/"),
+            ("web_search", {"query": "WSL 会话绑定"}, Phase.SEARCHING, "WSL 会话绑定"),
+            ("read", {"path": "agents/monitor.py"}, Phase.READING, "agents/monitor.py"),
+            ("edit", {"path": "agents/state.py"}, Phase.CODING, "agents/state.py"),
+        ):
+            with self.subTest(name=name):
+                tracker = self._tracker([
+                    ("turn/start", {"turn": 1}),
+                    ("tool/call", {"name": name, "callId": "call_1",
+                                   "arguments": json.dumps(arguments)}),
+                ], now)
+                for quiet in (1, dsh.OPEN_TURN_QUIET_SEC + 5):
+                    obs = tracker.observation(now + quiet)
+                    self.assertIs(obs.phase, phase)
+                    self.assertEqual(obs.summary, expected)
+                tracker.feed_event({"type": "tool/result", "time": int(now * 1000),
+                                    "data": {"message": {"toolCallId": "call_1",
+                                                         "content": "不要显示工具输出"}}}, now)
+                self.assertEqual(tracker.observation(now + 1).summary, "")
+                tracker.feed_event({"type": "assistant/message", "time": int(now * 1000),
+                                    "data": {"message": {"content": [
+                                        {"type": "reasoning", "text": "先检查会话归属 " + "后续" * 300}]}}}, now)
+                obs = tracker.observation(now + 1)
+                self.assertIs(obs.phase, Phase.THINKING)
+                self.assertTrue(obs.summary.startswith("先检查会话归属"))
+                self.assertLessEqual(len(obs.summary), dsh.SUMMARY_MAX)
+                tracker.feed_event({"type": "step/start", "time": int(now * 1000),
+                                    "data": {"turn": 1, "step": 2}}, now)
+                self.assertEqual(tracker.observation(now + 1).summary, "")
+
     def test_interrupted_closer_is_error_reminder(self):
         now = 1700000100.0
         t = self._tracker([

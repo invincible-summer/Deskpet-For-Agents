@@ -20,6 +20,9 @@ def main(argv=None) -> int:
     exe = dist / "DeskPet.exe"
     if not exe.is_file():
         raise SystemExit("DeskPet.exe missing")
+    for name in ("deskpet.png", "deskpet.ico"):
+        if not (dist / "assets" / "brand" / name).is_file():
+            raise SystemExit(f"bundled application icon missing: {name}")
 
     banned_names = {"config.json", "config.json.bak", ".venv"}
     for path in dist.rglob("*"):

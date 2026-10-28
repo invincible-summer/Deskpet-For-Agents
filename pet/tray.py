@@ -87,6 +87,8 @@ user32.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT,
 user32.LoadImageW.restype = wt.HANDLE
 user32.LoadIconW.argtypes = [wt.HINSTANCE, wt.LPCWSTR]
 user32.LoadIconW.restype = wt.HICON
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.GetSystemMetrics.restype = ctypes.c_int
 user32.DestroyIcon.argtypes = [wt.HICON]
 user32.DestroyIcon.restype = wt.BOOL
 user32.CreatePopupMenu.argtypes = []
@@ -132,7 +134,6 @@ NIN_KEYSELECT = 0x0401          # v4：SPACE/ENTER 键盘激活
 
 IMAGE_ICON = 1
 LR_LOADFROMFILE = 0x10
-LR_DEFAULTSIZE = 0x40
 IDI_APPLICATION = 32512
 
 TPM_RIGHTBUTTON = 0x0002
@@ -559,8 +560,7 @@ class TrayIcon:
     def _load_icon(self):
         """(hicon, owns)：文件 icon 需要本进程释放；shared 不释放。
 
-        V4.1.5：托盘图标 = 程序化绘制的原创小猫（pet/icon.py），不再
-        使用桌宠形象/皮肤素材；生成失败回退系统 shared 默认图标。
+        与仪表盘使用同一原创应用图标；缓存失败回退系统 shared 默认图标。
         """
         ico = None
         try:
@@ -570,8 +570,10 @@ class TrayIcon:
             ico = None
         if ico and os.path.isfile(ico):
             hicon = user32.LoadImageW(
-                None, ico, IMAGE_ICON, 0, 0,
-                LR_LOADFROMFILE | LR_DEFAULTSIZE)
+                None, ico, IMAGE_ICON,
+                max(16, user32.GetSystemMetrics(49)),  # SM_CXSMICON
+                max(16, user32.GetSystemMetrics(50)),  # SM_CYSMICON
+                LR_LOADFROMFILE)
             if hicon:
                 return hicon, True
         # MAKEINTRESOURCEW：按官方宏语义把资源 id 转成宽字符串指针

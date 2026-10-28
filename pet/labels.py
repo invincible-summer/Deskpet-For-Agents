@@ -8,6 +8,7 @@ STATUS_LABELS = {
 }
 PHASE_LABELS = {
     Phase.THINKING: "思考中", Phase.PLANNING: "计划中", Phase.READING: "阅读中",
+    Phase.SEARCHING: "搜索中",
     Phase.CODING: "编写中", Phase.EXECUTING: "执行中", Phase.TESTING: "测试中",
     Phase.ANSWERING: "回答中", Phase.APPROVAL: "等待审批",
     Phase.USER_INPUT: "等待输入",
@@ -69,7 +70,7 @@ def workspace_name(target) -> str:
 
 def activity_text(snap, detail=True, limit=120):
     """Format the observed action, never substitute the user's task or mode."""
-    from agents.summarize import fmt_command, summarize_text, tool_detail
+    from agents.summarize import activity_excerpt, summarize_text
     label = status_text(snap)
     if snap.status == Status.INPUT and "等待选择回复" in (snap.summary or ""):
         label = "等待选择回复"
@@ -78,9 +79,9 @@ def activity_text(snap, detail=True, limit=120):
     elif snap.status == Status.WORKING:
         label = phase_text(snap) or label
     if not detail:
-        return fmt_command(label, limit)
+        return activity_excerpt(label, limit)
     body = (snap.waiting_detail or snap.summary) if snap.status in (Status.WAITING, Status.INPUT) else snap.summary
-    body = (tool_detail(body, limit) if snap.status is Status.WORKING
+    body = (activity_excerpt(body, limit) if snap.status is Status.WORKING
             and snap.phase not in (Phase.THINKING, Phase.PLANNING, Phase.ANSWERING)
             else summarize_text(body, limit))
     # Older logs may already carry a presentation category. Strip only a
@@ -101,10 +102,8 @@ def activity_text(snap, detail=True, limit=120):
                             "执行", "修改", "读取", "搜索", "处理中"}:
         body = ""
     if not body:
-        return fmt_command(label, limit)
+        return activity_excerpt(label, limit)
     prefix = label + "："
-    if body.startswith(label):
-        return fmt_command(body, limit)
     if len(prefix) >= limit:
-        return fmt_command(label, limit)
-    return prefix + fmt_command(body, limit - len(prefix))
+        return activity_excerpt(label, limit)
+    return prefix + activity_excerpt(body, limit - len(prefix))

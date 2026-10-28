@@ -270,6 +270,7 @@ class ZCodeRemoteReader:
             ("tools", adapter.running_tools_sql(), []),
             ("turns", adapter.latest_turns_sql(), []),
             ("parts", adapter.live_parts_sql(), [fresh_ms]),
+            ("activity", adapter.activity_sql(), []),
         )
         plan = []
         for key, sql, params in candidates:
@@ -294,10 +295,12 @@ class ZCodeRemoteReader:
         catalog = rows("catalog")[:32]
         models = [
             (r.get("session_id"), r.get("parent_id"), r.get("query_source"),
-             r.get("started_at")) for r in rows("models")]
+             r.get("started_at"), r.get("turn_id"),
+             r.get("assistant_message_id")) for r in rows("models")]
         tools = [
             (r.get("session_id"), r.get("parent_id"), r.get("tool_name"),
-             r.get("status"), r.get("approval_status"), r.get("started_at"))
+             r.get("status"), r.get("approval_status"), r.get("started_at"),
+             r.get("turn_id"), r.get("tool_call_id"), r.get("assistant_message_id"))
             for r in rows("tools")]
         turns = [
             (r.get("session_id"), r.get("status"), r.get("started_at"),
@@ -306,6 +309,12 @@ class ZCodeRemoteReader:
         parts = [
             (r.get("session_id"), r.get("parent_id"), r.get("time_updated"),
              r.get("part_type"), r.get("tool_name"), r.get("tool_status"),
-             r.get("text")) for r in rows("parts")]
+             r.get("text"), r.get("detail")) for r in rows("parts")[:16]]
+        activity = [
+            (r.get("session_id"), r.get("parent_id"), r.get("message_id"),
+             r.get("time_updated"), r.get("part_type"), r.get("tool_name"),
+             r.get("call_id"), r.get("tool_status"), r.get("text"),
+             r.get("detail")) for r in rows("activity")[:16]]
         return {"catalog": catalog, "models": models,
-                "tools": tools, "turns": turns, "parts": parts}
+                "tools": tools, "turns": turns, "parts": parts,
+                "activity": activity}

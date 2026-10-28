@@ -56,7 +56,7 @@ from .sqlite_ro import (
     fingerprints_differ,
     stat_fingerprint,
 )
-from .summarize import summarize_text, tool_detail
+from .summarize import activity_excerpt, summarize_text, tool_detail
 
 _MAX_SESSIONS = 8            # plan2 §6.2：每 Desktop kind active-track ≤8
 _CATALOG_LIMIT = 32
@@ -237,37 +237,51 @@ class ZCodeSchemaAdapter:
                 "substr(json_extract(p.data, '$.type'), 1, 24) AS part_type, "
                 "substr(json_extract(p.data, '$.tool'), 1, 96) AS tool_name, "
                 "substr(json_extract(p.data, '$.state.status'), 1, 24) AS tool_status, "
-                "substr(json_extract(p.data, '$.text'), 1, 256) AS text "
+                "substr(json_extract(p.data, '$.text'), 1, 512) AS text, "
+                f"{self._input_detail_sql()} AS detail "
                 "FROM part p JOIN session s ON s.id = p.session_id "
                 "WHERE p.time_updated >= ? AND json_valid(p.data) "
                 "ORDER BY p.time_updated DESC LIMIT 16")
+
+    @staticmethod
+    def _input_detail_sql() -> str:
+        # The input allowlist excludes descriptions, output and metadata. Each
+        # projected value is bounded before crossing the local/WSL boundary.
+        fields = ",".join(
+            f"'{key}', CASE WHEN json_type(p.data, '$.state.input.{key}') = 'text' "
+            f"THEN substr(json_extract(p.data, '$.state.input.{key}'), 1, 256) END"
+            for key in ("command", "cmd", "file_path", "path", "query", "pattern", "url"))
+        return f"json_object({fields})"
 
     def activity_sql(self) -> str | None:
         if not self.caps.has_columns("part", ("session_id", "message_id", "data",
                                                "time_updated")):
             return None
         owners = []
-        for query in (self.running_models_sql(), self.running_tools_sql()):
+        for kind, query in (("model", self.running_models_sql()),
+                            ("tool", self.running_tools_sql())):
             if query:
-                owners.append("SELECT session_id, parent_id, assistant_message_id "
+                call_expr = "tool_call_id" if kind == "tool" else "NULL"
+                owners.append("SELECT session_id, parent_id, assistant_message_id, "
+                              f"{call_expr} AS call_id "
                               f"FROM ({query}) WHERE assistant_message_id IS NOT NULL")
         if not owners:
             return None
-        details = ",".join(
-            f"'{key}', substr(json_extract(p.data, '$.state.input.{key}'), 1, 256)"
-            for key in ("command", "cmd", "file_path", "path", "query", "pattern", "url"))
         return (f"WITH owners AS ({' UNION '.join(owners)}) "
                 "SELECT p.session_id, owners.parent_id, p.message_id, p.time_updated, "
-                "json_extract(p.data, '$.type') AS part_type, "
+                "substr(json_extract(p.data, '$.type'), 1, 24) AS part_type, "
                 "substr(json_extract(p.data, '$.tool'), 1, 96) AS tool_name, "
                 "substr(json_extract(p.data, '$.callID'), 1, 128) AS call_id, "
-                "json_extract(p.data, '$.state.status') AS tool_status, "
+                "substr(json_extract(p.data, '$.state.status'), 1, 24) AS tool_status, "
                 "substr(json_extract(p.data, '$.text'), 1, 512) AS text, "
-                f"json_object({details}) AS detail "
+                f"{self._input_detail_sql()} AS detail "
                 "FROM owners JOIN part p ON p.session_id = owners.session_id "
                 "AND p.message_id = owners.assistant_message_id "
-                "WHERE json_valid(p.data) AND json_extract(p.data, '$.type') "
-                "IN ('tool', 'reasoning', 'text') "
+                "WHERE json_valid(p.data) AND "
+                "((owners.call_id IS NULL AND json_extract(p.data, '$.type') "
+                "IN ('reasoning', 'text')) OR "
+                "(owners.call_id IS NOT NULL AND json_extract(p.data, '$.type') = 'tool' "
+                "AND json_extract(p.data, '$.callID') = owners.call_id)) "
                 "ORDER BY p.time_updated DESC LIMIT 16")
 
 
@@ -288,8 +302,40 @@ class ZCodeStateProjector:
         except (TypeError, ValueError):
             return 0.0
 
+    @staticmethod
+    def _part_presentation(part) -> tuple[Phase, str]:
+        part_type = str(part[1] or "")
+        if part_type == "tool":
+            detail = tool_detail(part[5], 160) if len(part) > 5 else ""
+            phase = classify_phase(str(part[2] or ""), detail)
+            return (phase if phase is not Phase.NONE else Phase.EXECUTING), detail
+        phase = Phase.ANSWERING if part_type == "text" else Phase.THINKING
+        return phase, activity_excerpt(part[4], 160)
+
+    @staticmethod
+    def _owned_part(usage, activity, *, tool=False):
+        # Positional usage rows are identical on Windows and after remote
+        # normalization. Missing IDs mean no attributable activity detail.
+        message_index = 8 if tool else 5
+        if usage is None or len(usage) <= message_index or not usage[message_index]:
+            return None
+        if tool and (len(usage) <= 7 or not usage[7]):
+            return None
+        for row in activity:
+            if (str(row[0] or "") != str(usage[0] or "")
+                    or str(row[2] or "") != str(usage[message_index])):
+                continue
+            part_type = str(row[4] or "")
+            if tool:
+                if part_type != "tool" or str(row[6] or "") != str(usage[7]):
+                    continue
+            elif part_type not in {"reasoning", "text"}:
+                continue
+            return (row[3], row[4], row[5], row[7], row[8], row[9])
+        return None
+
     def project(self, running_model, running_tool, latest_turn,
-                live_part=None) -> Observation | None:
+                live_part=None, activity=()) -> Observation | None:
         """单 session 的证据行 → Observation；无证据 → None（UNKNOWN）。
 
         live_part 是该 root 最新 part 行（time_updated 在流式期间实时前进），
@@ -322,8 +368,9 @@ class ZCodeStateProjector:
             obs.confidence = Confidence.EXACT
             obs.turn_active = True
             obs.expires_at = 0.0
-            summary = str(running_tool[2] or "等待批复")
-            obs.summary = summary[:160]
+            part = self._owned_part(running_tool, activity, tool=True)
+            obs.summary = self._part_presentation(part)[1] if part is not None else ""
+            obs.waiting_detail = obs.summary
             return obs
         # 2/3) 明确 running 活动 → WORKING（subagent 行已归并入父）
         if running_model is not None:
@@ -331,36 +378,32 @@ class ZCodeStateProjector:
             obs.phase = Phase.THINKING
             obs.confidence = Confidence.HIGH
             obs.turn_active = True
+            part = self._owned_part(running_tool, activity, tool=True)
+            if part is None:
+                part = self._owned_part(running_model, activity)
+            if part is not None:
+                obs.phase, obs.summary = self._part_presentation(part)
             return obs
         if running_tool is not None:
             name = str(running_tool[2] or "")
-            phase = classify_phase(name, "")
+            part = self._owned_part(running_tool, activity, tool=True)
+            detail = self._part_presentation(part)[1] if part is not None else ""
+            phase = classify_phase(name, detail)
             obs.status = Status.WORKING
             obs.phase = phase if phase is not Phase.NONE else Phase.EXECUTING
             obs.confidence = Confidence.HIGH
             obs.turn_active = True
-            obs.summary = name[:160]
+            obs.summary = detail
             return obs
         # 2.5) 流式 part 更新：usage 统计行未落盘的生成阶段保持 WORKING，
         # 携带思考/正文摘要，消除 turn 间隙的 执行中↔待命中 抖动。
         if live_part is not None:
             updated_s = self._ms_to_s(live_part[0])
             if 0 <= self.now_ms / 1000.0 - updated_s <= _LIVE_PART_FRESH_SEC:
-                part_type = str(live_part[1] or "")
-                tool = str(live_part[2] or "")
-                phase = (classify_phase(tool, "")
-                         if part_type == "tool" and tool else Phase.THINKING)
                 obs.status = Status.WORKING
-                obs.phase = (phase if phase is not Phase.NONE
-                             else (Phase.EXECUTING if part_type == "tool"
-                                   else Phase.THINKING))
+                obs.phase, obs.summary = self._part_presentation(live_part)
                 obs.confidence = Confidence.HIGH
                 obs.turn_active = True
-                text = str(live_part[4] or "")
-                if text:
-                    obs.summary = summarize_text(text, 160)
-                elif tool:
-                    obs.summary = tool[:160]
                 return obs
         # 4/5) 明确 completion / error 的展示窗口
         if latest_turn is not None:
@@ -621,7 +664,7 @@ class ZCodeDesktopSource(DesktopSessionSource):
             diag.append("INCOMPATIBLE_SCHEMA")
             return None
         facts: dict = {"catalog": [], "models": [], "tools": [],
-                       "turns": [], "parts": []}
+                       "turns": [], "parts": [], "activity": []}
         now_ms = int(time.time() * 1000)
         fresh_ms = now_ms - int(_LIVE_PART_FRESH_SEC * 1000)
         queries = (
@@ -630,6 +673,7 @@ class ZCodeDesktopSource(DesktopSessionSource):
             ("tools", adapter.running_tools_sql(), ()),
             ("turns", adapter.latest_turns_sql(), ()),
             ("parts", adapter.live_parts_sql(), (fresh_ms,)),
+            ("activity", adapter.activity_sql(), ()),
         )
         for key, sql, params in queries:
             if sql is None:
@@ -718,12 +762,17 @@ class ZCodeDesktopSource(DesktopSessionSource):
                                      row.get("parent_id"))
                 item = (row.get("time_updated"), row.get("part_type"),
                         row.get("tool_name"), row.get("tool_status"),
-                        row.get("text"))
+                        row.get("text"), row.get("detail"))
             else:
                 root = self._root_of(row[0], row[1])
                 item = tuple(row[2:])
             if root and root not in live_by_root:
                 live_by_root[root] = item
+        activity_by_root: dict[str, list] = {}
+        for row in facts.get("activity", ()):
+            root = self._root_of(row[0], row[1])
+            if root:
+                activity_by_root.setdefault(root, []).append(row)
 
         for sid in list(sessions):
             sess = sessions[sid]
@@ -736,7 +785,8 @@ class ZCodeDesktopSource(DesktopSessionSource):
                     sess.last_activity_ts, sess.db_updated_ms / 1000.0)
             obs = projector.project(
                 model_by_root.get(sid), tool_by_root.get(sid),
-                turn_by_root.get(sid), live_by_root.get(sid))
+                turn_by_root.get(sid), live_by_root.get(sid),
+                activity_by_root.get(sid, ()))
             if obs is not None and obs.turn_active and not runtime_active:
                 # A surviving remote-development server does not prove that its
                 # former Agent child is still running a persisted model/tool row.

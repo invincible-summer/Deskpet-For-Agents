@@ -1772,10 +1772,25 @@ class Dashboard(tk.Toplevel):
                              height=m.px(BRAND_HEIGHT))
         brand_row.pack(fill="x")
         brand_row.pack_propagate(False)
-        mark = tk.Label(brand_row, text="D", bg=LIGHT.accent,
-                        fg="#FFFFFF", width=2, anchor="center",
-                        font=pick_font(self, 14, True))
-        mark.pack(side="left", padx=(16, 9), pady=15)
+        self._brand_icon = None
+        self._window_icons = ()
+        try:
+            from PIL import ImageTk
+            from .icon import icon_image
+
+            self._brand_icon = ImageTk.PhotoImage(icon_image(m.px(38)), master=self)
+            self._window_icons = tuple(ImageTk.PhotoImage(icon_image(size), master=self)
+                                       for size in (16, 32, 48, 64))
+            self.iconphoto(False, *self._window_icons)
+        except (OSError, ValueError, tk.TclError):
+            # A missing/corrupt optional icon must not prevent opening settings.
+            pass
+        self._brand_mark = tk.Label(
+            brand_row, image=self._brand_icon,
+            text="" if self._brand_icon is not None else "D", bg=LIGHT.nav,
+            fg=LIGHT.accent, width=0 if self._brand_icon is not None else 2,
+            anchor="center", font=pick_font(self, 14, True))
+        self._brand_mark.pack(side="left", padx=(m.px(14), m.px(9)), pady=m.px(12))
         brand_group = tk.Frame(brand_row, bg=LIGHT.nav)
         brand_group.pack(side="left", fill="both", expand=True, pady=11)
         tk.Label(brand_group, text="DeskPet", bg=LIGHT.nav,

@@ -181,6 +181,9 @@ class DashboardContractTests(unittest.TestCase):
             app.open_dashboard()
             app.root.update()
             dash = app.dashboard
+            self.assertTrue(dash._brand_mark.cget("image"))
+            self.assertEqual(dash._brand_mark.cget("text"), "")
+            self.assertEqual(len(dash._window_icons), 4)
             names = list(dash._pages)
             self.assertEqual(names, [PAGE_AGENTS, PAGE_PETS,
                                      PAGE_LOOK, PAGE_MONITOR, PAGE_DIAG,

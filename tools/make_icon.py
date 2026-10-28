@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""命令行生成 assets/icon.ico：程序化小猫（V4.1.5，非桌宠形象）。
+"""Refresh the LocalAppData tray cache from the bundled original app icon.
 
-托盘启动时会自动生成/自愈该文件，此脚本仅供手动重建：
+The tray refreshes the same cache automatically; this is a manual repair tool:
 
   python tools/make_icon.py
 """

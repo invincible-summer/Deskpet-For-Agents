@@ -177,7 +177,7 @@ class SummaryAndTailerTests(unittest.TestCase):
         self.assertEqual(shorten("\x1b[31m# **标题**\x1b[0m\n第二行", 30), "标题")
         self.assertLessEqual(len(shorten("abc。" * 100, 20)), 20)
         self.assertEqual(fmt_command(["bash", "-lc", "pytest -q"]), "bash -lc pytest -q")
-        self.assertIn("测试", classify_tool("Bash", "pytest -q", 30))
+        self.assertEqual(classify_tool("Bash", "pytest -q", 30), "pytest -q")
 
     def test_tailer_handles_partial_lines_rotation_and_oversized_records(self):
         with tempfile.TemporaryDirectory() as temp:

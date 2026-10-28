@@ -601,12 +601,15 @@ class TrayHiconOwnershipTests(unittest.TestCase):
         with patch('pet.icon.ensure_icon_ico',
                    return_value='fake.ico'), \
              patch('os.path.isfile', return_value=True), \
+             patch.object(tray_mod.user32, 'GetSystemMetrics', return_value=24), \
              patch.object(tray_mod.user32, 'LoadImageW',
                           return_value=0x99) as load_image:
             hicon, owns = icon._load_icon()
         self.assertEqual(hicon, 0x99)
         self.assertTrue(owns)
-        load_image.assert_called_once()
+        load_image.assert_called_once_with(
+            None, 'fake.ico', tray_mod.IMAGE_ICON, 24, 24,
+            tray_mod.LR_LOADFROMFILE)
 
 
 # ================================================================ §12.2 generation

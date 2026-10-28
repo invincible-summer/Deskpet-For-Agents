@@ -67,6 +67,12 @@ class GeometryTests(unittest.TestCase):
             self.assertEqual(len(lines), 2)
             self.assertTrue(all(measure(line) <= 120 for line in lines))
         self.assertEqual(fit_text('abc', 0, measure), '')
+        command = '执行中：python -m build ' + 'keep_the_beginning_' * 80 + 'HIDDEN_TAIL'
+        lines = wrap_text(command, 240, measure, 2)
+        self.assertTrue(lines[0].startswith('执行中：python'))
+        self.assertNotIn('HIDDEN_TAIL', ''.join(lines))
+        self.assertTrue(lines[1].endswith('…'))
+        self.assertEqual(wrap_text(command, 240, measure, 2), lines)
 
     def test_no_key_injection_surface_remains(self):
         """V4.1 不变量：winkeys 不提供任何键盘注入入口。"""

@@ -28,7 +28,7 @@ from .models import (
 )
 from .summarize import (CODEX_MODE, CODEX_SANDBOX, fmt_command, shorten,
                         question_summary, wrapped_command, summarize_text,
-                        summarize_tool, tool_detail)
+                        tool_detail)
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
@@ -190,6 +190,9 @@ class CodexFile(FileState):
         self.meaningful_revision = 0
         self.last_meaningful_ts = 0.0
         self._feed_ts = 0.0
+        self._reasoning_head = ""
+        self._reasoning_item = ""
+        self._reasoning_deltas = {}
 
     def _reset_for_replacement(self):
         """Reset parser state when a rollout representation is atomically replaced."""
@@ -365,16 +368,31 @@ class CodexFile(FileState):
         detail_s = tool_detail(detail, SUMMARY_MAX)
         self.last_cmd = detail_s
         self.last_text = ""
-        self.last_tool = summarize_tool(name, detail_s, SUMMARY_MAX)
+        self.last_tool = detail_s
         self.last_tool_ts = ts
         self.last_activity_kind = "tool"
         phase = classify_phase(name, detail_s)
         self.phase = phase if phase is not Phase.NONE else Phase.EXECUTING
 
-    def _set_reasoning(self, value, ts: float):
+    def _set_reasoning(self, value, ts: float, *, append=False, item_id="", channel=""):
         """Project only reasoning text actually present in the session log."""
         self._mark_meaningful()
-        self.last_text = summarize_text(value, SUMMARY_MAX)
+        text = _text_content(value)
+        if append:
+            if (self.last_activity_kind != "reasoning"
+                    or self._reasoning_item != item_id):
+                self._reasoning_deltas.clear()
+            self._reasoning_deltas[channel] = (
+                self._reasoning_deltas.get(channel, "") + text[:512])[:512]
+            # Summary and raw content are separate upstream streams. Prefer
+            # the readable summary, keeping at most two bounded heads.
+            self._reasoning_head = (self._reasoning_deltas.get("reasoning_content_delta")
+                                    or self._reasoning_deltas[channel])
+        else:
+            self._reasoning_deltas.clear()
+            self._reasoning_head = text[:512]
+        self._reasoning_item = item_id
+        self.last_text = summarize_text(self._reasoning_head, SUMMARY_MAX)
         self.last_tool = self.last_cmd = ""
         self.last_assistant_ts = ts
         self.last_activity_kind = "reasoning"
@@ -504,20 +522,26 @@ class CodexFile(FileState):
             self._set_reasoning(payload.get("text") or payload.get("summary")
                                 or payload.get("summary_text"), ts)
         elif ptype in {"reasoning_content_delta", "reasoning_raw_content_delta"}:
-            self._set_reasoning(payload.get("delta") or payload.get("text"), ts)
+            self._set_reasoning(payload.get("delta") or payload.get("text"), ts,
+                                append=True, item_id=str(payload.get("item_id") or ""),
+                                channel=ptype)
         elif ptype == "agent_message_content_delta":
             self._set_assistant(_text_content(payload.get("delta")
                                               or payload.get("text")), ts)
+        elif ptype == "exec_command_output_delta":
+            # Output fragments contain no command; keep the invocation's head.
+            return
         elif ptype in {"mcp_tool_call_begin", "mcp_tool_call_end",
                        "web_search_begin", "web_search_end",
                        "image_generation_begin", "image_generation_end",
-                       "exec_command_begin", "exec_command_output_delta",
+                       "exec_command_begin",
                        "patch_apply_begin", "patch_apply_updated",
                        "sub_agent_activity",
                        "collab_agent_spawn_begin", "collab_agent_interaction_begin"}:
             invocation = payload.get("invocation") or {}
             detail = (payload.get("command") or payload.get("cmd")
-                      or payload.get("arguments") or invocation)
+                      or payload.get("arguments") or payload.get("action")
+                      or payload.get("query") or invocation)
             name = (invocation.get("tool") if isinstance(invocation, dict) else "") or \
                 payload.get("tool") or payload.get("name") or ptype
             self._set_tool(str(name), detail, ts)
@@ -582,7 +606,9 @@ class CodexFile(FileState):
         elif itype in {"mcp tool call", "mcptoolcall", "mcp_tool_call",
                        "dynamic_tool_call", "web_search", "image_generation",
                        "collab_agent_tool_call", "sub_agent_activity"}:
-            self._set_tool(str(item.get("tool") or "mcp"), item.get("arguments"), item_ts)
+            self._set_tool(str(item.get("tool") or itype),
+                           item.get("arguments") or item.get("action")
+                           or item.get("query"), item_ts)
 
     def _feed_response_item(self, payload: dict, ts: float):
         ptype = str(payload.get("type") or "")
@@ -707,7 +733,7 @@ class CodexFile(FileState):
             obs.phase = self.phase
             obs.turn_active = True
             obs.confidence = Confidence.HIGH
-            obs.summary = fmt_command(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            obs.summary = self._summary_text(Status.WORKING)
             # v4.4.1：上游 rollout policy 把 ExecApprovalRequest /
             # RequestUserInput 列为 transient 不落盘，rollout 读者永远看不到
             # 当前是否有未决审批。不伪造 WAITING，但要诚实告知"审批状态
@@ -730,7 +756,7 @@ class CodexFile(FileState):
             obs.turn_active = False
             obs.expires_at = anchor + grace
             obs.confidence = Confidence.MEDIUM
-            obs.summary = fmt_command(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            obs.summary = self._summary_text(Status.WORKING)
             return obs
         # 没有任何 turn 生命周期证据 → 不伪造状态。
         return None

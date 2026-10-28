@@ -1,28 +1,42 @@
 # -*- coding: utf-8 -*-
-"""程序化托盘图标：原创几何小猫（V4.1.5）。
+"""Shared original app artwork for the dashboard, window and system tray.
 
-版权立场（与 .gitignore"素材版权保护"一致）：
-
-  * 托盘图标**绝不使用桌宠形象/皮肤素材**——皮肤是用户自备的版权
-    素材，只放在本机 ``assets/pets/``（不入库）；
-  * 图标完全由代码绘制（椭圆 + 三角），零素材依赖，仓库保持零二进制；
-  * ``%LOCALAPPDATA%/DeskPet/icon.ico`` 是本机生成产物：启动时缺文件
-    自动生成，内容哈希与当前绘制不一致自动重写——旧版"从皮肤 GIF
-    裁帧"生成的桌宠图标会在下一次启动被无感替换成小猫；
-  * PIL 属于 core 依赖（requirements-core: Pillow>=10）；任何失败都
-    只返回 None，托盘回退系统默认图标，绝不影响启动。
+Bundled assets are immutable program resources. The tray keeps its existing
+LocalAppData ICO cache, replacing an older icon only when its content differs.
+The geometric ``draw_cat`` below belongs to the built-in skin and is independent
+of the application identity; user-supplied skin art is never used as an icon.
 """
 from __future__ import annotations
 
 import hashlib
-import io
 import os
+from functools import lru_cache
+from pathlib import Path
 
 from .runtime_paths import get_runtime_paths
 
-# 绘制内容变更时 +1：内容哈希天然不同，旧 icon.ico 会被自动重写
-ICON_REVISION = 1
-CAT_SIZES = (16, 24, 32, 48, 64, 128, 256)
+ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
+
+
+def icon_asset_path(name: str = "deskpet.png") -> Path:
+    """Resolve the same immutable artwork in source and compiled installs."""
+    return get_runtime_paths().program_root / "assets" / "brand" / name
+
+
+def icon_image(size: int):
+    """Load a small RGBA copy; callers own their Tk image references."""
+    from PIL import Image
+
+    size = max(8, min(256, int(size)))
+    with Image.open(icon_asset_path()) as source:
+        return source.convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
+
+
+@lru_cache(maxsize=1)
+def icon_ico_bytes() -> bytes:
+    """Use the prebuilt multi-size ICO; the GUI never encodes icon frames."""
+    return icon_asset_path("deskpet.ico").read_bytes()
+
 
 _HEAD = (62, 76, 86, 255)        # 蓝灰猫头
 _EAR_INNER = (216, 150, 162, 255)  # 粉色内耳
@@ -76,17 +90,6 @@ def draw_cat(size: int):
     return img.resize((size, size), Image.LANCZOS)
 
 
-def cat_ico_bytes() -> bytes:
-    """多尺寸 ICO（16–256 每档原生绘制，保证 16px 任务栏清晰）。"""
-    from PIL import Image
-
-    frames = [draw_cat(s) for s in CAT_SIZES]
-    buf = io.BytesIO()
-    frames[-1].save(buf, format="ICO", append_images=frames[:-1],
-                    sizes=[(s, s) for s in CAT_SIZES])
-    return buf.getvalue()
-
-
 def icon_ico_path(root_dir: str | None = None) -> str:
     if root_dir is not None:
         # Explicit root is retained for deterministic unit/build tooling.
@@ -95,14 +98,14 @@ def icon_ico_path(root_dir: str | None = None) -> str:
 
 
 def ensure_icon_ico(root_dir: str | None = None) -> str | None:
-    """确保运行期 LocalAppData icon.ico 存在且等于当前小猫绘制。
+    """Ensure the tray cache contains the current bundled app artwork.
 
-    * 缺文件 → 生成；内容哈希不一致（如旧版皮肤裁帧图标）→ 原子重写；
-    * 任何异常（无 PIL / 目录不可写）→ 返回 None，调用方回退默认图标。
+    Missing/stale files are replaced atomically. An inaccessible cache returns
+    None so the caller can use its shared system icon fallback.
     """
     try:
         path = icon_ico_path(root_dir)
-        data = cat_ico_bytes()
+        data = icon_ico_bytes()
         digest = hashlib.sha256(data).digest()
         if os.path.isfile(path):
             with open(path, "rb") as f:

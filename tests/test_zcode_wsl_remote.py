@@ -16,7 +16,7 @@ from agents import paths
 from agents.discovery import DistroInventory, WslProcessProbe, parse_metadata
 from agents.models import (
     AgentKind, AgentSurface, DesktopHost, RemoteRuntimeContext,
-    SourceProbeSnapshot, Status,
+    SourceProbeSnapshot, Phase, Status,
 )
 from agents.monitor import ProcessProbeWorker
 from agents.zcode_desktop import ZCodeDesktopSource
@@ -226,6 +226,68 @@ class RemoteReaderTests(unittest.TestCase):
             with self.subTest(context=ctx):
                 self.assertFalse(reader.read(ctx).authoritative)
         runner.assert_not_called()
+
+    def test_exact_running_activity_matches_local_and_remote_projection(self):
+        from tests.test_zcode_desktop import ZcodeDbFixture
+        now = time.time()
+        now_ms = int(now * 1000)
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = ZcodeDbFixture(Path(tmp))
+            for sid in ("command", "thought"):
+                fx.add_session(sid, title="目标不能冒充活动", updated_ms=now_ms)
+                fx.add_model(sid, started_ms=now_ms - 130_000)
+            fx.add_tool("command", tool="Bash", started_ms=now_ms - 125_000)
+            fx.add_part("command", "tool", tool="Bash", updated_ms=now_ms - 120_000,
+                        tool_input={"command": "rg real_activity agents/",
+                                    "description": "不能显示这条说明"})
+            fx.add_part("command", "tool", tool="Bash", updated_ms=now_ms - 1000,
+                        call_id="unrelated-call", tool_input={"command": "WRONG_CALL"})
+            fx.add_part("thought", "reasoning", "先检查正在运行消息的思考。" + "细节" * 300,
+                        updated_ms=now_ms - 120_000)
+            fx.exec("INSERT INTO part VALUES (?,?,?,?,?,?)", (
+                "unrelated", "another-message", "thought", now_ms - 2000,
+                now_ms - 1000, json.dumps({"type": "reasoning", "text": "WRONG_MESSAGE"})))
+            con = sqlite3.connect(fx.db_path)
+            con.row_factory = sqlite3.Row
+            try:
+                caps_payload = {"columns": {table: [r["name"] for r in con.execute(
+                    f'PRAGMA table_info("{table}")')] for table in (
+                        "session", "model_usage", "tool_usage", "turn_usage", "part")}}
+                from agents.zcode_desktop import ZCodeSchemaAdapter
+                adapter = ZCodeSchemaAdapter(ZCodeRemoteReader._caps(caps_payload))
+                plan = ZCodeRemoteReader._query_plan(adapter, now_ms)
+                self.assertIn("activity", {q["key"] for q in plan})
+                payload = {q["key"]: [dict(row) for row in con.execute(q["sql"], q["params"])]
+                           for q in plan}
+            finally:
+                con.close()
+            facts = ZCodeRemoteReader._normalize_facts(payload)
+            ctx = _ctx()
+            remote = ZCodeRemoteFactsSnapshot(ctx, True, facts, (), now)
+            local_source = ZCodeDesktopSource(zcode_db=fx.db_path)
+            remote_source = ZCodeDesktopSource(zcode_db=str(Path(tmp) / "missing.sqlite"),
+                remote_provider=lambda: {ctx.plane_key: remote})
+            try:
+                outputs = [source.poll((_host(),), frozenset(), now)
+                           for source in (local_source, remote_source)]
+                for snap in outputs:
+                    by_sid = {inst.logical_session_id: snap.observations[inst.key]
+                              for inst in snap.instances}
+                    self.assertEqual(by_sid["command"].phase, Phase.SEARCHING)
+                    self.assertEqual(by_sid["command"].summary, "rg real_activity agents/")
+                    self.assertEqual(by_sid["thought"].phase, Phase.THINKING)
+                    self.assertTrue(by_sid["thought"].summary.startswith("先检查正在运行消息的思考。"))
+                    for obs in by_sid.values():
+                        self.assertLessEqual(len(obs.summary), 160)
+                        self.assertNotIn("WRONG_", obs.summary)
+                        self.assertNotIn("不能", obs.summary)
+                self.assertEqual({o.session_id: (o.phase, o.summary)
+                                  for o in outputs[0].observations.values()},
+                                 {o.session_id: (o.phase, o.summary)
+                                  for o in outputs[1].observations.values()})
+            finally:
+                local_source.close()
+                remote_source.close()
 
 
 class DesktopProjectionTests(unittest.TestCase):

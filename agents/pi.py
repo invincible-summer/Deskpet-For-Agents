@@ -14,7 +14,8 @@ from .models import (
     Phase,
     Status,
 )
-from .summarize import fmt_command, shorten, summarize_text, summarize_tool, tool_detail
+from .summarize import (activity_excerpt, fmt_command, shorten, summarize_text,
+                        tool_detail)
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
@@ -81,6 +82,8 @@ class PiFile(FileState):
         self.done_ts = 0.0
         self.error_text = ""
         self.error_ts = 0.0
+        self.last_text = self.last_tool = self.last_cmd = ""
+        self.last_activity_kind = ""
         self.phase = Phase.THINKING
 
     def _set_error(self, obj: dict, ts: float):
@@ -159,24 +162,29 @@ class PiFile(FileState):
                 value = _text(block.get("text") or block.get("content"))
                 if value.strip():
                     self.goal = summarize_text(value, GOAL_MAX)
-            elif btype in {"thinking", "ThinkingContent", "thinking_content"}:
+            elif role == "assistant" and btype in {"thinking", "ThinkingContent", "thinking_content"}:
+                value = block.get("thinking") or block.get("text") or ""
+                self.last_text = (activity_excerpt(value, SUMMARY_MAX)
+                                  if not block.get("redacted") else "")
+                self.last_tool = self.last_cmd = ""
+                self.last_assistant_ts = ts
+                self.last_activity_kind = "reasoning"
                 self.phase = Phase.THINKING
-            elif btype in {"toolCall", "tool_call"}:
+                self.turn_active = True
+                self.turn_known_over = False
+            elif role == "assistant" and btype in {"toolCall", "tool_call"}:
                 name = block.get("name") or "?"
                 args = block.get("arguments")
                 detail = tool_detail(args, SUMMARY_MAX)
                 self.last_cmd = fmt_command(f"{name}: {detail}" if detail else str(name), 100)
-                self.last_tool = summarize_tool(str(name), detail, SUMMARY_MAX)
+                self.last_tool = detail
+                self.last_text = ""
                 self.last_tool_ts = ts
                 self.last_activity_kind = "tool"
                 phase = classify_phase(str(name), detail)
                 self.phase = phase if phase is not Phase.NONE else Phase.EXECUTING
             elif btype in {"toolResult", "tool_result"}:
-                value = _text(block.get("content") or block.get("text") or block.get("output"))
-                if value.strip():
-                    self.last_text = summarize_text(value, SUMMARY_MAX)
-                    self.last_assistant_ts = ts
-                    self.last_activity_kind = "assistant"
+                self._apply_tool_result_message(block, ts)
 
         # v4.2.3 §8.1：pi v3 assistant.stopReason 决定 turn 生命周期；
         # 独立 role=toolResult message 只是活动证据。
@@ -233,27 +241,16 @@ class PiFile(FileState):
         pi 可能继续推理并恢复；最终 turn 状态由后续 assistant stopReason
         决定。
         """
-        name = str(msg.get("toolName") or msg.get("tool")
-                   or msg.get("toolCallId") or "?")
-        content = msg.get("content")
-        if isinstance(content, list):
-            value = " ".join(
-                _text(item) if isinstance(item, dict) else str(item)
-                for item in content)
-        else:
-            value = _text(content)
-        value = summarize_text(value, SUMMARY_MAX)
-        if value or not self.last_tool:
-            self.last_tool = summarize_tool(name, value, SUMMARY_MAX)
-        self.last_tool_ts = ts
-        self.last_activity_kind = "tool"
-        if value:
-            self.last_text = value
-        phase = classify_phase(name, value)
-        self.phase = phase if phase is not Phase.NONE else Phase.EXECUTING
+        # ToolResult.content is output, not the command or a new thought.
+        # Once the known tool returns, wait for actual assistant reasoning;
+        # a delayed result must not replace a newer thought with old output.
+        if self.last_activity_kind == "tool":
+            self.last_text = self.last_tool = self.last_cmd = ""
+            self.last_activity_kind = ""
+            self.phase = Phase.THINKING
 
     def _summary_text(self) -> str:
-        if self.last_activity_kind == "assistant" and self.last_text:
+        if self.last_activity_kind in {"assistant", "reasoning"}:
             return self.last_text
         if self.last_activity_kind == "tool" and self.last_tool:
             return self.last_tool
@@ -288,7 +285,7 @@ class PiFile(FileState):
             obs.phase = self.phase
             obs.turn_active = True
             obs.confidence = Confidence.HIGH
-            obs.summary = fmt_command(self._summary_text() or "处理中", SUMMARY_MAX)
+            obs.summary = self._summary_text()
             return obs
         if self.turn_known_over:
             obs.status = Status.IDLE
@@ -303,7 +300,7 @@ class PiFile(FileState):
             obs.turn_active = False
             obs.expires_at = anchor + grace
             obs.confidence = Confidence.MEDIUM
-            obs.summary = fmt_command(self._summary_text() or "处理中", SUMMARY_MAX)
+            obs.summary = self._summary_text()
             return obs
         return None
 

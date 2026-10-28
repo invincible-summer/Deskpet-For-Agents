@@ -60,6 +60,8 @@ def build() -> None:
         "--include-package=actions",
         "--include-module=tools.convert",
         "--include-package-data=imageio_ffmpeg",
+        f"--include-data-files={ROOT / 'assets' / 'brand' / 'deskpet.png'}=assets/brand/deskpet.png",
+        f"--include-data-files={ROOT / 'assets' / 'brand' / 'deskpet.ico'}=assets/brand/deskpet.ico",
         str(ROOT / "main.py"),
     ]
     run(cmd)

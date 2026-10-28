@@ -29,8 +29,8 @@ from .models import (
     Status,
     parse_mode,
 )
-from .summarize import (fmt_command, shorten, question_summary,
-                        summarize_text, summarize_tool, tool_detail)
+from .summarize import (activity_excerpt, fmt_command, shorten, question_summary,
+                        summarize_text, tool_detail)
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
@@ -48,7 +48,8 @@ _TOP_TYPES = frozenset({
     "ApprovalRequestResolved", "context.append_loop_event",
     "interaction.request", "interaction.resolved",
     "TurnBegin", "TurnEnd", "ToolCall", "ToolCallRequest", "UserPrompt",
-    "UserMessage", "PromptSubmitted", "Notification", "StatusUpdate", "?",
+    "UserMessage", "PromptSubmitted", "Notification", "StatusUpdate",
+    "StepBegin", "ThinkPart", "ThinkingDelta", "?",
 })
 _LOOP_EVENT_TYPES = frozenset({
     "step.begin", "step.end", "tool.call", "tool.result", "content.part",
@@ -137,6 +138,7 @@ class KimiFile(FileState):
         self.last_assistant_ts = 0.0
         self.last_tool_ts = 0.0
         self.last_activity_kind = ""
+        self._reasoning_head = ""
         self.permission_mode = ""
 
     def _touch(self, obj: dict, payload: dict) -> float:
@@ -173,12 +175,25 @@ class KimiFile(FileState):
     def _set_tool(self, name, args, ts: float):
         detail = tool_detail(args, SUMMARY_MAX)
         self.last_cmd = fmt_command(f"{name}: {detail}" if detail else str(name), 100)
-        self.last_tool = summarize_tool(str(name), detail, SUMMARY_MAX)
+        self.last_tool = detail
         self.last_text = ""
         self.last_tool_ts = ts
         self.last_activity_kind = "tool"
         phase = classify_phase(str(name), detail)
         self.phase = phase if phase is not Phase.NONE else Phase.EXECUTING
+
+    def _set_reasoning(self, value, ts: float):
+        # Consecutive ThinkParts are deltas upstream. Keep a bounded beginning
+        # of the current thought instead of replacing it with each new tail.
+        if self.last_activity_kind != "reasoning":
+            self._reasoning_head = ""
+        if isinstance(value, str):
+            self._reasoning_head = (self._reasoning_head + value[:512])[:512]
+        self.last_text = activity_excerpt(self._reasoning_head, SUMMARY_MAX)
+        self.last_tool = self.last_cmd = ""
+        self.last_assistant_ts = ts
+        self.last_activity_kind = "reasoning"
+        self.phase = Phase.THINKING
 
     # ------------------------------------------------------------ 主入口
     def feed(self, line: str):
@@ -207,6 +222,8 @@ class KimiFile(FileState):
                 self.goal = summarize_text(text, GOAL_MAX)
             self._mark_turn_active()
             self.done_ts = 0.0
+            self.last_text = self.last_tool = self.last_cmd = ""
+            self.last_activity_kind = ""
             self.phase = Phase.THINKING
         elif t == "plan_mode.enter":
             self.mode, self.mode_raw = parse_mode("plan")
@@ -350,11 +367,7 @@ class KimiFile(FileState):
             if isinstance(part, dict):
                 ptype = str(part.get("type") or "")
                 if ptype == "think":
-                    self.last_text = summarize_text(part.get("think") or part.get("text"), SUMMARY_MAX)
-                    self.last_tool = self.last_cmd = ""
-                    self.last_assistant_ts = ts
-                    self.last_activity_kind = "reasoning"
-                    self.phase = Phase.THINKING
+                    self._set_reasoning(part.get("think") or part.get("text"), ts)
                 elif ptype == "text":
                     text = _text(part)
                     if text:
@@ -366,9 +379,9 @@ class KimiFile(FileState):
             self._set_error(event, ts)
 
     def _feed_legacy(self, obj: dict, t: str, ts: float):
-        payload = obj.get("payload") or {}
+        payload = obj.get("payload")
         if not isinstance(payload, dict):
-            payload = {}
+            payload = obj
         pt = str(payload.get("type") or t)
 
         if pt == "TurnBegin":
@@ -381,8 +394,12 @@ class KimiFile(FileState):
             self.pending = None
             self.pending_id = ""
             self.phase = Phase.NONE
-        elif pt in ("ThinkPart", "ThinkingDelta"):
+        elif pt == "StepBegin":
+            self.last_text = self.last_tool = self.last_cmd = ""
+            self.last_activity_kind = ""
             self.phase = Phase.THINKING
+        elif pt in ("ThinkPart", "ThinkingDelta"):
+            self._set_reasoning(_text(payload) or payload.get("delta"), ts)
         elif pt in ("ToolCall", "ToolCallRequest"):
             self._set_tool(payload.get("name") or payload.get("tool") or "?",
                            payload.get("arguments"), ts)
@@ -477,7 +494,7 @@ class KimiFile(FileState):
             obs.phase = self.phase
             obs.turn_active = True
             obs.confidence = Confidence.HIGH
-            obs.summary = fmt_command(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            obs.summary = self._summary_text(Status.WORKING)
             return obs
         if self.turn_known_over:
             obs.status = Status.IDLE
@@ -493,7 +510,7 @@ class KimiFile(FileState):
             obs.turn_active = False
             obs.expires_at = anchor + grace
             obs.confidence = Confidence.MEDIUM
-            obs.summary = fmt_command(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            obs.summary = self._summary_text(Status.WORKING)
             return obs
         return None
 

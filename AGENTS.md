@@ -37,13 +37,13 @@ annotations live only in this file, not in source headers.
 
 | Agent | Aligned upstream | Evidence date |
 | --- | --- | --- |
-| ZCode | 0.17.0 (live `db.sqlite` `session.version`; migrations through 0005 / 0.7.0 schema era) | 2026-10-27 |
-| Codex | 0.164.0-alpha.11.1 (live `state_5.sqlite` `cli_version`; rollout JSONL event schema) | 2026-10-27 |
-| OpenCode | anomalyco/opencode dev @ 86976449c40d (`session_v2` / `session_message` / `session_inbox`; `store.ts` `time_suspended` execution claim) | 2026-10-27 |
-| DSH | deepseek-ai/deepseek-harness master @ 22ddee379240 (session.vN.jsonl[.zstd] event stream) | 2026-10-23 |
-| pi | badlogic/pi-mono main @ 177e2ad7e41e (session JSONL event stream) | 2026-10-27 |
-| Kimi Code | live `wire.jsonl` verified on a real CLI install | 2026-09 |
-| Claude Code | code.claude.com docs (transcript/projects layout, permissionMode) | 2026-09 |
+| ZCode | 0.17.0 (live `db.sqlite` `session.version`); zai-org/ZCode main @ 3c5b227649371507ddc4eb46ac5133afe6db1cab (`ToolPart.state.input`, `ReasoningPart.text`, exact message/call attribution) | 2026-10-27 |
+| Codex | 0.164.0-alpha.11.1 (live `state_5.sqlite` `cli_version`); openai/codex main @ b89952d582beaae3af3ddd7b679286cbb094f8b9 (`ReasoningContentDeltaEvent`, `WebSearchAction`) | 2026-10-27 |
+| OpenCode | anomalyco/opencode dev @ 115113931c7a6957ca4325a37fbcdd2936edde79 (`session_v2` / `session_message`; assistant content text/reasoning/tool blocks, execution claim) | 2026-10-27 |
+| DSH | deepseek-ai/deepseek-harness master @ 22ddee379240 (session.vN.jsonl[.zstd], `tool/call.arguments`, `assistant/message` content) | 2026-10-27 |
+| pi | badlogic/pi-mono main @ 842c73170a3658d4e3b39fcc84690211ed503e09 (session JSONL, `ThinkingContent.thinking` / `ToolCall.arguments`) | 2026-10-27 |
+| Kimi Code | MoonshotAI/kimi-code main @ 68a283894163204e93b072cef20db164015a5cad (`ThinkPart.think` / `content.part` / `tool.call.args`, live wire compatibility retained) | 2026-10-27 |
+| Claude Code | code.claude.com docs (transcript/projects layout, permissionMode, tool input) | 2026-10-27 |
 
 All sources share one stable status contract: an open turn is durable evidence
 and holds WORKING through quiet gaps (bounded by an explicit crash-orphan TTL);

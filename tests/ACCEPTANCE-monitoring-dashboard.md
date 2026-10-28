@@ -3,6 +3,9 @@
 环境：Windows，仓库 `.venv/Scripts/python.exe`，Python 3.12.14。未发布版本或
 编译产物；下述合成数据和自动化结果不能替代真实 Agent 交互验收。
 
+本文记录先前修订；后续两行活动格式、解析和原创图标的当前结果见
+[补正验收](ACCEPTANCE-activity-icon.md)。
+
 ## 自动化
 
 所有实现完成后集中运行完整套件：**916 tests / 112.442s / OK**。测试清理前为

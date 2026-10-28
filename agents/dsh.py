@@ -1,6 +1,6 @@
 """DSH（DeepSeek Harness）无插件只读监听 adapter（无插件监听 plan §三/P3）。
 
-上游事实（DSH master 22ddee379240）：
+上游事实（core/session 与 llm 的事件类型）：
   * 数据根：``$DSH_HOME``（默认 ``~/.dsh``）下的 ``sessions/``；绝不读
     ``$DSH_HOME/.credentials.yaml``、launch token 或 Host 私有 IPC。
   * 物理布局：``sessions/--<projectKey(cwd)>--/<encodeSegment(id)>/
@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import paths
-from .base import BaseWatcher, FileState
+from .base import BaseWatcher, FileState, classify_phase
 from .desktop import (
     DesktopSessionSource,
     DesktopSourceSnapshot,
@@ -49,6 +49,7 @@ from .models import (
     Phase,
     Status,
 )
+from .summarize import summarize_text, tool_detail
 
 # 上游 core/session/src/types.ts：SESSION_FORMAT_VERSION = 4
 DSH_FORMAT_VERSION = 4
@@ -451,9 +452,9 @@ class DshEventTracker:
     open_turn_last_ts: float = 0.0
     turn_known_over: bool = False
     pending_approvals: dict[str, tuple[str, float]] = field(default_factory=dict)
-    last_tool_name: str = ""
-    last_step_ts: float = 0.0
-    last_assistant_ts: float = 0.0
+    last_call_id: str = ""
+    activity_phase: Phase = Phase.THINKING
+    activity_text: str = ""
     done_ts: float = 0.0
     error_ts: float = 0.0
     error_text: str = ""
@@ -492,6 +493,8 @@ class DshEventTracker:
             except (TypeError, ValueError):
                 self.open_turn = 0
             self.open_turn_last_ts = ts
+            self.activity_phase = Phase.THINKING
+            self.activity_text = self.last_call_id = ""
         elif etype == "turn/end":
             try:
                 ended = int(data.get("turn") or 0)
@@ -540,19 +543,48 @@ class DshEventTracker:
                 self.error_ts = max(self.error_ts, ts)
                 self.error_text = f"任务{reason}"[:SUMMARY_MAX]
         elif etype == "step/start":
-            self.last_step_ts = max(self.last_step_ts, ts)
+            self.activity_phase = Phase.THINKING
+            self.activity_text = self.last_call_id = ""
             if self.open_turn:
                 self.open_turn_last_ts = max(self.open_turn_last_ts, ts)
         elif etype == "tool/call":
             name = str(data.get("name") or "")
-            if name:
-                self.last_tool_name = name[:SUMMARY_MAX]
+            self.last_call_id = str(data.get("callId") or "")[:128]
+            self.activity_text = tool_detail(data.get("arguments"), SUMMARY_MAX)
+            phase = classify_phase(name, self.activity_text)
+            self.activity_phase = phase if phase is not Phase.NONE else Phase.EXECUTING
             if self.open_turn:
                 self.open_turn_last_ts = max(self.open_turn_last_ts, ts)
         elif etype == "assistant/message":
-            self.last_assistant_ts = max(self.last_assistant_ts, ts)
+            self.activity_text = self.last_call_id = ""
+            self.activity_phase = Phase.THINKING
+            message = data.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for block in content[:64]:
+                    if not isinstance(block, dict):
+                        continue
+                    kind = block.get("type")
+                    if kind in {"text", "reasoning"}:
+                        text = summarize_text(block.get("text"), SUMMARY_MAX)
+                        if text:
+                            self.activity_text = text
+                            self.activity_phase = (Phase.THINKING if kind == "reasoning"
+                                                   else Phase.ANSWERING)
+                    elif kind == "tool-call":
+                        name = str(block.get("name") or "")
+                        self.last_call_id = str(block.get("id") or "")[:128]
+                        self.activity_text = tool_detail(block.get("arguments"), SUMMARY_MAX)
+                        phase = classify_phase(name, self.activity_text)
+                        self.activity_phase = phase if phase is not Phase.NONE else Phase.EXECUTING
             if self.open_turn:
                 self.open_turn_last_ts = max(self.open_turn_last_ts, ts)
+        elif etype == "tool/result":
+            message = data.get("message")
+            if (isinstance(message, dict) and self.last_call_id
+                    and message.get("toolCallId") == self.last_call_id):
+                self.activity_phase = Phase.THINKING
+                self.activity_text = self.last_call_id = ""
         elif etype == "approval/asked":
             rid = str(data.get("id") or "")
             if rid and ts >= self.last_event_ts - self.approval_replay_sec:
@@ -609,11 +641,8 @@ class DshEventTracker:
                 obs.status = Status.WORKING
                 obs.confidence = Confidence.HIGH
                 obs.turn_active = True
-                if self.last_tool_name and now - self.last_step_ts <= OPEN_TURN_QUIET_SEC:
-                    obs.phase = Phase.EXECUTING
-                    obs.summary = self.last_tool_name
-                elif self.last_assistant_ts:
-                    obs.phase = Phase.THINKING
+                obs.phase = self.activity_phase
+                obs.summary = self.activity_text
                 return obs
             if 0 <= quiet <= OPEN_TURN_ORPHAN_SEC:
                 # 显式 turn/start 仍打开：静默只是事件稀疏（长命令、慢流式），
@@ -622,7 +651,8 @@ class DshEventTracker:
                 obs.status = Status.WORKING
                 obs.confidence = Confidence.MEDIUM
                 obs.turn_active = True
-                obs.phase = Phase.THINKING
+                obs.phase = self.activity_phase
+                obs.summary = self.activity_text
                 return obs
             # 打开的 turn 长时间无事件：crash orphan，绝不能永久 Working
             return None

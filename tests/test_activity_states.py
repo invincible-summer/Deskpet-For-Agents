@@ -4,7 +4,8 @@ import unittest
 from agents.codex import CodexFile
 from agents.claude import ClaudeFile
 from agents.kimi import KimiFile
-from agents.models import AgentKind, Mode, Status, parse_mode, Snapshot
+from agents.pi import PiFile
+from agents.models import AgentKind, Mode, Phase, Status, parse_mode, Snapshot
 from agents.summarize import shorten, fmt_command
 from pet.labels import activity_text
 
@@ -166,6 +167,127 @@ def test_codex_wrapper_displays_literal_command_without_executing_code():
     feed(state, dict(type='message', role='user', content=[{
         'text': '{"objective":"修复监听生命周期","metadata":{"revision":42}}'}]))
     assert state.observation(1000, {}).goal == '修复监听生命周期'
+
+
+def test_pi_activity_uses_thought_or_tool_input_without_replaying_output():
+    state = PiFile('unused')
+    def message(role, content, **fields):
+        state.feed(json.dumps({'type': 'message', 'timestamp': 100,
+                               'message': {'role': role, 'content': content, **fields}}))
+    message('user', '修复状态展示')
+    message('assistant', [{'type': 'toolCall', 'id': 'call-1', 'name': 'bash',
+                           'arguments': {'command': 'rg status agents/'}}],
+            stopReason='toolUse')
+    obs = state.observation(101, {})
+    assert obs.phase is Phase.SEARCHING
+    assert 'rg status agents/' in obs.summary
+    message('toolResult', [{'type': 'text', 'text': '命令输出不能冒充思考'}],
+            toolCallId='call-1', toolName='bash')
+    obs = state.observation(101, {})
+    assert obs.phase is Phase.THINKING
+    assert '命令输出' not in obs.summary
+    assert 'rg status' not in obs.summary
+    thought = '先检查状态来源，再核对每个解析器。' + '后续细节' * 100
+    message('assistant', [{'type': 'thinking', 'thinking': thought}])
+    obs = state.observation(101, {})
+    assert obs.status is Status.WORKING
+    assert obs.phase is Phase.THINKING
+    assert obs.summary.startswith('先检查状态来源')
+    assert len(obs.summary) <= 160
+    message('toolResult', [{'type': 'text', 'text': '迟到的工具输出'}],
+            toolCallId='call-1', toolName='bash')
+    assert state.observation(101, {}).summary == obs.summary
+    message('user', '下一项任务')
+    assert '先检查状态来源' not in state.observation(101, {}).summary
+
+
+def test_kimi_streamed_thought_keeps_its_beginning_in_wire_and_legacy_forms():
+    for form in ('wire', 'legacy', 'direct'):
+        state = KimiFile('unused')
+        def emit(event):
+            if form == 'wire':
+                obj = {'type': 'context.append_loop_event', 'event': event}
+            elif form == 'legacy':
+                obj = {'type': event['type'], 'payload': event}
+            else:
+                obj = event
+            state.feed(json.dumps({**obj, 'timestamp': 100}))
+        state.feed(json.dumps({'type': 'turn.started', 'timestamp': 99}))
+        emit({'type': 'step.begin' if form == 'wire' else 'StepBegin'})
+        def thought(text, delta=False):
+            if form == 'wire':
+                emit({'type': 'content.part', 'part': {'type': 'think', 'think': text}})
+            else:
+                emit({'type': 'ThinkingDelta' if delta else 'ThinkPart',
+                      'delta' if delta else 'think': text})
+        thought('先检查')
+        thought('取消任务的记录。', True)
+        obs = state.observation(101, {})
+        assert obs.phase is Phase.THINKING
+        assert obs.summary.startswith('先检查取消任务的记录。')
+        thought('后续推理' * 200, True)
+        stable = state.observation(101, {}).summary
+        thought('最后的新尾部', True)
+        assert state.observation(101, {}).summary == stable
+        assert stable.startswith('先检查取消任务的记录。')
+        assert len(stable) <= 160
+        emit({'type': 'step.begin' if form == 'wire' else 'StepBegin'})
+        thought('新步骤的思考')
+        assert state.observation(101, {}).summary == '新步骤的思考'
+
+
+def test_command_search_and_reasoning_heads_use_actual_activity():
+    from agents.models import Phase
+
+    codex = CodexFile('unused')
+    command = 'rg *.py agents/ ' + 'beginning_' * 40 + 'NEVER_SHOW_TAIL'
+    feed(codex, {'type': 'function_call', 'name': 'exec_command',
+                 'arguments': json.dumps({'cmd': command,
+                                           'description': '这是目的说明'})})
+    observed = codex.observation(101, {})
+    snap = Snapshot(key='test', kind=AgentKind.CODEX, source='windows', pid=1,
+                    status=observed.status, phase=observed.phase,
+                    summary=observed.summary)
+    assert activity_text(snap).startswith('搜索中：rg *.py agents/ beginning_')
+    assert 'NEVER_SHOW_TAIL' not in activity_text(snap)
+    assert '目的说明' not in activity_text(snap)
+    codex.feed(json.dumps({'type': 'event_msg', 'timestamp': 102, 'payload': {
+        'type': 'exec_command_output_delta', 'delta': '这是输出，不能冒充命令'}}))
+    assert codex.observation(103, {}).summary == observed.summary
+    for delta in ('先检查', '监听归属。', '后续内容' * 100):
+        codex.feed(json.dumps({'type': 'event_msg', 'timestamp': 104,
+                              'payload': {'type': 'reasoning_raw_content_delta',
+                                          'item_id': 'r1', 'delta': '另一条原始流'}}))
+        codex.feed(json.dumps({'type': 'event_msg', 'timestamp': 104,
+                              'payload': {'type': 'reasoning_content_delta',
+                                          'item_id': 'r1', 'delta': delta}}))
+    head = codex.observation(105, {}).summary
+    assert head.startswith('先检查监听归属。')
+    for _ in range(5):
+        codex.feed(json.dumps({'type': 'event_msg', 'timestamp': 106,
+                              'payload': {'type': 'reasoning_content_delta',
+                                          'item_id': 'r1', 'delta': '尾部内容'}}))
+        assert codex.observation(107, {}).summary == head
+    feed(codex, {'type': 'web_search_call',
+                 'action': {'type': 'search', 'query': 'WSL 会话状态归属'}})
+    assert codex.observation(108, {}).phase is Phase.SEARCHING
+    assert codex.observation(108, {}).summary == 'WSL 会话状态归属'
+
+    claude = ClaudeFile('unused')
+    for block, phase, summary in (
+        ({'type': 'thinking', 'thinking': '先检查真实活动证据'},
+         Phase.THINKING, '先检查真实活动证据'),
+        ({'type': 'tool_use', 'name': 'Bash', 'id': 'tool',
+          'input': {'command': 'echo *.py', 'description': '不要显示说明'}},
+         Phase.EXECUTING, 'echo *.py'),
+        ({'type': 'tool_use', 'name': 'WebSearch', 'id': 'search',
+          'input': {'query': '停止任务监听'}}, Phase.SEARCHING, '停止任务监听'),
+    ):
+        claude.feed(json.dumps({'type': 'assistant', 'timestamp': 109,
+                               'message': {'content': [block]}}))
+        obs = claude.observation(110, {})
+        assert obs.phase is phase
+        assert obs.summary == summary
 
 
 def load_tests(loader, tests, pattern):

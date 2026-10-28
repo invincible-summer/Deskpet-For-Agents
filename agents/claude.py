@@ -29,7 +29,7 @@ from .models import (
     parse_mode,
 )
 from .summarize import (fmt_command, shorten, question_summary,
-                        summarize_text, summarize_tool, tool_detail)
+                        summarize_text, tool_detail)
 
 GOAL_MAX = 120
 SUMMARY_MAX = 160
@@ -172,7 +172,7 @@ class ClaudeFile(FileState):
                     self.phase = Phase.THINKING
                 elif btype == "tool_use":
                     name, detail = _summarize_tool(block)
-                    summary = summarize_tool(name, detail, SUMMARY_MAX)
+                    summary = detail
                     self.last_tool = summary
                     self.last_text = ""
                     self.last_tool_ts = ts
@@ -322,7 +322,7 @@ class ClaudeFile(FileState):
             obs.phase = self.phase
             obs.turn_active = True
             obs.confidence = Confidence.HIGH
-            obs.summary = fmt_command(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            obs.summary = self._summary_text(Status.WORKING)
             return obs
         if self.turn_known_over:
             obs.status = Status.IDLE
@@ -338,7 +338,7 @@ class ClaudeFile(FileState):
             obs.turn_active = False
             obs.expires_at = anchor + grace
             obs.confidence = Confidence.MEDIUM
-            obs.summary = shorten(self._summary_text(Status.WORKING) or "处理中", SUMMARY_MAX)
+            obs.summary = self._summary_text(Status.WORKING)
             return obs
         return None
 

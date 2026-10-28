@@ -1,10 +1,10 @@
-# DeskPet V4.2.0
+# DeskPet V4.3.0
 
-DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的 AI 编码 Agent，并把当前任务、模式和工作状态显示成桌宠动画与气泡。
+DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的 AI 编码 Agent，并把工作区、当前任务和工作状态显示成桌宠动画与气泡。
 
 支持 Windows / WSL 终端中的 Codex CLI、Claude Code、Kimi CLI、pi、OpenCode CLI 与 DSH（DeepSeek Harness）CLI，以及 Codex Desktop / ChatGPT Desktop Codex 模式、ZCode Desktop、OpenCode Desktop 和 DeepSeek Harness Desktop；ZCode Desktop 通过 Remote Development 连接到 WSL 时，也会从对应 WSL 用户环境读取会话状态。DeskPet 不接管 Agent，不要求 Hook、插件或 MCP，也不会自动审批。
 
-当前源码版本是 **4.2.0**。`v4.2.0` 是本轮监听与桌面唤起可靠性升级的源码版本；本版本**不创建 GitHub Release，也不生成新的 Portable/EXE 发布文件**，除非另行发布验收通过的二进制资产。
+当前源码版本是 **4.3.0**。`v4.3.0` 是本轮监听、仪表盘、活动解析和应用图标升级的源码版本；本版本**不创建 GitHub Release，也不生成新的 Portable/EXE 发布文件**，除非另行发布验收通过的二进制资产。
 版本 tag 与二进制 Release 分开推进：tag 用于固定已经验收的源码里程碑，GitHub Release 只在确实值得重新分发 Portable 的版本上显式发布，不会再由 tag push 自动触发。历史 `v1.0.0`、`v2.0.0`、`v3.0.0` Release 用于按开发顺序补齐源码版本历史，不反向制造当时并不存在的 Portable 二进制。详细规则见 [VERSIONING.md](VERSIONING.md)。
 
 ## 下载与启动
@@ -67,12 +67,16 @@ DeskPet 自动发现并显示状态
 
 并行监听默认开启，每次启动默认进入**单宠聚合模式**。即使当前没有任何 Agent，也会保留至少一个桌宠显示在桌面上（`pet-1 idle fallback`），除非你在本次运行中主动隐藏桌宠。
 
-DeskPet 会根据可用证据显示 Thinking、Reading、Coding、Testing、Waiting Approval、Done、Idle 等状态；Mode（例如 Plan）会独立显示。
+DeskPet 会根据可用证据显示思考、搜索、阅读、编写、执行、测试、等待审批、完成和待命等状态；Mode（例如 Plan）可在会话详情查看。
 
-气泡首行显示当前工作区名称（来自会话的工作目录），下面依次显示 Agent/状态、
-当前动作和任务目标。活动摘要保留命令、文件路径或搜索词等必要对象；结构化输入
-只提取任务主干，不直接展示 JSON 字段。读取不到动作细节时沿用明确状态和任务
-上下文，不猜测 Agent 正在执行的内容；气泡不显示思考强度。
+气泡首行统一显示 `Agent · 工作区 · 状态`，中间固定两行显示当前活动，
+最底一行显示任务目标。活动保留真实命令、思考开头、文件路径或搜索内容，
+长内容在尾部省略，不滚动、不轮播；结构化输入只提取必要正文，不直接展示
+JSON 字段。读取不到活动细节时只显示明确状态，目标或工具说明不会冒充命令。
+气泡不显示 Default 等模式前缀或思考强度。
+
+仪表盘左上角、窗口和系统托盘共用原创猫形应用图标，与桌宠皮肤独立。
+图标资源与完整生成提示词见 [图标说明](assets/brand/README.md)。
 
 Dashboard 默认打开 **Agent 工作台**，在一个页面查看状态统计、筛选会话并展开
 所选会话详情；桌宠、外观、监听与隐私、诊断、设置分别管理各自功能。

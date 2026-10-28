@@ -47,7 +47,7 @@ class ZcodeDbFixture:
         con.execute("""CREATE TABLE model_usage (
             id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT,
             query_source TEXT, status TEXT, started_at INTEGER,
-            completed_at INTEGER)""")
+            completed_at INTEGER, assistant_message_id TEXT)""")
         con.execute("""CREATE TABLE tool_usage (
             id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT,
             tool_call_id TEXT, tool_name TEXT, status TEXT,
@@ -79,9 +79,9 @@ class ZcodeDbFixture:
         now_ms = started_ms if started_ms is not None else int(time.time() * 1000)
         con.execute(
             "INSERT INTO model_usage (id, session_id, turn_id, query_source, "
-            "status, started_at, completed_at) VALUES (?,?,?,?,?,?,?)",
+            "status, started_at, completed_at, assistant_message_id) VALUES (?,?,?,?,?,?,?,?)",
             (f"m-{sid}-{now_ms}-{query_source}", sid, "turn-1", query_source,
-             status, now_ms, None))
+             status, now_ms, None, f"msg-{sid}"))
         con.commit()
         con.close()
 
@@ -99,7 +99,7 @@ class ZcodeDbFixture:
         con.close()
 
     def add_part(self, sid: str, ptype="reasoning", text="", tool="",
-                 updated_ms=None):
+                 updated_ms=None, tool_input=None, call_id="call-1"):
         con = sqlite3.connect(self.db_path)
         now_ms = updated_ms if updated_ms is not None else int(
             time.time() * 1000)
@@ -108,6 +108,8 @@ class ZcodeDbFixture:
             data["text"] = text
         if tool:
             data["tool"] = tool
+            data["callID"] = call_id
+            data["state"] = {"status": "running", "input": tool_input or {}}
         con.execute(
             "INSERT INTO part (id, message_id, session_id, time_created, "
             "time_updated, data) VALUES (?,?,?,?,?,?)",
@@ -200,14 +202,38 @@ class ZCodeDesktopSourceTests(unittest.TestCase):
         # 实机取证：turn/model usage 是回合后统计表；流式期间只有
         # part.time_updated 实时前进 → WORKING/THINKING + 思考正文。
         now_ms = int(time.time() * 1000)
-        self.fx.add_session("s-live", updated_ms=now_ms)
-        self.fx.add_part("s-live", "reasoning", "正在统一气泡格式",
-                         updated_ms=now_ms - 2000)
+        cases = (
+            ("reasoning", "先核对气泡格式。" + "后续思考" * 120, "", None,
+             Phase.THINKING, "先核对气泡格式。"),
+            ("text", "正在解释解析结果", "", None, Phase.ANSWERING, "正在解释解析结果"),
+            ("tool", "", "Bash", {"command": "python build.py --target web",
+                                  "description": "不能把说明当命令"},
+             Phase.EXECUTING, "python build.py --target web"),
+            ("tool", "", "WebSearch", {"query": "ZCode part schema"},
+             Phase.SEARCHING, "ZCode part schema"),
+            ("tool", "", "Read", {"file_path": "/work/status.py"},
+             Phase.READING, "/work/status.py"),
+            ("tool", "", "Bash", {"description": "这只是目的说明"},
+             Phase.EXECUTING, ""),
+        )
+        for i, (ptype, text, tool, inputs, _phase, _summary) in enumerate(cases):
+            sid = f"s-live-{i}"
+            self.fx.add_session(sid, updated_ms=now_ms)
+            self.fx.add_part(sid, ptype, text, tool, updated_ms=now_ms - 2000,
+                             tool_input=inputs)
         snap = self._poll(self._source())
-        obs = snap.observations[snap.instances[0].key]
-        self.assertIs(obs.status, Status.WORKING)
-        self.assertIs(obs.phase, Phase.THINKING)
-        self.assertIn("气泡", obs.summary or "")
+        by_sid = {inst.logical_session_id: snap.observations[inst.key]
+                  for inst in snap.instances}
+        for i, (*_, phase, expected) in enumerate(cases):
+            with self.subTest(case=i):
+                obs = by_sid[f"s-live-{i}"]
+                self.assertIs(obs.status, Status.WORKING)
+                self.assertIs(obs.phase, phase)
+                self.assertTrue(obs.summary.startswith(expected))
+                if not expected:
+                    self.assertEqual(obs.summary, "")
+                self.assertNotIn("description", obs.summary)
+                self.assertLessEqual(len(obs.summary), 160)
 
     # ---- 基础：3 root tasks → 3 独立 target（AC-ZCODE-01 合成对照） ----
 

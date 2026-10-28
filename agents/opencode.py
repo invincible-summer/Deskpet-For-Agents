@@ -1,6 +1,6 @@
 """OpenCode 无插件只读监听 adapter（无插件监听 plan §三/P2）。
 
-上游事实（packages/core/src/session/sql.ts、store.ts，dev 86976449c40d）：
+上游事实（core/src/session/sql.ts、store.ts 与 schema/src/session-message.ts）：
   * 数据根：``<XDG_DATA_HOME|~/.local/share>/opencode``；DB 名
     ``opencode.db``（或渠道后缀 ``opencode-<channel>.db``）。
   * schema：``session_v2``（id/parent_id/directory/title/time_created/
@@ -37,7 +37,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from . import paths
-from .base import BaseWatcher
+from .base import BaseWatcher, classify_phase
 from .desktop import (
     DesktopSessionSource,
     DesktopSourceSnapshot,
@@ -62,7 +62,7 @@ from .sqlite_ro import (
     fingerprints_differ,
     stat_fingerprint,
 )
-from .summarize import summarize_text
+from .summarize import summarize_text, tool_detail
 
 _MAX_SESSIONS = 8
 _CATALOG_LIMIT = 32
@@ -86,6 +86,55 @@ _OPTIONAL_SESSION_COLUMNS = ("title", "parent_id", "time_idle",
                              "time_suspended", "time_archived",
                              "idle_outcome")
 
+# The same bounded projection is used by local SQLite and the WSL reader.
+# Select only the latest displayable assistant block, never tool output/native
+# metadata, and keep its leading text as the block grows during streaming.
+_MESSAGE_JSON = "CASE WHEN json_valid(m.data) THEN m.data ELSE '{}' END"
+_BLOCK_JSON = "CASE WHEN p.type = 'object' THEN p.value ELSE '{}' END"
+
+
+def _input_sql(keys: tuple[str, ...]) -> str:
+    """Fixed schema fields only; empty/scalar-type errors do not hide a fallback."""
+    return "COALESCE(" + ", ".join(
+        f"NULLIF(CASE WHEN json_type({_BLOCK_JSON}, '$.state.input.{key}') = 'text' "
+        f"THEN json_extract({_BLOCK_JSON}, '$.state.input.{key}') END, '')"
+        for key in keys) + ")"
+
+
+_BLOCK_COMMAND = _input_sql(("command", "cmd"))
+_BLOCK_QUERY = _input_sql(("query", "pattern", "q", "glob"))
+_BLOCK_PATH = _input_sql(("filePath", "file_path", "path", "url"))
+# Retain the known field context: a shell group beginning with '{' is a command,
+# not a damaged JSON envelope. At most two 256-character values cross the reader.
+_BLOCK_DETAIL = (
+    f"CASE WHEN {_BLOCK_COMMAND} IS NOT NULL THEN "
+    f"json_object('command', substr({_BLOCK_COMMAND}, 1, 256)) ELSE "
+    f"json_object('query', substr({_BLOCK_QUERY}, 1, 256), "
+    f"'path', substr({_BLOCK_PATH}, 1, 256)) END")
+_MESSAGE_ACTIVITY_SQL = (
+    f"CASE WHEN json_extract({_MESSAGE_JSON}, '$.type') = 'shell' THEN "
+    f"json_object('type', 'tool', 'name', 'shell', 'status', "
+    f"json_extract({_MESSAGE_JSON}, '$.status'), 'detail', "
+    f"json_object('command', substr(json_extract({_MESSAGE_JSON}, '$.command'), 1, 256))) ELSE "
+    "(SELECT json_object("
+    f"'type', json_extract({_BLOCK_JSON}, '$.type'), "
+    f"'text', CASE WHEN json_extract({_BLOCK_JSON}, '$.type') IN ('text', 'reasoning') "
+    f"THEN substr(json_extract({_BLOCK_JSON}, '$.text'), 1, 512) END, "
+    f"'name', substr(json_extract({_BLOCK_JSON}, '$.name'), 1, 96), "
+    f"'status', json_extract({_BLOCK_JSON}, '$.state.status'), "
+    f"'detail', {_BLOCK_DETAIL}) "
+    f"FROM json_each({_MESSAGE_JSON}, '$.content') p "
+    f"WHERE p.type = 'object' AND CAST(p.key AS INTEGER) < 64 "
+    f"AND json_extract({_BLOCK_JSON}, '$.type') IN ('tool', 'text', 'reasoning') "
+    f"ORDER BY CASE WHEN json_extract({_BLOCK_JSON}, '$.type') = 'tool' "
+    f"AND json_extract({_BLOCK_JSON}, '$.state.status') IN ('running', 'streaming') "
+    "THEN 1 ELSE 0 END DESC, CAST(p.key AS INTEGER) DESC LIMIT 1) END")
+_MESSAGE_FIELDS_SQL = (
+    f"COALESCE(json_extract({_MESSAGE_JSON}, '$.type'), "
+    f"json_extract({_MESSAGE_JSON}, '$.role')) AS role, "
+    f"substr(json_extract({_MESSAGE_JSON}, '$.text'), 1, 512) AS text, "
+    f"{_MESSAGE_ACTIVITY_SQL} AS activity")
+
 
 @dataclass(frozen=True)
 class OpenCodeFactsSnapshot:
@@ -94,7 +143,7 @@ class OpenCodeFactsSnapshot:
     plane_key: str
     authoritative: bool
     catalog: tuple = ()               # (id, directory, title, parent_id, time_updated_ms, ...)
-    messages: tuple = ()              # (session_id, max_time_updated_ms, role, text)
+    messages: tuple = ()              # (session_id, updated_ms, role, text, activity)
     diagnostics: tuple[str, ...] = ()
     observed_at: float = 0.0
 
@@ -202,12 +251,11 @@ class OpenCodeSchemaAdapter:
                                         "time_updated"))):
             return None
         if self.caps.has_columns("session_message", ("data",)):
-            role_expr = "substr(json_extract(data, '$.role'), 1, 24)"
-            text_expr = "substr(json_extract(data, '$.text'), 1, 256)"
+            fields = _MESSAGE_FIELDS_SQL
         else:
-            role_expr = text_expr = "NULL"
-        return (f"SELECT session_id, time_updated, {role_expr} AS role, "
-                f"{text_expr} AS text FROM session_message "
+            fields = "NULL AS role, NULL AS text, NULL AS activity"
+        return (f"SELECT session_id, time_updated, {fields} "
+                "FROM session_message m "
                 "WHERE time_created >= ? "
                 "ORDER BY time_created DESC LIMIT 16")
 
@@ -258,7 +306,7 @@ def _normalize_catalog_rows(rows, columns: tuple[str, ...]) -> tuple:
 
 
 def _normalize_message_rows(rows) -> tuple:
-    """session_message 新鲜行 → 每 session 最新一条 (sid, updated_ms, role, text)。"""
+    """Keep one bounded message projection per session, with old-row compatibility."""
     best: dict[str, list] = {}
     for row in rows or ():
         try:
@@ -273,13 +321,41 @@ def _normalize_message_rows(rows) -> tuple:
         except IndexError:
             role = ""
         try:
-            text = str(row[3] or "")[:256]
+            text = str(row[3] or "")[:512]
         except IndexError:
             text = ""
+        try:
+            activity = str(row[4] or "")[:4096]
+        except IndexError:
+            activity = ""
         cur = best.get(sid)
         if cur is None or updated > cur[1]:
-            best[sid] = [sid, updated, role, text]
+            best[sid] = [sid, updated, role, text, activity]
     return tuple(tuple(v) for v in best.values())
+
+
+def _message_activity(message: tuple | None) -> tuple[Phase, str]:
+    """Interpret only observed assistant content; a user prompt is never activity."""
+    if message is None or str(message[2] or "") not in {"assistant", "shell"}:
+        return Phase.THINKING, ""
+    try:
+        block = json.loads(message[4]) if len(message) > 4 and message[4] else None
+    except (TypeError, ValueError):
+        block = None
+    if isinstance(block, dict):
+        kind = block.get("type")
+        if kind == "tool":
+            if block.get("status") not in {"streaming", "running"}:
+                return Phase.THINKING, ""
+            detail = tool_detail(block.get("detail"), 160)
+            phase = classify_phase(str(block.get("name") or ""), detail)
+            return (phase if phase is not Phase.NONE else Phase.EXECUTING), detail
+        if kind in {"text", "reasoning"}:
+            phase = Phase.THINKING if kind == "reasoning" else Phase.ANSWERING
+            return phase, summarize_text(block.get("text"), 160)
+    # Historical data fixtures/clients used a plain assistant text field.
+    text = summarize_text(message[3], 160)
+    return (Phase.ANSWERING if text else Phase.THINKING), text
 
 
 class OpenCodeLocalReader:
@@ -502,12 +578,11 @@ try:
                 "PRAGMA table_info(session_message)")}
             if {"session_id", "time_created", "time_updated"} <= mcols:
                 if "data" in mcols:
-                    extras = (", substr(json_extract(data, '$.role'), 1, 24)"
-                              ", substr(json_extract(data, '$.text'), 1, 256)")
+                    extras = ", " + __MESSAGE_FIELDS_SQL__
                 else:
-                    extras = ", NULL, NULL"
+                    extras = ", NULL, NULL, NULL"
                 msql = ("SELECT session_id, time_updated" + extras +
-                        " FROM session_message WHERE time_created >= ?"
+                        " FROM session_message m WHERE time_created >= ?"
                         " ORDER BY time_created DESC LIMIT 16")
                 fresh = int(time.time() * 1000) - 90000
                 best = {}
@@ -519,7 +594,8 @@ try:
                     if cur is None or updated > cur[1]:
                         best[sid] = [sid, updated,
                                      str(row[2] or "")[:24],
-                                     str(row[3] or "")[:256]]
+                                     str(row[3] or "")[:512],
+                                     str(row[4] or "")[:4096]]
                 out["messages"] = list(best.values())[:16]
 except Exception as exc:
     out["error"] = type(exc).__name__
@@ -528,7 +604,7 @@ finally:
         con.close()
 out["sidecar_created"] = (not before) and sidecar_exists()
 sys.stdout.write(json.dumps(out, ensure_ascii=True))
-""".strip()
+""".strip().replace("__MESSAGE_FIELDS_SQL__", repr(_MESSAGE_FIELDS_SQL))
 
 
 class OpenCodeWslReader:
@@ -913,7 +989,8 @@ class OpenCodeRuntime:
         if idle_ms and idle_ms >= max(claim_ms, msg_ms):
             claim_ms = 0
             msg_fresh = False
-        text = str(message[3] or "") if message else ""
+        activity_phase, activity = (_message_activity(message) if msg_fresh
+                                    else (Phase.THINKING, ""))
         if pending_ok and sid in pending:
             # 可信实例的只读 pending 证据：唯一允许 WAITING 的来源
             obs.status = Status.WAITING
@@ -924,23 +1001,23 @@ class OpenCodeRuntime:
             obs.waiting_detail = pending[sid][:160]
         elif active_ok and sid in active:
             obs.status = Status.WORKING
-            obs.phase = Phase.THINKING
+            obs.phase = activity_phase
             obs.turn_active = True
             obs.confidence = Confidence.HIGH
-            obs.summary = summarize_text(text, 160) if text else "任务进行中"
+            obs.summary = activity
         elif msg_fresh:
             obs.status = Status.WORKING
-            obs.phase = Phase.THINKING
+            obs.phase = activity_phase
             obs.turn_active = True
             obs.confidence = Confidence.HIGH
-            obs.summary = summarize_text(text, 160) if text else "生成中"
+            obs.summary = activity
         elif (claim_ms and 0 <= now_ms - claim_ms
               <= int(_CLAIM_ORPHAN_SEC * 1000)):
             obs.status = Status.WORKING
             obs.phase = Phase.THINKING
             obs.turn_active = True
             obs.confidence = Confidence.MEDIUM
-            obs.summary = "任务进行中"
+            obs.summary = ""
         if obs.status in (Status.WAITING, Status.WORKING):
             return obs
         # The V2 catalog carries a bounded lifecycle outcome alongside

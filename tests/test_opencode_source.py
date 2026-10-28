@@ -20,6 +20,7 @@ from agents.models import (
     AgentSurface,
     Confidence,
     DesktopHost,
+    Phase,
     Status,
 )
 
@@ -304,6 +305,61 @@ class WatcherTests(unittest.TestCase):
         self.assertIs(
             runtime.observation_for_session(row, _NOW, message=stale).status,
             Status.UNKNOWN)
+        # Exercise the actual whitelist SQL used by both local and WSL readers.
+        from agents.sqlite_ro import SchemaCapabilities
+        caps = SchemaCapabilities(tables=frozenset({"session_message"}),
+                                  columns={"session_message": (
+                                      "session_id", "time_created", "time_updated", "data")})
+        adapter = opencode.OpenCodeSchemaAdapter(caps)
+        with sqlite3.connect(":memory:") as con:
+            con.execute("CREATE TABLE session_message (session_id TEXT, "
+                        "time_created INTEGER, time_updated INTEGER, data TEXT)")
+            for block, phase, expected in (
+                ({"type": "reasoning", "text": "先检查会话归属 " + "后续" * 300},
+                 Phase.THINKING, "先检查会话归属"),
+                ({"type": "text", "text": "正在读取文件"}, Phase.ANSWERING, "正在读取文件"),
+                ({"type": "tool", "name": "bash", "state": {"status": "running", "input": {
+                    "command": "git diff -- agents/", "description": "不要替代指令"},
+                    "output": "private-output"}}, Phase.EXECUTING, "git diff -- agents/"),
+                ({"type": "tool", "name": "web_search", "state": {"status": "running", "input": {
+                    "query": "WSL 会话绑定"}}}, Phase.SEARCHING, "WSL 会话绑定"),
+                ({"type": "tool", "name": "web_search", "state": {"status": "running", "input": {
+                    "command": "", "query": "空命令不能遮住搜索内容"}}},
+                 Phase.SEARCHING, "空命令不能遮住搜索内容"),
+                ({"type": "tool", "name": "bash", "state": {"status": "running", "input": {
+                    "command": "{ echo hello; }"}}}, Phase.EXECUTING, "{ echo hello; }"),
+                ({"type": "shell", "status": "running", "command": "{ echo shell; }"},
+                 Phase.EXECUTING, "{ echo shell; }"),
+                ([{"type": "tool", "name": "bash", "state": {"status": "running", "input": {
+                    "command": "sleep 30"}}},
+                  {"type": "tool", "name": "web_search", "state": {"status": "completed", "input": {
+                    "query": "already finished"}, "output": "private-output"}}],
+                 Phase.EXECUTING, "sleep 30"),
+                ({"type": "tool", "name": "read", "state": {"status": "running", "input": {
+                    "filePath": "agents/monitor.py"}}}, Phase.READING, "agents/monitor.py"),
+                ({"type": "tool", "name": "edit", "state": {"status": "running", "input": {
+                    "filePath": "agents/state.py"}}}, Phase.CODING, "agents/state.py"),
+                ({"type": "tool", "name": "bash", "state": {"status": "completed", "input": {
+                    "command": "old-command"}, "output": "private-output"}}, Phase.THINKING, ""),
+            ):
+                with self.subTest(expected=expected, phase=phase):
+                    data = (block if isinstance(block, dict) and block.get("type") == "shell"
+                            else {"type": "assistant", "content": block if isinstance(block, list)
+                                  else [block], "native": "private-metadata"})
+                    con.execute("DELETE FROM session_message")
+                    con.execute("INSERT INTO session_message VALUES (?,?,?,?)",
+                                ("ses_m", _NOW_MS - 2000, _NOW_MS - 1000, json.dumps(data)))
+                    messages = opencode._normalize_message_rows(
+                        con.execute(adapter.messages_sql(), (_NOW_MS - 90000,)).fetchall())
+                    obs = runtime.observation_for_session(row, _NOW, message=messages[0])
+                    self.assertIs(obs.phase, phase)
+                    self.assertTrue(obs.summary.startswith(expected))
+                    self.assertLessEqual(len(obs.summary), 160)
+                    self.assertNotIn("private", str(messages))
+                    self.assertNotIn("不要替代指令", obs.summary)
+        # A prompt/old message may prove activity, but must not become the action body.
+        user = ("ses_m", _NOW_MS - 1000, "user", "用户目标不是当前命令")
+        self.assertEqual(runtime.observation_for_session(row, _NOW, message=user).summary, "")
 
     def test_idle_newer_than_claim_suppresses_activity(self):
         # time_idle 晚于 claim/最新消息：turn 已结束，残留 claim 与旧消息
