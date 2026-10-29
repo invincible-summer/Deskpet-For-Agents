@@ -93,7 +93,7 @@ annotated tag -> optional explicit GitHub Release**.
 Source/tag cadence and binary-Release cadence are intentionally separate. DeskPet does
 **not** publish a Portable Release for every source patch or tag.
 
-The current source milestone is **4.3.1**. It remains source-only until an accepted
+The current source milestone is **4.3.2**. It remains source-only until an accepted
 annotated tag and any explicitly requested Portable distribution are produced.
 
 A formal GitHub Release is normally cut when a meaningful milestone has accumulated

@@ -123,8 +123,8 @@ class ReleaseLayoutTests(unittest.TestCase):
     def test_version_module_is_single_source(self):
         from pet.version import APP_LABEL, APP_NAME, APP_VERSION
         self.assertEqual(APP_NAME, "DeskPet")
-        self.assertEqual(APP_VERSION, "4.3.1")
-        self.assertEqual(APP_LABEL, "DeskPet V4.3.1")
+        self.assertEqual(APP_VERSION, "4.3.2")
+        self.assertEqual(APP_LABEL, "DeskPet V4.3.2")
         import pet.dashboard as dashboard
         self.assertEqual(dashboard.APP_VERSION, APP_LABEL)
 

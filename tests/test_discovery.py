@@ -970,6 +970,17 @@ class WindowsInventoryTests(unittest.TestCase):
         self.assertEqual(inv.terminal_instances, ())
         self.assertEqual(inv.desktop_hosts, ())
 
+    def test_codex_sandbox_service_is_not_an_agent_candidate(self):
+        # Codex's Windows sandbox service may be alive outside ChatGPT's tree;
+        # it must not create a terminal target or an unattributed warning.
+        inv = self._scan([
+            (33616, _EXPLORER, "codex-windows-sandbox-service.exe", [],
+             1001.5, "C:\\Program Files\\Codex\\codex-windows-sandbox-service.exe"),
+        ])
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertEqual(inv.desktop_hosts, ())
+        self.assertEqual(inv.diagnostics, ())
+
     def test_codex_gui_host_not_emitted_as_terminal_agent(self):
         # 实机形态：ChatGPT.exe(OpenAI.Codex 包) + codex.exe runtime 子进程。
         # 4.3.1 会把 codex.exe 误判成 CLI；v4.4 折叠为一个 Codex DesktopHost。

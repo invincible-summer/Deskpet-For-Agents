@@ -338,6 +338,15 @@ _CHATGPT_CODEX_PKG_MARK = "openai.codex"
 _CODEX_PROC_MARK = ("codex", ".exe")
 # Codex app-server/daemon 子命令（cmdline 明确开关名）
 _CODEX_HELPER_ARGS = frozenset({"app-server", "app-server-daemon", "daemon"})
+# Codex Desktop ships a few process-name-only support binaries.  They do not
+# own user rollouts and may run outside the ChatGPT process tree (for example
+# the Windows sandbox service); treating every ``codex*.exe`` as a CLI
+# candidate creates a false "unattributed Codex" listener/diagnostic.
+_CODEX_NON_AGENT_BASENAMES = frozenset({
+    "codex-windows-sandbox-service.exe",
+    "codex-code-mode-host.exe",
+    "codex-computer-use-swift.exe",
+})
 # ZCode helper：zcode.cjs 入口 + CLI/host-local 辅助进程名
 _ZCODE_HELPER_CMD_MARKS = ("zcode.cjs",)
 _ZCODE_HELPER_BASENAMES = frozenset({"zcode-cli.exe", "zcode-host-local.exe"})
@@ -463,7 +472,8 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
             else:
                 opencode_candidates.append(pid)
         elif base.startswith(_CODEX_PROC_MARK[0]) and base.endswith(_CODEX_PROC_MARK[1]):
-            codex_gu.append(pid)
+            if base not in _CODEX_NON_AGENT_BASENAMES:
+                codex_gu.append(pid)
 
     # OpenCode.exe 二义消解（无插件监听 plan §三：通用进程不能冒充桌面宿主）：
     # 桌面宿主必须有 Electron 佐证——同 exe --type= 后代或 opencode-cli.exe
@@ -611,6 +621,9 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
         base = _basename_of(inf)
         args = _args_of(inf)
         if base.startswith("codex") and base.endswith(".exe"):
+            if base in _CODEX_NON_AGENT_BASENAMES:
+                roles[pid] = ROLE_OTHER
+                continue
             if is_codex_maintenance(args):
                 roles[pid] = ROLE_OTHER
                 continue
