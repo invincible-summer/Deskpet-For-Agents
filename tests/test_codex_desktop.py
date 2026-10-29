@@ -160,6 +160,22 @@ class CodexDesktopSourceTests(unittest.TestCase):
         for obs in snap.observations.values():
             self.assertEqual(obs.status, Status.WORKING)
 
+    def test_large_live_rollout_reads_current_tail_on_first_poll(self):
+        # Desktop source owns its reader directly (without BaseWatcher), so a
+        # large rollout must start from a bounded tail.  Replaying from byte
+        # zero delays current events and can make a live Desktop task look
+        # dead before it is ever admitted.
+        path = self.fx.rollout_dir() / "rollout-large.jsonl"
+        with path.open("w", encoding="utf-8") as f:
+            f.write("{}\n" * (600 * 1024 // 3))
+            for event in active_rollout("large"):
+                f.write(json.dumps(event) + "\n")
+        self.fx.add_thread(_thread_row("large", str(path)))
+        snap = self._poll(self._source())
+        self.assertEqual(len(snap.instances), 1)
+        obs = snap.observations[snap.instances[0].key]
+        self.assertEqual(obs.status, Status.WORKING)
+
     def test_duplicate_catalog_rows_for_one_rollout_produce_one_target(self):
         path = self.fx.write_rollout("rollout-alias.jsonl",
                                      active_rollout("thread-new"))
@@ -198,7 +214,7 @@ class CodexDesktopSourceTests(unittest.TestCase):
     def test_windows_desktop_user_without_has_user_event_is_monitored(self):
         path = self.fx.write_rollout('desktop.jsonl', active_rollout('desktop'))
         self.fx.add_thread(_thread_row('desktop', path,
-                                      originator='Codex Desktop', source='vscode',
+                                      originator='codex-app-server', source='daemon',
                                       has_user_event=0, thread_source='user'))
         snap = self._poll(self._source())
         self.assertEqual(len(snap.instances), 1)

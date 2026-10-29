@@ -112,10 +112,13 @@ class WindowsExitWatcherTests(unittest.TestCase):
         self.fail(f"remove command for {key} not drained in time")
 
     def test_register_missing_pid_fails_closed(self):
-        # 不存在的 PID：OpenProcess 失败 → False，且绝不产生退出事件
-        self.assertFalse(self.watcher.register(_instance(99999999)))
+        # census 与注册之间进程退出时没有句柄可等待；只读 PID 复核会
+        # 发布一次 exact incarnation 退出候选，避免死 Agent 长期残留。
+        self.assertTrue(self.watcher.register(_instance(99999999)))
         self.assertEqual(self.watcher.watched_count(), 0)
-        self.assertEqual(self.watcher.drain(), [])
+        events = self.watcher.drain()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].pid, 99999999)
 
     def test_capacity_cap_returns_false(self):
         watcher = WindowsExitWatcher(max_watched=1)

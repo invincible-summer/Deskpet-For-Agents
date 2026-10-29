@@ -33,6 +33,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import paths
+from .base import LARGE_FILE_BYTES, LARGE_FILE_TAIL
 from .codex import CodexFile
 from .desktop import (
     DesktopSessionSource,
@@ -64,6 +65,7 @@ _DESKTOP_ORIGINATORS = frozenset({
     "codex_desktop", "codex_chatgpt_desktop", "codex_work_desktop",
     "codex_atlas",
     "codex desktop",  # Windows Desktop state_5.sqlite 实机来源名称
+    "codex-app-server",  # current managed remote-control daemon
 })
 
 
@@ -561,6 +563,16 @@ class CodexDesktopSource(DesktopSessionSource):
             if not self._admission_probe_wanted(sess, size):
                 return None
             sess.file = CodexFile(sess.rollout_path)
+            # Desktop source does not pass through BaseWatcher.refresh_files,
+            # so it must establish the same bounded tail baseline itself.
+            # Starting at byte zero made a large live rollout spend several
+            # polls replaying old history; the old active turn then expired
+            # before the reader ever reached the current events, which looked
+            # like the Desktop host was not being monitored at all.
+            if not sess.rollout_path.lower().endswith((".jsonl.zst", ".zst")):
+                sess.file.tailer.pos = (
+                    0 if size < LARGE_FILE_BYTES
+                    else max(0, size - LARGE_FILE_TAIL))
         sess.file.poll_lines()
         obs = sess.file.observation(now, self._cfg)
         if obs is None:

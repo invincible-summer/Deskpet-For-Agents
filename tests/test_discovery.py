@@ -882,10 +882,15 @@ def _proc_rows(rows):
     """(pid, ppid, name, cmdline, create_time, exe) → 假 psutil process_iter。"""
     import types
     out = []
-    for pid, ppid, name, cmd, ct, exe in rows:
+    for row in rows:
+        if len(row) == 6:
+            pid, ppid, name, cmd, ct, exe = row
+            status = "running"
+        else:
+            pid, ppid, name, cmd, ct, exe, status = row
         out.append(types.SimpleNamespace(info={
             "pid": pid, "ppid": ppid, "name": name, "cmdline": list(cmd),
-            "create_time": ct, "exe": exe}))
+            "create_time": ct, "exe": exe, "status": status}))
     return out
 
 
@@ -951,6 +956,18 @@ class WindowsInventoryTests(unittest.TestCase):
         ])
         self.assertEqual([i.kind for i in inv.terminal_instances],
                          [AgentKind.CODEX])
+        self.assertEqual(inv.desktop_hosts, ())
+
+    def test_dead_process_row_never_becomes_cli_or_desktop_host(self):
+        # A stale psutil row must not create a watcher registration.  This is
+        # the last line of defence when a process exits between two native
+        # census calls and a compatibility layer still reports the row once.
+        inv = self._scan([
+            (100, _EXPLORER, "WindowsTerminal.exe", ["wt"], 1000.0, ""),
+            (101, 100, "codex.exe", ["codex"], 1001.5,
+             "C:\\Users\\u\\.codex\\bin\\codex.exe", "dead"),
+        ])
+        self.assertEqual(inv.terminal_instances, ())
         self.assertEqual(inv.desktop_hosts, ())
 
     def test_codex_gui_host_not_emitted_as_terminal_agent(self):
@@ -1228,6 +1245,8 @@ class DaemonFormAgentTests(unittest.TestCase):
             "/bin/codex app-server daemon pid-update-loop"))
         self.assertFalse(discovery_mod.is_daemon_form("/bin/codex"))
         self.assertFalse(discovery_mod.is_daemon_form(""))
+        self.assertTrue(discovery_mod.is_codex_internal_server_process(
+            "/bin/codex exec-server --remote https://example"))
 
     def test_detached_daemon_promoted_to_unknown_not_filtered(self):
         rows = {
@@ -1257,12 +1276,14 @@ class DaemonFormAgentTests(unittest.TestCase):
                 with unittest.mock.patch("psutil.process_iter",
                                          return_value=_proc_rows(rows)):
                     inv = scan_windows_inventory()
-                self.assertEqual([i.pid for i in inv.terminal_instances],
-                                 [20] if with_runtime else [])
+                self.assertEqual(inv.terminal_instances, ())
+                self.assertEqual(
+                    [host.pid for host in inv.desktop_hosts],
+                    [20] if with_runtime else [])
         self.assertIsNone(WslProcessProbe._match_agent(
             "codex", "/bin/codex app-server daemon pid-update-loop"))
-        self.assertEqual(WslProcessProbe._match_agent(
-            "codex", "/bin/codex app-server --remote-control"), AgentKind.CODEX)
+        self.assertIsNone(WslProcessProbe._match_agent(
+            "codex", "/bin/codex app-server --remote-control"))
 
     def test_attached_still_wins_over_daemon_evidence(self):
         rows = {
@@ -1272,9 +1293,9 @@ class DaemonFormAgentTests(unittest.TestCase):
         state = discovery_mod.canonical_terminal_attachment(30, (), rows)
         self.assertIs(state, TerminalAttachment.ATTACHED)
 
-    def test_windows_daemon_form_is_terminal_agent(self):
-        # Windows 侧：无 terminal ancestry 的 codex.exe，带 daemon 自证据
-        # 时仍应成为 terminal agent（app-server 刻意脱离控制台）
+    def test_standalone_windows_daemon_is_desktop_host_not_terminal_agent(self):
+        # Windows 侧：孤立 app-server 可能在 ChatGPT/Codex 窗口退出后继续
+        # 存活；它必须进入有界 Desktop source，不能重新打开旧 CLI rollout。
         from agents.discovery import scan_windows_inventory
         rows = [
             (700, _EXPLORER, "codex.exe",
@@ -1284,8 +1305,50 @@ class DaemonFormAgentTests(unittest.TestCase):
         with unittest.mock.patch("psutil.process_iter",
                                  return_value=_proc_rows(rows)):
             inv = scan_windows_inventory()
-        self.assertEqual([i.kind for i in inv.terminal_instances],
-                         [AgentKind.CODEX])
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertEqual(len(inv.desktop_hosts), 1)
+        self.assertIs(inv.desktop_hosts[0].kind, AgentKind.CODEX)
+        self.assertEqual(inv.desktop_hosts[0].pid, 700)
+
+    def test_internal_exec_server_never_becomes_terminal_agent(self):
+        # Desktop remote execution child may survive its GUI parent; it is
+        # explicitly non-interactive and must not revive the CLI watcher.
+        from agents.discovery import scan_windows_inventory
+        rows = [
+            (701, 20, "codex.exe",
+             ["codex.exe", "exec-server", "--remote", "https://example"],
+             7001.0, "C:/Users/u/.codex/bin/codex.exe"),
+            (20, _EXPLORER, "WindowsTerminal.exe", ["wt"], 7000.0, ""),
+        ]
+        with unittest.mock.patch("psutil.process_iter",
+                                 return_value=_proc_rows(rows)):
+            inv = scan_windows_inventory()
+        self.assertEqual(inv.terminal_instances, ())
+        self.assertEqual(inv.desktop_hosts, ())
+
+    def test_gui_exit_does_not_promote_orphan_server_to_cli_agent(self):
+        # ChatGPT/Codex host disappears while its app-server child remains.
+        # The second census must keep the service on the Desktop data plane;
+        # it must never become a new terminal Codex incarnation.
+        from agents.discovery import scan_windows_inventory
+        first = [
+            (200, _EXPLORER, "ChatGPT.exe", ["ChatGPT.exe"], 2000.0,
+             _CHATGPT_CODEX_EXE),
+            (201, 200, "codex.exe",
+             ["codex.exe", "app-server", "--remote-control"], 2001.0,
+             "C:/Users/u/.codex/bin/codex.exe"),
+        ]
+        second = [first[1]]
+        with unittest.mock.patch("psutil.process_iter",
+                                 return_value=_proc_rows(first)):
+            before = scan_windows_inventory()
+        with unittest.mock.patch("psutil.process_iter",
+                                 return_value=_proc_rows(second)):
+            after = scan_windows_inventory()
+        self.assertEqual(before.terminal_instances, ())
+        self.assertEqual(after.terminal_instances, ())
+        self.assertEqual([host.pid for host in before.desktop_hosts], [200])
+        self.assertEqual([host.pid for host in after.desktop_hosts], [201])
 
     def test_windows_unattributed_codex_still_dropped(self):
         # 无 daemon 自证据、无 terminal ancestry 的 codex.exe 仍被拒绝

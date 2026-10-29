@@ -51,6 +51,40 @@ WAIT_OBJECT_0 = 0
 MAX_WATCHED = 16
 
 
+def _pid_incarnation_exists(pid: int, token: str) -> bool | None:
+    """Return False only for a provably missing/reused PID incarnation.
+
+    ``OpenProcess(SYNCHRONIZE)`` can fail for a live protected process, so the
+    fallback must never turn an access error into an exit fact.  ``None`` is
+    therefore the conservative result for unreadable metadata; ``False`` is
+    reserved for ``NoSuchProcess`` or a readable create-time mismatch.
+    """
+    if not token:
+        return None
+    try:
+        import psutil
+        proc = psutil.Process(int(pid))
+        if not proc.is_running():
+            return False
+        try:
+            expected = float(token)
+            actual = float(proc.create_time())
+        except (TypeError, ValueError, OSError, psutil.Error):
+            return None
+        return abs(actual - expected) <= 0.001
+    except Exception as exc:
+        # NoSuchProcess is the only definitive negative.  Keep this branch
+        # explicit so AccessDenied/other transient psutil failures stay
+        # fail-closed.
+        try:
+            import psutil
+            if isinstance(exc, psutil.NoSuchProcess):
+                return False
+        except Exception:
+            pass
+        return None
+
+
 @dataclass(frozen=True)
 class ProcessExitEvent:
     """一个已 signal 的进程句柄对应的候选退出事件。
@@ -186,8 +220,10 @@ class WindowsExitWatcher:
     def register(self, instance) -> bool:
         """注册一个 Windows Agent 实例；句柄打不开/超上限返回 False。
 
-        返回 False 绝不代表进程已退出——退出判定只能来自 signal 事件
-        或 authoritative census（fail-closed）。
+        返回 False 代表句柄不可用且 liveness fallback 无法给出结论；
+        若 fallback 明确确认该 PID/incarnation 已不存在，则发布一个与
+        native signal 等价的候选退出事件。Monitor 仍会做 exact key/token
+        核对后才提交退出。
         调用线程 OpenProcess 后立即把所有权转移给 _pending_add；转移后
         本线程绝不再 close 该 handle。
         """
@@ -218,6 +254,21 @@ class WindowsExitWatcher:
         handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
         if not handle:
             self.open_failures += 1
+            # A process can terminate between the census and this registration
+            # call.  In that race there is no wait handle to signal, so a
+            # stale Agent would otherwise survive until the next successful
+            # census (or forever while the census is degraded).  Use one
+            # read-only PID/create-time check only on this failure path; an
+            # inaccessible live process remains fail-closed and is left to the
+            # authoritative census instead of being guessed dead.
+            if _pid_incarnation_exists(pid, token) is False:
+                with self._lock:
+                    self._logical_keys.discard(key)
+                    if not any(event.key == key for event in self._events):
+                        self._events.append(ProcessExitEvent(
+                            key=key, pid=pid, process_token=token,
+                            timestamp=time.time()))
+                return True
             with self._lock:
                 self._logical_keys.discard(key)
             return False

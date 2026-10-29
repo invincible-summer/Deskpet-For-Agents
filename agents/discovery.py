@@ -46,14 +46,21 @@ _PS_FORMAT = "pid=,ppid=,sid=,pgid=,tpgid=,tty=,uid=,etimes=,stat=,comm=,args="
 # 绝不作为 live Agent（v4plan §4.4）。S/T/D/R/I 等只说明当前没跑 CPU。
 _DEAD_STATES = frozenset("ZXx")
 
+# psutil can return a process row during the short interval between a native
+# process terminating and the next census.  Windows normally has no zombie
+# state, but the same API is also used by compatibility shims and test hosts
+# that expose ``dead``/``zombie`` explicitly.  Such rows are never live Agent
+# evidence and must not be handed to a watcher or exit-handle registry.
+_DEAD_PROCESS_STATUSES = frozenset({"dead", "zombie", "terminated"})
+
 # 官方“常驻服务形态”的进程自证据（2026-10 实机取证）：
 #   Codex `codex app-server --remote-control --listen unix://…` 与
 #   `codex app-server daemon pid-update-loop` 是官方 remote-control
 #   常驻 runtime（.research/codex-upstream.md §8.3 记录了
 #   $CODEX_HOME/app-server-control / app-server-daemon 官方路径），
 #   刻意脱离 controlling TTY（tty=? / tpgid=-1）。这类进程的 DETACHED
-#   是设计意图而非孤儿，必须保留为可观察 Agent；没有任何 daemon 自证据
-#   的 DETACHED 仍按孤儿过滤。
+#   是服务形态证据，但服务本身归入 Desktop data host，不得成为终端
+#   Agent；没有任何 daemon 自证据的 DETACHED 仍按孤儿过滤。
 _DAEMON_FORM_MARKS = (
     "app-server",
     "app-server-daemon",
@@ -102,12 +109,39 @@ def classify_ps_terminal_attachment(tty: str, tpgid: int) -> TerminalAttachment:
 def is_daemon_form(args) -> bool:
     """命令行是否声明官方常驻服务形态（2026-10 实机取证）。
 
-    这类进程刻意脱离 controlling TTY，因此它的 DETACHED 不是孤儿证据。
+    这类进程刻意脱离 controlling TTY，因此它的 DETACHED 是服务形态证据。
     只用明确的自证据标记，绝不按进程名猜——普通 CLI 被 detach 时
-    仍然要按孤儿过滤。
+    仍然要按孤儿过滤；调用方决定将服务归入 Desktop data host。
     """
     low = str(args or "").lower()
     return any(mark in low for mark in _DAEMON_FORM_MARKS)
+
+
+def is_codex_service_process(args) -> bool:
+    """Whether this is a Codex app-server service, rather than a user CLI.
+
+    A detached app-server can outlive the ChatGPT/Codex window that launched
+    it. It is a data-plane host and must never be promoted to a terminal Agent
+    when its parent GUI disappears; otherwise the old rollout reader survives
+    a dead desktop process. Maintenance publishers are excluded separately.
+    """
+    return is_daemon_form(args) and not is_codex_maintenance(args)
+
+
+def is_codex_internal_server_process(args) -> bool:
+    """Whether a Codex binary is an internal non-terminal server child.
+
+    ``exec-server --remote`` is launched by the Desktop app for remote
+    execution.  It is not a user CLI turn and can outlive its GUI parent; if
+    it inherits a terminal ancestor, treating it as Codex CLI revives the
+    wrong rollout after the real process has stopped.
+    """
+    try:
+        argv = shlex.split(args) if isinstance(args, str) else list(args or ())
+    except ValueError:
+        return False
+    commands = [str(arg).casefold() for arg in argv]
+    return "exec-server" in commands
 
 
 def is_codex_maintenance(args) -> bool:
@@ -475,6 +509,20 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
         if pid in codex_host_roots:
             continue
         args = _args_of(info(pid))
+        if is_codex_maintenance(args):
+            continue
+        if is_codex_internal_server_process(args):
+            continue
+        # A standalone app-server is a bounded Desktop data host. If the
+        # original GUI is gone, retaining it as a terminal Agent would revive
+        # the last rollout through CodexWatcher. If it is already inside a
+        # recognized GUI tree, the existing GUI root owns it as a helper.
+        if is_codex_service_process(args):
+            if any(a in _desktop_mains
+                   for a in _ancestor_chain(pid, parent_by_pid)):
+                continue
+            codex_host_roots.append(pid)
+            continue
         if _is_electron_helper(args) or _is_codex_helper_cmd(args):
             continue
         if any(basename(a) == "codex.exe"
@@ -566,14 +614,20 @@ def _classify_windows_inventory(info_by_pid: dict[int, dict],
             if is_codex_maintenance(args):
                 roles[pid] = ROLE_OTHER
                 continue
+            if is_codex_internal_server_process(args):
+                roles[pid] = ROLE_OTHER
+                continue
             # CLI 判定严格于 4.3.1 的宽 name 匹配：必须终端 ancestry 或
             # 控制台宿主证据；explorer/未知 ancestry 的 codex.exe 不再
             # 冒充 CLI（避免桌面宿主 runtime 误报）。
-            # v4.4.1 例外：官方 daemon/app-server 常驻形态自带确凿自证据
-            # （刻意脱离控制台），不再要求 terminal ancestry——否则
-            # `codex app-server --remote-control` 整组 Agent 会被漏报。
-            if is_daemon_form(args):
-                roles[pid] = ROLE_TERMINAL_AGENT
+            # v4.4.1：官方 daemon/app-server 常驻形态自带确凿自证据，
+            # 但它是 Desktop data host，不是 terminal Agent；否则宿主窗口
+            # 退出后孤立服务会重新打开旧 rollout。
+            if is_codex_service_process(args):
+                # Service roots are added to codex_host_roots above. This
+                # guard protects unusual census ordering and keeps them out
+                # of the terminal watcher if their parent vanished.
+                roles[pid] = ROLE_CODEX_DESKTOP_HOST
             elif _terminal_ancestry(pid) or _has_conhost_child(
                     pid, parent_by_pid, info_by_pid):
                 roles[pid] = ROLE_TERMINAL_AGENT
@@ -681,7 +735,8 @@ def scan_windows_inventory() -> WindowsRuntimeInventory:
 
     try:
         procs = list(psutil.process_iter(
-            attrs=["pid", "name", "cmdline", "create_time", "ppid", "exe"]))
+            attrs=["pid", "name", "cmdline", "create_time", "ppid", "exe",
+                   "status"]))
     except Exception as exc:
         raise ProbeUnavailable(f"process_iter failed: {exc!r}") from exc
 
@@ -691,6 +746,9 @@ def scan_windows_inventory() -> WindowsRuntimeInventory:
         try:
             pid = p.info["pid"]
             if pid == _SELF_PID:
+                continue
+            status = str(p.info.get("status") or "").strip().casefold()
+            if status in _DEAD_PROCESS_STATUSES:
                 continue
             parent_by_pid[pid] = int(p.info.get("ppid") or 0)
             info_by_pid[pid] = p.info
@@ -1148,7 +1206,9 @@ class WslProcessProbe:
         if re.search(r"(^|/)claude( |$|\.)", low) or "claude-code" in low or "@anthropic-ai/claude-code" in low:
             return AgentKind.CLAUDE
         if re.search(r"(^|/)codex( |$|\.)", low) or low.startswith("codex ") or "codex-x86_64" in low or "codex-aarch64" in low:
-            if is_codex_maintenance(args):
+            if (is_codex_maintenance(args)
+                    or is_codex_service_process(args)
+                    or is_codex_internal_server_process(args)):
                 return None
             return AgentKind.CODEX
         if "kimi" in low and ("kimi-cli" in low or "/kimi" in low or low.startswith("kimi") or " kimi " in low):

@@ -4,10 +4,10 @@ DeskPet 使用 Semantic Versioning 2.0.0。版本 tag 与 GitHub Release 的关�
 [VERSIONING.md](VERSIONING.md)。本文件维护每个可识别版本新增了什么功能、
 修复了什么问题，以及其分发状态。
 
-## Unreleased — v4.3.0 监听、仪表盘与活动呈现升级
+## Unreleased — v4.3.1 Codex 监听稳定性修复
 
-后续两行活动解析与原创图标修订：Windows Python 3.12 完整套件集中运行一次，
-**919 项通过**；四项阻塞 benchmark、编译检查和 diff 检查通过。详见
+Codex 监听补正后，Windows Python 3.12 完整套件集中运行一次，**923 项通过**；
+相关阻塞 benchmark、编译检查和 diff 检查通过。详见
 [两行活动与图标验收](tests/ACCEPTANCE-activity-icon.md)。
 
 状态：**2026-10-27 的监听生命周期、ZCode WSL、仪表盘与气泡修订完成源码验收。
@@ -18,7 +18,7 @@ Windows Python 3.12 完整套件 916 项通过（此前 951 项，净减少 35 �
 [本轮验收记录](tests/ACCEPTANCE-monitoring-dashboard.md)。**
 此前用户确认 Codex、DSH、ZCode 从应用自身托盘隐藏后均可正常唤起交互；反复
 真实托盘、P95/RSS/CPU 专项与编译产物验收仍需完成。
-按 SemVer 属于向后兼容的 MINOR 功能；源码版本已调整为 4.3.0，GitHub Release
+按 SemVer 属于向后兼容的 PATCH 修复；源码版本已调整为 4.3.1，GitHub Release
 仍待真实机器验收后单独决定。
 
 ### 新增
@@ -28,8 +28,16 @@ Windows Python 3.12 完整套件 916 项通过（此前 951 项，净减少 35 �
   generation 事件和 pi/Claude 的空会话过滤；未知 schema 继续降级为
   UNKNOWN，不写入 Agent 数据。
 
-### 修复（v4.3.0 监听与桌面唤起可靠性）
+### 修复（v4.3.1 Codex 监听与桌面唤起可靠性）
 
+- 修复 Codex 桌面宿主退出后遗留的 `app-server --remote-control` 被重新归类为
+  终端 Agent、继续打开旧 rollout 的问题。独立 app-server 现在作为数据宿主进入
+  有界 Desktop source，维护进程和 WSL app-server 服务不会再创建 CLI 监听目标。
+- 修复 Codex CLI 退出竞态：Windows 的 `dead/zombie/terminated` 进程行不再进入
+  监听器；句柄注册失败时只在明确确认 PID/创建时间代次已消失时发布一次退出候选，
+  并排除 Desktop 的 `exec-server --remote` 内部子进程，避免旧 CLI 目标残留或重复监听。
+- 修复 Codex Desktop 大型 rollout 首轮从文件头回放导致当前活动迟迟读不到、被孤儿租约
+  清掉的问题；现在首轮从有界尾部读取，桌面活动可以及时进入监听。
 - 所有受支持 harness 统一提取真实命令、思考开头与搜索内容。活动固定两行、
   超长时只省略尾部；流式分片保留开头，工具输出和目的说明不会冒充命令。
   补齐 ZCode 本地/WSL、OpenCode、DSH、pi/Kimi 的正文投影和搜索状态标签。

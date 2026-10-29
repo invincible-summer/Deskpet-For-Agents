@@ -38,7 +38,7 @@ annotations live only in this file, not in source headers.
 | Agent | Aligned upstream | Evidence date |
 | --- | --- | --- |
 | ZCode | 0.17.0 (live `db.sqlite` `session.version`); zai-org/ZCode main @ 3c5b227649371507ddc4eb46ac5133afe6db1cab (`ToolPart.state.input`, `ReasoningPart.text`, exact message/call attribution) | 2026-10-27 |
-| Codex | 0.164.0-alpha.11.1 (live `state_5.sqlite` `cli_version`); openai/codex main @ b89952d582beaae3af3ddd7b679286cbb094f8b9 (`ReasoningContentDeltaEvent`, `WebSearchAction`) | 2026-10-27 |
+| Codex | 0.164.0-alpha.11.1 (live `state_5.sqlite` `cli_version`); openai/codex main @ f276b82185f021e7b8d532a3851413bc79a67594 (`app-server-daemon` PID/start-time lifecycle, `ReasoningContentDeltaEvent`, `WebSearchAction`) | 2026-10-29 |
 | OpenCode | anomalyco/opencode dev @ 115113931c7a6957ca4325a37fbcdd2936edde79 (`session_v2` / `session_message`; assistant content text/reasoning/tool blocks, execution claim) | 2026-10-27 |
 | DSH | deepseek-ai/deepseek-harness master @ 22ddee379240 (session.vN.jsonl[.zstd], `tool/call.arguments`, `assistant/message` content) | 2026-10-27 |
 | pi | badlogic/pi-mono main @ 842c73170a3658d4e3b39fcc84690211ed503e09 (session JSONL, `ThinkingContent.thinking` / `ToolCall.arguments`) | 2026-10-27 |

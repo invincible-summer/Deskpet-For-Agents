@@ -4,5 +4,5 @@
 `v{APP_VERSION}`; GitHub Releases are published separately according to VERSIONING.md.
 """
 APP_NAME = "DeskPet"
-APP_VERSION = "4.3.0"
+APP_VERSION = "4.3.1"
 APP_LABEL = f"{APP_NAME} V{APP_VERSION}"

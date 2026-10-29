@@ -21,9 +21,32 @@ sources（5000 ticks）、Presentation、UI architecture。`compileall` 和
 只读 SQL 仍采用固定字段、行数和文本上限，使用既有事实刷新时机；没有新增
 轮询、Hook、控制连接或向 Agent 数据写入。
 
+## Codex dead-process follow-up — 2026-10-29
+
+补充修复了 ChatGPT/Codex 宿主退出后遗留 `codex app-server --remote-control`
+被下一次 census 重新提升为终端 Agent 的问题。孤立 app-server 现在保持在
+Desktop data host 数据面，维护进程和 WSL app-server 服务不会创建 CLI watcher
+目标；Desktop source 仍按 originator、rollout 活跃证据和有界 orphan TTL 决定
+是否显示会话。
+
+本次集中复验：完整套件 **923 tests / 97.501s / OK**；Desktop sources
+5000 ticks **16.4s / BENCHMARK OK**，Monitor 5000 ticks **10.8s / BENCHMARK OK**；
+discovery/Codex Desktop/WindowsExitWatcher **123 项**聚焦回归通过；compileall 与
+`git diff --check` 通过。新增回归覆盖 GUI 退出后孤立服务、独立 daemon host、
+维护进程、WSL 服务过滤、dead process 行、缺失 PID 退出候选、内部 exec-server
+过滤、大型 rollout 首轮尾部读取，以及 `codex-app-server` originator 的只读
+threads 读取。
+
 ## 上游字段证据
 
-- [Codex protocol](https://github.com/openai/codex/blob/b89952d582beaae3af3ddd7b679286cbb094f8b9/codex-rs/protocol/src/protocol.rs)：reasoning delta 的 item/channel 与 WebSearchEnd；[models](https://github.com/openai/codex/blob/b89952d582beaae3af3ddd7b679286cbb094f8b9/codex-rs/protocol/src/models.rs)：reasoning summary、WebSearchAction。
+- [Codex protocol](https://github.com/openai/codex/blob/f276b82185f021e7b8d532a3851413bc79a67594/codex-rs/protocol/src/protocol.rs)：reasoning delta 的 item/channel 与 WebSearchEnd；[models](https://github.com/openai/codex/blob/f276b82185f021e7b8d532a3851413bc79a67594/codex-rs/protocol/src/models.rs)：reasoning summary、WebSearchAction；[app-server daemon](https://github.com/openai/codex/blob/f276b82185f021e7b8d532a3851413bc79a67594/codex-rs/app-server-daemon/README.md)：PID/start-time 生命周期。
+
+### CLI 残留与 Desktop 首轮读取补正
+
+- Windows census 现在丢弃 `dead`/`zombie`/`terminated` 进程行；watcher 句柄注册若遇到进程退出竞态，只在只读 PID+创建时间复核明确确认该代次消失时发出一次退出候选，仍由 Monitor 做 exact key/token 核对。
+- Codex Desktop 的大 rollout 首轮从有界尾部读取，避免从文件头回放多轮后才到达当前事件，导致活动被误判为 crash orphan；`exec-server --remote` 内部服务子进程也不再创建 CLI target。
+
+回归覆盖：discovery/Codex Desktop/WindowsExitWatcher **123 tests / OK**；其中含大型 live rollout 首轮读取、dead process 行、内部 exec-server 过滤、缺失 PID 退出候选和重复事件检查。
 - [Claude 官方文档](https://code.claude.com/docs/en/hooks)：transcript 路径与工具输入。只读已有会话，不安装 Hook。
 - [Kimi message](https://github.com/MoonshotAI/kimi-code/blob/68a283894163204e93b072cef20db164015a5cad/packages/kosong/src/message.ts)：ThinkPart.think 追加；[loop fold](https://github.com/MoonshotAI/kimi-code/blob/68a283894163204e93b072cef20db164015a5cad/packages/agent-core-v2/src/agent/contextMemory/loopEventFold.ts)：content.part、tool.call.args。
 - [pi types](https://github.com/badlogic/pi-mono/blob/842c73170a3658d4e3b39fcc84690211ed503e09/packages/ai/src/types.ts)：ThinkingContent.thinking、ToolCall.arguments、ToolResultMessage.content。

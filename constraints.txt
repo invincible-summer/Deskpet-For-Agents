@@ -1,4 +1,4 @@
-# DeskPet v4.3.0 release constraints (plan2 §21/§22)
+# DeskPet v4.3.1 release constraints (plan2 §21/§22)
 # Python 3.12 / Windows — verified by CI. requirements-*.txt keep expressing
 # compatible minimums; this file pins the reproducible public-release set.
 # Upgrade only after the full Windows Python 3.12 CI passes.

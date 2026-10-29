@@ -1,10 +1,10 @@
-# DeskPet V4.3.0
+# DeskPet V4.3.1
 
 DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的 AI 编码 Agent，并把工作区、当前任务和工作状态显示成桌宠动画与气泡。
 
 支持 Windows / WSL 终端中的 Codex CLI、Claude Code、Kimi CLI、pi、OpenCode CLI 与 DSH（DeepSeek Harness）CLI，以及 Codex Desktop / ChatGPT Desktop Codex 模式、ZCode Desktop、OpenCode Desktop 和 DeepSeek Harness Desktop；ZCode Desktop 通过 Remote Development 连接到 WSL 时，也会从对应 WSL 用户环境读取会话状态。DeskPet 不接管 Agent，不要求 Hook、插件或 MCP，也不会自动审批。
 
-当前源码版本是 **4.3.0**。`v4.3.0` 是本轮监听、仪表盘、活动解析和应用图标升级的源码版本；本版本**不创建 GitHub Release，也不生成新的 Portable/EXE 发布文件**，除非另行发布验收通过的二进制资产。
+当前源码版本是 **4.3.1**。`v4.3.1` 是本轮 Codex 进程退出竞态、桌面首轮 rollout 读取和监听稳定性修复的源码版本；本版本**不创建 GitHub Release，也不生成新的 Portable/EXE 发布文件**，除非另行发布验收通过的二进制资产。
 版本 tag 与二进制 Release 分开推进：tag 用于固定已经验收的源码里程碑，GitHub Release 只在确实值得重新分发 Portable 的版本上显式发布，不会再由 tag push 自动触发。历史 `v1.0.0`、`v2.0.0`、`v3.0.0` Release 用于按开发顺序补齐源码版本历史，不反向制造当时并不存在的 Portable 二进制。详细规则见 [VERSIONING.md](VERSIONING.md)。
 
 ## 下载与启动
