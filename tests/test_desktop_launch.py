@@ -59,8 +59,13 @@ class DesktopLaunchTests(unittest.TestCase):
                 self.launch.reset_mock()
                 self.assertIsInstance(self._start(kind), desktop_launch.DesktopReopen)
                 args, options = self.launch.call_args
-                self.assertEqual(args, ([os.path.normcase(os.path.realpath(executable))],))
-                self.assertEqual(options["cwd"], os.path.normcase(str(self.root)))
+                # Both sides canonicalize identically: on GitHub Windows
+                # runners TEMP is an 8.3 short path (RUNNER~1), so an
+                # expectation built from the un-resolved temp path can never
+                # match the implementation's realpath-derived cwd there.
+                canonical = os.path.normcase(os.path.realpath(executable))
+                self.assertEqual(args, ([canonical],))
+                self.assertEqual(options["cwd"], os.path.dirname(canonical))
                 self.assertEqual(options["env"], self.environment)
                 self.assertFalse(options["shell"])
                 self.assertTrue(options["close_fds"])
