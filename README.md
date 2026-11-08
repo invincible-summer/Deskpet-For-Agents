@@ -1,10 +1,10 @@
-# DeskPet V4.3.2
+# DeskPet V4.4.0
 
 DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的 AI 编码 Agent，并把工作区、当前任务和工作状态显示成桌宠动画与气泡。
 
-支持 Windows / WSL 终端中的 Codex CLI、Claude Code、Kimi CLI、pi、OpenCode CLI 与 DSH（DeepSeek Harness）CLI，以及 Codex Desktop / ChatGPT Desktop Codex 模式、ZCode Desktop、OpenCode Desktop 和 DeepSeek Harness Desktop；ZCode Desktop 通过 Remote Development 连接到 WSL 时，也会从对应 WSL 用户环境读取会话状态。DeskPet 不接管 Agent，不要求 Hook、插件或 MCP，也不会自动审批。
+支持 Windows / WSL 终端中的 Codex CLI、Claude Code、Kimi CLI、pi、OpenCode CLI 与 DSH（DeepSeek Harness）CLI，以及 Codex Desktop / ChatGPT Desktop Codex 模式、ZCode Desktop、OpenCode Desktop 和 DeepSeek Harness Desktop；ZCode Desktop 通过 Remote Development 连接到 WSL 时，也会从对应 WSL 用户环境读取会话状态。DeskPet 不接管 Agent，监控本身不要求 Hook、插件或 MCP，也不会自动审批；另提供一个可选的 DSH 插件，仅作为 DeskPet 的下载与启动载体，不改变监听方式。
 
-当前源码版本是 **4.3.2**。`v4.3.2` 是本轮 Codex 内部服务误识别和监听诊断修复的源码版本；本版本**不创建 GitHub Release，也不生成新的 Portable/EXE 发布文件**，除非另行发布验收通过的二进制资产。
+当前源码版本是 **4.4.0**。`v4.4.0` 新增可选的 DSH（DeepSeek Harness）插件分发渠道（`dsh-plugin/`），监控逻辑零改动；`v4.3.2` 是上一轮 Codex 内部服务误识别和监听诊断修复的源码版本。本版本**不创建 GitHub Release，也不生成新的 Portable/EXE 发布文件**，除非另行发布验收通过的二进制资产。
 版本 tag 与二进制 Release 分开推进：tag 用于固定已经验收的源码里程碑，GitHub Release 只在确实值得重新分发 Portable 的版本上显式发布，不会再由 tag push 自动触发。历史 `v1.0.0`、`v2.0.0`、`v3.0.0` Release 用于按开发顺序补齐源码版本历史，不反向制造当时并不存在的 Portable 二进制。详细规则见 [VERSIONING.md](VERSIONING.md)。
 
 ## 下载与启动
@@ -50,6 +50,22 @@ Start-Desktop.bat
 ```
 
 `Setup-Desktop.bat` 用于创建并准备 `.venv`；`Start-Desktop.bat` 只负责启动，不会每次重新安装依赖。
+
+### 方式 C：通过 DSH 插件安装（DSH 用户可选）
+
+如果你主要在 DeepSeek Harness（DSH）里工作，可以把 DeskPet 作为 DSH 插件安装，由插件负责下载与启动：
+
+```sh
+dsh plugin --profile desktop add github:invincible-summer/Deskpet-For-Agents#v4.4.0
+```
+
+也可以先完整退出 DSH Desktop，再用本地路径安装仓库中的插件目录：
+
+```sh
+dsh plugin --profile desktop add ./dsh-plugin
+```
+
+插件会把 DeskPet 便携版安装到 `$DSH_HOME/deskpet`（默认 `~/.dsh/deskpet`），并在 DSH 每次启动时自动拉起；下载内容按 Release 的 `SHA256SUMS.txt` 校验，失败则放弃启动（fail-closed）。该插件只是安装/启动载体：DeskPet 对 DSH 的监控仍是无插件的被动只读，插件不读取任何会话数据；DSH 退出也不会结束桌宠。详见 [dsh-plugin/README.md](dsh-plugin/README.md)。
 
 ## 开始使用
 
@@ -168,7 +184,8 @@ OpenCode 与 DSH（DeepSeek Harness）同样以无插件、只读方式接入：
   `turn/end`、`step/*`、`tool/*` 事件给出 Working/Done/Error 状态，
   `approval/asked` 与 `approval/decided` 按请求 id 配对给出真实的
   等待审批与解除。DeskPet 不读取 `$DSH_HOME/.credentials.yaml`，不参与
-  DSH Host 的任何私有 IPC。
+  DSH Host 的任何私有 IPC。可选的 DSH 插件（`dsh-plugin/`）只负责下载
+  与启动 DeskPet，不订阅 Host 事件、不读会话数据，上述边界不变。
 - **审批可见性**：Codex 的 rollout 把审批请求列为 transient 不落盘，
   因此 rollout 数据面无法判断当前是否有未决审批。这类会话工作时会明确
   标注"审批状态不可见"，而不是伪造等待审批；DSH 的
@@ -196,6 +213,8 @@ DSH 压缩日志帧对齐起步与 header 引导已在本机实机复现取证�
 4. 启动新的 `DeskPet.exe`。
 
 配置和皮肤仍保存在 `%LOCALAPPDATA%\DeskPet`，不会因为更换程序目录而消失。
+
+由 DSH 插件托管的安装：退出 DeskPet 后删除 `$DSH_HOME/deskpet`，再重启 DSH，插件会按配置的 `releaseTag` 重新下载并启动新版。
 
 ## 发布文件说明
 

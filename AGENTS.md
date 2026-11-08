@@ -12,7 +12,10 @@ require hooks, input injection, automatic approval or writes to Agent-owned data
 Keep boundaries explicit: discovery/session parsing/state reduction belong in
 `agents/`; UI/presentation/config/skin runtime belong in `pet/`; public Win32 window
 actions belong in `actions/`; probes/build utilities belong in `tools/`. Do not mix
-packaging, persistence or UI concerns into Monitor/state reducers.
+packaging, persistence or UI concerns into Monitor/state reducers. The optional DSH
+plugin (`dsh-plugin/`) is a distribution vehicle only: it downloads and launches the
+DeskPet portable build and must never read Agent-owned data; monitoring stays
+passive and plugin-free in `agents/`.
 
 Prefer one clear implementation over parallel legacy paths. Remove dead code and old
 architecture when a replacement is accepted. Do not add abstractions without a real
@@ -40,7 +43,7 @@ annotations live only in this file, not in source headers.
 | ZCode | 0.17.0 (live `db.sqlite` `session.version`); zai-org/ZCode main @ 3c5b227649371507ddc4eb46ac5133afe6db1cab (`ToolPart.state.input`, `ReasoningPart.text`, exact message/call attribution) | 2026-10-27 |
 | Codex | 0.164.0-alpha.11.1 (live `state_5.sqlite` `cli_version`); openai/codex main @ f276b82185f021e7b8d532a3851413bc79a67594 (`app-server-daemon` PID/start-time lifecycle, `ReasoningContentDeltaEvent`, `WebSearchAction`) | 2026-10-29 |
 | OpenCode | anomalyco/opencode dev @ 115113931c7a6957ca4325a37fbcdd2936edde79 (`session_v2` / `session_message`; assistant content text/reasoning/tool blocks, execution claim) | 2026-10-27 |
-| DSH | deepseek-ai/deepseek-harness master @ 22ddee379240 (session.vN.jsonl[.zstd], `tool/call.arguments`, `assistant/message` content) | 2026-10-27 |
+| DSH | deepseek-ai/deepseek-harness master @ fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159 (session.vN.jsonl[.zstd], `tool/call.arguments`, `assistant/message` content; everything-is-a-plugin: `dsh.bundle.patch` manifest, `engines.dsh` compat check, `dsh plugin --profile <p> add <npm\|github\|path\|tarball>` specs) | 2026-11-08 |
 | pi | badlogic/pi-mono main @ 842c73170a3658d4e3b39fcc84690211ed503e09 (session JSONL, `ThinkingContent.thinking` / `ToolCall.arguments`) | 2026-10-27 |
 | Kimi Code | MoonshotAI/kimi-code main @ 68a283894163204e93b072cef20db164015a5cad (`ThinkPart.think` / `content.part` / `tool.call.args`, live wire compatibility retained) | 2026-10-27 |
 | Claude Code | code.claude.com docs (transcript/projects layout, permissionMode, tool input) | 2026-10-27 |

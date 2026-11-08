@@ -1,0 +1,24 @@
+{
+  "name": "dsh-deskpet",
+  "version": "4.4.0",
+  "description": "DeskPet launcher for DeepSeek Harness: downloads and starts the DeskPet Windows portable app. DeskPet monitors DSH sessions passively by reading session logs; this plugin only installs and launches it, and never reads or writes session data.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "dsh": ">=0.2.0 <0.3.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

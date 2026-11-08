@@ -4,7 +4,30 @@ DeskPet 使用 Semantic Versioning 2.0.0。版本 tag 与 GitHub Release 的关�
 [VERSIONING.md](VERSIONING.md)。本文件维护每个可识别版本新增了什么功能、
 修复了什么问题，以及其分发状态。
 
-## Unreleased — v4.3.2 Codex 监听稳定性修复
+## Unreleased — v4.4.0 DSH 插件分发渠道
+
+新增可选的 DSH（DeepSeek Harness）插件 `dsh-plugin/`（包名 `dsh-deskpet`）：
+在 DSH 中安装该插件即可自动下载（按 Release `SHA256SUMS.txt` 做 SHA-256
+校验）并启动 DeskPet 便携版，安装位置 `$DSH_HOME/deskpet`，支持
+`autoStart` / `exePath` / `releaseTag` 行配置。插件仅是安装/启动载体：
+**监控逻辑零改动**，仍为无插件被动只读；插件不订阅 Host 事件、不读会话
+数据、不碰 `.credentials.yaml`；DSH 退出或插件禁用不结束 DeskPet；
+非 Windows 宿主为记日志的 no-op，任何失败 fail-closed 只记日志、绝不
+拖垮 DSH 宿主进程。
+
+- 上游对齐：deepseek-harness master @
+  `fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159`（0.2.2-rc.1，2026-11-04）。
+  插件体系事实：包清单 `dsh.bundle.patch` 声明、`engines.dsh` 兼容检查、
+  `dsh plugin --profile <p> add <npm名|github:仓库|本地路径|tarball>`
+  安装规格、宿主与插件同 Node 进程运行。
+- 测试：新增 `tests/test_dsh_plugin_layout.py`（清单/补丁/版本同步/
+  卫生检查），`node --check dsh-plugin/index.js` 纳入 CI；监控套件回归。
+
+状态：源码版本 4.4.0；按 VERSIONING.md，GitHub Release 与 Portable 资产
+另行决定（插件安装的是最新已发布 Portable，当前仍为 v4.0.0；4.4.0 的
+Portable 未随本变更发布）。
+
+## 4.3.2 — Codex 监听稳定性修复（源码版本）
 
 Codex 监听补正后，Windows Python 3.12 完整套件集中运行一次，**923 项通过**；
 相关阻塞 benchmark、编译检查和 diff 检查通过。详见

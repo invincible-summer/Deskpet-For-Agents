@@ -1,0 +1,14 @@
+# DeskPet launcher bundle. The row config is optional; every key falls back to
+# the defaults enforced in index.js when omitted or empty. A user patch row
+# replaces this whole config object (upstream semantics: no deep merge).
+#   autoStart  - launch DeskPet when DSH starts (default true)
+#   exePath    - absolute path to an existing DeskPet.exe; skips the managed
+#                download under $DSH_HOME/deskpet (default '')
+#   releaseTag - GitHub release tag to install from, 'latest' or e.g. 'v4.0.0'
+- insert:
+    - id: deskpet
+      name: 'dsh-deskpet'
+      config:
+        autoStart: true
+        exePath: ''
+        releaseTag: 'latest'
