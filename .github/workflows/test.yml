@@ -21,7 +21,30 @@ jobs:
       - name: Byte-compile
         run: python -m compileall agents pet actions tools
       - name: Unit tests
-        run: python -m unittest discover tests -p "test_*.py"
+        shell: pwsh
+        run: |
+          python --version | Tee-Object -FilePath unittest-output.log
+          python -m pip list --format=freeze | Tee-Object -Append unittest-output.log
+          python -m unittest discover tests -p "test_*.py" 2>&1 | Tee-Object -Append unittest-output.log
+          exit $LASTEXITCODE
+      - name: Publish failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          # 失败输出尾部写入 step summary（公开可读），FAIL/ERROR 行转为
+          # error 注解（annotations API 公开可读），完整日志上传 artifact。
+          $log = Get-Content unittest-output.log -Raw
+          $tail = $log.Substring([Math]::Max(0, $log.Length - 12000))
+          Add-Content $env:GITHUB_STEP_SUMMARY "## Unit test output (tail)`n``````$tail``````"
+          Select-String -Path unittest-output.log -Pattern '^(FAIL|ERROR):' | ForEach-Object {
+            Write-Host "::error title=unittest::$($_.Line)"
+          }
+      - name: Upload unit test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unittest-output
+          path: unittest-output.log
       - name: DSH plugin syntax check
         run: node --check dsh-plugin/index.js
       - name: Monitor benchmark
