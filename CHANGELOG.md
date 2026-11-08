@@ -22,6 +22,13 @@ DeskPet 使用 Semantic Versioning 2.0.0。版本 tag 与 GitHub Release 的关�
   安装规格、宿主与插件同 Node 进程运行。
 - 测试：新增 `tests/test_dsh_plugin_layout.py`（清单/补丁/版本同步/
   卫生检查），`node --check dsh-plugin/index.js` 纳入 CI；监控套件回归。
+- CI 加固（去字面量化）：版本号断言改为 SemVer 结构校验、依赖 pin
+  断言改为"全量精确 pin + 覆盖 requirements"、AGENTS.md 上游 SHA 断言
+  改为结构合同——版本 bump / 依赖刷新 / 上游对齐刷新不再误红 CI；
+  UI 按钮延迟基准改为噪声免疫（min<50ms + 最差<250ms 硬上限，CI 共享
+  runner 瞬时抖动不再误杀）；GitHub Actions 升级到 Node 24 大版本
+  （v4/v5 一代已被标记 Node 20 deprecated）；补上 `constraints.txt`
+  漏 pin 的 `zstandard`。
 
 状态：源码版本 4.4.0；按 VERSIONING.md，GitHub Release 与 Portable 资产
 另行决定（插件安装的是最新已发布 Portable，当前仍为 v4.0.0；4.4.0 的

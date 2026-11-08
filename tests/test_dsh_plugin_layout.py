@@ -28,6 +28,10 @@ sys.path.insert(0, str(ROOT))
 PLUGIN_DIR = ROOT / "dsh-plugin"
 PACKAGE_NAME = "dsh-deskpet"
 ROW_ID = "deskpet"
+# DSH 插件渠道的历史引入版本。CHANGELOG 记录的是"该版本引入此渠道"
+# 这一历史事实，条目永存，不随 APP_VERSION 递增——版本 bump 不需要
+# 改这里的断言。
+INTRODUCED_VERSION = "4.4.0"
 
 
 def _read(path: Path) -> str:
@@ -176,19 +180,26 @@ class DshPluginDocsSyncTests(unittest.TestCase):
         readme = _read(ROOT / "README.md")
         self.assertIn("方式 C：通过 DSH 插件安装", readme)
         self.assertIn("dsh-plugin/README.md", readme)
-        # 监听边界声明插件不改变被动只读边界
-        self.assertIn("不订阅 Host 事件、不读会话数据", readme)
+        # 监听边界声明插件不改变被动只读边界（短稳定子串，容忍措辞微调）
+        self.assertIn("不读会话数据", readme)
 
     def test_changelog_and_versioning_synced(self):
         changelog = _read(ROOT / "CHANGELOG.md")
-        self.assertIn("v4.4.0 DSH 插件分发渠道", changelog)
+        # CHANGELOG 记录历史事实：引入插件渠道的版本条目永存，不随
+        # 后续 bump 失效。
+        self.assertIn(f"v{INTRODUCED_VERSION} DSH 插件分发渠道", changelog)
+        # VERSIONING 的"当前源码里程碑"行必须跟随 APP_VERSION——
+        # 版本 bump 后忘记更新该行属于真实文档漂移，应在此红。
+        from pet.version import APP_VERSION
         versioning = _read(ROOT / "VERSIONING.md")
-        self.assertIn("**4.4.0**", versioning)
+        self.assertIn(f"**{APP_VERSION}**", versioning)
 
     def test_agents_md_alignment_refreshed(self):
         agents = _read(ROOT / "AGENTS.md")
-        # 上游对齐行刷新到本轮证据；架构纪律声明插件仅为分发载体
-        self.assertIn("fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159", agents)
+        # 结构合同：DSH 上游对齐行存在且架构纪律声明插件仅为分发载体。
+        # 具体 commit SHA/证据日期由维护者按 AGENTS.md 契约在每次上游
+        # 对齐时刷新——不在此锁字面量，否则每次刷新都会打红 CI。
+        self.assertIn("deepseek-ai/deepseek-harness", agents)
         self.assertIn("distribution vehicle only", agents)
 
     def test_ci_runs_node_syntax_check(self):

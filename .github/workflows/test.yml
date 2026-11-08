@@ -12,8 +12,10 @@ jobs:
       # windows runner 默认代码页 cp1252，中文输出会 UnicodeEncodeError
       PYTHONUTF8: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # actions 固定到当前大版本（Node 24 运行时）：v4/v5 一代已被
+      # GitHub 标记 Node 20 deprecated，结束强制迁移后会直接失败。
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install dependencies
@@ -41,7 +43,7 @@ jobs:
           }
       - name: Upload unit test log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unittest-output
           path: unittest-output.log
@@ -82,25 +84,25 @@ jobs:
           }
       - name: Upload benchmark report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: monitor-benchmark
           path: benchmark-report.json
       - name: Upload presentation benchmark report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: presentation-benchmark
           path: presentation-benchmark.json
       - name: Upload UI architecture benchmark report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ui-architecture-benchmark
           path: ui-architecture-benchmark.json
       - name: Upload desktop sources benchmark report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: desktop-source-benchmark
           path: desktop-source-benchmark.json

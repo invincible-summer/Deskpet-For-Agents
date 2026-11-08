@@ -19,11 +19,11 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ inputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Verify annotated stable SemVer tag and source version
@@ -61,7 +61,7 @@ jobs:
         run: python tools/build_release.py
       - name: Upload build diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deskpet-release-diagnostics
           path: |
@@ -72,7 +72,7 @@ jobs:
             presentation-benchmark.json
             ui-architecture-benchmark.json
       - name: Upload portable artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DeskPet-windows-x64-portable
           path: |

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -113,18 +114,42 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertIn("%LOCALAPPDATA%\\DeskPet", readme)
 
     def test_constraints_file_pins_verified_set(self):
+        # 结构合同：constraints.txt 是可复现的精确 pin 集（每行都是
+        # name==version，无范围/操作符），且覆盖全部 requirements 声明。
+        # 不锁具体版本号——依赖升级刷新 pin 不需要改本测试，漏 pin
+        # 或退化为范围约束时在这里红。
         path = ROOT / "constraints.txt"
         self.assertTrue(path.exists())
-        text = path.read_text(encoding="utf-8")
-        for pin in ("psutil==7.2.2", "Pillow==12.3.0", "comtypes==1.4.16",
-                    "imageio-ffmpeg==0.6.0", "numpy==2.5.3", "scipy==1.18.1"):
-            self.assertIn(pin, text)
+        pins: dict[str, str] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)==(\S+)", line)
+            self.assertIsNotNone(
+                m, f"constraints 行必须精确 pin（==）：{line}")
+            pins[m.group(1).lower()] = m.group(2)
+        self.assertTrue(pins)
+        for req_name in ("requirements-core.txt", "requirements-convert.txt"):
+            text = (ROOT / req_name).read_text(encoding="utf-8")
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith(("#", "-")):
+                    continue
+                m = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+                self.assertIsNotNone(m, f"{req_name} 无法解析：{line}")
+                name = m.group(1).lower()
+                self.assertIn(name, pins,
+                              f"{req_name} 依赖 {name} 缺少 constraints pin")
 
     def test_version_module_is_single_source(self):
         from pet.version import APP_LABEL, APP_NAME, APP_VERSION
         self.assertEqual(APP_NAME, "DeskPet")
-        self.assertEqual(APP_VERSION, "4.4.0")
-        self.assertEqual(APP_LABEL, "DeskPet V4.4.0")
+        # 结构校验而非字面量锁定：pet/version.py 是唯一版本源，
+        # 版本 bump 只改 version.py（+文档），不需要改本测试。
+        # SemVer 2.0.0 主版本，允许 -rc.1 等预发布后缀。
+        self.assertRegex(APP_VERSION, r"^\d+\.\d+\.\d+([+-]|$)")
+        self.assertEqual(APP_LABEL, f"{APP_NAME} V{APP_VERSION}")
         import pet.dashboard as dashboard
         self.assertEqual(dashboard.APP_VERSION, APP_LABEL)
 
