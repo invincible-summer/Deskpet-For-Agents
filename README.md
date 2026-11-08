@@ -9,7 +9,7 @@ DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的
 
 ## 下载与启动
 
-DeskPet 提供两种使用方式。普通用户建议直接使用 Portable 版；需要改代码或调试时再使用 Python 源码方式。
+DeskPet 提供三种使用方式。普通用户建议直接使用 Portable 版；DSH 用户可以选用 DSH 插件自动安装与启动；需要改代码或调试时再使用 Python 源码方式。
 
 ### 方式 A：下载 Windows Portable（推荐）
 
@@ -56,6 +56,7 @@ Start-Desktop.bat
 如果你主要在 DeepSeek Harness（DSH）里工作，可以把 DeskPet 作为 DSH 插件安装，由插件负责下载与启动：
 
 ```sh
+# 从本仓库安装（# 后替换为已发布的版本 tag，如 v4.4.0）
 dsh plugin --profile desktop add github:invincible-summer/Deskpet-For-Agents#v4.4.0
 ```
 
@@ -153,7 +154,7 @@ Dashboard 的设置页可以直接查看并打开这个目录。
 不会。DeskPet 的正常监听路径保持被动、只读：
 
 - 不向 Agent 进程注入代码；
-- 不要求配置 Hook、插件或代理脚本；
+- 不要求配置 Hook、插件或代理脚本（可选的 DSH 插件只是 DeskPet 的下载与启动载体，不属于监听路径，也不读取任何会话数据）；
 - 不向 Agent 数据库写数据；
 - 不自动发送键盘输入；
 - 不自动批准 Approve 请求；
