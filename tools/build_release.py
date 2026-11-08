@@ -73,10 +73,15 @@ def build() -> None:
     if not (DIST / "DeskPet.exe").is_file():
         raise SystemExit(f"Nuitka output missing: {DIST / 'DeskPet.exe'}")
 
-    for name in ("README.md", "THIRD_PARTY_NOTICES.md"):
-        src = ROOT / name
-        if src.is_file():
-            shutil.copy2(src, DIST / name)
+    # THIRD_PARTY_NOTICES 自仓库结构标准化起收在 docs/；法律声明缺失时
+    # 直接失败而不是静默漏装（release_acceptance 无法检测这一缺失）。
+    notices = ROOT / "docs" / "THIRD_PARTY_NOTICES.md"
+    if not notices.is_file():
+        raise SystemExit(f"Missing third-party notices: {notices}")
+    shutil.copy2(notices, DIST / "THIRD_PARTY_NOTICES.md")
+    readme_src = ROOT / "README.md"
+    if readme_src.is_file():
+        shutil.copy2(readme_src, DIST / "README.md")
 
     run([sys.executable, str(ROOT / "tools" / "release_acceptance.py"),
          "--dist", str(DIST)])

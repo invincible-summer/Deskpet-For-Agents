@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+DOCS = ROOT / "docs"
 STABLE_SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 
 
@@ -14,9 +15,11 @@ class VersioningPolicyTests(unittest.TestCase):
         self.assertRegex(APP_VERSION, STABLE_SEMVER)
 
     def test_policy_and_changelog_exist(self):
-        self.assertTrue((ROOT / "VERSIONING.md").is_file())
+        # 版本策略文档自仓库结构标准化起收在 docs/（CHANGELOG/AGENTS/README
+        # 按生态惯例留在根目录）。
+        self.assertTrue((DOCS / "VERSIONING.md").is_file())
         self.assertTrue((ROOT / "CHANGELOG.md").is_file())
-        policy = (ROOT / "VERSIONING.md").read_text(encoding="utf-8")
+        policy = (DOCS / "VERSIONING.md").read_text(encoding="utf-8")
         self.assertIn("Semantic Versioning 2.0.0", policy)
         self.assertIn("public compatibility contract", policy)
         self.assertIn("published release tag", policy.lower())

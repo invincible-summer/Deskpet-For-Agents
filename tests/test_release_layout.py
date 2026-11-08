@@ -113,6 +113,15 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertIn("现有 Python 3.12", readme)
         self.assertIn("%LOCALAPPDATA%\\DeskPet", readme)
 
+    def test_third_party_notices_live_in_docs_and_build_fails_closed(self):
+        # 仓库结构标准化：法律声明收在 docs/，build_release 必须从那里
+        # 取并在缺失时显式失败——静默漏装无法被 release_acceptance 检出。
+        self.assertTrue((ROOT / "docs" / "THIRD_PARTY_NOTICES.md").is_file())
+        build_src = (ROOT / "tools" / "build_release.py").read_text(
+            encoding="utf-8")
+        self.assertIn('ROOT / "docs" / "THIRD_PARTY_NOTICES.md"', build_src)
+        self.assertIn("Missing third-party notices", build_src)
+
     def test_constraints_file_pins_verified_set(self):
         # 结构合同：constraints.txt 是可复现的精确 pin 集（每行都是
         # name==version，无范围/操作符），且覆盖全部 requirements 声明。

@@ -5,7 +5,7 @@ DeskPet 是一个轻量的 Windows 桌宠，用来被动观察你已经启动的
 支持 Windows / WSL 终端中的 Codex CLI、Claude Code、Kimi CLI、pi、OpenCode CLI 与 DSH（DeepSeek Harness）CLI，以及 Codex Desktop / ChatGPT Desktop Codex 模式、ZCode Desktop、OpenCode Desktop 和 DeepSeek Harness Desktop；ZCode Desktop 通过 Remote Development 连接到 WSL 时，也会从对应 WSL 用户环境读取会话状态。DeskPet 不接管 Agent，监控本身不要求 Hook、插件或 MCP，也不会自动审批；另提供一个可选的 DSH 插件，仅作为 DeskPet 的下载与启动载体，不改变监听方式。
 
 当前源码版本是 **4.4.0**。`v4.4.0` 新增可选的 DSH（DeepSeek Harness）插件分发渠道（`dsh-plugin/`），监控逻辑零改动；`v4.3.2` 是上一轮 Codex 内部服务误识别和监听诊断修复的源码版本。本版本**不创建 GitHub Release，也不生成新的 Portable/EXE 发布文件**，除非另行发布验收通过的二进制资产。
-版本 tag 与二进制 Release 分开推进：tag 用于固定已经验收的源码里程碑，GitHub Release 只在确实值得重新分发 Portable 的版本上显式发布，不会再由 tag push 自动触发。历史 `v1.0.0`、`v2.0.0`、`v3.0.0` Release 用于按开发顺序补齐源码版本历史，不反向制造当时并不存在的 Portable 二进制。详细规则见 [VERSIONING.md](VERSIONING.md)。
+版本 tag 与二进制 Release 分开推进：tag 用于固定已经验收的源码里程碑，GitHub Release 只在确实值得重新分发 Portable 的版本上显式发布，不会再由 tag push 自动触发。历史 `v1.0.0`、`v2.0.0`、`v3.0.0` Release 用于按开发顺序补齐源码版本历史，不反向制造当时并不存在的 Portable 二进制。详细规则见 [VERSIONING.md](docs/VERSIONING.md)。
 
 ## 下载与启动
 
@@ -112,7 +112,7 @@ Dashboard 默认打开 **Agent 工作台**，在一个页面查看状态统计�
 
 双击对应 Agent 的气泡或桌宠可以请求唤起它所在的终端或桌面应用。桌面端目前只承诺恢复并前置宿主应用，不猜测或调用私有会话跳转接口。
 
-Codex、DSH、ZCode 最小化到托盘时，DeskPet 使用已核验的应用单实例启动入口，请应用自身恢复窗口内容；任务栏最小化使用 Windows 恢复。重复唤起请求会合并，Dashboard 保持当前显隐状态。无法核验宿主或启动方式时显示失败，不猜测启动另一个实例。真实托盘交互验收进度见 [验收记录](tests/ACCEPTANCE-desktop-activation.md)。
+Codex、DSH、ZCode 最小化到托盘时，DeskPet 使用已核验的应用单实例启动入口，请应用自身恢复窗口内容；任务栏最小化使用 Windows 恢复。重复唤起请求会合并，Dashboard 保持当前显隐状态。无法核验宿主或启动方式时显示失败，不猜测启动另一个实例。真实托盘交互验收进度见 [验收记录](docs/acceptance/ACCEPTANCE-desktop-activation.md)。
 
 ## 自定义皮肤
 
@@ -230,9 +230,10 @@ SHA256SUMS.txt                     ZIP 的 SHA-256 校验值
 
 ## 项目资料
 
-- [VERSIONING.md](VERSIONING.md)：Semantic Versioning、源码 tag 与正式 Release 规则。
+- [VERSIONING.md](docs/VERSIONING.md)：Semantic Versioning、源码 tag 与正式 Release 规则。
 - [CHANGELOG.md](CHANGELOG.md)：各版本新增功能、修复内容及历史版本映射。
 - [AGENTS.md](AGENTS.md)：仓库开发和验收约定（含各 Agent 上游对齐版本表）。
-- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)：Portable 包中第三方组件说明。
+- [THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md)：Portable 包中第三方组件说明。
+- [docs/acceptance/](docs/acceptance/)：各轮实机验收记录。
 
 源码测试与发布构建面向维护者，不影响普通用户通过 Portable ZIP 解压即用。

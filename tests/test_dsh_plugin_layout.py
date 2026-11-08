@@ -191,7 +191,7 @@ class DshPluginDocsSyncTests(unittest.TestCase):
         # VERSIONING 的"当前源码里程碑"行必须跟随 APP_VERSION——
         # 版本 bump 后忘记更新该行属于真实文档漂移，应在此红。
         from pet.version import APP_VERSION
-        versioning = _read(ROOT / "VERSIONING.md")
+        versioning = _read(ROOT / "docs" / "VERSIONING.md")
         self.assertIn(f"**{APP_VERSION}**", versioning)
 
     def test_agents_md_alignment_refreshed(self):

@@ -1,7 +1,7 @@
 # DeskPet 版本变更记录
 
 DeskPet 使用 Semantic Versioning 2.0.0。版本 tag 与 GitHub Release 的关系见
-[VERSIONING.md](VERSIONING.md)。本文件维护每个可识别版本新增了什么功能、
+[VERSIONING.md](docs/VERSIONING.md)。本文件维护每个可识别版本新增了什么功能、
 修复了什么问题，以及其分发状态。
 
 ## Unreleased — v4.4.0 DSH 插件分发渠道
@@ -29,6 +29,11 @@ DeskPet 使用 Semantic Versioning 2.0.0。版本 tag 与 GitHub Release 的关�
   runner 瞬时抖动不再误杀）；GitHub Actions 升级到 Node 24 大版本
   （v4/v5 一代已被标记 Node 20 deprecated）；补上 `constraints.txt`
   漏 pin 的 `zstandard`。
+- 仓库结构标准化：版本策略与第三方声明移入 `docs/`
+  （`docs/VERSIONING.md`、`docs/THIRD_PARTY_NOTICES.md`），五份实机
+  验收记录移入 `docs/acceptance/`；根目录只保留 README / CHANGELOG /
+  AGENTS 三个生态惯例文档。`tools/build_release.py` 改从 `docs/` 取
+  第三方声明且缺失即构建失败（原先静默跳过、验收无法检出）。
 
 状态：源码版本 4.4.0；按 VERSIONING.md，GitHub Release 与 Portable 资产
 另行决定（插件安装的是最新已发布 Portable，当前仍为 v4.0.0；4.4.0 的
@@ -38,14 +43,14 @@ Portable 未随本变更发布）。
 
 Codex 监听补正后，Windows Python 3.12 完整套件集中运行一次，**923 项通过**；
 相关阻塞 benchmark、编译检查和 diff 检查通过。详见
-[两行活动与图标验收](tests/ACCEPTANCE-activity-icon.md)。
+[两行活动与图标验收](docs/acceptance/ACCEPTANCE-activity-icon.md)。
 
 状态：**2026-10-27 的监听生命周期、ZCode WSL、仪表盘与气泡修订完成源码验收。
 Windows Python 3.12 完整套件 916 项通过（此前 951 项，净减少 35 项）；最终审查
 和截图发现问题的相关模块复验、四项阻塞 benchmark、compileall 与 diff 检查通过。
 宽/紧凑窗口和气泡三种尺寸已检查合成数据截图。当前没有 ZCode 远程活跃实例，
 真实 WSL 连接交互保持 NOT_TESTED。具体证据见
-[本轮验收记录](tests/ACCEPTANCE-monitoring-dashboard.md)。**
+[本轮验收记录](docs/acceptance/ACCEPTANCE-monitoring-dashboard.md)。**
 此前用户确认 Codex、DSH、ZCode 从应用自身托盘隐藏后均可正常唤起交互；反复
 真实托盘、P95/RSS/CPU 专项与编译产物验收仍需完成。
 按 SemVer 属于向后兼容的 PATCH 修复；源码版本已调整为 4.3.2，GitHub Release
@@ -247,7 +252,7 @@ master，2026-10）定位；**没有放宽任何 fail-closed 语义**，没有�
   完成后按表面公布 PASS/FAIL/DEGRADED。
 
 DeskPet 使用 Semantic Versioning 2.0.0。版本 tag 与 GitHub Release 的关系见
-[VERSIONING.md](VERSIONING.md)。本文件维护每个可识别版本新增了什么功能、
+[VERSIONING.md](docs/VERSIONING.md)。本文件维护每个可识别版本新增了什么功能、
 修复了什么问题，以及其分发状态。
 
 ## 4.1.0 — ZCode WSL Remote Development 被动监听
